@@ -14,6 +14,98 @@ use tauri::{
 
 use crate::window_pos;
 
+struct TrayOverview {
+    balance_item: MenuItem<tauri::Wry>,
+    order: Mutex<BalanceOrder>,
+}
+#[derive(Default)]
+struct BalanceOrder {
+    session: u64,
+    revision: u64,
+}
+impl BalanceOrder {
+    fn begin(&mut self, clear: impl FnOnce() -> Result<(), String>) -> Result<u64, String> {
+        let next = self
+            .session
+            .checked_add(1)
+            .ok_or("托盘会话已耗尽，请重启应用")?;
+        clear()?;
+        self.session = next;
+        self.revision = 0;
+        Ok(next)
+    }
+    fn update(
+        &mut self,
+        session: u64,
+        revision: u64,
+        apply: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if session == 0 || session != self.session || revision <= self.revision {
+            return Ok(());
+        }
+        apply()?;
+        self.revision = revision;
+        Ok(())
+    }
+}
+fn set_balance_caption(
+    app: &tauri::AppHandle,
+    overview: &TrayOverview,
+    caption: &str,
+) -> Result<(), String> {
+    overview
+        .balance_item
+        .set_text(caption)
+        .map_err(|_| "托盘菜单更新失败")?;
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_tooltip(Some(format!("DeepSeek Monitor\n{caption}")))
+            .map_err(|_| "托盘提示更新失败")?;
+    }
+    Ok(())
+}
+pub(crate) fn begin_balance_session(app: &tauri::AppHandle) -> Result<u64, String> {
+    let overview = app.try_state::<TrayOverview>().ok_or("托盘尚未就绪")?;
+    let mut order = overview.order.lock().map_err(|_| "托盘状态不可用")?;
+    order.begin(|| set_balance_caption(app, &overview, "余额：尚未取得"))
+}
+pub fn balance_caption(
+    total: Option<&str>,
+    currency: Option<&str>,
+    stale: bool,
+) -> Result<String, String> {
+    let Some(total) = total else {
+        return Ok("余额：尚未取得".into());
+    };
+    let value = total.parse::<f64>().map_err(|_| "余额格式不可用")?;
+    if !value.is_finite() || value.abs() > 1e15 {
+        return Err("余额格式不可用".into());
+    }
+    let unit = match currency {
+        Some("CNY") => "¥",
+        Some("USD") => "$",
+        _ => return Err("余额币种不可用".into()),
+    };
+    Ok(format!(
+        "余额：{unit}{value:.2} · {}",
+        if stale { "旧数据" } else { "最近成功" }
+    ))
+}
+pub(crate) fn update_balance(
+    app: &tauri::AppHandle,
+    session: u64,
+    revision: u64,
+    total: Option<&str>,
+    currency: Option<&str>,
+    stale: bool,
+) -> Result<(), String> {
+    let caption = balance_caption(total, currency, stale)?;
+    let overview = app.try_state::<TrayOverview>().ok_or("托盘尚未就绪")?;
+    let mut order = overview.order.lock().map_err(|_| "托盘状态不可用")?;
+    order.update(session, revision, || {
+        set_balance_caption(app, &overview, &caption)
+    })
+}
+
 const EVENT_MAIN_WINDOW_SHOWN: &str = "main-window-shown";
 const EVENT_MAIN_WINDOW_HIDDEN: &str = "main-window-hidden";
 
@@ -140,9 +232,15 @@ pub(crate) fn hide_main_window_inner(window: &WebviewWindow) -> Result<(), Strin
 pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "显示主面板", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+    let balance_item = MenuItem::with_id(app, "balance", "余额：尚未取得", false, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show_item, &balance_item, &quit_item])?;
+    app.manage(TrayOverview {
+        balance_item,
+        order: Mutex::new(BalanceOrder::default()),
+    });
 
-    let mut tray_builder = TrayIconBuilder::new()
+    let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+        .tooltip("DeepSeek Monitor · 余额尚未取得")
         .menu(&tray_menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -204,4 +302,73 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
     tray_builder.build(app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+    #[test]
+    fn reload_accepts_new_session_clear_and_rejects_old_or_out_of_order_updates() {
+        let mut order = BalanceOrder::default();
+        let mut caption = String::new();
+        let old = order.begin(|| Ok(())).unwrap();
+        order
+            .update(old, 40, || {
+                caption = "old".into();
+                Ok(())
+            })
+            .unwrap();
+        let current = order
+            .begin(|| {
+                caption.clear();
+                Ok(())
+            })
+            .unwrap();
+        order
+            .update(current, 1, || {
+                caption = "new".into();
+                Ok(())
+            })
+            .unwrap();
+        order
+            .update(current, 2, || {
+                caption.clear();
+                Ok(())
+            })
+            .unwrap();
+        for (session, revision) in [(old, 100), (current, 1), (0, 100), (current + 1, 100)] {
+            order
+                .update(session, revision, || panic!("obsolete update applied"))
+                .unwrap();
+        }
+        assert!(caption.is_empty());
+        assert!(order
+            .update(current, 3, || Err("native failure".into()))
+            .is_err());
+        order
+            .update(current, 3, || {
+                caption = "retry".into();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(caption, "retry");
+        assert!(order.begin(|| Err("clear failed".into())).is_err());
+        assert_eq!(order.session, current);
+    }
+    #[test]
+    fn 托盘标明最近成功与旧数据_清除不遗留数字() {
+        assert_eq!(
+            balance_caption(Some("19.62"), Some("CNY"), false).unwrap(),
+            "余额：¥19.62 · 最近成功"
+        );
+        assert!(balance_caption(Some("0"), Some("CNY"), true)
+            .unwrap()
+            .contains("旧数据"));
+        assert_eq!(
+            balance_caption(None, None, false).unwrap(),
+            "余额：尚未取得"
+        );
+        assert!(balance_caption(Some("SECRET"), Some("CNY"), false).is_err());
+        assert!(balance_caption(Some("NaN"), Some("CNY"), false).is_err());
+    }
 }

@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:5180",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm run local-usage:prepare && npm run dev",
+    "beforeBuildCommand": "npm run local-usage:prepare && npm run build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -32,6 +32,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "resources/local-usage/": "local-usage/"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

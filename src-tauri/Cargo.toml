@@ -28,16 +28,32 @@ reqwest = { version = "0.12", features = ["json"] }
 # 凭据加密（M-1）用 DPAPI，密文以 base64 落在 config.json。
 # base64 已经是 Tauri 依赖链里的既有 crate（见 Cargo.lock），不新增编译单元。
 base64 = "0.22"
+# 固定版本的本地用量引擎执行前校验SHA-256；sha2为既有传递依赖。
+sha2 = "0.10"
+# 手动检查正式发行版本，使用语义版本比较而不是字符串比较；为Tauri既有依赖。
+semver = "1"
+# 固定兼容Rust 1.88的插件版本，仅Rust端注册固定快捷键，不授予网页插件权限。
+tauri-plugin-global-shortcut = "=2.3.0"
+# 原生提醒仅由Rust发送；固定兼容最低Rust 1.88的插件版本。
+tauri-plugin-notification = "=2.3.1"
+# 免打扰使用电脑本地时区；chrono为日志插件已有依赖。
+chrono = "0.4"
+# ZCode指定数据库的只读元数据查询；固定版本、内置SQLite和可取消/有界查询，兼容Rust1.88。
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled", "hooks", "limits"] }
+# 本地工具目录变更仅作刷新信号；固定notify 8.2，Windows原生监听失败仍定时兜底。
+notify = { version = "=8.2.0", default-features = false }
 
 # Tauri 已间接依赖 tokio，这里只是提为直接依赖以便用 try_join! 并发发起两个用量请求，
 # 不会新增编译单元。
-tokio = { version = "1", features = ["macros", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "time", "sync", "process", "io-util"] }
 
 # 凭据加密（M-1）。windows crate 本就是 tauri 的传递依赖（经 tao / webview2-com），
 # 这里提为直接依赖只为拿到 DPAPI（CryptProtectData / CryptUnprotectData）与
 # 缓存目录变更监听（ReadDirectoryChangesW，见 cache_watch.rs），
 # 不新增任何编译单元。仅开用到的 Win32 面，避免拖入整个表面。
 [target.'cfg(windows)'.dependencies]
+# 通知插件允许notify-rust 4.x；4.18.2要求Rust1.89，固定经最低工具链核验的版本。
+notify-rust = { version = "=4.17.0", default-features = false }
 # 自启通过原生 Unicode 注册表 API 读写并精确回滚 Run 值，替代 reg.exe 子进程。
 winreg = "0.55"
 # 直接使用 WebView2 profile 的 ClearBrowsingDataAll 与完成回调，清登录数据须等待真实完成。

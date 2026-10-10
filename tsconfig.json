@@ -14,11 +14,12 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx"
   },
   "include": ["src"],
-  // 测试文件与它的 Node 类型垫片不进应用构建：前者 import 带 .ts 后缀（Vite 侧不需要）、
-  // 引用 node: 内置模块；它们由 tsconfig.test.json 单独做类型检查。
+  // 测试文件与 Node 类型垫片不进应用构建；测试引用 node: 内置模块，
+  // 由 tsconfig.test.json 单独检查。共享纯函数可使用 .ts 后缀兼容 Node 类型剥离。
   "exclude": ["src/**/*.test.ts", "src/node-shims.d.ts"],
   "references": []
 }

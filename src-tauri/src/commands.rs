@@ -28,6 +28,297 @@ fn require_main(window: &WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalUsageStatus {
+    enabled: bool,
+    snapshot: Option<crate::local_usage::LocalSnapshot>,
+    busy: bool,
+    last_error: Option<String>,
+}
+#[tauri::command]
+pub(crate) fn get_local_sources(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::local_sources::SourceOptions, String> {
+    require_main(&window)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    if state.sources.is_none() {
+        state.sources = Some(crate::local_sources::load()?);
+    }
+    Ok(state.sources.clone().unwrap())
+}
+#[tauri::command]
+pub(crate) fn save_local_sources(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    options: crate::local_sources::SourceOptions,
+) -> Result<crate::local_sources::SourceOptions, String> {
+    require_main(&window)?;
+    let options = crate::local_sources::validate_options(options)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    crate::local_sources::save(&options)?;
+    state.sources = Some(options.clone());
+    state.generation = state.generation.wrapping_add(1);
+    state.snapshot = None;
+    state.last_error = None;
+    state.last_scan_failed = false;
+    if let Some(cancel) = state.cancel.take() {
+        cancel.notify_one();
+    }
+    crate::local_background::changed().notify_one();
+    Ok(options)
+}
+#[tauri::command]
+pub(crate) async fn list_running_wsl(
+    window: WebviewWindow,
+) -> Result<crate::local_sources::WslStatus, String> {
+    require_main(&window)?;
+    crate::local_sources::running_wsl().await
+}
+#[tauri::command]
+pub(crate) fn save_local_archive(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    collected_at: u64,
+    scope: crate::local_archive::ArchiveScope,
+    include_paths: bool,
+) -> Result<crate::local_archive::ArchiveEntry, String> {
+    require_main(&window)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "系统时钟不可用")?
+        .as_millis() as u64;
+    let snapshot = crate::local_archive::current_snapshot(&state, collected_at, now)?;
+    crate::local_archive::capture(snapshot, &scope, include_paths, state.last_scan_failed, now)
+}
+#[tauri::command]
+pub(crate) fn list_local_archives(
+    window: WebviewWindow,
+) -> Result<Vec<crate::local_archive::ArchiveSummary>, String> {
+    require_main(&window)?;
+    crate::local_archive::list()
+}
+#[tauri::command]
+pub(crate) fn read_local_archive(
+    window: WebviewWindow,
+    id: String,
+) -> Result<crate::local_archive::ArchiveEntry, String> {
+    require_main(&window)?;
+    crate::local_archive::read(&id)
+}
+#[tauri::command]
+pub(crate) fn delete_local_archive(window: WebviewWindow, id: String) -> Result<(), String> {
+    require_main(&window)?;
+    crate::local_archive::delete(&id)
+}
+#[tauri::command]
+pub(crate) fn clear_local_archives(window: WebviewWindow) -> Result<(), String> {
+    require_main(&window)?;
+    crate::local_archive::clear()
+}
+fn local_preference_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::config::config_path()?.with_file_name("local-usage-enabled.json"))
+}
+#[tauri::command]
+pub(crate) fn get_local_retention_enabled(window: WebviewWindow) -> Result<bool, String> {
+    require_main(&window)?;
+    crate::local_retention::enabled()
+}
+#[tauri::command]
+pub(crate) fn set_local_retention_enabled(
+    window: WebviewWindow,
+    enabled: bool,
+) -> Result<bool, String> {
+    require_main(&window)?;
+    crate::local_retention::set_enabled(enabled)
+}
+#[tauri::command]
+pub(crate) fn list_local_retention(
+    window: WebviewWindow,
+) -> Result<Vec<crate::local_archive::ArchiveSummary>, String> {
+    require_main(&window)?;
+    crate::local_retention::list()
+}
+#[tauri::command]
+pub(crate) fn read_local_retention(
+    window: WebviewWindow,
+    id: String,
+) -> Result<crate::local_archive::ArchiveEntry, String> {
+    require_main(&window)?;
+    crate::local_retention::read(&id)
+}
+#[tauri::command]
+pub(crate) fn delete_local_retention(window: WebviewWindow, id: String) -> Result<(), String> {
+    require_main(&window)?;
+    crate::local_retention::delete(&id)
+}
+#[tauri::command]
+pub(crate) fn clear_local_retention(window: WebviewWindow) -> Result<(), String> {
+    require_main(&window)?;
+    crate::local_retention::clear()
+}
+pub(crate) fn local_enabled(state: &mut crate::local_usage::LocalState) -> Result<bool, String> {
+    if let Some(enabled) = state.enabled {
+        return Ok(enabled);
+    }
+    let path = local_preference_path()?;
+    let enabled = match std::fs::read(path) {
+        Ok(data) => serde_json::from_slice::<bool>(&data)
+            .map_err(|_| "本地用量设置损坏，请修复配置后重试")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err("本地用量设置无法读取".into()),
+    };
+    state.enabled = Some(enabled);
+    Ok(enabled)
+}
+#[tauri::command]
+pub(crate) fn get_local_usage(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<LocalUsageStatus, String> {
+    require_main(&window)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    Ok(LocalUsageStatus {
+        enabled: local_enabled(&mut state)?,
+        snapshot: state.snapshot.clone(),
+        busy: state.busy,
+        last_error: state.last_error.clone(),
+    })
+}
+#[tauri::command]
+pub(crate) fn set_local_usage_enabled(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<LocalUsageStatus, String> {
+    require_main(&window)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    let path = local_preference_path()?;
+    let parent = path.parent().ok_or("本地用量目录不可用")?;
+    std::fs::create_dir_all(parent).map_err(|_| "本地用量设置无法保存")?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, if enabled { "true" } else { "false" })
+        .map_err(|_| "本地用量设置无法保存")?;
+    std::fs::rename(&temporary, &path).map_err(|_| "本地用量设置无法保存")?;
+    state.generation = state.generation.wrapping_add(1);
+    state.enabled = Some(enabled);
+    state.snapshot = None;
+    if let Some(cancel) = state.cancel.take() {
+        cancel.notify_one();
+    }
+    state.last_error = None;
+    crate::local_background::changed().notify_one();
+    Ok(LocalUsageStatus {
+        enabled,
+        snapshot: None,
+        busy: state.busy,
+        last_error: None,
+    })
+}
+#[tauri::command]
+pub(crate) async fn scan_local_usage(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::local_usage::LocalSnapshot, String> {
+    require_main(&window)?;
+    collect_local_usage(&app, false)
+        .await?
+        .ok_or("采集未开始".into())
+}
+pub(crate) async fn collect_local_usage(
+    app: &tauri::AppHandle,
+    background: bool,
+) -> Result<Option<crate::local_usage::LocalSnapshot>, String> {
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let (generation, cancel, sources) = {
+        let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+        if background
+            && (!local_enabled(&mut state)?
+                || !crate::local_background::enabled(&mut state)?
+                || state.busy)
+        {
+            return Ok(None);
+        }
+        if !local_enabled(&mut state)? {
+            return Err("尚未启用本地用量".into());
+        }
+        if state.busy {
+            return Err("正在采集，请稍后重试".into());
+        }
+        if state.sources.is_none() {
+            state.sources = Some(crate::local_sources::load()?);
+        }
+        let sources = state.sources.clone().unwrap();
+        state.busy = true;
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        state.cancel = Some(cancel.clone());
+        (state.generation, cancel, sources)
+    };
+    let resource = app
+        .path()
+        .resource_dir()
+        .map(|dir| dir.join("local-usage/tokscale.exe"));
+    let path = if cfg!(debug_assertions) {
+        Ok(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/local-usage/tokscale.exe"))
+    } else {
+        resource
+    };
+    let mut result = match path {
+        Ok(path) => tokio::select! {
+            result = crate::local_usage::run_sources(&path, &sources, app) => result,
+            _ = cancel.notified() => Err("本地采集已停止".into()),
+        },
+        Err(_) => Err("采集引擎目录不可用".into()),
+    };
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    state.busy = false;
+    if generation != state.generation {
+        return Err("本地采集设置已变化".into());
+    }
+    state.cancel = None;
+    state.last_scan_failed = result.is_err();
+    state.last_error = result.as_ref().err().cloned();
+    if let Ok(snapshot) = &mut result {
+        snapshot.retention_warning = crate::local_retention::checkpoint(snapshot).err();
+        state.snapshot = Some(snapshot.clone());
+    }
+    result.map(Some)
+}
+
+#[tauri::command]
+pub(crate) fn get_local_background(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::local_background::Status, String> {
+    require_main(&window)?;
+    crate::local_background::status(&app)
+}
+#[tauri::command]
+pub(crate) fn set_local_background(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<crate::local_background::Status, String> {
+    require_main(&window)?;
+    {
+        let collector = app.state::<crate::local_usage::LocalCollector>();
+        let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+        if enabled && !local_enabled(&mut state)? {
+            return Err("请先开启本地统计".into());
+        }
+        crate::local_background::save(&mut state, enabled)?;
+    }
+    crate::local_background::status(&app)
+}
+
 #[tauri::command]
 pub(crate) fn hide_main_window(window: WebviewWindow) -> Result<(), String> {
     require_main(&window)?;
@@ -82,6 +373,91 @@ pub(crate) fn open_support_page(window: WebviewWindow, page: String) -> Result<(
 }
 
 #[tauri::command]
+pub(crate) async fn check_app_release(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::update_check::UpdateResult, String> {
+    require_main(&window)?;
+    crate::update_check::check(
+        &app.package_info().version.to_string(),
+        &app.state::<crate::update_check::UpdateCache>(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) fn get_alert_status(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::alerts::AlertStatus, String> {
+    require_main(&window)?;
+    crate::alerts::status(&app)
+}
+#[tauri::command]
+pub(crate) fn save_alert_options(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    options: crate::alerts::AlertOptions,
+) -> Result<crate::alerts::AlertStatus, String> {
+    require_main(&window)?;
+    crate::alerts::save_options(&app, options)
+}
+#[tauri::command]
+pub(crate) fn test_alert_notification(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_main(&window)?;
+    crate::alerts::test_notification(&app)
+}
+#[tauri::command]
+pub(crate) fn get_desktop_options(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<crate::desktop::DesktopOptions, String> {
+    require_main(&window)?;
+    crate::desktop::get(&app)
+}
+#[tauri::command]
+pub(crate) fn set_desktop_options(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    always_on_top: bool,
+    shortcut_enabled: bool,
+) -> Result<crate::desktop::DesktopOptions, String> {
+    require_main(&window)?;
+    crate::desktop::set(&app, always_on_top, shortcut_enabled)
+}
+#[tauri::command]
+pub(crate) fn begin_tray_balance_session(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<u64, String> {
+    require_main(&window)?;
+    crate::tray::begin_balance_session(&app)
+}
+#[tauri::command]
+pub(crate) fn update_tray_balance(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    session: u64,
+    revision: u64,
+    total: Option<String>,
+    currency: Option<String>,
+    stale: bool,
+) -> Result<(), String> {
+    require_main(&window)?;
+    crate::tray::update_balance(
+        &app,
+        session,
+        revision,
+        total.as_deref(),
+        currency.as_deref(),
+        stale,
+    )
+}
+
+#[tauri::command]
 pub(crate) async fn save_api_key(
     window: WebviewWindow,
     app: tauri::AppHandle,
@@ -98,10 +474,10 @@ pub(crate) async fn save_api_key(
         CommandError::new(format!("验证未通过，原 Key 未更改：{e}"), Some("api_key"))
     })?;
     let config = app.state::<ApiKeySession>().0.commit(generation, || {
-        to_app_config(edit_config(|config| {
-            config.api_key = Some(value);
-            Ok(())
-        })?)
+        to_app_config(crate::config::edit_validated_credential(
+            crate::config::ValidatedCredential::ApiKey,
+            value,
+        )?)
     })?;
     Ok(SavedApiKey { config, balance })
 }

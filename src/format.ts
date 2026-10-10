@@ -7,6 +7,7 @@
 // 注意本文件**不得** import 任何浏览器或 Tauri API，否则 Node 侧测不了。
 
 export type UsageDay = {
+  rawModels?: import("./types").RawModelUsage[];
   unavailable?: boolean;
   date: string;
   flashTokens: number;

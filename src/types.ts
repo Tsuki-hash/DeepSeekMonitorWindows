@@ -1,6 +1,7 @@
 import type { UsageDay } from "./format";
 
-export type ViewName = "dashboard" | "settings" | "detail";
+export type ViewName =
+  "dashboard" | "settings" | "detail" | "history" | "local";
 export type ModelName = "flash" | "pro" | "other";
 export type AppConfig = {
   configWarnings?: string[];
@@ -34,10 +35,26 @@ export type UsageModel = {
   cost: number;
 };
 export type UsageResult = {
+  schemaVersion?: number;
+  modelMappingVersion?: string;
+  rawModels?: RawModelUsage[];
   accountingDate?: string;
   warnings?: string[];
   unavailableDates?: string[];
   models: UsageModel[];
   days: UsageDay[];
   monthCost: number;
+};
+
+export type RawModelUsage = {
+  dataWarning?: string | null;
+  model: string;
+  groupKey: string | null;
+  totalTokens: number | null;
+  requestCount: number | null;
+  cacheHitTokens: number | null;
+  cacheMissTokens: number | null;
+  responseTokens: number | null;
+  otherTokens: number | null;
+  cost: number | null;
 };

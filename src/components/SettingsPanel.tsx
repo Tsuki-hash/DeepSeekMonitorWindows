@@ -1,4 +1,5 @@
 import React from "react";
+import { GlassSettings } from "./GlassSettings";
 import {
   BarChart3,
   CheckCircle2,
@@ -12,10 +13,12 @@ import {
 import { refreshOptions } from "../usage-api";
 import { useTheme } from "../theme";
 import { useSettingsState } from "../settings-state";
-import type { BalanceData, UsageResult } from "../types";
-import { updateTime } from "../data-display";
+import type { BalanceData, UsageResult, LoadState } from "../types";
+import { updateTime, snapshotAge, snapshotHealth } from "../data-display";
 import { usageNotices } from "../usage-notices";
 import { SupportSettings } from "./SupportSettings";
+import { DesktopSettings } from "./DesktopSettings";
+import { AlertSettings } from "./AlertSettings";
 import { BrandIcon } from "./BrandIcon";
 import { SettingsSection, Toggle } from "./ui";
 
@@ -25,6 +28,10 @@ function SettingsPanel({
   usageUpdatedAt,
   balanceError = "",
   usageError = "",
+  balanceState = "loading",
+  usageState = "loading",
+  balanceErrorCode,
+  usageErrorCode,
   usage,
   showDataNotices = false,
   onRetry,
@@ -40,6 +47,10 @@ function SettingsPanel({
   usageUpdatedAt?: number | null;
   balanceError?: string;
   usageError?: string;
+  balanceState?: LoadState;
+  usageState?: LoadState;
+  balanceErrorCode?: string;
+  usageErrorCode?: string;
   usage?: UsageResult | null;
   showDataNotices?: boolean;
   onRetry?: () => Promise<unknown>;
@@ -93,6 +104,11 @@ function SettingsPanel({
   const [retrying, setRetrying] = React.useState(false);
   const [confirmForget, setConfirmForget] = React.useState(false);
   const notices = usageNotices(usage ?? null);
+  const [healthClock, setHealthClock] = React.useState(Date.now);
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setHealthClock(Date.now()), 60000);
+    return () => window.clearInterval(timer);
+  }, []);
   const noticesRef = React.useRef<HTMLDetailsElement>(null);
   React.useEffect(() => {
     if (showDataNotices) noticesRef.current?.scrollIntoView({ block: "start" });
@@ -347,9 +363,30 @@ function SettingsPanel({
                 ? "查看更新状态与数据提示"
                 : "更新时间与统计说明"}
             </summary>
+            <p className="muted">
+              余额来自官方余额
+              API；用量来自平台网页登录接口。两种凭据分别配置，尚未核对是否属于同一账户。
+            </p>
+            <p className="muted">
+              {usage
+                ? "当前用量来自最近成功快照"
+                : "当前没有可用的本月用量快照"}
+              ；旧数据按最近成功时间判断新鲜程度，凭据失效时重新同步，未取得的日期不代表零用量。
+            </p>
             <div className="update-status-row">
               <span>余额更新</span>
               <span>{updateTime(balanceUpdatedAt, true)}</span>
+            </div>
+            <div className="update-status-row">
+              <span>
+                {snapshotHealth(
+                  balanceState,
+                  balanceState === "ok" && balanceUpdatedAt != null,
+                  balanceError,
+                  balanceErrorCode,
+                )}
+              </span>
+              <span>{snapshotAge(balanceUpdatedAt, healthClock)}</span>
             </div>
             {balanceError && (
               <p className="data-error" role="alert">
@@ -359,6 +396,18 @@ function SettingsPanel({
             <div className="update-status-row">
               <span>用量更新</span>
               <span>{updateTime(usageUpdatedAt, true)}</span>
+            </div>
+            <div className="update-status-row">
+              <span>
+                {snapshotHealth(
+                  usageState,
+                  usage != null,
+                  usageError,
+                  usageErrorCode,
+                  notices.length > 0,
+                )}
+              </span>
+              <span>{snapshotAge(usageUpdatedAt, healthClock)}</span>
             </div>
             {usageError && (
               <p className="data-error" role="alert">
@@ -457,9 +506,12 @@ function SettingsPanel({
               {settingErrors.refresh}
             </p>
           )}
+          <AlertSettings />
         </SettingsSection>
 
         <SettingsSection icon={<Info size={15} />} title="外观">
+          <GlassSettings />
+          <DesktopSettings />
           <Toggle
             label={
               theme === "dark"

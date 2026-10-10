@@ -1,9 +1,10 @@
 // 单测专用配置。
 //
-// 与根 tsconfig.json 的区别只有三点，都是为了在**不引入任何依赖**的前提下让
+// 与根 tsconfig.json 的区别主要是测试范围与 Node 类型声明；两者都允许 .ts 后缀，
+// 为了在**不引入任何依赖**的前提下让
 // `node --test --experimental-strip-types` 能直接跑 .ts 测试：
-// 1. 放开 `allowImportingTsExtensions` —— Node 的类型剥离要求 import 写明 `.ts` 后缀，
-//    而应用代码（走 Vite）不带后缀；
+// 1. `allowImportingTsExtensions` 与根配置一致 —— Node 类型剥离要求运行时跨模块
+//    import 写明 .ts 后缀；Vite 与两套 noEmit 类型检查都支持这一写法；
 // 2. 不 include 应用源码，只 include 测试文件与它们依赖的纯函数模块；
 // 3. DOM lib 只用于同模块浏览器函数的类型检查；Node 测试仍只执行纯函数，
 //    不访问 DOM，也不引入 jsdom。

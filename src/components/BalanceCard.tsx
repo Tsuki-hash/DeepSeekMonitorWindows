@@ -3,6 +3,7 @@ import { CalendarDays, CreditCard, SunMedium } from "lucide-react";
 import { currencySymbol, fmtMoney, fmtMoneyDisplay } from "../format";
 import { updateTime } from "../data-display";
 import type { BalanceData, LoadState } from "../types";
+import { PricingPeriodBadge } from "./PricingPeriodBadge";
 
 function BalanceCard({
   updatedAt,
@@ -59,6 +60,7 @@ function BalanceCard({
               {updateTime(updatedAt)}
             </time>
           )}
+          <PricingPeriodBadge />
         </div>
         {error && state === "ok" ? (
           <button

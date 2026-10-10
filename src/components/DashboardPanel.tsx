@@ -22,6 +22,7 @@ function DashboardPanel({
   onSettings,
   onDataStatus,
   onDetail,
+  onHistory,
 }: {
   balanceUpdatedAt?: number | null;
   usageUpdatedAt?: number | null;
@@ -36,6 +37,7 @@ function DashboardPanel({
   onSettings: () => void;
   onDataStatus?: () => void;
   onDetail: (model: ModelName) => void;
+  onHistory: () => void;
 }) {
   const { theme, toggleTheme } = useTheme();
   // 手动刷新路径会把状态打回 loading；静默刷新保持 ok 不转，避免托盘唤出时图标常转
@@ -128,6 +130,7 @@ function DashboardPanel({
       </div>
 
       <UsageChart
+        onHistory={onHistory}
         usage={usage}
         state={usageState}
         error={usageError}

@@ -1,4 +1,5 @@
 import React from "react";
+import { applyStoredGlass } from "./components/GlassSettings";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
@@ -18,6 +19,9 @@ import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
 import { DashboardPanel } from "./components/DashboardPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelDetailPanel } from "./components/ModelDetailPanel";
+import { HistoryPanel } from "./components/HistoryPanel";
+import { LocalUsagePanel } from "./components/LocalUsagePanel";
+import { TrayBalancePublisher } from "./tray-balance";
 
 function App() {
   const [showDataNotices, setShowDataNotices] = React.useState(false);
@@ -27,13 +31,31 @@ function App() {
   const [balance, setBalance] = React.useState<BalanceData | null>(null);
   const [balanceState, setBalanceState] = React.useState<LoadState>("loading");
   const [balanceError, setBalanceError] = React.useState("");
+  const [balanceErrorCode, setBalanceErrorCode] = React.useState<string>();
   const [balanceUpdatedAt, setBalanceUpdatedAt] = React.useState<number | null>(
     null,
   );
+  const trayPublisher = React.useRef<TrayBalancePublisher | null>(null);
+  React.useEffect(() => {
+    const publisher = new TrayBalancePublisher(invoke);
+    trayPublisher.current = publisher;
+    void publisher.start();
+    return () => publisher.stop();
+  }, []);
+  React.useEffect(() => {
+    const available =
+      balance && (balanceState === "ok" || balanceState === "loading");
+    trayPublisher.current?.update({
+      total: available ? balance.totalBalance : null,
+      currency: available ? balance.currency : null,
+      stale: Boolean(balanceError || balanceState === "loading"),
+    });
+  }, [balance, balanceState, balanceError]);
 
   const [usage, setUsage] = React.useState<UsageResult | null>(null);
   const [usageState, setUsageState] = React.useState<LoadState>("loading");
   const [usageError, setUsageError] = React.useState("");
+  const [usageErrorCode, setUsageErrorCode] = React.useState<string>();
   const [usageUpdatedAt, setUsageUpdatedAt] = React.useState<number | null>(
     null,
   );
@@ -75,6 +97,7 @@ function App() {
           return;
         }
         const { message, code } = errorInfo(error);
+        setBalanceErrorCode(code);
         failures.current.balance += 1;
         setBalanceError(message);
         setBalanceState((prev) =>
@@ -124,6 +147,7 @@ function App() {
           return;
         }
         const { message, code } = errorInfo(error);
+        setUsageErrorCode(code);
         failures.current.usage += 1;
         setUsageError(message);
         const retained =
@@ -280,10 +304,16 @@ function App() {
     };
   }, [loadUsage]);
 
+  React.useEffect(() => {
+    applyStoredGlass();
+  }, []);
   return (
-    <div className="stage">
+    <div
+      className={`stage ${["dashboard", "local", "history"].includes(view) ? "with-navigation" : ""}`}
+    >
       {view === "dashboard" && (
         <DashboardPanel
+          onHistory={() => setView("history")}
           balanceUpdatedAt={balanceUpdatedAt}
           usageUpdatedAt={usageUpdatedAt}
           balance={balance}
@@ -310,6 +340,10 @@ function App() {
       )}
       {view === "settings" && (
         <SettingsPanel
+          balanceState={balanceState}
+          usageState={usageState}
+          balanceErrorCode={balanceErrorCode}
+          usageErrorCode={usageErrorCode}
           onRetry={() => refreshAll(true)}
           balanceUpdatedAt={balanceUpdatedAt}
           usageUpdatedAt={usageUpdatedAt}
@@ -383,6 +417,31 @@ function App() {
           usageError={usageError}
           onBack={() => setView("dashboard")}
         />
+      )}
+      {view === "history" && (
+        <HistoryPanel onBack={() => setView("dashboard")} />
+      )}
+      {view === "local" && (
+        <LocalUsagePanel onBack={() => setView("dashboard")} />
+      )}
+      {["dashboard", "local", "history"].includes(view) && (
+        <nav className="primary-navigation" aria-label="主导航">
+          {(
+            [
+              ["dashboard", "账户"],
+              ["local", "Agent"],
+              ["history", "历史"],
+            ] as const
+          ).map(([target, label]) => (
+            <button
+              key={target}
+              aria-current={view === target ? "page" : undefined}
+              onClick={() => setView(target)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
       )}
     </div>
   );

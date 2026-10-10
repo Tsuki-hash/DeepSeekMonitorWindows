@@ -1,0 +1,8 @@
+{
+  "repository": "Javis603/tokscale",
+  "commit": "d5e8ad9b25bfafb43b5b6804940929b728a6f48a",
+  "release": "token-monitor-d5e8ad9b",
+  "asset": "tokscale-win32-x64.exe",
+  "sha256": "0d9c6b6e2c23ffcfe0b2a1ebf5b2e27e9fa726465a89f70d86a72a45214118a2",
+  "reference": "Javis603/token-monitor@c62544e7ffae8dfa863c92a4e81571ad381110f0"
+}

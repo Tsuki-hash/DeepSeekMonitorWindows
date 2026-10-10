@@ -4,6 +4,7 @@ node_modules/
 # ---------- Build artifacts ----------
 dist/
 src-tauri/target/
+src-tauri/resources/local-usage/tokscale.exe
 
 # ---------- Markdown docs policy ----------
 # Public docs are the two READMEs and CHANGELOG. Other Markdown (internal notes, drafts)

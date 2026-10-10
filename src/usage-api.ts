@@ -2,9 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { todayStr } from "./format";
 import type { UsageResult } from "./types";
 import { RequestGate } from "./request-gate";
+import { historyCache } from "./history-cache";
 
 const usageGate = new RequestGate<UsageResult>();
-export const invalidateUsageRequests = () => usageGate.invalidate();
+export const invalidateUsageRequests = () => {
+  usageGate.invalidate();
+  historyCache.invalidate();
+};
 
 export const fetchMonthUsage = (month: number, year: number) => {
   return invoke<UsageResult>("fetch_usage", { month, year });

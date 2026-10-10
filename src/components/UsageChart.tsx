@@ -13,6 +13,7 @@ function UsageChart({
   state,
   error,
   onDataStatus,
+  onHistory,
 }: {
   updatedAt?: number | null;
   onSettings?: () => void;
@@ -20,6 +21,7 @@ function UsageChart({
   state: LoadState;
   error: string;
   onDataStatus?: () => void;
+  onHistory?: () => void;
 }) {
   const days = recentUsageDays(usage?.days ?? [], 7, usage?.unavailableDates);
   // all：合计含未识别模型（差额并入 other），避免按日图静默丢量
@@ -45,12 +47,17 @@ function UsageChart({
   return (
     <article className="card chart-card">
       <div className="card-title-row">
-        <div className="caption-with-icon">
+        <button
+          className="caption-with-icon history-entry"
+          aria-label="用量历史"
+          title="查看历史查询与导出"
+          onClick={onHistory}
+        >
           <BarChart3 size={16} className="brand-blue" />
           <span title={`输入缓存命中率 ${hitRate}%（命中 / 已知输入）`}>
-            近7日 Tokens
+            近7日 Tokens ›
           </span>
-        </div>
+        </button>
         <span className="chart-total">
           {error && state !== "nokey" ? (
             <button className="data-status-link" onClick={onDataStatus}>

@@ -18,6 +18,7 @@
     "format": "prettier --write .",
     "verify": "pwsh -NoProfile -File scripts/verify.ps1",
     "check:version": "node scripts/check-version.mjs",
+    "local-usage:prepare": "node scripts/prepare-local-usage.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

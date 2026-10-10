@@ -197,6 +197,7 @@ pub struct CostResp {
 #[serde(rename_all = "camelCase")]
 pub struct UsageDaySummary {
     pub date: String,
+    pub raw_models: Vec<crate::usage_history::RawModelUsage>,
     pub flash_tokens: u64,
     pub flash_cache_hit: u64,
     pub flash_cache_miss: u64,
@@ -214,6 +215,9 @@ pub struct UsageDaySummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageResult {
+    pub schema_version: u32,
+    pub model_mapping_version: &'static str,
+    pub raw_models: Vec<crate::usage_history::RawModelUsage>,
     pub warnings: Vec<String>,
     pub models: Vec<UsageModelSummary>,
     pub days: Vec<UsageDaySummary>,
@@ -223,6 +227,10 @@ pub struct UsageResult {
 /// 纯聚合：amount/cost 响应 → 界面用量结构。新旧模型名归并、费用口径均在此。
 pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     let cost_total = cost.data.biz_data.first();
+    let raw_models = crate::usage_history::raw_models(
+        &amount.data.biz_data.total,
+        cost_total.map(|c| c.total.as_slice()).unwrap_or(&[]),
+    );
     let cost_for_model = |model: &str| -> f64 {
         cost_total
             .map(|item| {
@@ -323,6 +331,24 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             });
         }
     }
+    let mut raw_amount_days: std::collections::BTreeMap<&str, Vec<ModelUsage>> =
+        std::collections::BTreeMap::new();
+    let mut raw_cost_days: std::collections::BTreeMap<&str, Vec<ModelUsage>> =
+        std::collections::BTreeMap::new();
+    for day in &amount.data.biz_data.days {
+        raw_amount_days
+            .entry(&day.date)
+            .or_default()
+            .extend(day.data.iter().cloned());
+    }
+    if let Some(item) = cost_total {
+        for day in &item.days {
+            raw_cost_days
+                .entry(&day.date)
+                .or_default()
+                .extend(day.data.iter().cloned());
+        }
+    }
     for day in &daily_source {
         let mut flash = 0u64;
         let mut flash_hit = 0u64;
@@ -357,6 +383,16 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         }
         days.push(UsageDaySummary {
             date: day.date.clone(),
+            raw_models: crate::usage_history::raw_models(
+                raw_amount_days
+                    .get(day.date.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                raw_cost_days
+                    .get(day.date.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            ),
             flash_tokens: flash,
             flash_cache_hit: flash_hit,
             flash_cache_miss: flash_miss,
@@ -376,14 +412,25 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         .map(|item| item.total.iter().map(|m| cost_sum(&m.usage)).sum())
         .unwrap_or(0.0);
 
+    let mut warnings = if source.len() != amount.data.biz_data.total.len()
+        || daily_source.len() != amount.data.biz_data.days.len()
+    {
+        vec!["费用与 Token 数据尚未完全对齐，请稍后刷新".into()]
+    } else {
+        vec![]
+    };
+    if raw_models
+        .iter()
+        .chain(days.iter().flat_map(|day| &day.raw_models))
+        .any(|model| model.data_warning.is_some())
+    {
+        warnings.push("平台 Token 计数异常，受影响的历史字段保留为未知".into());
+    }
     UsageResult {
-        warnings: if source.len() != amount.data.biz_data.total.len()
-            || daily_source.len() != amount.data.biz_data.days.len()
-        {
-            vec!["费用与 Token 数据尚未完全对齐，请稍后刷新".into()]
-        } else {
-            vec![]
-        },
+        schema_version: 2,
+        model_mapping_version: "deepseek-slots-v1",
+        raw_models,
+        warnings,
         models,
         days,
         month_cost,
@@ -489,6 +536,84 @@ mod tests {
         let result = build_usage_result(&amount, &cost);
         assert!((result.models[0].cost - 0.6).abs() < 1e-9);
         assert!((result.month_cost - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn finite_fractional_count_passes_existing_entry_gate_but_history_is_unknown_with_warning() {
+        let mut amount = amount_sample();
+        for model in [
+            &mut amount.data.biz_data.total[0],
+            &mut amount.data.biz_data.days[0].data[0],
+        ] {
+            model.usage.push(Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "0.25".into(),
+            });
+        }
+        let cost = cost_sample();
+        assert!(validate_usage_entries(&amount, &cost).is_ok());
+        let result = build_usage_result(&amount, &cost);
+        let monthly = result
+            .raw_models
+            .iter()
+            .find(|model| model.model == amount.data.biz_data.total[0].model)
+            .unwrap();
+        assert_eq!(monthly.response_tokens, None);
+        assert_eq!(monthly.total_tokens, None);
+        assert!(monthly.data_warning.is_some());
+        let daily = result.days[0]
+            .raw_models
+            .iter()
+            .find(|model| model.model == amount.data.biz_data.days[0].data[0].model)
+            .unwrap();
+        assert_eq!(daily.response_tokens, None);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Token 计数异常")));
+    }
+
+    #[test]
+    fn 历史原始模型保留别名且日模型费用请求独立() {
+        let result = build_usage_result(&amount_sample(), &cost_sample());
+        assert_eq!(result.schema_version, 2);
+        assert!(result
+            .raw_models
+            .iter()
+            .any(|m| m.model == "deepseek-flash"));
+        assert!(result
+            .raw_models
+            .iter()
+            .any(|m| m.model == "deepseek-v4-flash"));
+        let flash = result.days[0]
+            .raw_models
+            .iter()
+            .find(|m| m.model == "deepseek-flash")
+            .unwrap();
+        assert!(flash.total_tokens.is_some());
+        assert!(flash.cost.is_some());
+    }
+
+    #[test]
+    fn 历史仅日记录的未知模型保留名称且缺费用不为零() {
+        let mut amount = amount_sample();
+        amount.data.biz_data.days[0].data.push(ModelUsage {
+            model: "future-model".into(),
+            usage: vec![Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "7".into(),
+            }],
+        });
+        let result = build_usage_result(&amount, &cost_sample());
+        let model = result.days[0]
+            .raw_models
+            .iter()
+            .find(|m| m.model == "future-model")
+            .unwrap();
+        assert_eq!(model.total_tokens, Some(7));
+        assert_eq!(model.cost, None);
+        assert_eq!(model.request_count, None);
+        assert_eq!(model.group_key, None);
     }
 
     #[test]

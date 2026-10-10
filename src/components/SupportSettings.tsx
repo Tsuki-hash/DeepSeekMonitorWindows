@@ -1,6 +1,7 @@
 import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errorMessage } from "../error-state";
+import { updateTime } from "../data-display";
 
 type Diagnostics = {
   version: string;
@@ -10,11 +11,32 @@ type Diagnostics = {
   autoRefreshEnabled: boolean;
   refreshIntervalSeconds: number;
 };
+type ReleaseCheck = {
+  currentVersion: string;
+  latestVersion: string | null;
+  state: "available" | "current" | "ahead" | "unavailable";
+  checkedAt: number;
+};
 
 export function SupportSettings() {
   const [busy, setBusy] = React.useState(false);
   const [status, setStatus] = React.useState("");
   const [diagnostics, setDiagnostics] = React.useState("");
+  const [release, setRelease] = React.useState<ReleaseCheck | null>(null);
+  const [releaseError, setReleaseError] = React.useState(false);
+  const checkRelease = async () => {
+    setBusy(true);
+    setStatus("");
+    setReleaseError(false);
+    try {
+      setRelease(await invoke<ReleaseCheck>("check_app_release"));
+    } catch (error) {
+      setReleaseError(true);
+      setStatus(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  };
   const openPage = async (page: "releases" | "issues") => {
     setBusy(true);
     setStatus("");
@@ -63,7 +85,7 @@ export function SupportSettings() {
         <button
           className="secondary"
           disabled={busy}
-          onClick={() => void openPage("releases")}
+          onClick={() => void checkRelease()}
         >
           检查更新
         </button>
@@ -90,6 +112,28 @@ export function SupportSettings() {
             复制诊断
           </button>
         )}
+      </div>
+      {release && (
+        <p className="muted" role="status">
+          {release.state === "available"
+            ? `发现新版本 v${release.latestVersion}`
+            : release.state === "current"
+              ? "当前已是最新发行版"
+              : release.state === "ahead"
+                ? `当前为开发版本，最新发行版为 v${release.latestVersion}`
+                : "暂未取得公开发行版本"}{" "}
+          · 检查于 {updateTime(release.checkedAt)}
+          {releaseError && "（上次结果）"}
+        </p>
+      )}
+      <div className="disclosure-actions">
+        <button
+          className="secondary"
+          disabled={busy}
+          onClick={() => void openPage("releases")}
+        >
+          查看发行页面
+        </button>
       </div>
       {diagnostics && (
         <textarea

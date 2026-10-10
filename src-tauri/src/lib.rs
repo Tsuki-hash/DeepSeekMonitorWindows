@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod autostart;
 pub mod browsing_data;
 pub mod cache_watch;
@@ -5,15 +6,24 @@ pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod deepseek_api;
+pub mod desktop;
 pub mod error;
 pub mod http;
+pub mod local_archive;
+pub mod local_background;
+pub mod local_retention;
+pub mod local_sources;
+pub mod local_usage;
 pub mod sync_script;
 pub mod sync_session;
 pub mod token_sync;
 pub mod tray;
+pub mod update_check;
 pub mod usage;
+pub mod usage_history;
 pub mod usage_watcher;
 pub mod window_pos;
+pub mod zcode_usage;
 
 #[cfg(test)]
 mod test_support;
@@ -37,12 +47,62 @@ pub fn run() {
         }))
         .manage(sync_session::SyncSession::default())
         .manage(sync_session::ApiKeySession::default())
+        .manage(local_usage::LocalCollector::default())
+        .manage(local_background::Runtime::default())
+        .manage(desktop::DesktopState::default())
+        .manage(update_check::UpdateCache::default())
+        .manage(alerts::AlertRuntime::default())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, key, event| {
+                    if key == &desktop::shortcut()
+                        && event.state == tauri_plugin_global_shortcut::ShortcutState::Released
+                    {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = tray::hide_main_window_inner(&window);
+                            } else {
+                                tray::show_main_window(&window);
+                            }
+                        }
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
             commands::is_main_window_visible,
             commands::get_app_config,
             commands::get_diagnostics,
             commands::open_support_page,
+            commands::check_app_release,
+            commands::get_desktop_options,
+            commands::set_desktop_options,
+            commands::begin_tray_balance_session,
+            commands::update_tray_balance,
+            commands::get_alert_status,
+            commands::save_alert_options,
+            commands::test_alert_notification,
+            commands::get_local_usage,
+            commands::set_local_usage_enabled,
+            commands::scan_local_usage,
+            commands::get_local_background,
+            commands::set_local_background,
+            commands::save_local_archive,
+            commands::list_local_archives,
+            commands::read_local_archive,
+            commands::delete_local_archive,
+            commands::clear_local_archives,
+            commands::get_local_retention_enabled,
+            commands::set_local_retention_enabled,
+            commands::list_local_retention,
+            commands::read_local_retention,
+            commands::delete_local_retention,
+            commands::clear_local_retention,
+            commands::get_local_sources,
+            commands::save_local_sources,
+            commands::list_running_wsl,
             commands::save_api_key,
             commands::clear_api_key,
             commands::save_refresh_interval,
@@ -80,6 +140,9 @@ pub fn run() {
             }
 
             tray::build_tray(app)?;
+            desktop::restore(app.handle());
+            alerts::start(app.handle().clone());
+            local_background::start(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

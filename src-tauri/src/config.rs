@@ -112,6 +112,66 @@ pub const DEFAULT_REFRESH_INTERVAL_SECONDS: u64 = 60;
 /// 避免无谓的迁移分支。
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
+static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
+static API_KEY_VALIDATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static USAGE_TOKEN_VALIDATION_REVISION: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy)]
+pub enum ValidatedCredential {
+    ApiKey,
+    UsageToken,
+}
+fn credential_counter(kind: ValidatedCredential) -> &'static AtomicU64 {
+    match kind {
+        ValidatedCredential::ApiKey => &API_KEY_VALIDATION_REVISION,
+        ValidatedCredential::UsageToken => &USAGE_TOKEN_VALIDATION_REVISION,
+    }
+}
+pub fn credential_validation_revision(kind: ValidatedCredential) -> u64 {
+    credential_counter(kind).load(Ordering::SeqCst)
+}
+/// Call only after verification. Publish the recovery epoch under the config lock,
+/// after a successful disk write, including same-value commits. Never reset receipts.
+pub fn edit_validated_credential(
+    kind: ValidatedCredential,
+    value: String,
+) -> Result<StoredConfig, String> {
+    let _guard = lock_config_io();
+    let mut config = read_stored_config_unlocked()?;
+    match kind {
+        ValidatedCredential::ApiKey => config.api_key = Some(value),
+        ValidatedCredential::UsageToken => config.usage_token = Some(value),
+    }
+    write_stored_config_unlocked(&config)?;
+    credential_counter(kind).fetch_add(1, Ordering::SeqCst);
+    changed().notify_one();
+    Ok(config)
+}
+pub fn revision() -> u64 {
+    CONFIG_REVISION.load(Ordering::SeqCst)
+}
+pub fn changed() -> &'static tokio::sync::Notify {
+    static CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    CHANGED.get_or_init(tokio::sync::Notify::new)
+}
+pub fn read_snapshot() -> Result<(u64, StoredConfig), String> {
+    let _guard = lock_config_io();
+    let config = read_stored_config_unlocked()?;
+    Ok((revision(), config))
+}
+/// Final background side effects share the config write lock. A clear/change cannot
+/// race between the final generation check and submitting a notification.
+pub fn with_current<T>(
+    expected: u64,
+    action: impl FnOnce(&StoredConfig) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let _guard = lock_config_io();
+    let config = read_stored_config_unlocked()?;
+    if revision() != expected {
+        return Ok(None);
+    }
+    action(&config).map(Some)
+}
+
 pub fn default_refresh_interval_seconds() -> u64 {
     DEFAULT_REFRESH_INTERVAL_SECONDS
 }
@@ -137,6 +197,12 @@ pub struct StoredConfig {
     /// 因此不需要递增 schema 版本。None = 从未记录（首次运行），按托盘附近定位。
     #[serde(default)]
     pub window_position: Option<[i32; 2]>,
+    #[serde(default)]
+    pub always_on_top: bool,
+    #[serde(default)]
+    pub shortcut_enabled: bool,
+    #[serde(default)]
+    pub alerts: crate::alerts::AlertOptions,
 }
 
 impl StoredConfig {
@@ -349,7 +415,10 @@ fn write_stored_config_with(
         // rename 失败时清理临时文件，避免在配置目录留下垃圾
         let _ = fs::remove_file(&temp_path);
         error.to_string()
-    })
+    })?;
+    CONFIG_REVISION.fetch_add(1, Ordering::SeqCst);
+    changed().notify_one();
+    Ok(())
 }
 
 /// API Key 预览：仅展示前 7 后 4 字符，中间省略。过短的 key 不展示任何片段。
@@ -426,6 +495,8 @@ mod tests {
         assert_eq!(config.refresh_interval_seconds, 60);
         assert!(!config.auto_refresh_enabled);
         assert!(!config.autostart);
+        assert!(!config.alerts.enabled);
+        assert_eq!(config.alerts.low_balance_cny, 10.0);
         assert_eq!(config.version, 0);
         assert_eq!(config.api_key.as_deref(), Some("sk-abc"));
     }
@@ -503,6 +574,9 @@ mod tests {
             auto_refresh_enabled: true,
             autostart: false,
             window_position: None,
+            always_on_top: false,
+            shortcut_enabled: false,
+            alerts: Default::default(),
         };
         write_stored_config(&config).unwrap();
 
@@ -532,6 +606,14 @@ mod tests {
             auto_refresh_enabled: true,
             autostart: true,
             window_position: Some([-1920, 240]),
+            always_on_top: true,
+            shortcut_enabled: true,
+            alerts: crate::alerts::AlertOptions {
+                enabled: true,
+                monthly_budget_enabled: true,
+                monthly_budget_cny: 123.45,
+                ..Default::default()
+            },
         };
         write_stored_config(&config).unwrap();
         let reread = read_stored_config().unwrap();
@@ -539,6 +621,8 @@ mod tests {
         assert_eq!(reread.usage_token, config.usage_token);
         assert_eq!(reread.refresh_interval_seconds, 3600);
         assert_eq!(reread.window_position, Some([-1920, 240]));
+        assert!(reread.always_on_top && reread.shortcut_enabled);
+        assert_eq!(reread.alerts, config.alerts);
         assert!(reread.auto_refresh_enabled && reread.autostart);
     }
 

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::cache_watch;
-use crate::config::{edit_config, to_app_config, AppConfig};
+use crate::config::{to_app_config, AppConfig};
 use crate::deepseek_api::{verify_usage_token, VerifyFailure};
 use crate::sync_script::USAGE_SYNC_POLL_JS;
 use crate::sync_session::SyncSession;
@@ -35,7 +35,7 @@ const FAST_POLL_ROUNDS: u32 = 20;
 
 /// 东八区当前 (月, 年)。平台按北京时间记账，试调月不能用本机时区：
 /// 海外机器在月初会把「北京时间的新月」错算成上个月。
-fn cst_month(now: SystemTime) -> (u32, u32) {
+pub(crate) fn cst_month(now: SystemTime) -> (u32, u32) {
     const CST_OFFSET_SECS: i64 = 8 * 3600;
     let secs = now
         .duration_since(UNIX_EPOCH)
@@ -242,10 +242,10 @@ pub(crate) fn capture_usage_token(
         return Err("用量 Token 为空".to_string());
     }
     app.state::<SyncSession>().commit(generation, || {
-        let app_config = to_app_config(edit_config(|config| {
-            config.usage_token = Some(value);
-            Ok(())
-        })?)?;
+        let app_config = to_app_config(crate::config::edit_validated_credential(
+            crate::config::ValidatedCredential::UsageToken,
+            value,
+        )?)?;
 
         if let Some(window) = app.get_webview_window("login-sync") {
             // 防御：确保标题不含历史 title 通道残留后再关窗
