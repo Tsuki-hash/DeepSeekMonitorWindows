@@ -6,7 +6,7 @@ use std::{
 };
 
 pub const RELEASE_API: &str =
-    "https://api.github.com/repos/Tsuki-hash/DeepSeekMonitorWin/releases/latest";
+    "https://api.github.com/repos/Tsuki-hash/DeepSeekMonitorWindows/releases/latest";
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateResult {

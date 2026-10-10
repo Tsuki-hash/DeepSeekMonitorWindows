@@ -7,8 +7,8 @@
     <img src="https://img.shields.io/badge/License-MIT-22c55e?style=flat-square" alt="MIT License" />
   </p>
   <p>
-    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/latest">下载安装</a> ·
-    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWin/issues">反馈问题</a> ·
+    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest">下载安装</a> ·
+    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWindows/issues">反馈问题</a> ·
     <a href="README.md">简体中文</a> / <a href="README_EN.md">English</a>
   </p>
 </div>
@@ -19,7 +19,7 @@
 
 **本项目不是 DeepSeek 官方产品，与 DeepSeek 公司无关。**
 
-本轮源码已新增常驻「账户 / Agent / 历史」导航。项目与会话从 **Agent** 一步进入；导出和归档在「数据」，目录和后台采集在「采集设置」。1.3.0 包含透明度控制、完整历史、趋势提示及零用量模型折叠，可从 [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/tag/v1.3.0) 下载。
+1.3.0 提供常驻「账户 / Agent / 历史」导航。项目与会话从 **Agent** 一步进入；导出和归档在「数据」，目录和后台采集在「采集设置」。1.3.0 包含透明度控制、完整历史、趋势提示及零用量模型折叠，可从 [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.0) 下载。
 
 ## 界面
 
@@ -45,7 +45,7 @@
 
 </details>
 
-*以上界面为本地 1.3.0 待发布版本的演示数据，非真实账户；最终模型显示名仍待上线核对。*
+*以上截图使用 1.3.0 当前界面与合成演示数据，不包含真实账户信息。*
 
 <details>
 <summary>查看余额与预算提醒设置</summary>
@@ -68,7 +68,7 @@ DeepSeek 官方只开放了余额接口，没有账户级的用量接口。网�
 
 ### 安装
 
-从 [Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/latest) 下载最新已发布版本的 `x64-setup.exe` 安装。覆盖安装不需要先卸载旧版本。
+从 [Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest) 下载最新已发布版本的 `x64-setup.exe` 安装。覆盖安装不需要先卸载旧版本。
 
 运行环境：Windows 10 或 Windows 11，以及 Microsoft Edge WebView2 Runtime（Windows 11 自带，Windows 10 若缺失需单独安装）。
 
@@ -91,7 +91,9 @@ DeepSeek 官方只开放了余额接口，没有账户级的用量接口。网�
 - 余额更新时间旁的“峰／谷”标签按北京时间显示当前计价时段：峰为淡琥珀色，谷为淡青绿色。点击查看下一切换和规则；谷价为峰价的一半。节假日采用国务院2026年整段放假日历，周末调休上班仍为谷；未覆盖年份的潜在高峰显示“—”待核对。该标签是规则提示，实际扣费以平台账单为准。
 - 余额与用量各有更新时间，按电脑本地时区显示；同月用量更新失败保留最近成功数据，跨月旧累计不继续作为本月展示，未取得的新日期标为未知；可查看原因、重试或重新同步。
 - 图表可指向预览、点击固定明细；键盘 Tab 选择日期，Enter / Space 固定，Esc 收起。数据明细显示在图表下方。
-- 点击「近7日 Tokens ›」进入用量历史，可查本月、上月或近30天，按原始模型筛选、切换 Token / 费用趋势，展开请求数及缓存分段。未取得的日期或字段显示未知，不补成零。
+- 点击底部「历史」进入平台用量历史，可查本月、上月、近30天、指定历史月份或全部历史。全部历史从2020年起按接口允许范围逐月加载，优先最近月份，显示进度并支持停止；趋势按月展示并可横向浏览。未返回的记录保持未知，无法保证平台长期保留所有月份。
+- 历史趋势悬停显示日期与完整数值，点击固定、方向键切换、Esc 收起；高亮仅覆盖实际柱体。默认隐藏明确零用量模型，勾选「显示无用量模型」可恢复；有消费、未知或异常数据不会按旧模型名称删除。
+- 「设置 → 外观 → 背景透明度」支持 0–70% 即时调节，自动保存并可恢复默认；文字与图标保持清晰。
 - 历史页可手动导出全部模型：CSV 包含所选区间的每日记录；JSON 另包含所查询月份的完整月汇总（近30天跨月时，月汇总范围可能大于30天）。导出不含 Key、Token 或 Cookie；CSV 使用 UTF-8 BOM 并防公式注入。
 - 设置「数据状态与口径」中可查看两种数据来源、各自更新状态和数据年龄。历史查询使用最多4个月、5分钟有效的内存缓存；更换或清除用量会话立即作废缓存和旧响应。余额 Key 与用量 Token 是否属于同一账户尚未自动核对。
 
@@ -177,9 +179,9 @@ DeepSeek 在 2026-09-10 上线了 V4.1 Flash，模型名从 `deepseek-v4-flash` 
 
 本地CSV／JSON保留实际统计月份和采集时电脑的UTC偏移。旧快照缺少的信息保留为空；从项目进入会话后保存快照，只保留当前项目内的会话数据。
 
-本地页「导出」折叠区支持 CSV / JSON：按当前全部记录、项目或会话导出用量元数据，保留未知值和采集时间。默认排除完整项目路径、内部行ID、源会话标题、对话正文及凭据；只有主动勾选「包含项目完整路径」才带路径。CSV 使用 UTF-8 BOM 和公式注入防护，来源可能含 Token 估算，不作为实际账单。
+Agent →「数据」→「导出」折叠区支持 CSV / JSON：按当前全部记录、项目或会话导出用量元数据，保留未知值和采集时间。默认排除完整项目路径、内部行ID、源会话标题、对话正文及凭据；只有主动勾选「包含项目完整路径」才带路径。CSV 使用 UTF-8 BOM 和公式注入防护，来源可能含 Token 估算，不作为实际账单。
 
-从历史页进入「项目与会话」，首次点「开启本地统计」。参考 [Token Monitor](https://github.com/Javis603/token-monitor) 的采集方式，使用固定版本 Tokscale 读取 OpenCode、Claude Code、ZCode、Hermes、OpenClaw 和 DeepSeek Harness 的本机记录；按项目进入会话，查看原始模型、输入/输出/缓存/推理分段。项目或字段未记录时显示未知，不猜测。此版提供本月的会话按模型明细，逐条请求详情仍待扩展，本地后台采集现可单独开启；ZCode指定本地数据库已支持。
+点击底部「Agent」，首次点「开启本地统计」。项目／会话可直接切换；导出与归档位于「数据」，目录与后台采集位于「采集设置」。参考 [Token Monitor](https://github.com/Javis603/token-monitor) 的采集方式，使用固定版本 Tokscale 读取 OpenCode、Claude Code、ZCode、Hermes、OpenClaw 和 DeepSeek Harness 的本机记录；按项目进入会话，查看原始模型、输入/输出/缓存/推理分段。项目或字段未记录时显示未知，不猜测。此版提供本月的会话按模型明细，逐条请求详情仍待扩展，本地后台采集现可单独开启；ZCode指定本地数据库已支持。
 
 tok/s 使用可靠输出 Token 与生成耗时：首次采集显示有耗时记录的平均值，后续新增性能记录显示近期速度，不以扫描间隔作分母。部分耗时覆盖或无耗时时显示 —；这是记录更新后的速度，不是逐 Token 流式测速。
 
@@ -211,7 +213,7 @@ ZCode指定本地数据库已接入：展开“采集目录 → 单工具数据�
 
 ### 手动保存与查看快照
 
-手动快照归档初版：本地页默认折叠“保存快照与历史归档”，可按全部／项目／会话保存已接收的本月模型汇总。历史页独立查看、CSV／JSON导出，单份删除与清空全部均二次确认；归档不更新、不与当前统计或其他快照相加。默认不保存项目完整路径，显式勾选才包含；会话ID及项目名称保留，内部项目键哈希化，不复制正文、凭据或源标题。应用配置旁local-usage-archive.json存放明文用量元数据（schema1），最多12份／总8MiB，满后提示且不覆盖。失败、损坏或未知版本不改写原文件，显式清空可恢复；删除只影响本应用归档，不删工具日志或引擎缓存。未知计数、未标定精度、耗时覆盖、旧结果及不完整来源状态继续保留。
+手动快照归档初版：Agent →「数据」中展开“保存快照与历史归档”，可按全部／项目／会话保存已接收的本月模型汇总。历史页独立查看、CSV／JSON导出，单份删除与清空全部均二次确认；归档不更新、不与当前统计或其他快照相加。默认不保存项目完整路径，显式勾选才包含；会话ID及项目名称保留，内部项目键哈希化，不复制正文、凭据或源标题。应用配置旁local-usage-archive.json存放明文用量元数据（schema1），最多12份／总8MiB，满后提示且不覆盖。失败、损坏或未知版本不改写原文件，显式清空可恢复；删除只影响本应用归档，不删工具日志或引擎缓存。未知计数、未标定精度、耗时覆盖、旧结果及不完整来源状态继续保留。
 
 保存只接受后端当前快照及匹配采集时间，统计关闭、采集中、结果变更、系统时钟回退或非当前本地月份均拒绝；多来源采集跨电脑本地月份拒收混合结果，前端跨月清旧累计，已保存归档仍保留原月份。进入归档页停止后续轮询，迟到页面响应作废。手动保留不证明源日志已删除，也不能恢复未曾采集／保存的记录；自动会话留存及可选后台采集已完成；逐请求、逐条实测／估算仍待扩展。
 
@@ -220,7 +222,7 @@ ZCode指定本地数据库已接入：展开“采集目录 → 单工具数据�
 
 ### 后台采集（默认关闭）
 
-✅ 本地后台采集已接入：展开“后台采集”，开启“收起后继续采集”。开关保存于独立的local-usage-background-enabled.json，默认关闭，需先开启本地统计；离页／隐藏到托盘仍采集，退出停止。关闭统计暂停但保留后台偏好，再开启统计后恢复；已开启的后台偏好在启动时恢复。自动会话留存仍是独立开关，启用后后台成功快照也参与留存。历史页面停止前台轮询，但不关闭用户开启的后台采集。
+✅ 本地后台采集已接入：在 Agent →「采集设置」展开“后台采集”，开启“收起后继续采集”。开关保存于独立的local-usage-background-enabled.json，默认关闭，需先开启本地统计；离页／隐藏到托盘仍采集，退出停止。关闭统计暂停但保留后台偏好，再开启统计后恢复；已开启的后台偏好在启动时恢复。自动会话留存仍是独立开关，启用后后台成功快照也参与留存。历史页面停止前台轮询，但不关闭用户开启的后台采集。
 
 复用固定引擎与同一个collector；前后台不并发采集，来源变化／关闭统计／后台开关修改递增代际并取消旧任务。原生目录事件仅作刷新提示，不用事件推断用量或日志删除；1.5秒静默合并，后台任务开始至少间隔5秒，约60秒兜底，持续事件不饿死兜底，失败按尝试间隔120／240／480／600秒退避。忽略访问事件及纯SQLite -shm变化，避免自身读取触发连续刷新；-wal及真正数据变化仍触发。后台模式下前端定时读取已接受的快照，不另启动重复扫描；手动刷新仍可用。
 
@@ -296,8 +298,8 @@ API Key 和用量 Token 存在这个文件里，**已用 Windows DPAPI 加密**�
 ### 常用命令
 
 ```powershell
-git clone https://github.com/Tsuki-hash/DeepSeekMonitorWin.git
-cd DeepSeekMonitorWin
+git clone https://github.com/Tsuki-hash/DeepSeekMonitorWindows.git
+cd DeepSeekMonitorWindows
 npm install
 npm run tauri:dev
 ```
@@ -334,7 +336,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib   # 后端
 ### 代码结构
 
 ```text
-DeepSeekMonitorWin/
+DeepSeekMonitorWindows/
 ├── scripts/                     # check-version.mjs、verify.ps1（本地门禁）
 ├── src/                         # 前端
 │   ├── main.tsx                 # 入口
@@ -400,7 +402,7 @@ DeepSeekMonitorWin/
 | --- | --- | --- | --- |
 | 初代 | [JayHome137/DeepSeekMonitor](https://github.com/JayHome137/DeepSeekMonitor) | macOS 菜单栏与 WidgetKit 桌面小组件 | Swift 5.9+、SwiftUI、AppKit、WidgetKit |
 | 二代 | [Joyi-code/DeepSeekMonitorWindows](https://github.com/Joyi-code/DeepSeekMonitorWindows) | Windows 桌面端 | Tauri 2、React、TypeScript、Rust |
-| 本项目 | [Tsuki-hash/DeepSeekMonitorWin](https://github.com/Tsuki-hash/DeepSeekMonitorWin) | Windows 桌面端 | 同上，承接二代继续迭代 |
+| 本项目 | [Tsuki-hash/DeepSeekMonitorWindows](https://github.com/Tsuki-hash/DeepSeekMonitorWindows) | Windows 桌面端 | 同上，承接二代继续迭代 |
 
 - **感谢 [@JayHome137](https://github.com/JayHome137/DeepSeekMonitor)**：用 Swift、SwiftUI、AppKit 与 WidgetKit 做出了 macOS 版本，确立了「在桌面角落随手看一眼余额与用量」这个产品形态。没有这个原项目，就没有后面所有版本。
 - **感谢 [@Joyi-code](https://github.com/Joyi-code/DeepSeekMonitorWindows)**：把这个想法完整移植到 Windows——重建界面与后端，处理托盘驻留、无边框窗口、WebView2 登录态同步等大量平台细节，并把仓库与安装包完整开源。**本项目的代码基线正是来自这个仓库。**

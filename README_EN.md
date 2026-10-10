@@ -7,8 +7,8 @@
     <img src="https://img.shields.io/badge/License-MIT-22c55e?style=flat-square" alt="MIT License" />
   </p>
   <p>
-    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/latest">Download</a> ·
-    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWin/issues">Feedback</a> ·
+    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest">Download</a> ·
+    <a href="https://github.com/Tsuki-hash/DeepSeekMonitorWindows/issues">Feedback</a> ·
     <a href="README.md">简体中文</a> / <a href="README_EN.md">English</a>
   </p>
 </div>
@@ -19,7 +19,7 @@ Windows 10 / 11 only. Built with Tauri 2, React 18, and Rust.
 
 **This project is not an official DeepSeek product and is not affiliated with DeepSeek.**
 
-The current source adds persistent Account / Agent / History navigation. Open Agent directly for projects and sessions; exports and archives live under Data, and collection controls under Collection settings. Version 1.3.0 includes adjustable transparency, full history, trend readings, and collapsed zero-usage models. Download it from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/tag/v1.3.0).
+Version 1.3.0 provides persistent Account / Agent / History navigation. Open Agent directly for projects and sessions; exports and archives live under Data, and collection controls under Collection settings. Version 1.3.0 includes adjustable transparency, full history, trend readings, and collapsed zero-usage models. Download it from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.0).
 
 ## Screenshots
 
@@ -45,7 +45,7 @@ The 1.3.0 installer was updated on 2026-10-10 with this feature set and UI chang
 
 </details>
 
-*These screenshots show the local, unreleased 1.3.0 build with sample data, not a real account. Final model names will be checked when the model launches.*
+*These screenshots show the current 1.3.0 interface with synthetic sample data and contain no real account information.*
 
 <details>
 <summary>View balance and budget reminder settings</summary>
@@ -68,7 +68,7 @@ This project combines three things:
 
 ### Install
 
-Download the latest published `x64-setup.exe` installer from [Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/latest). Installing over an older version does not require uninstalling it first.
+Download the latest published `x64-setup.exe` installer from [Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest). Installing over an older version does not require uninstalling it first.
 
 Requirements: Windows 10 or Windows 11, plus the Microsoft Edge WebView2 Runtime (included with Windows 11; install separately on Windows 10 if missing).
 
@@ -91,6 +91,10 @@ Usage needs a second credential. See "Two credentials, don't mix them" below.
 - The small “峰” (peak, muted amber) / “谷” (off-peak, muted teal) badge beside the balance update time follows Beijing time. Click for the next transition and rules; off-peak prices are half of peak prices. Holiday exclusions use the full published 2026 State Council holiday ranges, while make-up weekends remain off-peak. Potential peak windows in uncovered years show “—” pending calendar verification. This is a rule-based indication; actual charges follow the platform bill.
 - Balance and usage have separate update times displayed in the computer's local time zone. Usage failures preserve successful data from the same accounting month. Previous-month totals are hidden after a month change, and new dates without fetched data remain unknown. Details and retry or synchronization actions are available.
 - Hover to preview daily data, click to pin it, or use Tab and Enter / Space. Esc dismisses details, which appear below the chart.
+
+- Open **History** from the bottom navigation to browse this month, last month, the last 30 days, a chosen historical month, or all available history. All history loads one month at a time from the API-supported 2020 boundary, newest first, with progress and cancellation. Its monthly chart scrolls horizontally; missing records remain unknown, and platform retention is not guaranteed.
+- Hover over a history bar for the date and exact value; click to pin, use arrow keys to move, or Esc to dismiss. Selection highlights only the actual bar. Explicit zero-usage models are hidden by default and can be shown again; model age alone never removes historical spending.
+- **Settings → Appearance → 背景透明度** adjusts background transparency from 0–70% with live preview, persistence, and reset. Text and icons remain readable.
 
 ## Two credentials, don't mix them
 
@@ -179,7 +183,7 @@ Local CSV/JSON exports retain the actual statistics month and the computer's UTC
 
 The local page's **导出** disclosure exports CSV or JSON for all current records, the selected project or the selected session, preserving unknown values and collection time. Full project paths, internal row IDs, source session titles, conversation bodies and credentials are excluded by default. Paths require explicitly selecting **包含项目完整路径**. CSV uses a UTF-8 BOM and formula-injection protection. Source counts may include token estimates and are not billing evidence.
 
-Open **项目与会话** from history and select **开启本地统计** to enable local statistics. Following [Token Monitor](https://github.com/Javis603/token-monitor), a pinned Tokscale engine reads native records from OpenCode, Claude Code, ZCode, Hermes, OpenClaw and DeepSeek Harness. Drill down from projects to sessions and inspect original model IDs, input/output/cache/reasoning counts. Missing project attribution or fields stay unknown. This version shows per-model session details for the current local month; individual request details remain pending; background collection is now an independent opt-in; standalone local ZCode databases are now supported.
+Open **Agent** in the bottom navigation and select **开启本地统计** to enable local statistics. Switch between projects and sessions directly; exports and archives live under **数据**, and paths/background collection under **采集设置**. Following [Token Monitor](https://github.com/Javis603/token-monitor), a pinned Tokscale engine reads native records from OpenCode, Claude Code, ZCode, Hermes, OpenClaw and DeepSeek Harness. Drill down from projects to sessions and inspect original model IDs, input/output/cache/reasoning counts. Missing project attribution or fields stay unknown. This version shows per-model session details for the current local month; individual request details remain pending; background collection is now an independent opt-in; standalone local ZCode databases are now supported.
 
 Speed uses matched output tokens and generation duration. The initial read shows an average for timed records; subsequent performance-counter changes yield a recent tok/s sample. Polling time is never its denominator, and incomplete timing coverage stays unavailable. It updates from persisted records rather than measuring each streamed token.
 
@@ -220,7 +224,7 @@ Saving accepts only the backend's current snapshot with its matching timestamp. 
 
 ### Background collection (off by default)
 
-Expand **后台采集** and enable **收起后继续采集** after enabling local statistics. This separate setting is stored in local-usage-background-enabled.json and defaults to off. Collection continues outside the local page and while hidden in the tray; quitting stops it. Disabling statistics pauses collection while keeping the background preference; enabling statistics resumes it. Persisted opt-in settings restore at startup. Session retention remains a separate opt-in, and accepted background snapshots participate when it is enabled. Browsing saved history stops foreground polling without disabling configured background collection.
+Open **Agent → 采集设置 → 后台采集** and enable **收起后继续采集** after enabling local statistics. This separate setting is stored in local-usage-background-enabled.json and defaults to off. Collection continues outside the local page and while hidden in the tray; quitting stops it. Disabling statistics pauses collection while keeping the background preference; enabling statistics resumes it. Persisted opt-in settings restore at startup. Session retention remains a separate opt-in, and accepted background snapshots participate when it is enabled. Browsing saved history stops foreground polling without disabling configured background collection.
 
 Foreground and background work share one collector. Source or policy changes invalidate and cancel old work. Native directory events only hint that a refresh may be needed, without deriving token counts or deletion claims. Quiet events coalesce for 1.5 seconds; background scan starts are at least five seconds apart, with an approximately 60-second fallback. Failures back off to 120/240/480/600 seconds between attempts. Access events and SQLite shared-memory-only changes are ignored; WAL and data changes remain eligible. The page reads accepted snapshots in background mode rather than launching duplicate scans; manual refresh remains available.
 
@@ -232,7 +236,7 @@ Actual tray/background cadence, installed restart/retention, tool versions, WSL 
 
 ### Automatic session retention (off by default)
 
-Expand **保存快照与历史归档 → 自动会话留存** and enable **自动留存已读取会话**. Accepted scans retain the latest observed session summary (foreground by default, also background when separately enabled), separated by local month, source, tool and session ID. Corrections replace the summary exactly; unchanged records are not rewritten. Missing sessions remain saved, without implying their source logs were deleted. Records never observed cannot be recovered. Retained records never add to current totals or one another.
+Open **Agent → 数据 → 保存快照与历史归档 → 自动会话留存** and enable **自动留存已读取会话**. Accepted scans retain the latest observed session summary (foreground by default, also background when separately enabled), separated by local month, source, tool and session ID. Corrections replace the summary exactly; unchanged records are not rewritten. Missing sessions remain saved, without implying their source logs were deleted. Records never observed cannot be recovered. Retained records never add to current totals or one another.
 
 `local-usage-retention.json` stores schema1 plain usage metadata separately from manual snapshots; `local-usage-retention-enabled.json` stores the opt-in setting. Limits are 128 monthly session records and 8MiB total, with no automatic eviction. Full project paths, bodies, credentials and source titles are excluded; session IDs, project basenames and source IDs remain. Project keys are hashed. Atomic replacement and validation preserve existing records on corruption, unknown schema, stale timestamps, capacity or write failures. A retention failure warns without discarding successfully collected current statistics. Failed preference reads disable the toggle until explicitly reset to off.
 
@@ -298,8 +302,8 @@ The minimum versions have been verified on Windows MSVC: Node.js 22.6.0 with npm
 The native collector is pinned to Tokscale `d5e8ad9b`; its Windows x64 asset is about 25 MiB. `npm run local-usage:prepare` downloads it and verifies SHA-256. Tauri development and packaging run this preparation first; a verified cached asset can be reused offline. Runtime collection disables online pricing and never downloads an engine. The generated executable stays out of Git; its manifest and MIT notices are tracked. Node/Rust minimum versions remain unchanged.
 
 ```powershell
-git clone https://github.com/Tsuki-hash/DeepSeekMonitorWin.git
-cd DeepSeekMonitorWin
+git clone https://github.com/Tsuki-hash/DeepSeekMonitorWindows.git
+cd DeepSeekMonitorWindows
 npm install
 npm run tauri:dev
 ```
@@ -334,7 +338,7 @@ The installer is produced in `src-tauri/target/release/bundle/nsis/`. If you see
 ### Code layout
 
 ```text
-DeepSeekMonitorWin/
+DeepSeekMonitorWindows/
 ├── .github/workflows/           # CI (version consistency, frontend tests + build, cargo check/clippy/test)
 ├── src/                         # Frontend
 │   ├── main.tsx                 # The entire UI: dashboard, settings, detail page
@@ -397,7 +401,7 @@ This project continues the DeepSeek Monitor family on the Windows desktop. It bu
 | --- | --- | --- | --- |
 | Original | [JayHome137/DeepSeekMonitor](https://github.com/JayHome137/DeepSeekMonitor) | macOS menu bar and WidgetKit desktop widget | Swift 5.9+, SwiftUI, AppKit, WidgetKit |
 | Second | [Joyi-code/DeepSeekMonitorWindows](https://github.com/Joyi-code/DeepSeekMonitorWindows) | Windows desktop | Tauri 2, React, TypeScript, Rust |
-| This project | [Tsuki-hash/DeepSeekMonitorWin](https://github.com/Tsuki-hash/DeepSeekMonitorWin) | Windows desktop | Same as the second generation, continued |
+| This project | [Tsuki-hash/DeepSeekMonitorWindows](https://github.com/Tsuki-hash/DeepSeekMonitorWindows) | Windows desktop | Same as the second generation, continued |
 
 - **Thanks to [@JayHome137](https://github.com/JayHome137/DeepSeekMonitor)** for building the macOS version with Swift, SwiftUI, AppKit, and WidgetKit, and for establishing the idea of glancing at your balance and usage from the corner of your desktop. Without that original project, none of the later versions would exist.
 - **Thanks to [@Joyi-code](https://github.com/Joyi-code/DeepSeekMonitorWindows)** for porting that idea fully to Windows — rebuilding the interface and backend, handling a large amount of platform detail such as tray residency, frameless windows, and WebView2 login-state synchronization, and open-sourcing both the repository and the installer. **The code baseline of this project comes from that repository.**

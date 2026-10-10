@@ -1,5 +1,11 @@
 # Changelog
 
+## 仓库与文档维护（2026-10-10）
+
+- 仓库更名为 `DeepSeekMonitorWindows`，同步下载／反馈／更新地址与克隆命令。
+- 中英文 README 同步 1.3.0 入口、完整历史、透明度与模型过滤，重截账户、Agent 和历史界面。
+
+
 ## 1.3.0 — 2026-10-10
 
 ### 新增功能
@@ -133,7 +139,7 @@
 - 真实平台历史覆盖、账单字段和打包后WebView2下载仍待真机验收；六款工具的真实日志/版本/性能覆盖也待核对，合成验证不代表所有版本兼容。逐请求详情和后台监听仍待实施；前台自动会话留存已完成；本轮未打包/提交/推送。
 - 待新模型发布后核对真实模型名称、平台接口与多业务费用口径；正式发布仍需明确授权。
 
-已发布版本见[GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases)。
+已发布版本见[GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases)。
 
 本批单路径验证：最新79前端/134Rust完整verify、Rust1.88 locked all-targets通过；五工具单路径真实固定引擎/Rust合成集成另显式1项PASS，浅356/深320新增2组UI及目录3组/项目2组/桌面导出3组回归PASS。3项集成默认ignored：单home六工具此前PASS，双home与单工具本轮分别PASS。全部为合成数据，不读取真实用户日志/账户或执行原生WSL命令。原生WSL/SQLite竞争/工具版本/通知/桌面操作/DPI与新包验收仍待进行，未打包/commit/push/tag/Release。
 

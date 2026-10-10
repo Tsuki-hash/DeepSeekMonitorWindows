@@ -358,8 +358,8 @@ pub(crate) fn get_diagnostics(
 pub(crate) fn open_support_page(window: WebviewWindow, page: String) -> Result<(), String> {
     require_main(&window)?;
     let url = match page.as_str() {
-        "releases" => "https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases",
-        "issues" => "https://github.com/Tsuki-hash/DeepSeekMonitorWin/issues",
+        "releases" => "https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases",
+        "issues" => "https://github.com/Tsuki-hash/DeepSeekMonitorWindows/issues",
         _ => return Err("未知支持页面".into()),
     };
     let explorer =
