@@ -19,11 +19,11 @@ Windows 10 / 11 only. Built with Tauri 2, React 18, and Rust.
 
 **This project is not an official DeepSeek product and is not affiliated with DeepSeek.**
 
-The current source adds persistent Account / Agent / History navigation. Open Agent directly for projects and sessions; exports and archives live under Data, and collection controls under Collection settings. The October 10 local test installer includes adjustable transparency, full history, trend readings, and collapsed zero-usage models; native acceptance is pending.
+The current source adds persistent Account / Agent / History navigation. Open Agent directly for projects and sessions; exports and archives live under Data, and collection controls under Collection settings. Version 1.3.0 includes adjustable transparency, full history, trend readings, and collapsed zero-usage models. Download it from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWin/releases/tag/v1.3.0).
 
 ## Screenshots
 
-The current local 1.3.0 candidate was updated on 2026-10-10 with this feature set and UI changes. Native acceptance is pending; no public 1.3.0 release has been published.
+The 1.3.0 installer was updated on 2026-10-10 with this feature set and UI changes.
 
 | Dark skin | Light skin |
 | :---: | :---: |
@@ -213,7 +213,7 @@ Avoid adding a database already covered by native/home sources; overlapping sour
 
 Expand **保存快照与历史归档** on the local page to save the accepted all/project/session view. Saved snapshots have a separate read-only page with CSV/JSON downloads, confirmed single deletion and confirmed clear-all. They never update or add to current totals or one another. Full project paths default to excluded and must be chosen when saving; session IDs and project basenames remain. Internal project keys are hashed. Bodies, credentials and source titles are excluded. `local-usage-archive.json` beside the app configuration stores plain usage metadata (schema1), limited to 12 snapshots and 8MiB total. Full, corrupt or unknown-version stores are not overwritten. Explicit clear-all can recover an unreadable store; it only removes app archives, leaving tool logs and engine caches intact. Unknown counts, unclassified provenance, timing coverage and partial/previous-result flags are retained.
 
-Saving accepts only the backend's current snapshot with its matching timestamp. Disabled/busy collection, changed snapshots, a clock rollback or a previous local month are rejected. Collection spanning local months is rejected; the live view clears old-month totals while saved snapshots keep their original month. Browsing history stops subsequent polling and ignores late UI responses. Manual snapshots cannot recover records never collected and saved, or prove a tool log was deleted. Session retention and background collection are implemented below; individual request records and per-row measured/estimated markers remain pending. Browser examples use synthetic callbacks; native Windows file permissions, restart/log-deletion behavior, DPI and packaged WebView2 still need acceptance. The latest local installer awaits these checks; no public 1.3.0 release has been published.
+Saving accepts only the backend's current snapshot with its matching timestamp. Disabled/busy collection, changed snapshots, a clock rollback or a previous local month are rejected. Collection spanning local months is rejected; the live view clears old-month totals while saved snapshots keep their original month. Browsing history stops subsequent polling and ignores late UI responses. Manual snapshots cannot recover records never collected and saved, or prove a tool log was deleted. Session retention and background collection are implemented below; individual request records and per-row measured/estimated markers remain pending. Browser examples use synthetic callbacks; native Windows file permissions, restart/log-deletion behavior, DPI and packaged WebView2 still need acceptance. The latest local installer awaits these checks; the 1.3.0 release is available on GitHub.
 
 
 ![Saved local history (synthetic data)](screenshots/local-archive-light.png)

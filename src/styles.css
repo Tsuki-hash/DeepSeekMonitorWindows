@@ -2774,7 +2774,11 @@ button:disabled:hover {
 }
 .history-bars > button:hover,
 .history-bars > button.active {
-  background: var(--control-bg);
+  background: transparent;
+}
+.history-bars > button:hover i,
+.history-bars > button.active i {
+  box-shadow: inset 0 0 0 1px var(--brand-ink);
 }
 .history-bars > button:focus-visible {
   outline-offset: 0;
