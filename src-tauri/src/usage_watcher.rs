@@ -231,6 +231,24 @@ pub(crate) async fn verify_token_with_probes(token: &str) -> Result<(), String> 
     Err(VerifyFailure::Transient.message())
 }
 
+/// 同步会话的统一终止点：超时、窗口关闭、建窗失败都走这里。
+///
+/// 评审 P2：原实现里超时路径只结束会话、发事件，却没有关闭 `login-sync` 窗口。
+/// 下一次同步若仍找不到有效缓存 Token 会创建同名窗口，旧窗口还带着旧代际留在屏幕上，
+/// 用户看到的是「重试没反应」。这里保证**每条退出路径都释放窗口**；旧代际的迟到回传
+/// 仍由 `SyncSession::commit` 拒绝，守卫没有被削弱。
+///
+/// 成功路径不用它：成功由 `capture_usage_token` 自己提交并关窗。
+pub(crate) fn end_sync_session(app: &tauri::AppHandle, generation: u64) {
+    let _ = app.state::<SyncSession>().commit(generation, || {
+        if let Some(login) = app.get_webview_window("login-sync") {
+            let _ = login.close();
+        }
+        let _ = app.emit("usage-sync-ended", ());
+        Ok(())
+    });
+}
+
 /// 三条捕获路径共用的落库动作：写配置、置成功标志、关登录窗、广播事件。
 pub(crate) fn capture_usage_token(
     app: &tauri::AppHandle,
@@ -321,10 +339,8 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
                 break;
             }
             if app.get_webview_window("login-sync").is_none() {
-                let _ = app.state::<SyncSession>().commit(generation, || {
-                    let _ = app.emit("usage-sync-ended", ());
-                    Ok(())
-                });
+                // 用户自己关了窗口：清会话状态即可，窗口已不在。
+                end_sync_session(&app, generation);
                 return;
             }
             if let Some(token) =
@@ -335,10 +351,7 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
                 }
                 if let Err(error) = capture_usage_token(&app, token, generation) {
                     log::warn!("用量 Token 捕获后保存失败：{error}");
-                    let _ = app.state::<SyncSession>().commit(generation, || {
-                        let _ = app.emit("usage-sync-ended", ());
-                        Ok(())
-                    });
+                    end_sync_session(&app, generation);
                 }
                 return;
             }
@@ -346,10 +359,7 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
 
             let Some(window) = app.get_webview_window("login-sync") else {
                 // 窗口已关闭：若不是因成功捕获而关闭，才通知前端结束等待
-                let _ = app.state::<SyncSession>().commit(generation, || {
-                    let _ = app.emit("usage-sync-ended", ());
-                    Ok(())
-                });
+                end_sync_session(&app, generation);
                 return;
             };
 
@@ -392,10 +402,9 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
             }
         }
         log::warn!("登录同步等待超时（{MAX_WATCH_ROUNDS} 轮），未捕获到用量 Token；可重试同步或改用手动粘贴");
-        let _ = app.state::<SyncSession>().commit(generation, || {
-            let _ = app.emit("usage-sync-ended", ());
-            Ok(())
-        });
+        // 超时也必须关窗：否则下次同步建同名窗口时旧窗口还在，
+        // 用户会以为「重试没反应」，而旧窗口的回传又会被旧代际拒绝。
+        end_sync_session(&app, generation);
     });
 }
 

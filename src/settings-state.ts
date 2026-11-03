@@ -26,7 +26,12 @@ function useSettingsActions(handlers: {
       return fetchCurrentUsage()
         .then((usage) => {
           onUsageLoaded(usage);
-          setUsageStatus(`${prefix}，本月消费 ${fmtMoney(usage.monthCost)}`);
+          // 费用缺失时明确说「未取得」，不能显示成 ¥0.00。
+          setUsageStatus(
+            `${prefix}，本月消费 ${
+              usage.monthCost != null ? fmtMoney(usage.monthCost) : "未取得"
+            }`,
+          );
           return usage;
         })
         .catch((error) => {

@@ -664,16 +664,27 @@ pub(crate) async fn start_usage_sync(
     }
     let generation = session.begin()?;
 
+    // 上一次同步超时后可能残留同名窗口（旧代际）。先清掉它再继续，
+    // 否则建窗会失败或留下两个窗口；旧代际的迟到回传仍会被 commit 拒绝。
+    if let Some(stale) = app.get_webview_window("login-sync") {
+        log::warn!("发现残留的登录窗口，已在新同步开始前关闭");
+        let _ = stale.close();
+    }
+
     // 先扫一次缓存：登录完成后重复点击本命令，缓存落盘后即可命中。
     // 收集在 spawn_blocking（同步 IO 不占 async 工作线程），验证是异步请求，
-    // 且候选先收集后验证——单个候选失败不会卡住其余候选（评审 F-25）。
+    // 且候选先收集后验证——单个候选不会卡住其余候选（评审 F-25）。
     if let Some(token) = prescan_cached_token(&app, generation).await {
         capture_usage_token(&app, token, generation)?;
         return Ok(true);
     }
 
     // 建窗和取消也共用会话锁，防止慢预扫描在取消后重新弹窗。
-    session.with_current(generation, || open_login_window(&app, generation))?;
+    // 建窗失败同样要释放会话，否则前端会一直停在「等待网页登录」。
+    if let Err(error) = session.with_current(generation, || open_login_window(&app, generation)) {
+        crate::usage_watcher::end_sync_session(&app, generation);
+        return Err(error);
+    }
     spawn_title_watcher(app.clone(), generation);
     Ok(false)
 }

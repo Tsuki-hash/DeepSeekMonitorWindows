@@ -6,10 +6,13 @@ export function HistoryTrend({
   days,
   metric,
   monthly = false,
+  dateLabel = (date: string) => (monthly ? date.slice(0, 7) : mmdd(date)),
 }: {
   monthly?: boolean;
   days: Day[];
   metric: "totalTokens" | "cost";
+  /** 日期显示口径；跨年范围由调用方切成完整日期，避免不同年份显示成同一天。 */
+  dateLabel?: (date: string) => string;
 }) {
   const [active, setActive] = React.useState<string | null>(null);
   const [pinned, setPinned] = React.useState<string | null>(null);
@@ -20,7 +23,7 @@ export function HistoryTrend({
   }, [monthly, days.length]);
   const buttons = React.useRef<(HTMLButtonElement | null)[]>([]);
   const selected = days.find((day) => day.date === (active ?? pinned));
-  const label = (day: Day) => (monthly ? day.date.slice(0, 7) : day.date);
+  const label = (day: Day) => dateLabel(day.date);
   const maximum = Math.max(...days.map((day) => day.value ?? 0), 1);
   const value = (day: Day) =>
     day.value == null
@@ -104,9 +107,9 @@ export function HistoryTrend({
         ))}
       </div>
       <div className="history-axis">
-        <span>{days[0] ? mmdd(days[0].date) : ""}</span>
+        <span>{days[0] ? label(days[0]) : ""}</span>
         <span>
-          {days[days.length - 1] ? mmdd(days[days.length - 1]!.date) : ""}
+          {days[days.length - 1] ? label(days[days.length - 1]!) : ""}
         </span>
       </div>
     </>

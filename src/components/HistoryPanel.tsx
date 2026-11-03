@@ -13,6 +13,11 @@ import {
   sumModels,
   isUnusedHistoryModel,
 } from "../history";
+import {
+  classifyHistoryFailure,
+  historyFailureOutcome,
+  failedMonthsOnly,
+} from "../history-failure";
 import type { HistoryRange, HistorySnapshot } from "../history";
 import type { RawModelUsage } from "../types";
 
@@ -26,6 +31,17 @@ const valueText = (value: number | null, metric: "totalTokens" | "cost") =>
     : metric === "cost"
       ? fmtMoneyDisplay(value)
       : fmtTokensShort(value);
+
+/**
+ * 日期显示：跨年范围用完整日期，单年内仍用 `9/11` 短格式。
+ *
+ * 评审 P2：全部历史用 `mmdd` 会让不同年份的同月日显示成同一个「1/1」，
+ * 原始数据与导出都保留完整日期，缺口只在展示。
+ */
+const historyDateLabel = (date: string, from: string, to: string) => {
+  const spansYears = from.slice(0, 4) !== to.slice(0, 4);
+  return spansYears ? date : mmdd(date);
+};
 
 export function HistoryPanel({
   onBack,
@@ -47,6 +63,10 @@ export function HistoryPanel({
   const [snapshot, setSnapshot] = React.useState<HistorySnapshot | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [recovery, setRecovery] = React.useState<
+    "configure" | "relogin" | "retry" | "partial" | null
+  >(null);
+  const [failed, setFailed] = React.useState<string[]>([]);
   const [exportStatus, setExportStatus] = React.useState("");
   const snapshotEpoch = React.useRef(-1);
   const [clock, setClock] = React.useState(Date.now);
@@ -57,17 +77,22 @@ export function HistoryPanel({
   const date = todayStr();
   const sequence = React.useRef({ value: 0 });
   const request = React.useCallback(
-    async (force = false) => {
+    async (force = false, monthsOnly: string[] | null = null) => {
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
       const window = historyWindow(range, date, selectedMonth);
+      // 只重试失败月份时，区间与汇总仍按完整窗口，但只请求指定月份。
+      const targets = monthsOnly
+        ? failedMonthsOnly(monthsOnly, window.months)
+        : window.months;
       setBusy(true);
       setError("");
+      setRecovery(null);
       setExportStatus("");
       const successful: HistorySnapshot["months"] = [];
       const failed: string[] = [];
-      setProgress({ done: 0, total: window.months.length });
-      for (const month of [...window.months].reverse()) {
+      setProgress({ done: 0, total: targets.length });
+      for (const month of [...targets].reverse()) {
         if (
           id !== sequence.current.value ||
           requestedEpoch !== historyCache.epoch()
@@ -82,8 +107,26 @@ export function HistoryPanel({
               force,
             ),
           );
-        } catch {
+        } catch (failure) {
+          const classified = classifyHistoryFailure(failure, month);
+          const outcome = historyFailureOutcome(classified, [...failed, month]);
           failed.push(month);
+          // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
+          if (!outcome.continue) {
+            setProgress({
+              done: successful.length + failed.length,
+              total: targets.length,
+            });
+            if (successful.length) {
+              snapshotEpoch.current = requestedEpoch;
+              setSnapshot(buildHistory(window, [...successful], [...failed]));
+            }
+            setFailed(failed);
+            setRecovery(outcome.recovery);
+            setError(outcome.text);
+            setBusy(false);
+            return;
+          }
         }
         if (
           id !== sequence.current.value ||
@@ -92,15 +135,18 @@ export function HistoryPanel({
           return;
         setProgress({
           done: successful.length + failed.length,
-          total: window.months.length,
+          total: targets.length,
         });
         if (successful.length) {
           snapshotEpoch.current = requestedEpoch;
           setSnapshot(buildHistory(window, [...successful], [...failed]));
         }
       }
-      if (failed.length)
+      setFailed(failed);
+      if (failed.length) {
+        setRecovery("partial");
         setError(`${failed.length}个月份未取得，未返回日期标为未知。`);
+      }
 
       setBusy(false);
     },
@@ -319,6 +365,35 @@ export function HistoryPanel({
               : ""}
           </p>
         )}
+        {recovery && !busy && (
+          <div className="disclosure-actions history-recovery">
+            {recovery === "relogin" && (
+              <button
+                className="secondary"
+                onClick={() => {
+                  // 重新登录入口在设置页；这里只提示去向，不在此处重复实现同步。
+                  onBack();
+                }}
+              >
+                去设置页重新同步 Token
+              </button>
+            )}
+            {recovery === "configure" && (
+              <button className="secondary" onClick={onBack}>
+                去设置页配置用量 Token
+              </button>
+            )}
+            {failed.length > 0 && (
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => void request(false, failed)}
+              >
+                只重试失败月份（{failed.length}）
+              </button>
+            )}
+          </div>
+        )}
         {busy && (
           <p className="history-message" role="status">
             正在查询 {progress.done}/{progress.total} 个月…
@@ -359,6 +434,13 @@ export function HistoryPanel({
                 days={days}
                 monthly={range === "all"}
                 metric={metric}
+                dateLabel={(value) =>
+                  historyDateLabel(
+                    value,
+                    snapshot.window.from,
+                    snapshot.window.to,
+                  )
+                }
               />
             </article>
             {unusedModels.size > 0 && (
@@ -427,7 +509,11 @@ export function HistoryPanel({
                   {rows.map((row) => (
                     <tr key={`${row.date}-${row.model.model}`}>
                       <td>
-                        {mmdd(row.date)}
+                        {historyDateLabel(
+                          row.date,
+                          snapshot.window.from,
+                          snapshot.window.to,
+                        )}
                         <span title={row.model.model}>{row.model.model}</span>
                       </td>
                       <td>{valueText(row.model.totalTokens, "totalTokens")}</td>

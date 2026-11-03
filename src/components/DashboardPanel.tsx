@@ -52,8 +52,16 @@ function DashboardPanel({
     1,
   );
   const today = usage?.days.find((day) => day.date === todayStr()) ?? null;
-  const todayCost = usageState === "ok" && today ? today.totalCost : null;
-  const monthCost = usageState === "ok" && usage ? usage.monthCost : null;
+  // 费用为 null 表示「未取得」，与真实的 ¥0.00 必须区分开。
+  const todayCost =
+    usageState === "ok" && today ? (today.totalCost ?? null) : null;
+  const monthCost =
+    usageState === "ok" && usage ? (usage.monthCost ?? null) : null;
+  // 快照所属记账月：与当前记账月不同时，卡片标题不能再说「本月」。
+  const snapshotMonth = usage?.accountingDate?.slice(0, 7) ?? null;
+  const currentMonth = todayStr().slice(0, 7);
+  const monthLabel =
+    snapshotMonth && snapshotMonth !== currentMonth ? "上期消费" : "本月消费";
 
   return (
     <section className="panel dashboard-panel" data-testid="dashboard-panel">
@@ -101,6 +109,7 @@ function DashboardPanel({
         error={balanceError}
         todayCost={todayCost}
         monthCost={monthCost}
+        monthLabel={monthLabel}
       />
 
       <div className="usage-stack">

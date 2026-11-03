@@ -14,6 +14,7 @@ function BalanceCard({
   error,
   todayCost,
   monthCost,
+  monthLabel = "本月消费",
 }: {
   updatedAt?: number | null;
   onSettings?: () => void;
@@ -23,6 +24,7 @@ function BalanceCard({
   error: string;
   todayCost: number | null;
   monthCost: number | null;
+  monthLabel?: string;
 }) {
   const symbol = currencySymbol(balance?.currency);
   const amount =
@@ -116,11 +118,15 @@ function BalanceCard({
         <div className="mini-card">
           <div className="caption-with-icon orange">
             <CalendarDays size={15} />
-            <span>本月消费</span>
+            <span>{monthLabel}</span>
           </div>
           <strong
             key={monthCost ?? "na"}
-            title={monthCost != null ? fmtMoney(monthCost) : undefined}
+            title={
+              monthCost != null
+                ? fmtMoney(monthCost)
+                : "费用暂未取得，不代表零消费"
+            }
           >
             {monthCost != null ? fmtMoneyDisplay(monthCost, "¥") : "—"}
           </strong>

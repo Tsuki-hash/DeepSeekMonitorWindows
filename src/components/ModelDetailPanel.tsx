@@ -40,8 +40,10 @@ function ModelDetailPanel({
   const title =
     data?.name ?? (isFlash ? "V4.1 Flash" : isOther ? "其他" : "V4 Pro");
   const tintClass = isFlash ? "flash" : isOther ? "other" : "pro";
-  const cost = data ? fmtMoneyDisplay(data.cost) : "—";
-  const totalText = data ? fmtTokensShort(data.totalTokens) : "—";
+  // 费用/计数为 null 表示未取得：显示「—」，不能显示成 ¥0.00 / 0 Tokens。
+  const cost = data?.cost != null ? fmtMoneyDisplay(data.cost) : "—";
+  const totalText =
+    data?.totalTokens != null ? fmtTokensShort(data.totalTokens) : "—";
 
   const days = recentUsageDays(usage?.days ?? [], 7, usage?.unavailableDates);
   const points = days.map((day) =>
@@ -75,7 +77,9 @@ function ModelDetailPanel({
         </div>
         <div>
           <h1 title={title}>{title}</h1>
-          <p title={data ? fmtMoney(data.cost) : undefined}>本月 · {cost}</p>
+          <p title={data?.cost != null ? fmtMoney(data.cost) : undefined}>
+            本月 · {cost}
+          </p>
         </div>
       </article>
 
@@ -83,7 +87,7 @@ function ModelDetailPanel({
         <article className="card metric-card">
           <span>本月请求次数</span>
           <strong className={tintClass}>
-            {data ? fmtInt(data.requestCount) : "—"}
+            {data?.requestCount != null ? fmtInt(data.requestCount) : "—"}
           </strong>
         </article>
         <article className="card metric-card">

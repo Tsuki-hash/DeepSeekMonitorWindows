@@ -1,6 +1,6 @@
 //! Lossless model identity for history/export, alongside the existing dashboard slots.
 use crate::deepseek_api::ModelUsage;
-use crate::usage::{cost_sum, model_slot, Entry};
+use crate::usage::{amount, cost_sum, count, model_slot, Entry, MAX_SAFE_COUNT};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -19,21 +19,6 @@ pub struct RawModelUsage {
     pub data_warning: Option<String>,
 }
 
-const MAX_SAFE_COUNT: u64 = 9_007_199_254_740_991;
-fn count(value: &str) -> Option<u64> {
-    let value = value.trim();
-    let (integer, fractional) = value.split_once('.').unwrap_or((value, ""));
-    if integer.is_empty()
-        || !integer.bytes().all(|c| c.is_ascii_digit())
-        || !fractional.bytes().all(|c| c == b'0')
-    {
-        return None;
-    }
-    integer
-        .parse::<u64>()
-        .ok()
-        .filter(|value| *value <= MAX_SAFE_COUNT)
-}
 fn sum(entries: &[Entry], include: impl Fn(&str) -> bool) -> Option<u64> {
     entries
         .iter()
@@ -45,17 +30,18 @@ fn sum(entries: &[Entry], include: impl Fn(&str) -> bool) -> Option<u64> {
         })
 }
 
-pub fn raw_models(amount: &[ModelUsage], cost: &[ModelUsage]) -> Vec<RawModelUsage> {
+pub fn raw_models(amount_rows: &[ModelUsage], cost_rows: &[ModelUsage]) -> Vec<RawModelUsage> {
     let mut tokens: BTreeMap<&str, Vec<_>> = BTreeMap::new();
-    let mut costs = BTreeMap::new();
-    for row in amount {
+    let mut costs: BTreeMap<&str, Option<f64>> = BTreeMap::new();
+    for row in amount_rows {
         tokens
             .entry(&row.model)
             .or_default()
             .extend(row.usage.iter().cloned());
     }
-    for row in cost {
-        *costs.entry(row.model.as_str()).or_insert(0.0) += cost_sum(&row.usage);
+    for row in cost_rows {
+        let entry = costs.entry(row.model.as_str()).or_insert(Some(0.0));
+        *entry = entry.and_then(|total| cost_sum(&row.usage).map(|value| total + value));
     }
     let names: std::collections::BTreeSet<_> = tokens.keys().chain(costs.keys()).copied().collect();
     names
@@ -88,6 +74,7 @@ pub fn raw_models(amount: &[ModelUsage], cost: &[ModelUsage]) -> Vec<RawModelUsa
                         .filter(|value| *value <= MAX_SAFE_COUNT)
                 });
             let invalid = values.iter().any(|entry| count(&entry.amount).is_none())
+                || values.iter().any(|entry| amount(&entry.amount).is_none())
                 || [request, hit, miss, response, other, total]
                     .iter()
                     .any(Option::is_none);
@@ -100,7 +87,7 @@ pub fn raw_models(amount: &[ModelUsage], cost: &[ModelUsage]) -> Vec<RawModelUsa
                 cache_miss_tokens: present("PROMPT_CACHE_MISS_TOKEN").then_some(miss).flatten(),
                 response_tokens: present("RESPONSE_TOKEN").then_some(response).flatten(),
                 other_tokens: has_tokens.then_some(other).flatten(),
-                cost: costs.get(model).copied(),
+                cost: costs.get(model).copied().flatten(),
                 data_warning: invalid
                     .then(|| "平台 Token 计数异常，受影响的历史字段保留为未知".into()),
             }

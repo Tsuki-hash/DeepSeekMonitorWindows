@@ -364,13 +364,14 @@ fn balance_sample(data: deepseek_api::BalanceResult, options: &AlertOptions) -> 
     }
 }
 fn budget_sample(data: deepseek_api::UsageResult, options: &AlertOptions) -> (String, bool) {
-    if !data.warnings.is_empty()
-        || !data.month_cost.is_finite()
-        || !(0.0..=1e12).contains(&data.month_cost)
-    {
+    // 费用缺失（None）不能用于预算判定：宁可「待核对」，也不把缺失当成零消费。
+    let Some(month_cost) = data.month_cost else {
+        return ("invalid_data".into(), false);
+    };
+    if !data.warnings.is_empty() || !month_cost.is_finite() || !(0.0..=1e12).contains(&month_cost) {
         return ("invalid_data".into(), false);
     }
-    ("ok".into(), data.month_cost >= options.monthly_budget_cny)
+    ("ok".into(), month_cost >= options.monthly_budget_cny)
 }
 fn outcome<T>(
     result: Option<Result<T, String>>,
@@ -749,7 +750,7 @@ mod tests {
     }
     #[test]
     fn 预算待核对或无效数字不能触发_阈值包含等号() {
-        let data = |cost, warnings| deepseek_api::UsageResult {
+        let data = |cost: Option<f64>, warnings| deepseek_api::UsageResult {
             schema_version: 2,
             model_mapping_version: "test",
             raw_models: vec![],
@@ -758,14 +759,19 @@ mod tests {
             days: vec![],
             month_cost: cost,
         };
-        assert!(budget_sample(data(100.0, vec![]), &Default::default()).1);
-        assert!(!budget_sample(data(99.99, vec![]), &Default::default()).1);
+        assert!(budget_sample(data(Some(100.0), vec![]), &Default::default()).1);
+        assert!(!budget_sample(data(Some(99.99), vec![]), &Default::default()).1);
         for cost in [f64::NAN, f64::INFINITY, -1.0] {
-            assert!(!budget_sample(data(cost, vec![]), &Default::default()).1);
+            assert!(!budget_sample(data(Some(cost), vec![]), &Default::default()).1);
         }
+        // 费用缺失不能被当成 0 消费：既不发预算提醒，也不标记为正常。
+        assert_eq!(
+            budget_sample(data(None, vec![]), &Default::default()).0,
+            "invalid_data"
+        );
         assert!(
             !budget_sample(
-                data(200.0, vec!["费用与Token未对齐".into()]),
+                data(Some(200.0), vec!["费用与Token未对齐".into()]),
                 &Default::default()
             )
             .1

@@ -198,18 +198,20 @@ pub struct CostResp {
 pub struct UsageDaySummary {
     pub date: String,
     pub raw_models: Vec<crate::usage_history::RawModelUsage>,
-    pub flash_tokens: u64,
-    pub flash_cache_hit: u64,
-    pub flash_cache_miss: u64,
-    pub flash_response: u64,
-    pub pro_tokens: u64,
-    pub pro_cache_hit: u64,
-    pub pro_cache_miss: u64,
-    pub pro_response: u64,
-    pub flash_other_tokens: u64,
-    pub pro_other_tokens: u64,
-    pub total_tokens: u64,
-    pub total_cost: f64,
+    /// 以下计数为 `None` 表示平台没给或无法解析；不能当作零用量。
+    pub flash_tokens: Option<u64>,
+    pub flash_cache_hit: Option<u64>,
+    pub flash_cache_miss: Option<u64>,
+    pub flash_response: Option<u64>,
+    pub pro_tokens: Option<u64>,
+    pub pro_cache_hit: Option<u64>,
+    pub pro_cache_miss: Option<u64>,
+    pub pro_response: Option<u64>,
+    pub flash_other_tokens: Option<u64>,
+    pub pro_other_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// `None` 表示费用接口没有返回该日期；不是「当天免费」。
+    pub total_cost: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,26 +223,27 @@ pub struct UsageResult {
     pub warnings: Vec<String>,
     pub models: Vec<UsageModelSummary>,
     pub days: Vec<UsageDaySummary>,
-    pub month_cost: f64,
+    /// `None` 表示费用接口缺项/无法解析；主面板显示「—」而不是 ¥0.00。
+    pub month_cost: Option<f64>,
 }
 
 /// 纯聚合：amount/cost 响应 → 界面用量结构。新旧模型名归并、费用口径均在此。
+///
+/// **缺失不等于零**：费用接口没有返回某模型/日期时，费用为 `None`；计数解析失败时
+/// 对应计数为 `None`。两者都不会被静默补成 0，而是产生质量警告，让界面显示「—」。
 pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     let cost_total = cost.data.biz_data.first();
     let raw_models = crate::usage_history::raw_models(
         &amount.data.biz_data.total,
         cost_total.map(|c| c.total.as_slice()).unwrap_or(&[]),
     );
-    let cost_for_model = |model: &str| -> f64 {
-        cost_total
-            .map(|item| {
-                item.total
-                    .iter()
-                    .filter(|m| m.model == model)
-                    .map(|m| cost_sum(&m.usage))
-                    .sum()
-            })
-            .unwrap_or(0.0)
+    // 费用接口整份缺失（或该模型没有条目）时返回 None，而不是 0.0。
+    let cost_for_model = |model: &str| -> Option<f64> {
+        let item = cost_total?;
+        item.total
+            .iter()
+            .filter(|m| m.model == model)
+            .try_fold(0.0, |total, m| Some(total + cost_sum(&m.usage)?))
     };
 
     // 按槽位归并：迁移期内 deepseek-flash 与旧名可能同时出现在同一份账单里，
@@ -264,12 +267,25 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         }
     }
     let mut charged_models = std::collections::HashSet::new();
+    // 只在费用侧出现的模型没有数量数据：计数必须保持未知，不能被空 usage 解析成零。
+    let amount_models: std::collections::HashSet<&str> = amount
+        .data
+        .biz_data
+        .total
+        .iter()
+        .map(|model| model.model.as_str())
+        .collect();
     for model_usage in &source {
-        let breakdown = token_breakdown(&model_usage.usage);
+        let breakdown = if amount_models.contains(model_usage.model.as_str()) {
+            token_breakdown(&model_usage.usage)
+        } else {
+            unknown_breakdown()
+        };
+        // 同名模型可能重复出现：只有第一条带费用，后续同名条目费用记 0（已计入）。
         let cost = if charged_models.insert(&model_usage.model) {
             cost_for_model(&model_usage.model)
         } else {
-            0.0
+            Some(0.0)
         };
         match model_slot(&model_usage.model) {
             Some((slot, display)) if slot == FLASH_SLOT => {
@@ -306,16 +322,26 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     let mut models = Vec::new();
     models.extend(flash_sum);
     models.extend(pro_sum);
-    // 本月没有未知模型时不出「其他」行，避免常态下多一行空白
-    if let Some(other) = other_sum.filter(|sum| sum.total_tokens > 0 || sum.cost != 0.0) {
+    // 本月没有未知模型时不出「其他」行，避免常态下多一行空白。
+    // 判定用「有 token 或有费用」；两者都未知时不凭空生成空行。
+    if let Some(other) = other_sum
+        .filter(|sum| sum.total_tokens.unwrap_or(0) > 0 || sum.cost.is_some_and(|cost| cost != 0.0))
+    {
         models.push(other);
     }
 
-    let mut cost_by_date: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    // 按日费用：任一模型的金额无法解析就让该日为未知，不丢半个数字。
+    let mut cost_by_date: std::collections::HashMap<String, Option<f64>> =
+        std::collections::HashMap::new();
     if let Some(item) = cost_total {
         for day in &item.days {
-            let day_cost: f64 = day.data.iter().map(|m| cost_sum(&m.usage)).sum();
-            *cost_by_date.entry(day.date.clone()).or_default() += day_cost;
+            let entry = cost_by_date.entry(day.date.clone()).or_insert(Some(0.0));
+            *entry = entry.and_then(|total| {
+                day.data
+                    .iter()
+                    .try_fold(0.0, |sum, m| Some(sum + cost_sum(&m.usage)?))
+                    .map(|sum| total + sum)
+            });
         }
     }
 
@@ -350,34 +376,34 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         }
     }
     for day in &daily_source {
-        let mut flash = 0u64;
-        let mut flash_hit = 0u64;
-        let mut flash_miss = 0u64;
-        let mut flash_resp = 0u64;
-        let mut pro = 0u64;
-        let mut pro_hit = 0u64;
-        let mut pro_miss = 0u64;
-        let mut pro_resp = 0u64;
-        let mut total = 0u64;
-        let mut flash_other = 0u64;
-        let mut pro_other = 0u64;
+        let mut flash = Some(0u64);
+        let mut flash_hit = Some(0u64);
+        let mut flash_miss = Some(0u64);
+        let mut flash_resp = Some(0u64);
+        let mut pro = Some(0u64);
+        let mut pro_hit = Some(0u64);
+        let mut pro_miss = Some(0u64);
+        let mut pro_resp = Some(0u64);
+        let mut total = Some(0u64);
+        let mut flash_other = Some(0u64);
+        let mut pro_other = Some(0u64);
         for model_usage in &day.data {
             let breakdown = token_breakdown(&model_usage.usage);
-            total += breakdown.total;
+            total = sum_counts(total, breakdown.total);
             // total 覆盖当天全部模型（含未知模型），槽位分摊只作用于已识别的模型
             if let Some((slot, _)) = model_slot(&model_usage.model) {
                 if slot == FLASH_SLOT {
-                    flash += breakdown.total;
-                    flash_hit += breakdown.cache_hit;
-                    flash_miss += breakdown.cache_miss;
-                    flash_resp += breakdown.response;
-                    flash_other += breakdown.other;
+                    flash = sum_counts(flash, breakdown.total);
+                    flash_hit = sum_counts(flash_hit, breakdown.cache_hit);
+                    flash_miss = sum_counts(flash_miss, breakdown.cache_miss);
+                    flash_resp = sum_counts(flash_resp, breakdown.response);
+                    flash_other = sum_counts(flash_other, breakdown.other);
                 } else {
-                    pro += breakdown.total;
-                    pro_hit += breakdown.cache_hit;
-                    pro_miss += breakdown.cache_miss;
-                    pro_resp += breakdown.response;
-                    pro_other += breakdown.other;
+                    pro = sum_counts(pro, breakdown.total);
+                    pro_hit = sum_counts(pro_hit, breakdown.cache_hit);
+                    pro_miss = sum_counts(pro_miss, breakdown.cache_miss);
+                    pro_resp = sum_counts(pro_resp, breakdown.response);
+                    pro_other = sum_counts(pro_other, breakdown.other);
                 }
             }
         }
@@ -404,27 +430,26 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             flash_other_tokens: flash_other,
             pro_other_tokens: pro_other,
             total_tokens: total,
-            total_cost: cost_by_date.get(&day.date).copied().unwrap_or(0.0),
+            total_cost: cost_by_date.get(&day.date).copied().flatten(),
         });
     }
 
-    let month_cost: f64 = cost_total
-        .map(|item| item.total.iter().map(|m| cost_sum(&m.usage)).sum())
-        .unwrap_or(0.0);
+    let month_cost: Option<f64> = cost_total.and_then(|item| {
+        item.total
+            .iter()
+            .try_fold(0.0, |total, m| Some(total + cost_sum(&m.usage)?))
+    });
 
-    let mut warnings = if source.len() != amount.data.biz_data.total.len()
-        || daily_source.len() != amount.data.biz_data.days.len()
-    {
-        vec!["费用与 Token 数据尚未完全对齐，请稍后刷新".into()]
-    } else {
-        vec![]
-    };
+    let mut warnings = usage_alignment_warnings(amount, cost, &days);
     if raw_models
         .iter()
         .chain(days.iter().flat_map(|day| &day.raw_models))
         .any(|model| model.data_warning.is_some())
     {
         warnings.push("平台 Token 计数异常，受影响的历史字段保留为未知".into());
+    }
+    if month_cost.is_none() {
+        warnings.push("费用接口未返回可用的本月费用，费用显示为未知而不是零".into());
     }
     UsageResult {
         schema_version: 2,
@@ -435,6 +460,82 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         days,
         month_cost,
     }
+}
+
+/// 计数相加：任一未知即未知（缺失不补零）。
+fn sum_counts(total: Option<u64>, value: Option<u64>) -> Option<u64> {
+    total?
+        .checked_add(value?)
+        .filter(|value| *value <= crate::usage::MAX_SAFE_COUNT)
+}
+
+/// 完全没有数量数据时的明细：所有计数未知，不借空数组伪装成零。
+fn unknown_breakdown() -> crate::usage::TokenBreakdown {
+    crate::usage::TokenBreakdown {
+        total: None,
+        request: None,
+        cache_hit: None,
+        cache_miss: None,
+        response: None,
+        other: None,
+    }
+}
+
+/// 双向对齐检查：数量有费用无、费用有数量无、日期两侧不齐，都要能被用户看见。
+///
+/// 这里只产生**质量警告**，不改变数值：真正的「缺失」语义由 `Option` 承载。
+fn usage_alignment_warnings(
+    amount: &AmountResp,
+    cost: &CostResp,
+    days: &[UsageDaySummary],
+) -> Vec<String> {
+    let cost_total = cost.data.biz_data.first();
+    let amount_models: std::collections::HashSet<&str> = amount
+        .data
+        .biz_data
+        .total
+        .iter()
+        .map(|model| model.model.as_str())
+        .filter(|model| !model.is_empty())
+        .collect();
+    let cost_models: std::collections::HashSet<&str> = cost_total
+        .map(|item| {
+            item.total
+                .iter()
+                .map(|model| model.model.as_str())
+                .filter(|model| !model.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let amount_dates: std::collections::HashSet<&str> = amount
+        .data
+        .biz_data
+        .days
+        .iter()
+        .map(|day| day.date.as_str())
+        .collect();
+    let cost_dates: std::collections::HashSet<&str> = cost_total
+        .map(|item| item.days.iter().map(|day| day.date.as_str()).collect())
+        .unwrap_or_default();
+
+    let models_mismatch = !amount_models.is_subset(&cost_models)
+        || !cost_models.is_subset(&amount_models)
+        || amount.data.biz_data.total.len() != cost_models.len();
+    // 日期只有一侧存在，或某天算不出费用/数量，都算不齐。
+    let dates_mismatch = !amount_dates.is_subset(&cost_dates)
+        || !cost_dates.is_subset(&amount_dates)
+        || days
+            .iter()
+            .any(|day| day.total_cost.is_none() || day.total_tokens.is_none());
+
+    let mut warnings = Vec::new();
+    if models_mismatch {
+        warnings.push("费用与 Token 数据尚未完全对齐，请稍后刷新".into());
+    }
+    if dates_mismatch {
+        warnings.push("部分日期缺少费用或数量，相关数值按未知显示".into());
+    }
+    warnings
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(
@@ -534,8 +635,8 @@ mod tests {
         let duplicate = cost.data.biz_data[0].total[0].clone();
         cost.data.biz_data[0].total.push(duplicate);
         let result = build_usage_result(&amount, &cost);
-        assert!((result.models[0].cost - 0.6).abs() < 1e-9);
-        assert!((result.month_cost - 0.6).abs() < 1e-9);
+        assert!((result.models[0].cost.unwrap() - 0.6).abs() < 1e-9);
+        assert!((result.month_cost.unwrap() - 0.6).abs() < 1e-9);
     }
 
     #[test]
@@ -571,6 +672,10 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("Token 计数异常")));
+        // 主面板口径与历史一致：同一份小数计数不能出现「面板 0 而历史未知」。
+        assert_eq!(result.models[0].response_tokens, None);
+        assert_eq!(result.models[0].total_tokens, None);
+        assert_eq!(result.days[0].flash_response, None);
     }
 
     #[test]
@@ -625,8 +730,67 @@ mod tests {
         assert_eq!(result.models.len(), 1);
         assert_eq!(result.days.len(), 1);
         assert_eq!(result.days[0].date, "2026-09-01");
-        assert!((result.days[0].total_cost - 0.05).abs() < 1e-9);
+        assert!((result.days[0].total_cost.unwrap() - 0.05).abs() < 1e-9);
         assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn 数量有费用缺时费用为未知而非零_双向都告警() {
+        // 费用接口整份缺失：模型/日/月费用全部未知，且必须产生对齐警告。
+        let empty_cost: CostResp = serde_json::from_str(r#"{"data":{"biz_data":[]}}"#).unwrap();
+        let result = build_usage_result(&amount_sample(), &empty_cost);
+        assert_eq!(result.month_cost, None, "缺失费用不能折算成 ¥0.00");
+        assert!(result.models.iter().all(|model| model.cost.is_none()));
+        assert!(result.days.iter().all(|day| day.total_cost.is_none()));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("费用与 Token 数据尚未完全对齐")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("本月费用")));
+        // 数量本身仍然完整可用。
+        assert_eq!(result.models[0].total_tokens, Some(190));
+
+        // 反向：费用接口多出一个数量接口没有的模型 —— 费用保留，数量侧为未知。
+        let mut cost = cost_sample();
+        cost.data.biz_data[0].total.push(ModelUsage {
+            model: "cost-only-model".into(),
+            usage: vec![Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "0.40".into(),
+            }],
+        });
+        let result = build_usage_result(&amount_sample(), &cost);
+        assert!(result.month_cost.is_some(), "费用侧完整时仍给出金额");
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("尚未完全对齐")));
+        let extra = result
+            .models
+            .iter()
+            .find(|model| model.key == "other")
+            .expect("仅有费用的模型应出现在「其他」行");
+        assert_eq!(extra.total_tokens, None, "数量缺失不能补成零");
+        assert!((extra.cost.unwrap() - 0.40).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 单日缺费用只影响该日且不污染月合计() {
+        let mut cost = cost_sample();
+        cost.data.biz_data[0].days.clear();
+        let result = build_usage_result(&amount_sample(), &cost);
+        assert_eq!(result.days[0].total_cost, None, "该日费用未知");
+        assert!(
+            result.month_cost.unwrap() > 0.0,
+            "月合计来自月级费用，不因日级缺项清零"
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("部分日期缺少费用")));
     }
 
     #[test]
@@ -750,12 +914,12 @@ mod tests {
         let flash = &result.models[0];
         assert_eq!(flash.key, "flash");
         assert_eq!(flash.name, "V4.1 Flash");
-        assert_eq!(flash.cache_hit_tokens, 110);
-        assert_eq!(flash.response_tokens, 30);
-        assert_eq!(flash.request_count, 3);
+        assert_eq!(flash.cache_hit_tokens, Some(110));
+        assert_eq!(flash.response_tokens, Some(30));
+        assert_eq!(flash.request_count, Some(3));
         // 0.10 + 0.20（REQUEST 不计费用）
-        assert!((flash.cost - 0.30).abs() < 1e-9);
-        assert!((result.month_cost - 0.30).abs() < 1e-9);
+        assert!((flash.cost.unwrap() - 0.30).abs() < 1e-9);
+        assert!((result.month_cost.unwrap() - 0.30).abs() < 1e-9);
     }
 
     #[test]
@@ -763,8 +927,8 @@ mod tests {
         let result = build_usage_result(&amount_sample(), &cost_sample());
         assert_eq!(result.days.len(), 1);
         assert_eq!(result.days[0].date, "2026-09-01");
-        assert!((result.days[0].total_cost - 0.05).abs() < 1e-9);
-        assert_eq!(result.days[0].total_tokens, 70);
+        assert!((result.days[0].total_cost.unwrap() - 0.05).abs() < 1e-9);
+        assert_eq!(result.days[0].total_tokens, Some(70));
     }
 
     #[test]
@@ -806,8 +970,8 @@ mod tests {
         assert_eq!(result.models.len(), 1);
         assert_eq!(result.models[0].key, "other");
         assert_eq!(result.models[0].name, "其他");
-        assert_eq!(result.models[0].total_tokens, 10);
-        assert_eq!(result.days[0].total_tokens, 10);
+        assert_eq!(result.models[0].total_tokens, Some(10));
+        assert_eq!(result.days[0].total_tokens, Some(10));
     }
 
     #[test]
@@ -840,7 +1004,7 @@ mod tests {
         let cost: CostResp = serde_json::from_str(cost_json).unwrap();
         let result = build_usage_result(&amount, &cost);
         assert!(result.models.is_empty());
-        assert_eq!(result.days[0].total_tokens, 10);
+        assert_eq!(result.days[0].total_tokens, Some(10));
     }
 
     #[test]
@@ -862,6 +1026,6 @@ mod tests {
         let result = build_usage_result(&amount, &cost);
         assert_eq!(result.models.len(), 1);
         assert_eq!(result.models[0].key, "other");
-        assert_eq!(result.models[0].total_tokens, 16);
+        assert_eq!(result.models[0].total_tokens, Some(16));
     }
 }

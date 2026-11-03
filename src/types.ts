@@ -23,16 +23,17 @@ export type BalanceData = {
 export type SavedApiKey = { config: AppConfig; balance: BalanceData };
 // 通用的异步加载状态，余额与用量共用。
 export type LoadState = "loading" | "ok" | "error" | "nokey";
+// 计数为 null 表示平台没给或无法解析，**不等于零**；金额为 null 同理。
 export type UsageModel = {
   key: string;
   name: string;
-  totalTokens: number;
-  requestCount: number;
-  cacheHitTokens: number;
-  cacheMissTokens: number;
-  responseTokens: number;
-  otherTokens: number;
-  cost: number;
+  totalTokens: number | null;
+  requestCount: number | null;
+  cacheHitTokens: number | null;
+  cacheMissTokens: number | null;
+  responseTokens: number | null;
+  otherTokens: number | null;
+  cost: number | null;
 };
 export type UsageResult = {
   schemaVersion?: number;
@@ -43,7 +44,7 @@ export type UsageResult = {
   unavailableDates?: string[];
   models: UsageModel[];
   days: UsageDay[];
-  monthCost: number;
+  monthCost: number | null;
 };
 
 export type RawModelUsage = {

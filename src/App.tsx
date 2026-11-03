@@ -16,12 +16,22 @@ import { fetchCurrentUsage, invalidateUsageRequests } from "./usage-api";
 import { RequestGate } from "./request-gate";
 import { errorInfo } from "./error-state";
 import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
+import { msUntilNextAccountingDate } from "./accounting-clock";
 import { DashboardPanel } from "./components/DashboardPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelDetailPanel } from "./components/ModelDetailPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { LocalUsagePanel } from "./components/LocalUsagePanel";
 import { TrayBalancePublisher } from "./tray-balance";
+
+/** 自动刷新退避：只对「值得重试」的错误退避，且按通道各自计数。 */
+const retryableCode = (code?: string) =>
+  code === "rate_limited" || code === "unavailable" || code === "unknown";
+/** 未配置 / 凭据失效：该通道暂停，不参与退避，也不拖慢健康通道。 */
+const pausedCode = (code?: string) =>
+  code === "not_configured" || code === "credentials_invalid";
+const backoffSeconds = (base: number, failures: number) =>
+  Math.min(3600, base * 2 ** Math.min(6, Math.max(0, failures)));
 
 function App() {
   const [showDataNotices, setShowDataNotices] = React.useState(false);
@@ -35,6 +45,10 @@ function App() {
   const [balanceUpdatedAt, setBalanceUpdatedAt] = React.useState<number | null>(
     null,
   );
+  // 「有缓存」与「当前凭据仍有效」是两件事（评审 P2：托盘有效性）。
+  // 凭据失效时余额对象与这个标记一起撤销，托盘不会把被撤销凭据的金额重新发布。
+  const [balanceCredentialValid, setBalanceCredentialValid] =
+    React.useState(false);
   const trayPublisher = React.useRef<TrayBalancePublisher | null>(null);
   React.useEffect(() => {
     const publisher = new TrayBalancePublisher(invoke);
@@ -43,14 +57,17 @@ function App() {
     return () => publisher.stop();
   }, []);
   React.useEffect(() => {
-    const available =
-      balance && (balanceState === "ok" || balanceState === "loading");
+    // 只有「凭据仍有效」的快照才允许发布；loading 期间保留旧值并标旧，
+    // 但凭据一旦失效就立即变 null，避免金额短暂回闪。
+    const available = balanceCredentialValid && balance != null;
     trayPublisher.current?.update({
-      total: available ? balance.totalBalance : null,
-      currency: available ? balance.currency : null,
-      stale: Boolean(balanceError || balanceState === "loading"),
+      total: available ? balance!.totalBalance : null,
+      currency: available ? balance!.currency : null,
+      stale: available
+        ? Boolean(balanceError || balanceState === "loading")
+        : false,
     });
-  }, [balance, balanceState, balanceError]);
+  }, [balance, balanceState, balanceError, balanceCredentialValid]);
 
   const [usage, setUsage] = React.useState<UsageResult | null>(null);
   const [usageState, setUsageState] = React.useState<LoadState>("loading");
@@ -71,6 +88,8 @@ function App() {
   const balanceRequestId = React.useRef(0);
   const availableSnapshot = React.useRef({ balance: false, usage: false });
   const failures = React.useRef({ balance: 0, usage: 0 });
+  // 通道暂停状态：未配置或凭据失效时置 true，健康通道不受影响（评审 P2 独立退避）。
+  const paused = React.useRef({ balance: false, usage: false });
   const balanceGate = React.useRef(new RequestGate<BalanceData>());
   const loadBalance = React.useCallback((silent = false) => {
     const requestId = ++balanceRequestId.current;
@@ -86,8 +105,10 @@ function App() {
           return;
         }
         availableSnapshot.current.balance = true;
+        paused.current.balance = false;
         setBalance(data);
         setBalanceUpdatedAt(Date.now());
+        setBalanceCredentialValid(true);
         failures.current.balance = 0;
         setBalanceState("ok");
         setBalanceError("");
@@ -98,14 +119,23 @@ function App() {
         }
         const { message, code } = errorInfo(error);
         setBalanceErrorCode(code);
-        failures.current.balance += 1;
+        // 只有可重试错误才累加退避次数；未配置/失效凭据走暂停通道。
+        paused.current.balance = pausedCode(code);
+        if (retryableCode(code)) failures.current.balance += 1;
+        else failures.current.balance = 0;
+        // 凭据失效：撤销快照有效性，避免托盘把旧金额当成当前余额重新发布。
+        // 普通网络失败保留快照，但明确标旧。
+        if (pausedCode(code)) {
+          availableSnapshot.current.balance = false;
+          setBalanceCredentialValid(false);
+          setBalance(null);
+          setBalanceUpdatedAt(null);
+        }
         setBalanceError(message);
         setBalanceState((prev) =>
           nextLoadStateAfterError(
             availableSnapshot.current.balance ? "ok" : prev,
-            availableSnapshot.current.balance &&
-              code !== "not_configured" &&
-              code !== "credentials_invalid",
+            availableSnapshot.current.balance,
             message,
             code,
           ),
@@ -148,12 +178,13 @@ function App() {
         }
         const { message, code } = errorInfo(error);
         setUsageErrorCode(code);
-        failures.current.usage += 1;
+        paused.current.usage = pausedCode(code);
+        if (retryableCode(code)) failures.current.usage += 1;
+        else failures.current.usage = 0;
         setUsageError(message);
-        const retained =
-          code === "credentials_invalid" || code === "not_configured"
-            ? null
-            : currentUsageSnapshot(usageSnapshot.current, todayStr());
+        const retained = pausedCode(code)
+          ? null
+          : currentUsageSnapshot(usageSnapshot.current, todayStr());
         usageSnapshot.current = retained;
         availableSnapshot.current.usage = retained !== null;
         setUsage(retained);
@@ -162,9 +193,7 @@ function App() {
         setUsageState((prev) =>
           nextLoadStateAfterError(
             availableSnapshot.current.usage ? "ok" : prev,
-            availableSnapshot.current.usage &&
-              code !== "not_configured" &&
-              code !== "credentials_invalid",
+            availableSnapshot.current.usage,
             message,
             code,
           ),
@@ -227,43 +256,95 @@ function App() {
     if (!autoRefreshEnabled || !windowVisible) {
       return;
     }
-    // 自动刷新属于后台更新，走静默模式。
+    // 两路各自调度（评审 P2）：余额与用量互不影响。
+    // 未配置/失效凭据的通道直接暂停，不让它把健康通道的周期拖到 1 小时。
     // 用 setTimeout 链而非 setInterval：睡眠唤醒后 interval 可能连发补帧，
-    // 链式调度总是等上一次结束后再计时，避免睡眠唤醒后 interval 连发补帧。
+    // 链式调度总是等上一次结束后再计时。
     let cancelled = false;
-    let timer = 0;
-    const schedule = () => {
-      timer = window.setTimeout(
+    const timers = new Set<number>();
+    const schedule = (
+      channel: "balance" | "usage",
+      run: (silent: boolean) => Promise<unknown>,
+    ) => {
+      if (cancelled) return;
+      const delay = paused.current[channel]
+        ? 0
+        : backoffSeconds(refreshIntervalSeconds, failures.current[channel]);
+      const timer = window.setTimeout(
         () => {
-          if (cancelled) {
+          timers.delete(timer);
+          if (cancelled) return;
+          // 暂停通道：不联网，但保留定时器以便凭据恢复后重新纳入调度。
+          if (paused.current[channel]) {
+            schedule(channel, run);
             return;
           }
-          void refreshAll(true).finally(() => {
-            if (!cancelled) schedule();
-          });
+          void run(true).finally(() => schedule(channel, run));
         },
-        Math.min(
-          3600,
-          refreshIntervalSeconds *
-            2 **
-              Math.min(
-                6,
-                Math.max(failures.current.balance, failures.current.usage),
-              ),
-        ) * 1000,
+        paused.current[channel]
+          ? Math.min(300, refreshIntervalSeconds) * 1000
+          : delay * 1000,
       );
+      timers.add(timer);
     };
-    schedule();
+    schedule("balance", loadBalance);
+    schedule("usage", loadUsage);
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
+      timers.forEach((timer) => window.clearTimeout(timer));
+      timers.clear();
     };
-  }, [autoRefreshEnabled, refreshAll, refreshIntervalSeconds, windowVisible]);
+  }, [
+    autoRefreshEnabled,
+    loadBalance,
+    loadUsage,
+    refreshIntervalSeconds,
+    windowVisible,
+  ]);
 
   const hideWindow = React.useCallback(() => {
     void invoke("hide_main_window").catch(() => {
       // Browser preview has no Tauri IPC. Keep it non-blocking for visual checks.
     });
+  }, []);
+
+  // 记账日期驱动（评审 P1：跨月后不能把旧累计称为「本月」）。
+  // 独立于刷新路径：即使自动刷新关闭、用户一直开着面板，跨过北京时间月界时
+  // 也要立即让旧月累计失效。这里**只失效、不联网**——是否重新请求仍由刷新策略决定，
+  // 不在用户不知情时启用自动联网。
+  React.useEffect(() => {
+    let cancelled = false;
+    let timer = 0;
+    const check = () => {
+      if (cancelled) return;
+      // currentUsageSnapshot 自带跨月拒绝；这里把它当作「日期变化探测器」。
+      const retained = currentUsageSnapshot(usageSnapshot.current, todayStr());
+      if (usageSnapshot.current && retained !== usageSnapshot.current) {
+        usageSnapshot.current = retained;
+        availableSnapshot.current.usage = retained !== null;
+        setUsage(retained);
+        if (!retained) {
+          setUsageUpdatedAt(null);
+          setUsageState((prev) => (prev === "ok" ? "error" : prev));
+          setUsageError("记账月份已变化，请刷新本月用量");
+          setUsageErrorCode("invalid_data");
+        } else {
+          setUsage(retained);
+        }
+      }
+      timer = window.setTimeout(check, msUntilNextAccountingDate());
+    };
+    // 同时监听系统唤醒：睡眠跨月时定时器可能被推迟。
+    const onVisible = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    check();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   // 无论设置页是否挂载，登录同步成功都使旧凭据响应失效并刷新主数据。

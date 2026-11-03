@@ -18,6 +18,8 @@ export type ArchiveSummary = {
   savedAt: number;
   collectedAt: number;
   periodKey: string;
+  /** 采集时的本地 UTC 偏移（秒）；旧归档为 null（未知，导出时不补写）。 */
+  accountingUtcOffsetSeconds?: number | null;
   scope: string;
   includesPaths: boolean;
   complete: boolean;
@@ -72,15 +74,23 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     "stale",
     "includesPaths",
   ] as const;
+  // 旧归档没有偏移字段：保持 null，不用导出时的电脑时区补写。
+  const offset =
+    typeof entry.accountingUtcOffsetSeconds === "number" &&
+    Number.isInteger(entry.accountingUtcOffsetSeconds) &&
+    Math.abs(entry.accountingUtcOffsetSeconds) < 86400
+      ? entry.accountingUtcOffsetSeconds
+      : null;
   // Entry data came from the backend archive whitelist. CSV selects fields again.
   return {
     json: JSON.stringify(
       {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: "saved-local-usage-snapshot",
         captureKind,
         id: entry.id,
         engineVersion: entry.engineVersion,
+        accountingUtcOffsetSeconds: offset,
         ...Object.fromEntries(metadata.map((field) => [field, entry[field]])),
         rows: entry.rows.map((row) =>
           Object.fromEntries(
@@ -99,7 +109,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     csv:
       "\uFEFF" +
       [
-        [...fields, ...metadata, "captureKind"],
+        [...fields, ...metadata, "accountingUtcOffsetSeconds", "captureKind"],
         ...entry.rows.map((row) => [
           ...fields.map((field) =>
             field === "tokenAccuracy"
@@ -107,6 +117,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
               : (row as Record<string, unknown>)[field],
           ),
           ...metadata.map((field) => entry[field]),
+          offset,
           captureKind,
         ]),
       ]

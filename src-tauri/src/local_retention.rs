@@ -150,6 +150,8 @@ pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<(), String> {
             saved_at: snapshot.collected_at,
             collected_at: snapshot.collected_at,
             period_key: snapshot.period_key.clone(),
+            // 与手动归档一致：保留采集时的本地 UTC 偏移，便于换时区复核。
+            accounting_utc_offset_seconds: snapshot.accounting_utc_offset_seconds,
             engine_version: snapshot.engine_version.clone(),
             scope: "session".into(),
             includes_paths: false,
@@ -203,6 +205,7 @@ pub fn list() -> Result<Vec<ArchiveSummary>, String> {
             saved_at: entry.saved_at,
             collected_at: entry.collected_at,
             period_key: entry.period_key,
+            accounting_utc_offset_seconds: entry.accounting_utc_offset_seconds,
             scope: entry.scope,
             includes_paths: false,
             complete: entry.complete,

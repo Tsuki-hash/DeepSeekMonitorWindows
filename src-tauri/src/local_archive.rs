@@ -53,6 +53,11 @@ pub struct ArchiveEntry {
     pub saved_at: u64,
     pub collected_at: u64,
     pub period_key: String,
+    /// 采集时的本地 UTC 偏移（秒）。实时快照带这个值，归档曾丢失它，
+    /// 换时区复核时无法重建原始采集边界。旧归档保持 `None`，
+    /// 绝不拿导出时的电脑时区补写。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_utc_offset_seconds: Option<i32>,
     pub engine_version: String,
     pub scope: String,
     pub includes_paths: bool,
@@ -85,6 +90,9 @@ pub struct ArchiveSummary {
     pub saved_at: u64,
     pub collected_at: u64,
     pub period_key: String,
+    /// 采集时的本地 UTC 偏移；旧归档没有该字段时为 `None`（未知，不补写）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounting_utc_offset_seconds: Option<i32>,
     pub scope: String,
     pub includes_paths: bool,
     pub complete: bool,
@@ -158,9 +166,14 @@ pub(crate) fn valid_entry(entry: &ArchiveEntry) -> bool {
     };
     let number = |value: Option<u64>| value.is_none_or(|value| value <= 9_007_199_254_740_991);
     let month = entry.period_key.as_bytes();
+    // 偏移是可选兼容字段：给了就必须是合法时区偏移（UTC−12:00..+14:00）。
+    let offset_valid = entry
+        .accounting_utc_offset_seconds
+        .is_none_or(|value| (-43_200..=50_400).contains(&value));
     valid_id(&entry.id)
         && entry.collected_at <= 8_640_000_000_000_000
         && entry.saved_at <= 8_640_000_000_000_000
+        && offset_valid
         && text(&entry.engine_version)
         && matches!(entry.scope.as_str(), "all" | "project" | "session")
         && month.len() == 7
@@ -329,6 +342,7 @@ pub fn capture(
         saved_at,
         collected_at: snapshot.collected_at,
         period_key: snapshot.period_key.clone(),
+        accounting_utc_offset_seconds: snapshot.accounting_utc_offset_seconds,
         engine_version: snapshot.engine_version.clone(),
         scope: scope_name.into(),
         includes_paths,
@@ -358,6 +372,7 @@ pub fn list() -> Result<Vec<ArchiveSummary>, String> {
             saved_at: entry.saved_at,
             collected_at: entry.collected_at,
             period_key: entry.period_key,
+            accounting_utc_offset_seconds: entry.accounting_utc_offset_seconds,
             scope: entry.scope,
             includes_paths: entry.includes_paths,
             complete: entry.complete,

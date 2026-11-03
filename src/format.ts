@@ -6,22 +6,23 @@
 //
 // 注意本文件**不得** import 任何浏览器或 Tauri API，否则 Node 侧测不了。
 
+// 日级计数与费用：`null` 表示「未取得」，不是零。图表据此区分空柱与未知柱。
 export type UsageDay = {
   rawModels?: import("./types").RawModelUsage[];
   unavailable?: boolean;
   date: string;
-  flashTokens: number;
-  flashCacheHit: number;
-  flashCacheMiss: number;
-  flashResponse: number;
-  proTokens: number;
-  proCacheHit: number;
-  proCacheMiss: number;
-  proResponse: number;
-  flashOtherTokens: number;
-  proOtherTokens: number;
-  totalTokens: number;
-  totalCost: number;
+  flashTokens: number | null;
+  flashCacheHit: number | null;
+  flashCacheMiss: number | null;
+  flashResponse: number | null;
+  proTokens: number | null;
+  proCacheHit: number | null;
+  proCacheMiss: number | null;
+  proResponse: number | null;
+  flashOtherTokens: number | null;
+  proOtherTokens: number | null;
+  totalTokens: number | null;
+  totalCost: number | null;
 };
 
 /** 千分位整数。用于 tooltip 里的精确 token 数。 */
@@ -164,6 +165,12 @@ export type ChartPoint = {
   total: number;
 };
 
+/** 任一分段未知即整根柱子未知；缺失不能画成零高度的空柱。 */
+const sumKnown = (values: (number | null)[]): number | null =>
+  values.some((value) => value == null)
+    ? null
+    : values.reduce<number>((total, value) => total + (value as number), 0);
+
 /**
  * 把单日用量映射成柱状图数据点。
  *
@@ -172,43 +179,71 @@ export type ChartPoint = {
  * 单模型（flash/pro）没有独立的 total 字段，仍按分段求和。
  * `scope === "other"` 是未接入模型的兜底档：平台不给分段明细，
  * 按日量 = 当日合计 − flash − pro，柱子只有一段。
+ *
+ * 任一参与计算的字段为 `null` 时返回 `unavailable: true`：接口缺项与真实零用量
+ * 在图上必须是两种不同的显示。
  */
 export const chartPointFromDay = (
   day: UsageDay,
   scope: ChartScope = "all",
 ): ChartPoint => {
-  const hit =
+  const unknown = {
+    unavailable: true,
+    date: day.date,
+    hit: 0,
+    miss: 0,
+    response: 0,
+    other: 0,
+    total: 0,
+  };
+  const hit = sumKnown(
     scope === "flash"
-      ? day.flashCacheHit
+      ? [day.flashCacheHit]
       : scope === "pro"
-        ? day.proCacheHit
+        ? [day.proCacheHit]
         : scope === "all"
-          ? day.flashCacheHit + day.proCacheHit
-          : 0;
-  const miss =
+          ? [day.flashCacheHit, day.proCacheHit]
+          : [],
+  );
+  const miss = sumKnown(
     scope === "flash"
-      ? day.flashCacheMiss
+      ? [day.flashCacheMiss]
       : scope === "pro"
-        ? day.proCacheMiss
+        ? [day.proCacheMiss]
         : scope === "all"
-          ? day.flashCacheMiss + day.proCacheMiss
-          : 0;
-  const response =
+          ? [day.flashCacheMiss, day.proCacheMiss]
+          : [],
+  );
+  const response = sumKnown(
     scope === "flash"
-      ? day.flashResponse
+      ? [day.flashResponse]
       : scope === "pro"
-        ? day.proResponse
+        ? [day.proResponse]
         : scope === "all"
-          ? day.flashResponse + day.proResponse
-          : 0;
+          ? [day.flashResponse, day.proResponse]
+          : [],
+  );
+  if (hit == null || miss == null || response == null) return unknown;
   const knownOther =
     scope === "flash"
-      ? day.flashOtherTokens
+      ? (day.flashOtherTokens ?? null)
       : scope === "pro"
-        ? day.proOtherTokens
+        ? (day.proOtherTokens ?? null)
         : scope === "all"
-          ? day.flashOtherTokens + day.proOtherTokens
-          : Math.max(0, day.totalTokens - day.flashTokens - day.proTokens);
+          ? sumKnown([day.flashOtherTokens, day.proOtherTokens])
+          : sumKnown(
+              day.totalTokens == null ||
+                day.flashTokens == null ||
+                day.proTokens == null
+                ? [null]
+                : [
+                    Math.max(
+                      0,
+                      day.totalTokens - day.flashTokens - day.proTokens,
+                    ),
+                  ],
+            );
+  if (knownOther == null) return unknown;
   const segmented = hit + miss + response + knownOther;
   if (scope !== "all") {
     return {
@@ -221,6 +256,7 @@ export const chartPointFromDay = (
       total: segmented,
     };
   }
+  if (day.totalTokens == null) return unknown;
   const total = Math.max(day.totalTokens, segmented);
   const other = knownOther + (total - segmented);
   return {

@@ -8,12 +8,15 @@ export function LocalArchiveCapture({
   scope,
   disabled,
   retentionWarning,
+  backgroundEnabled = false,
   onOpen,
 }: {
   collectedAt: number | null;
   scope: ArchiveScope;
   disabled: boolean;
   retentionWarning?: string | null;
+  /** 后台采集是否开启：决定留存说明里「隐藏后是否仍会采集」。 */
+  backgroundEnabled?: boolean;
   onOpen: (mode: "manual" | "retention") => void;
 }) {
   const [paths, setPaths] = React.useState(false),
@@ -170,7 +173,10 @@ export function LocalArchiveCapture({
           自动留存已读取会话
         </label>
         <p>
-          开启后，每次成功采集保存会话的最近汇总；来源或月份不同分开保留，与当前统计不相加。仅在本地页可见时采集，隐藏后不持续扫描。
+          开启后，每次成功采集保存会话的最近汇总；来源或月份不同分开保留，与当前统计不相加。
+          {backgroundEnabled
+            ? "后台采集已开启：收起或隐藏面板后成功采集的结果同样参与留存。"
+            : "当前仅在本页可见时采集；若需收起后继续留存，请另行开启「后台采集」。"}
         </p>
         <p>
           不保存项目完整路径、正文或凭据；会话ID和项目名称会保留。最多128条月度会话记录、总8MiB，满后提示。记录未再出现不代表已删除。

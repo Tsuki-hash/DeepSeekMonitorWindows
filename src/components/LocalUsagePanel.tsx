@@ -60,7 +60,10 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
   const control = React.useRef({ sequence: 0, inFlight: false });
   const tracker = React.useRef(new LocalRateTracker());
   const background = React.useRef(false);
+  // 后台采集开关同时驱动「留存说明」的措辞，避免文案与实际行为矛盾（评审 P2）。
+  const [backgroundEnabled, setBackgroundEnabled] = React.useState(false);
   const backgroundMode = React.useCallback((enabled: boolean) => {
+    setBackgroundEnabled(enabled);
     if (background.current !== enabled) {
       background.current = enabled;
       tracker.current.reset();
@@ -598,6 +601,7 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
           <LocalArchiveCapture
             retentionWarning={snapshot?.retentionWarning}
             collectedAt={snapshot?.collectedAt || null}
+            backgroundEnabled={backgroundEnabled}
             scope={
               session != null
                 ? { kind: "session", key: session, projectKey: project }
@@ -639,7 +643,7 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
               —。
             </p>
             <p>
-              生成耗时通常在调用结束后落盘；来源未记录的项目、Token或耗时不会猜测。此版提供会话按模型明细，逐条请求详情暂未接入。默认仅在本页可见时采集；可单独开启后台采集，在收起后继续更新。关闭统计暂停采集并清除内存结果，保留已有会话留存与引擎缓存，原工具记录不删除。
+              生成耗时通常在调用结束后落盘；来源未记录的项目、Token或耗时不会猜测。此版提供会话按模型明细，逐条请求详情暂未接入。默认仅在本页可见时采集；单独开启「后台采集」后，收起面板仍继续更新。关闭统计暂停采集并清除内存结果，保留已有会话留存与引擎缓存，原工具记录不删除。
             </p>
             <p>
               默认统计本机目录，可添加额外主目录或支持工具的数据路径，WSL目录只读取确认运行的发行版；不同来源不合并同名会话。可指定ZCode本地数据库，其WSL数据库路径暂不支持。本地费用不估算，避免与峰谷实际账单混淆。

@@ -24,27 +24,38 @@ function UsageRow({
     data?.name ?? (isFlash ? "V4.1 Flash" : isOther ? "其他" : "V4 Pro");
   // 这一行只有约 115px 给 token 数，千万级以上再写精确千分位会溢出成省略号，
   // 因此大数用紧凑写法，精确值仍可通过图表按钮的无障碍标签与明细标题查看。
-  const tokensText = data
-    ? `${
-        data.totalTokens < 1_000_000
-          ? fmtInt(data.totalTokens)
-          : fmtTokensShort(data.totalTokens)
-      } Tokens`
-    : state === "loading"
-      ? "查询中…"
-      : state === "nokey"
-        ? "未配置 Token"
-        : state === "error"
-          ? "用量不可用"
-          : "—";
-  const cost = data ? fmtMoneyDisplay(data.cost) : "—";
+  // totalTokens 为 null 表示平台没给或无法解析 —— 不能写成 0 Tokens。
+  const totalTokens = data?.totalTokens ?? null;
+  const tokensText =
+    totalTokens == null
+      ? data
+        ? "Tokens 未知"
+        : state === "loading"
+          ? "查询中…"
+          : state === "nokey"
+            ? "未配置 Token"
+            : state === "error"
+              ? "用量不可用"
+              : "—"
+      : `${
+          totalTokens < 1_000_000
+            ? fmtInt(totalTokens)
+            : fmtTokensShort(totalTokens)
+        } Tokens`;
+  const cost = data?.cost != null ? fmtMoneyDisplay(data.cost) : "—";
   const ratio =
-    data && data.cost > 0
-      ? `${fmtTokensShort(data.totalTokens / data.cost)} T/¥`
+    data?.cost != null && totalTokens != null && data.cost > 0
+      ? `${fmtTokensShort(totalTokens / data.cost)} T/¥`
       : "—";
-  const width = data
-    ? `${Math.max(2, (data.totalTokens / maxTokens) * 100)}%`
-    : "0%";
+  const width =
+    totalTokens == null
+      ? "0%"
+      : `${Math.max(2, (totalTokens / maxTokens) * 100)}%`;
+  // 缓存命中率只在两个分母分量都已知时计算，否则显示未知。
+  const hit = data?.cacheHitTokens ?? null;
+  const miss = data?.cacheMissTokens ?? null;
+  const hitRate =
+    hit != null && miss != null && hit + miss > 0 ? hit + miss : null;
 
   return (
     <button className="card usage-row" onClick={onClick}>
@@ -65,7 +76,11 @@ function UsageRow({
           <small className="model-period">本月</small>
         </h2>
         <div className="token-line">
-          <span title={data ? `${fmtInt(data.totalTokens)} Tokens` : undefined}>
+          <span
+            title={
+              totalTokens != null ? `${fmtInt(totalTokens)} Tokens` : "未取得"
+            }
+          >
             {tokensText}
           </span>
           <div className="progress-track">
@@ -77,23 +92,19 @@ function UsageRow({
             />
           </div>
         </div>
-        {data && data.cacheHitTokens + data.cacheMissTokens > 0 && (
+        {hitRate != null && (
           <span
             className={`cache-hit-rate ${tint}`}
             title="缓存命中输入 /（缓存命中输入 + 未命中输入），不含输出与未知输入"
           >
-            缓存命中{" "}
-            {(
-              (data.cacheHitTokens /
-                (data.cacheHitTokens + data.cacheMissTokens)) *
-              100
-            ).toFixed(0)}
-            %
+            缓存命中 {((hit! / hitRate) * 100).toFixed(0)}%
           </span>
         )}
       </div>
       <div className="usage-price">
-        <strong title={data ? fmtMoney(data.cost) : undefined}>{cost}</strong>
+        <strong title={data?.cost != null ? fmtMoney(data.cost) : undefined}>
+          {cost}
+        </strong>
         <span title="本月 Token 总数 / 本月人民币费用">{ratio}</span>
       </div>
     </button>
