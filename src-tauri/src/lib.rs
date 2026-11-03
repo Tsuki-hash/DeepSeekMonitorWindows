@@ -11,6 +11,7 @@ pub mod error;
 pub mod http;
 pub mod local_archive;
 pub mod local_background;
+pub mod local_overlap;
 pub mod local_retention;
 pub mod local_sources;
 pub mod local_usage;
@@ -96,6 +97,7 @@ pub fn run() {
             commands::clear_local_archives,
             commands::get_local_retention_enabled,
             commands::set_local_retention_enabled,
+            commands::get_local_retention_capacity,
             commands::list_local_retention,
             commands::read_local_retention,
             commands::delete_local_retention,

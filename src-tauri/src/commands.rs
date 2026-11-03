@@ -138,6 +138,13 @@ pub(crate) fn set_local_retention_enabled(
     crate::local_retention::set_enabled(enabled)
 }
 #[tauri::command]
+pub(crate) fn get_local_retention_capacity(
+    window: WebviewWindow,
+) -> Result<crate::local_retention::Capacity, String> {
+    require_main(&window)?;
+    crate::local_retention::capacity()
+}
+#[tauri::command]
 pub(crate) fn list_local_retention(
     window: WebviewWindow,
 ) -> Result<Vec<crate::local_archive::ArchiveSummary>, String> {
@@ -287,7 +294,19 @@ pub(crate) async fn collect_local_usage(
     state.last_scan_failed = result.is_err();
     state.last_error = result.as_ref().err().cloned();
     if let Ok(snapshot) = &mut result {
-        snapshot.retention_warning = crate::local_retention::checkpoint(snapshot).err();
+        // 留存是可选功能：失败不阻断统计。逐条策略下「部分写入」也要如实告诉用户，
+        // 而不是只在整批失败时才提示。
+        snapshot.retention_warning = match crate::local_retention::checkpoint(snapshot) {
+            Ok(outcome) if outcome.failed => {
+                Some("留存写入失败，已保存的旧记录未改动；当前统计仍可用".into())
+            }
+            Ok(outcome) if outcome.skipped > 0 => Some(format!(
+                "留存已满：{} 条会话继续更新，{} 条新会话未保存；可导出后清理旧留存",
+                outcome.written, outcome.skipped
+            )),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
         state.snapshot = Some(snapshot.clone());
     }
     result.map(Some)
@@ -470,8 +489,13 @@ pub(crate) async fn save_api_key(
     }
 
     let generation = app.state::<ApiKeySession>().0.begin()?;
+    // 错误种类由来源层给出，这里只补上下文文案，不用文案反推分类。
     let balance = fetch_balance_with_key(&value).await.map_err(|e| {
-        CommandError::new(format!("验证未通过，原 Key 未更改：{e}"), Some("api_key"))
+        CommandError::kind(
+            format!("验证未通过，原 Key 未更改：{}", e.message),
+            e.kind,
+            Some("api_key"),
+        )
     })?;
     let config = app.state::<ApiKeySession>().0.commit(generation, || {
         to_app_config(crate::config::edit_validated_credential(
@@ -550,7 +574,7 @@ pub(crate) async fn fetch_balance(window: WebviewWindow) -> Result<BalanceResult
         .ok_or_else(|| CommandError::new("未配置 API Key".into(), Some("api_key")))?;
     fetch_balance_with_key(&api_key)
         .await
-        .map_err(|e| CommandError::new(e, Some("api_key")))
+        .map_err(|e| CommandError::kind(e.message, e.kind, Some("api_key")))
 }
 
 #[tauri::command]
@@ -647,7 +671,7 @@ pub(crate) async fn fetch_usage(
         .ok_or_else(|| CommandError::new("未配置用量 Token".into(), Some("usage_token")))?;
     fetch_usage_with_token(&token, month, year)
         .await
-        .map_err(|e| CommandError::new(e, Some("usage_token")))
+        .map_err(|e| CommandError::kind(e.message, e.kind, Some("usage_token")))
 }
 
 #[tauri::command]

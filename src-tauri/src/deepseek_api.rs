@@ -3,11 +3,67 @@
 //! 网络 I/O 与「响应 → 界面模型」的纯聚合拆开，后者可直接单测（含反序列化样本），
 //! 不必启动 Tauri 或打真实接口。
 
+use crate::error::ErrorKind;
 use crate::http::http_client;
 use crate::usage::{
     cost_sum, merge_model_slot, model_slot, token_breakdown, Entry, UsageModelSummary, FLASH_SLOT,
 };
 use serde::{Deserialize, Serialize};
+
+/// 来源层错误：稳定 kind + 展示文案。
+///
+/// 评审 P2：网络层原先返回 `String`，上层只能靠匹配中文分类，改措辞就会改重试策略。
+/// 现在 HTTP 状态码在**产生错误的地方**就映射成 `ErrorKind`，展示层只负责翻译文案。
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<ApiError> for crate::error::CommandError {
+    fn from(error: ApiError) -> Self {
+        crate::error::CommandError::kind(error.message, error.kind, None)
+    }
+}
+
+/// 旧调用点（提示检查等）仍在用字符串错误：默认按「暂不可用」分类。
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        ApiError::new(ErrorKind::Unavailable, message)
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(message: &str) -> Self {
+        ApiError::new(ErrorKind::Unavailable, message)
+    }
+}
+
+/// HTTP 状态码 → 稳定错误种类。未知状态码按「暂不可用」处理（可重试）。
+fn status_kind(code: u16) -> ErrorKind {
+    match code {
+        401 | 403 => ErrorKind::CredentialsInvalid,
+        429 => ErrorKind::RateLimited,
+        code if code >= 500 => ErrorKind::Unavailable,
+        404 => ErrorKind::Unavailable,
+        _ => ErrorKind::Unknown,
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,28 +113,35 @@ impl BalanceResponse {
 }
 
 /// 实时查询 DeepSeek 账户余额。
-pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, String> {
-    let client = http_client()?;
+pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, ApiError> {
+    let client = http_client().map_err(|error| ApiError::new(ErrorKind::Unavailable, error))?;
     let response = client
         .get("https://api.deepseek.com/user/balance")
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|error| format!("网络请求失败：{error}"))?;
+        .map_err(|error| ApiError::new(ErrorKind::Unavailable, format!("网络请求失败：{error}")))?;
 
     match response.status().as_u16() {
         200 => {}
-        401 => return Err("API Key 无效或已过期".to_string()),
-        429 => return Err("请求过于频繁，请稍后再试".to_string()),
-        code if code >= 500 => return Err(format!("DeepSeek 服务器错误：{code}")),
-        code => return Err(format!("请求失败：HTTP {code}")),
+        code => {
+            let kind = status_kind(code);
+            let message = match code {
+                401 => "API Key 无效或已过期".to_string(),
+                429 => "请求过于频繁，请稍后再试".to_string(),
+                code if code >= 500 => format!("DeepSeek 服务器错误：{code}"),
+                code => format!("请求失败：HTTP {code}"),
+            };
+            return Err(ApiError::new(kind, message));
+        }
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取余额响应失败：{error}"))?;
-    parse_balance(BalanceResponse::from_json(&text)?)
+    let text = response.text().await.map_err(|error| {
+        ApiError::new(ErrorKind::Unavailable, format!("读取余额响应失败：{error}"))
+    })?;
+    let parsed = BalanceResponse::from_json(&text)
+        .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
+    parse_balance(parsed).map_err(|message| ApiError::new(ErrorKind::InvalidData, message))
 }
 
 /// 用量 Token 校验失败的性质。
@@ -542,7 +605,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     token: &str,
-) -> Result<T, String> {
+) -> Result<T, ApiError> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -550,23 +613,27 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .header("Accept", "*/*")
         .send()
         .await
-        .map_err(|error| format!("用量请求失败：{error}"))?;
+        .map_err(|error| ApiError::new(ErrorKind::Unavailable, format!("用量请求失败：{error}")))?;
     match resp.status().as_u16() {
         200 => {}
-        401 => return Err("用量 Token 无效或已过期，请重新同步用量 Token（设置页）".to_string()),
-        403 => return Err("用量接口拒绝访问，请重新同步用量 Token（设置页）".to_string()),
-        404 => return Err("用量接口路径可能已变更，可稍后重试或使用手动粘贴 Token".to_string()),
-        429 => return Err("请求过于频繁，请稍后再试".to_string()),
-        code if code >= 500 => {
-            return Err(format!(
-                "用量服务暂时不可用（HTTP {code}），余额查询不受影响"
-            ))
+        code => {
+            let kind = status_kind(code);
+            let message = match code {
+                401 => "用量 Token 无效或已过期，请重新同步用量 Token（设置页）".to_string(),
+                403 => "用量接口拒绝访问，请重新同步用量 Token（设置页）".to_string(),
+                404 => "用量接口路径可能已变更，可稍后重试或使用手动粘贴 Token".to_string(),
+                429 => "请求过于频繁，请稍后再试".to_string(),
+                code if code >= 500 => {
+                    format!("用量服务暂时不可用（HTTP {code}），余额查询不受影响")
+                }
+                code => format!("用量接口错误：HTTP {code}，余额查询不受影响"),
+            };
+            return Err(ApiError::new(kind, message));
         }
-        code => return Err(format!("用量接口错误：HTTP {code}，余额查询不受影响")),
     }
-    resp.json::<T>()
-        .await
-        .map_err(|error| format!("解析用量数据失败：{error}"))
+    resp.json::<T>().await.map_err(|error| {
+        ApiError::new(ErrorKind::InvalidData, format!("解析用量数据失败：{error}"))
+    })
 }
 
 /// 并发拉取 amount/cost 并聚合成界面结构。
@@ -574,8 +641,8 @@ pub async fn fetch_usage_with_token(
     token: &str,
     month: u32,
     year: u32,
-) -> Result<UsageResult, String> {
-    let client = http_client()?;
+) -> Result<UsageResult, ApiError> {
+    let client = http_client().map_err(|error| ApiError::new(ErrorKind::Unavailable, error))?;
     let amount_url =
         format!("https://platform.deepseek.com/api/v0/usage/amount?month={month}&year={year}");
     let cost_url =
@@ -588,9 +655,13 @@ pub async fn fetch_usage_with_token(
     )?;
 
     if cost.data.biz_data.len() > 1 {
-        return Err("平台返回多个费用业务分组，暂无法确认统计口径，请保留旧数据并反馈".into());
+        return Err(ApiError::new(
+            ErrorKind::InvalidData,
+            "平台返回多个费用业务分组，暂无法确认统计口径，请保留旧数据并反馈",
+        ));
     }
-    validate_usage_entries(&amount, &cost)?;
+    validate_usage_entries(&amount, &cost)
+        .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
     Ok(build_usage_result(&amount, &cost))
 }
 

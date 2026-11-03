@@ -1,5 +1,5 @@
 //! Opt-in independent reminder checks. No retained/failed data can trigger a notice.
-use crate::{config, deepseek_api, error::CommandError};
+use crate::{config, deepseek_api};
 use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -374,12 +374,13 @@ fn budget_sample(data: deepseek_api::UsageResult, options: &AlertOptions) -> (St
     ("ok".into(), month_cost >= options.monthly_budget_cny)
 }
 fn outcome<T>(
-    result: Option<Result<T, String>>,
+    result: Option<Result<T, deepseek_api::ApiError>>,
     evaluate: impl FnOnce(T) -> (String, bool),
 ) -> Option<(String, bool)> {
     result.map(|result| match result {
         Ok(data) => evaluate(data),
-        Err(message) => (CommandError::new(message, None).code.into(), false),
+        // 错误种类直接来自来源层，不再靠文案反推。
+        Err(error) => (error.kind.code().to_string(), false),
     })
 }
 pub async fn while_current<T>(

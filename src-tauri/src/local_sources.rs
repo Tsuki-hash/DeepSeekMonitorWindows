@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -381,6 +381,78 @@ pub async fn probe_path(home: PathBuf, directory: bool) -> Result<PathBuf, Strin
     .map_err(|_| "主目录检查失败")?
 }
 
+/// 解析后的目标是否需要重新核对来源策略。
+///
+/// 评审条件验收：本地路径经 junction / symlink 指向别处时，配置里写的路径通过了
+/// 校验，但真正被读取的是解析后的目标。这里对**解析后的路径**再跑一遍门类检查，
+/// 让「指向 WSL 挂载点」「指向系统目录」这类情况在采集前就失败，而不是绕过策略。
+///
+/// 返回解析后的路径；策略不通过时返回可解释错误。
+pub fn recheck_resolved_target(
+    requested: &str,
+    resolved: &Path,
+    expect: ResolvedExpect,
+) -> Result<PathBuf, String> {
+    let resolved_text = resolved.to_string_lossy().to_string();
+    // 解析后落到 WSL 挂载点：本地入口不允许，必须显式用 WSL 入口配置。
+    if is_wsl_path(&resolved_text) {
+        return Err("路径解析后指向 WSL 目录，请改用 WSL 入口配置".into());
+    }
+    // 解析后仍是 Windows 系统盘根目录或系统目录：不读取。
+    if is_protected_system_path(&resolved_text) {
+        return Err("路径解析后指向 Windows 系统目录，未读取".into());
+    }
+    let metadata = std::fs::metadata(resolved).map_err(|_| "解析后的路径无法访问")?;
+    let matches_kind = match expect {
+        ResolvedExpect::Directory => metadata.is_dir(),
+        ResolvedExpect::File => metadata.is_file(),
+    };
+    if !matches_kind {
+        return Err(match expect {
+            ResolvedExpect::Directory => "解析后的目标不是目录",
+            ResolvedExpect::File => "解析后的目标不是文件",
+        }
+        .into());
+    }
+    let _ = requested;
+    Ok(resolved.to_path_buf())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedExpect {
+    Directory,
+    File,
+}
+
+fn is_wsl_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("\\\\wsl$\\") || lower.starts_with("\\\\wsl.localhost\\")
+}
+
+fn is_protected_system_path(value: &str) -> bool {
+    let lower = value
+        .replace("\\\\?\\", "")
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    // 只比较盘符之后的部分（`c:\windows\...` → `\windows\...`），避免把
+    // 用户目录里恰好叫 windows 的项目目录误判。
+    let tail = match lower.find('\\') {
+        Some(index) => &lower[index..],
+        None => return false,
+    };
+    const PROTECTED: &[&str] = &[
+        "\\windows",
+        "\\program files",
+        "\\program files (x86)",
+        "\\programdata",
+        "\\$recycle.bin",
+        "\\system volume information",
+    ];
+    PROTECTED
+        .iter()
+        .any(|prefix| tail == *prefix || tail.starts_with(&format!("{prefix}\\")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,5 +624,36 @@ mod tests {
         std::fs::create_dir(dir.join("local-usage-sources.tmp")).unwrap();
         assert!(save(&Default::default()).is_err());
         assert_eq!(load().unwrap(), options);
+    }
+    #[test]
+    fn 解析后目标指向wsl或系统目录时拒绝() {
+        // 只检查纯判定函数：真实 junction 需在 Windows 上手工验收。
+        assert!(is_wsl_path(r"\\wsl$\Ubuntu\home\user\.claude\projects"));
+        assert!(is_wsl_path(r"\\wsl.localhost\Ubuntu\home\user"));
+        assert!(!is_wsl_path(r"D:\Users\A\.claude\projects"));
+
+        assert!(is_protected_system_path(r"C:\Windows\System32"));
+        assert!(is_protected_system_path(r"C:\Program Files\Vendor"));
+        assert!(is_protected_system_path(r"D:\ProgramData\Vendor"));
+        // 用户目录里恰好叫 windows 的项目目录不能被误判。
+        assert!(!is_protected_system_path(
+            r"D:\Users\A\projects\windows\logs"
+        ));
+        assert!(!is_protected_system_path(r"D:\Users\A\.claude\projects"));
+    }
+    #[test]
+    fn 解析后类型不符时报错且不静默通过() {
+        let dir = crate::test_support::TempConfigDir::new("resolved-target");
+        let file = dir.join("db.sqlite");
+        std::fs::write(&file, b"x").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        assert!(recheck_resolved_target("db.sqlite", &canonical, ResolvedExpect::File).is_ok());
+        assert!(
+            recheck_resolved_target("db.sqlite", &canonical, ResolvedExpect::Directory).is_err()
+        );
+        // 目录同理
+        let directory = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(recheck_resolved_target("dir", &directory, ResolvedExpect::Directory).is_ok());
+        assert!(recheck_resolved_target("dir", &directory, ResolvedExpect::File).is_err());
     }
 }

@@ -347,6 +347,36 @@ pub async fn collect_sources(
         candidates.push((id, label, entry.path.clone().into(), kind, false));
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // 来源重叠检测（评审 P1）：默认主目录与「指向同一批日志」的单工具路径
+    // 各自有不同的 sourceId，若直接合并会让同一份记录被统计两次。
+    // 这里在采集前先算出被覆盖的工具来源，采到时跳过并给出可解释状态。
+    let home_roots: Vec<crate::local_overlap::HomeRoot> = candidates
+        .iter()
+        .filter(|(id, _, _, _, _)| {
+            // 只有「主目录」来源参与重叠判定；单工具路径不覆盖别人。
+            !options
+                .tool_paths
+                .iter()
+                .any(|entry| tool_source_id(entry) == *id)
+        })
+        .map(|(id, _, home, _, _)| crate::local_overlap::HomeRoot {
+            id: id.clone(),
+            path: home.to_string_lossy().to_string(),
+        })
+        .collect();
+    let tool_roots: Vec<crate::local_overlap::ToolRoot> = options
+        .tool_paths
+        .iter()
+        .map(|entry| crate::local_overlap::ToolRoot {
+            id: tool_source_id(entry),
+            tool: entry.tool.clone(),
+            path: entry.path.clone(),
+        })
+        .collect();
+    let overlaps: std::collections::BTreeMap<String, String> =
+        crate::local_overlap::overlapping_tools(&home_roots, &tool_roots)
+            .into_iter()
+            .collect();
     let wsl = if candidates
         .iter()
         .any(|(_, _, _, kind, _)| matches!(kind, HomeKind::Wsl { .. }))
@@ -363,7 +393,19 @@ pub async fn collect_sources(
         let mut state = "ok";
         let mut message = None;
         let gate = source_gate(&kind, &wsl);
-        if let Err(error) = gate {
+        if let Some(covered_by) = overlaps.get(&id) {
+            // 已被某个主目录来源的标准布局覆盖：跳过采集，明确告知用户，
+            // 而不是静默重复统计。
+            state = "duplicate";
+            message = Some(format!(
+                "已被主目录来源 {} 的标准布局覆盖，未重复采集",
+                home_roots
+                    .iter()
+                    .find(|home| home.id == *covered_by)
+                    .map(|home| home.path.as_str())
+                    .unwrap_or("同一主目录")
+            ));
+        } else if let Err(error) = gate {
             state = "unavailable";
             message = Some(error);
         } else if deadline <= tokio::time::Instant::now() {
@@ -379,6 +421,17 @@ pub async fn collect_sources(
                 let directory = tool_path
                     .is_none_or(|entry| !matches!(entry.tool.as_str(), "opencode" | "zcode"));
                 let canonical = crate::local_sources::probe_path(home.clone(), directory).await?;
+                // 解析后的目标要重新核对来源策略（评审条件验收：junction/symlink）。
+                // 配置里写的路径通过了校验，但真正读取的是解析后的路径。
+                let canonical = crate::local_sources::recheck_resolved_target(
+                    &home.to_string_lossy(),
+                    &canonical,
+                    if directory {
+                        crate::local_sources::ResolvedExpect::Directory
+                    } else {
+                        crate::local_sources::ResolvedExpect::File
+                    },
+                )?;
                 let key = format!(
                     "{}:{}",
                     tool_path.map(|entry| entry.tool.as_str()).unwrap_or("home"),

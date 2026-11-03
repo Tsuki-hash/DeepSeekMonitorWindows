@@ -30,6 +30,14 @@ export function LocalArchiveCapture({
     [retentionBusy, setRetentionBusy] = React.useState(false),
     [retentionError, setRetentionError] = React.useState(""),
     [retentionMessage, setRetentionMessage] = React.useState("");
+  // 容量计量：满额前就能看到剩余条数与占用，而不是只在写满时报错。
+  const [capacity, setCapacity] = React.useState<{
+    entries: number;
+    maxEntries: number;
+    bytes: number;
+    maxBytes: number;
+    remainingEntries: number;
+  } | null>(null);
   React.useEffect(() => {
     const state = retentionOwner.current;
     state.active = true;
@@ -45,6 +53,17 @@ export function LocalArchiveCapture({
         if (state.active && seq === state.sequence)
           setRetentionError(errorMessage(failure));
       });
+    void invoke<{
+      entries: number;
+      maxEntries: number;
+      bytes: number;
+      maxBytes: number;
+      remainingEntries: number;
+    }>("get_local_retention_capacity")
+      .then((value) => {
+        if (state.active && seq === state.sequence) setCapacity(value);
+      })
+      .catch(() => undefined);
     return () => {
       state.active = false;
       state.sequence++;
@@ -179,8 +198,18 @@ export function LocalArchiveCapture({
             : "当前仅在本页可见时采集；若需收起后继续留存，请另行开启「后台采集」。"}
         </p>
         <p>
-          不保存项目完整路径、正文或凭据；会话ID和项目名称会保留。最多128条月度会话记录、总8MiB，满后提示。记录未再出现不代表已删除。
+          不保存项目完整路径、正文或凭据；会话ID和项目名称会保留。最多128条月度会话记录、总8MiB。满额后已存在会话继续更新，新会话不再写入，并提示可导出后清理。记录未再出现不代表已删除。
         </p>
+        {capacity && (
+          <p className="muted" role="status">
+            已用 {capacity.entries}/{capacity.maxEntries} 条 ·{" "}
+            {(capacity.bytes / 1024).toFixed(0)}/
+            {(capacity.maxBytes / 1024).toFixed(0)} KiB
+            {capacity.remainingEntries === 0
+              ? " · 已满：新会话将等待清理"
+              : ` · 还可新增 ${capacity.remainingEntries} 条`}
+          </p>
+        )}
         <button
           className="secondary"
           disabled={retentionBusy || saving}

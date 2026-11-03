@@ -129,10 +129,55 @@ fn write(store: &Store) -> Result<(), String> {
     }
     atomic(store_path()?, &bytes)
 }
-pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<(), String> {
+/// 容量状态：让界面能显示「还剩几条」而不是只在满额时报错。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Capacity {
+    pub entries: usize,
+    pub max_entries: usize,
+    pub bytes: u64,
+    pub max_bytes: u64,
+    /// 剩余可新增的会话月份数；0 表示已满。
+    pub remaining_entries: usize,
+}
+
+pub fn capacity() -> Result<Capacity, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
+    let store = load()?;
+    let bytes = store_path()
+        .ok()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    Ok(Capacity {
+        entries: store.entries.len(),
+        max_entries: MAX_ENTRIES,
+        bytes,
+        max_bytes: MAX_BYTES as u64,
+        remaining_entries: MAX_ENTRIES.saturating_sub(store.entries.len()),
+    })
+}
+
+/// 采集检查点的结果：区分「完全成功」与「部分写入」。
+///
+/// 评审 P2：原实现在满额时**整批**返回错误，连已存在会话这一轮的更新也不落盘。
+/// 新策略是逐条判定：已存在的会话继续更新，新会话在无空间时单独拒绝并计入
+/// `skipped`；已写入的部分照常落盘，用户看到的是明确的部分结果而不是整体失败。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CheckpointOutcome {
+    /// 已写入（含内容未变的跳过写盘）。
+    pub written: usize,
+    /// 因容量已满而未新增的会话数。
+    pub skipped: usize,
+    /// 写入失败（此时整批不落盘，保持原记录）。
+    pub failed: bool,
+}
+
+pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String> {
+    let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
+    let mut outcome = CheckpointOutcome::default();
     if !load_enabled()? {
-        return Ok(());
+        return Ok(outcome);
     }
     let mut store = load()?;
     let mut groups: BTreeMap<(&str, &str, &str), Vec<&crate::local_usage::LocalRow>> =
@@ -173,22 +218,29 @@ pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<(), String> {
             if previous.rows == entry.rows
                 && previous.complete == entry.complete
                 && previous.engine_version == entry.engine_version
+                && previous.accounting_utc_offset_seconds == entry.accounting_utc_offset_seconds
             {
+                outcome.written += 1;
                 continue;
             }
             *previous = entry;
+            outcome.written += 1;
+        } else if store.entries.len() >= MAX_ENTRIES {
+            // 只拒绝这一条新会话，已存在会话的更新不受影响。
+            outcome.skipped += 1;
+            continue;
         } else {
-            if store.entries.len() >= MAX_ENTRIES {
-                return Err("已保留128个会话月份，请删除旧留存；未自动覆盖".into());
-            }
             store.entries.push(entry);
+            outcome.written += 1;
         }
         changed = true;
     }
-    if changed {
-        write(&store)?;
+    if changed && write(&store).is_err() {
+        // 写盘失败：整批未提交，原记录保留，如实报告。
+        outcome.failed = true;
+        return Ok(outcome);
     }
-    Ok(())
+    Ok(outcome)
 }
 pub fn list() -> Result<Vec<ArchiveSummary>, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
@@ -356,7 +408,7 @@ mod tests {
         );
     }
     #[test]
-    fn capacity_rejects_whole_batch_and_corruption_not_overwritten() {
+    fn capacity_keeps_existing_updates_and_only_rejects_new_sessions() {
         let _dir = TempConfigDir::new("retention-limits");
         set_enabled(true).unwrap();
         let mut next = snapshot(1000);
@@ -365,10 +417,27 @@ mod tests {
             next.rows[0].session_id = format!("s{index}");
             checkpoint(&next).unwrap();
         }
+        assert_eq!(capacity().unwrap().remaining_entries, 0);
         let before = fs::read(store_path().unwrap()).unwrap();
+        // 新会话在满额时被单独拒绝，已存在会话仍能更新（不是整批失败）。
         next.rows[0].session_id = "overflow".into();
-        assert!(checkpoint(&next).is_err());
+        let outcome = checkpoint(&next).unwrap();
+        assert_eq!(outcome.skipped, 1);
+        assert!(!outcome.failed);
         assert_eq!(fs::read(store_path().unwrap()).unwrap(), before);
+        // 已存在的会话继续更新并落盘。
+        next.rows[0].session_id = "s0".into();
+        next.collected_at = 2000;
+        next.rows[0].input = Some(7);
+        next.rows[0].total_tokens = Some(37);
+        let outcome = checkpoint(&next).unwrap();
+        assert_eq!(outcome.written, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(
+            read(&list().unwrap()[0].id).unwrap().rows[0].input,
+            Some(7),
+            "满额时已存在会话的更新必须落盘"
+        );
         for data in [
             b"broken".to_vec(),
             br#"{"schemaVersion":2,"entries":[]}"#.to_vec(),
@@ -391,7 +460,8 @@ mod tests {
         fs::create_dir(&temp).unwrap();
         let mut next = snapshot(2000);
         next.rows[0].input = Some(2);
-        assert!(checkpoint(&next).is_err());
+        let outcome = checkpoint(&next).unwrap();
+        assert!(outcome.failed, "写盘失败必须如实报告，不能假装成功");
         assert_eq!(fs::read(store_path().unwrap()).unwrap(), before);
         fs::remove_dir(temp).unwrap();
         fs::write(dir.join("tool.log"), b"keep").unwrap();
