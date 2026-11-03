@@ -74,6 +74,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
             commands::is_main_window_visible,
+            commands::set_panel_mode,
             commands::get_app_config,
             commands::get_diagnostics,
             commands::open_support_page,
@@ -95,6 +96,8 @@ pub fn run() {
             commands::read_local_archive,
             commands::delete_local_archive,
             commands::clear_local_archives,
+            commands::get_local_data_overview,
+            commands::clear_local_engine_cache,
             commands::get_local_retention_enabled,
             commands::set_local_retention_enabled,
             commands::get_local_retention_capacity,

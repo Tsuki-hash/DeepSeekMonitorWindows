@@ -197,6 +197,29 @@ test("历史月份支持闰月与边界，全部历史跨多年且不包含未�
   );
 });
 
+test("未加载月份不算平台未返回_分批加载不伪造缺失日期", () => {
+  const all = historyWindow("all", "2026-10-10");
+  const unloaded = all.months.slice(0, 70);
+  const loaded = all.months.slice(-12);
+  const result = buildHistory(all, [], [], unloaded);
+  assert.deepEqual(result.unloadedMonths, unloaded);
+  // 未加载的 2020-01..2025-10 不应出现在 missingDates；只有已加载月份才可能缺失。
+  assert.equal(
+    result.missingDates.some((date) => date.startsWith("2020-01")),
+    false,
+  );
+  assert.ok(
+    result.missingDates.every((date) => loaded.includes(date.slice(0, 7))),
+  );
+  // 不传 unloaded 时行为与旧版一致（用于非分批区间）。
+  assert.equal(
+    buildHistory(all, [], []).missingDates.some((date) =>
+      date.startsWith("2020-01"),
+    ),
+    true,
+  );
+});
+
 test("历史展示隐藏明确零用量，不隐藏未知、费用、请求或异常数据", () => {
   const zero = {
     ...model("old-model"),

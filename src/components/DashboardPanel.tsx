@@ -7,6 +7,8 @@ import { BrandIcon } from "./BrandIcon";
 import { BalanceCard } from "./BalanceCard";
 import { UsageRow } from "./UsageRow";
 import { UsageChart } from "./UsageChart";
+import { SourceTrustLine } from "./SourceTrustLine";
+import { updateTime } from "../data-display";
 
 function DashboardPanel({
   balanceUpdatedAt,
@@ -62,6 +64,20 @@ function DashboardPanel({
   const currentMonth = todayStr().slice(0, 7);
   const monthLabel =
     snapshotMonth && snapshotMonth !== currentMonth ? "上期消费" : "本月消费";
+  // 来源与可信状态摘要（评审 P2）：四维信息放在数字旁边，而不是只在设置页说明。
+  const usageTrust = {
+    source: "平台用量",
+    period: `${snapshotMonth ?? currentMonth} · 北京时间`,
+    lastSuccess:
+      usageUpdatedAt != null ? updateTime(usageUpdatedAt, true) : null,
+    completeness: (usageState !== "ok"
+      ? "unknown"
+      : usage?.unavailableDates?.length
+        ? "partial"
+        : "complete") as "complete" | "partial" | "unknown",
+    accountVerified: false,
+    stale: usageState === "error",
+  };
 
   return (
     <section className="panel dashboard-panel" data-testid="dashboard-panel">
@@ -111,6 +127,8 @@ function DashboardPanel({
         monthCost={monthCost}
         monthLabel={monthLabel}
       />
+
+      <SourceTrustLine trust={usageTrust} />
 
       <div className="usage-stack">
         <UsageRow

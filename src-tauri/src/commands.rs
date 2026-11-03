@@ -121,6 +121,101 @@ pub(crate) fn clear_local_archives(window: WebviewWindow) -> Result<(), String> 
     require_main(&window)?;
     crate::local_archive::clear()
 }
+
+/// 本机数据总览：让用户在一个地方看到「哪些数据存在、多大、怎么清」。
+///
+/// 评审 P2：清除 Key、清除 Token、忘记登录、停止采集、清空归档各有不同作用，
+/// 分散在多处容易让人误以为其中一个动作就删光了本机数据。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalDataOverview {
+    api_key_configured: bool,
+    usage_token_configured: bool,
+    local_enabled: bool,
+    local_collecting: bool,
+    archive_entries: usize,
+    retention_entries: usize,
+    retention_bytes: u64,
+    engine_cache_bytes: u64,
+    /// 引擎缓存可能包含源会话标题；停止采集不代表缓存被删。
+    engine_cache_may_hold_titles: bool,
+}
+
+fn directory_size(path: &std::path::Path) -> u64 {
+    // 只统计一层目录内的普通文件，避免递归遍历大目录拖慢界面。
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn engine_cache_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::config::config_path()?.with_file_name("local-usage-engine"))
+}
+
+#[tauri::command]
+pub(crate) fn get_local_data_overview(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<LocalDataOverview, String> {
+    require_main(&window)?;
+    let config = to_app_config(read_stored_config()?)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    let local_enabled = local_enabled(&mut state)?;
+    let local_collecting = state.busy;
+    drop(state);
+    let capacity = crate::local_retention::capacity().ok();
+    Ok(LocalDataOverview {
+        api_key_configured: config.api_key_configured,
+        usage_token_configured: config.usage_token_configured,
+        local_enabled,
+        local_collecting,
+        archive_entries: crate::local_archive::list()
+            .map(|list| list.len())
+            .unwrap_or(0),
+        retention_entries: capacity.as_ref().map(|value| value.entries).unwrap_or(0),
+        retention_bytes: capacity.as_ref().map(|value| value.bytes).unwrap_or(0),
+        engine_cache_bytes: engine_cache_path()
+            .ok()
+            .map(|path| directory_size(&path))
+            .unwrap_or(0),
+        engine_cache_may_hold_titles: true,
+    })
+}
+
+/// 清理采集引擎缓存。
+///
+/// 只在采集**没有在进行**时允许，避免删掉正在写入的元数据；只删本应用目录，
+/// 不触碰原工具日志，也不承诺取证级安全擦除。自动留存开启时，清空后新采集
+/// 会重新产生记录，这一点由界面在确认框中说明。
+#[tauri::command]
+pub(crate) fn clear_local_engine_cache(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    require_main(&window)?;
+    let collector = app.state::<crate::local_usage::LocalCollector>();
+    {
+        let state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+        if state.busy {
+            return Err("正在采集，请等待本轮结束后再清理引擎缓存".into());
+        }
+    }
+    let path = engine_cache_path()?;
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("引擎缓存无法清理，请稍后重试".into()),
+    }
+}
+
 fn local_preference_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::config::config_path()?.with_file_name("local-usage-enabled.json"))
 }
@@ -348,6 +443,42 @@ pub(crate) fn hide_main_window(window: WebviewWindow) -> Result<(), String> {
 pub(crate) fn is_main_window_visible(window: WebviewWindow) -> Result<bool, String> {
     require_main(&window)?;
     Ok(window.is_visible().unwrap_or(true))
+}
+
+/// 面板尺寸模式。
+///
+/// 评审 P2：主窗口固定 356×600，适合托盘速览；历史、项目分析这类复杂任务需要
+/// 更宽的阅读区。这里只提供「紧凑 / 展开」两档，默认仍是紧凑，展开由用户显式触发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PanelMode {
+    Compact,
+    Expanded,
+}
+
+#[tauri::command]
+pub(crate) fn set_panel_mode(window: WebviewWindow, mode: PanelMode) -> Result<(), String> {
+    require_main(&window)?;
+    let (width, height): (f64, f64) = match mode {
+        PanelMode::Compact => (356.0, 600.0),
+        PanelMode::Expanded => (720.0, 760.0),
+    };
+    let monitor = window
+        .current_monitor()
+        .map_err(|_| "无法读取显示器信息")?
+        .ok_or("无法读取显示器信息")?;
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area().size;
+    // 留出边距，避免展开后压到任务栏或超出工作区。
+    let max_width = (area.width as f64 / scale) - 24.0;
+    let max_height = (area.height as f64 / scale) - 24.0;
+    window
+        .set_size(tauri::LogicalSize::new(
+            width.min(max_width).max(320.0),
+            height.min(max_height).max(480.0),
+        ))
+        .map_err(|_| "调整面板尺寸失败")?;
+    Ok(())
 }
 
 #[tauri::command]

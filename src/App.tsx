@@ -17,21 +17,20 @@ import { RequestGate } from "./request-gate";
 import { errorInfo } from "./error-state";
 import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
 import { msUntilNextAccountingDate } from "./accounting-clock";
+import { balancePublishable, channelDecision } from "./refresh-policy";
 import { DashboardPanel } from "./components/DashboardPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelDetailPanel } from "./components/ModelDetailPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { LocalUsagePanel } from "./components/LocalUsagePanel";
 import { TrayBalancePublisher } from "./tray-balance";
+import { OnboardingPanel } from "./components/OnboardingPanel";
+import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
+import { panelModeLabel, suggestedMode } from "./panel-mode";
+import type { PanelMode } from "./panel-mode";
+import { Maximize2, Minimize2 } from "lucide-react";
 
-/** 自动刷新退避：只对「值得重试」的错误退避，且按通道各自计数。 */
-const retryableCode = (code?: string) =>
-  code === "rate_limited" || code === "unavailable" || code === "unknown";
-/** 未配置 / 凭据失效：该通道暂停，不参与退避，也不拖慢健康通道。 */
-const pausedCode = (code?: string) =>
-  code === "not_configured" || code === "credentials_invalid";
-const backoffSeconds = (base: number, failures: number) =>
-  Math.min(3600, base * 2 ** Math.min(6, Math.max(0, failures)));
+// 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
 function App() {
   const [showDataNotices, setShowDataNotices] = React.useState(false);
@@ -59,13 +58,15 @@ function App() {
   React.useEffect(() => {
     // 只有「凭据仍有效」的快照才允许发布；loading 期间保留旧值并标旧，
     // 但凭据一旦失效就立即变 null，避免金额短暂回闪。
-    const available = balanceCredentialValid && balance != null;
+    const published = balancePublishable({
+      credentialValid: balanceCredentialValid,
+      balance,
+      stale: Boolean(balanceError || balanceState === "loading"),
+    });
     trayPublisher.current?.update({
-      total: available ? balance!.totalBalance : null,
-      currency: available ? balance!.currency : null,
-      stale: available
-        ? Boolean(balanceError || balanceState === "loading")
-        : false,
+      total: published?.totalBalance ?? null,
+      currency: published?.currency ?? null,
+      stale: published?.stale ?? false,
     });
   }, [balance, balanceState, balanceError, balanceCredentialValid]);
 
@@ -78,6 +79,12 @@ function App() {
   );
   const [refreshIntervalSeconds, setRefreshIntervalSeconds] =
     React.useState(60);
+  // 退避基数用 ref 读取：它只影响「下次间隔」，不应改变 loadBalance/loadUsage 的
+  // 回调身份（否则每次改间隔都会重建请求函数并打断在途刷新）。
+  const refreshIntervalRef = React.useRef(60);
+  React.useEffect(() => {
+    refreshIntervalRef.current = refreshIntervalSeconds;
+  }, [refreshIntervalSeconds]);
   const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(false);
 
   // silent=true 表示后台刷新：已有数据时保留旧值，不再把面板打回「查询中…」骨架，
@@ -120,12 +127,16 @@ function App() {
         const { message, code } = errorInfo(error);
         setBalanceErrorCode(code);
         // 只有可重试错误才累加退避次数；未配置/失效凭据走暂停通道。
-        paused.current.balance = pausedCode(code);
-        if (retryableCode(code)) failures.current.balance += 1;
-        else failures.current.balance = 0;
+        const decision = channelDecision({
+          code,
+          failures: failures.current.balance,
+          baseSeconds: refreshIntervalRef.current,
+        });
+        paused.current.balance = decision.paused;
+        failures.current.balance = decision.failures;
         // 凭据失效：撤销快照有效性，避免托盘把旧金额当成当前余额重新发布。
         // 普通网络失败保留快照，但明确标旧。
-        if (pausedCode(code)) {
+        if (decision.paused) {
           availableSnapshot.current.balance = false;
           setBalanceCredentialValid(false);
           setBalance(null);
@@ -178,11 +189,15 @@ function App() {
         }
         const { message, code } = errorInfo(error);
         setUsageErrorCode(code);
-        paused.current.usage = pausedCode(code);
-        if (retryableCode(code)) failures.current.usage += 1;
-        else failures.current.usage = 0;
+        const decision = channelDecision({
+          code,
+          failures: failures.current.usage,
+          baseSeconds: refreshIntervalRef.current,
+        });
+        paused.current.usage = decision.paused;
+        failures.current.usage = decision.failures;
         setUsageError(message);
-        const retained = pausedCode(code)
+        const retained = decision.paused
           ? null
           : currentUsageSnapshot(usageSnapshot.current, todayStr());
         usageSnapshot.current = retained;
@@ -212,11 +227,22 @@ function App() {
     refreshAll();
   }, [refreshAll]);
 
+  // 首次使用分流（评审 P2）：只在三个任务都未完成时出现，任一完成即收起。
+  const [onboardingDismissed, setOnboardingDismissed] = React.useState(false);
+  const [configSnapshot, setConfigSnapshot] = React.useState<{
+    apiKeyConfigured: boolean;
+    usageTokenConfigured: boolean;
+  } | null>(null);
+
   React.useEffect(() => {
     void invoke<AppConfig>("get_app_config")
       .then((config) => {
         setRefreshIntervalSeconds(config.refreshIntervalSeconds || 60);
         setAutoRefreshEnabled(config.autoRefreshEnabled);
+        setConfigSnapshot({
+          apiKeyConfigured: config.apiKeyConfigured,
+          usageTokenConfigured: config.usageTokenConfigured,
+        });
       })
       .catch(() => {
         setRefreshIntervalSeconds(60);
@@ -267,9 +293,11 @@ function App() {
       run: (silent: boolean) => Promise<unknown>,
     ) => {
       if (cancelled) return;
-      const delay = paused.current[channel]
-        ? 0
-        : backoffSeconds(refreshIntervalSeconds, failures.current[channel]);
+      const decision = channelDecision({
+        failures: failures.current[channel],
+        baseSeconds: refreshIntervalSeconds,
+      });
+      const delay = decision.delaySeconds;
       const timer = window.setTimeout(
         () => {
           timers.delete(timer);
@@ -301,6 +329,22 @@ function App() {
     refreshIntervalSeconds,
     windowVisible,
   ]);
+
+  // 面板尺寸（评审 P2）：用户显式切换后固定，不再被视图建议覆盖。
+  const [manualMode, setManualMode] = React.useState<PanelMode | null>(null);
+  const mode = suggestedMode(view, manualMode);
+  React.useEffect(() => {
+    void invoke("set_panel_mode", { mode }).catch(() => {
+      // 浏览器预览没有 Tauri IPC；尺寸切换失败不影响数据展示。
+    });
+  }, [mode]);
+
+  const showOnboarding = shouldShowOnboarding({
+    apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
+    usageTokenConfigured: configSnapshot?.usageTokenConfigured ?? false,
+    localEnabled: false,
+    dismissed: onboardingDismissed,
+  });
 
   const hideWindow = React.useCallback(() => {
     void invoke("hide_main_window").catch(() => {
@@ -369,12 +413,16 @@ function App() {
       setUsageError("未配置用量 Token");
     });
     const browsingCleared = listen("browsing-data-cleared", () => {
+      // 「退出并忘记账户」只应清除网页登录数据，外观偏好必须保留。
+      // 主题与透明度都存在 localStorage 里，清理 WebView 数据会一并清掉，
+      // 所以先把当前生效值写回，再重新应用，避免用户以为设置被重置。
       const current = document.documentElement.getAttribute(THEME_ATTR);
       localStorage.setItem(
         THEME_STORAGE_KEY,
         current === "dark" ? "dark" : "light",
       );
       localStorage.setItem(THEME_MIGRATION_KEY, "1");
+      applyStoredGlass();
     });
     return () => {
       void captured.then((unlisten) => unlisten()).catch(() => undefined);
@@ -388,36 +436,77 @@ function App() {
   React.useEffect(() => {
     applyStoredGlass();
   }, []);
+
+  // 视图切换的焦点管理（评审 P2 无障碍）：
+  // 进入新视图时把焦点移到该视图的标题，返回时由各面板自己的返回按钮
+  // 触发 `restoreFocus`。这样纯键盘用户不会在切换后「丢失」当前位置。
+  const stageRef = React.useRef<HTMLDivElement>(null);
+  const previousView = React.useRef(view);
+  React.useEffect(() => {
+    if (previousView.current === view) return;
+    previousView.current = view;
+    // 让 React 先把新视图渲染出来，再找标题。
+    const frame = window.requestAnimationFrame(() => {
+      const heading = stageRef.current?.querySelector<HTMLElement>(
+        "h1, [role='heading'], .panel h2",
+      );
+      heading?.setAttribute("tabindex", "-1");
+      heading?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [view]);
+
   return (
     <div
+      ref={stageRef}
       className={`stage ${["dashboard", "local", "history"].includes(view) ? "with-navigation" : ""}`}
     >
       {view === "dashboard" && (
-        <DashboardPanel
-          onHistory={() => setView("history")}
-          balanceUpdatedAt={balanceUpdatedAt}
-          usageUpdatedAt={usageUpdatedAt}
-          balance={balance}
-          balanceState={balanceState}
-          balanceError={balanceError}
-          usage={usage}
-          usageState={usageState}
-          usageError={usageError}
-          onRefresh={() => refreshAll()}
-          onClose={hideWindow}
-          onSettings={() => {
-            setShowDataNotices(false);
-            setView("settings");
-          }}
-          onDataStatus={() => {
-            setShowDataNotices(true);
-            setView("settings");
-          }}
-          onDetail={(nextModel) => {
-            setModel(nextModel);
-            setView("detail");
-          }}
-        />
+        <>
+          {showOnboarding && (
+            <OnboardingPanel
+              tasks={onboardingTasks({
+                apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
+                usageTokenConfigured:
+                  configSnapshot?.usageTokenConfigured ?? false,
+                localEnabled: false,
+                dismissed: onboardingDismissed,
+              })}
+              onChoose={(task) => {
+                setOnboardingDismissed(true);
+                setShowDataNotices(false);
+                // 平台用量与余额都在设置页配置；本地统计在 Agent 页开启。
+                setView(task === "local" ? "local" : "settings");
+              }}
+              onDismiss={() => setOnboardingDismissed(true)}
+            />
+          )}
+          <DashboardPanel
+            onHistory={() => setView("history")}
+            balanceUpdatedAt={balanceUpdatedAt}
+            usageUpdatedAt={usageUpdatedAt}
+            balance={balance}
+            balanceState={balanceState}
+            balanceError={balanceError}
+            usage={usage}
+            usageState={usageState}
+            usageError={usageError}
+            onRefresh={() => refreshAll()}
+            onClose={hideWindow}
+            onSettings={() => {
+              setShowDataNotices(false);
+              setView("settings");
+            }}
+            onDataStatus={() => {
+              setShowDataNotices(true);
+              setView("settings");
+            }}
+            onDetail={(nextModel) => {
+              setModel(nextModel);
+              setView("detail");
+            }}
+          />
+        </>
       )}
       {view === "settings" && (
         <SettingsPanel
@@ -522,6 +611,20 @@ function App() {
               {label}
             </button>
           ))}
+          <button
+            className="nav-mode-toggle"
+            aria-label={panelModeLabel(mode)}
+            title={panelModeLabel(mode)}
+            onClick={() =>
+              setManualMode(mode === "expanded" ? "compact" : "expanded")
+            }
+          >
+            {mode === "expanded" ? (
+              <Minimize2 size={15} />
+            ) : (
+              <Maximize2 size={15} />
+            )}
+          </button>
         </nav>
       )}
     </div>

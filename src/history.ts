@@ -13,6 +13,8 @@ export type HistorySnapshot = {
   rows: HistoryRecord[];
   missingDates: string[];
   failedMonths: string[];
+  /** 尚未加载的月份（全部历史分批加载）：这些月份不能算作「未返回」。 */
+  unloadedMonths: string[];
 };
 
 export function historyWindow(
@@ -70,6 +72,7 @@ export function buildHistory(
   window: HistoryWindow,
   months: HistoryMonth[],
   failedMonths: string[],
+  unloadedMonths: string[] = [],
 ): HistorySnapshot {
   const rows = new Map<string, HistoryRecord>();
   const returned = new Set<string>();
@@ -88,6 +91,8 @@ export function buildHistory(
         rows.set(`${day.date}\0${model.model}`, { date: day.date, model });
     }
   }
+  // 未加载的月份不能被算成「平台未返回」：它们是「还没查」。
+  const unloadedSet = new Set(unloadedMonths);
   return {
     window,
     months,
@@ -98,8 +103,9 @@ export function buildHistory(
         a.model.model.localeCompare(b.model.model),
     ),
     missingDates: historyDates(window.from, window.to).filter(
-      (d) => !returned.has(d),
+      (date) => !returned.has(date) && !unloadedSet.has(date.slice(0, 7)),
     ),
+    unloadedMonths: [...unloadedSet],
   };
 }
 
@@ -163,6 +169,8 @@ export function historyExport(
     to: snapshot.window.to,
     failedMonths: snapshot.failedMonths,
     missingDates: snapshot.missingDates,
+    // 明确区分「没查」与「平台没给」：未加载月份不计入 missingDates。
+    unloadedMonths: snapshot.unloadedMonths,
   };
   const daily = snapshot.rows.map((row) => ({
     date: row.date,

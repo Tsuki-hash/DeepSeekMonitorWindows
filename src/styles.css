@@ -2863,3 +2863,118 @@ button:disabled:hover {
 .history-unused-toggle input {
   accent-color: var(--brand-ink);
 }
+
+/* 来源与可信状态摘要：放在数字正上方，比散落的说明更靠近用户实际读数。
+   小字号、低对比，但保留足够行高以支持 200% 缩放与高对比度模式。 */
+.source-trust {
+  margin: 2px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  word-break: break-word;
+}
+.source-trust-warn {
+  color: var(--orange-ink);
+  font-weight: 700;
+}
+@media (forced-colors: active) {
+  .source-trust,
+  .source-trust-warn {
+    color: CanvasText;
+  }
+  .source-trust-warn {
+    text-decoration: underline;
+  }
+}
+
+/* 首次使用入口卡：三张轻量任务卡，不占满屏、不阻塞主面板读数。 */
+.onboarding-panel {
+  margin-bottom: 10px;
+}
+.onboarding-panel h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+.onboarding-tasks {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+.onboarding-task {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--control-bg);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.onboarding-task:hover {
+  background: var(--control-hover);
+}
+.onboarding-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--brand-soft, var(--control-bg));
+  color: var(--brand-ink);
+}
+.onboarding-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.onboarding-copy strong {
+  font-size: 13px;
+}
+.onboarding-copy small {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.45;
+}
+.onboarding-requirement {
+  font-weight: 700;
+  color: var(--brand-ink);
+}
+
+/* 面板尺寸切换：与主导航同排，弱化为图标按钮。 */
+.nav-mode-toggle {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+/* 本机数据管理清单：每项一行，标签与数值分开，说明用更小的字。 */
+.local-data-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+}
+.local-data-list li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.local-data-list small {
+  grid-column: 1 / -1;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.45;
+}

@@ -11,7 +11,13 @@ import { LocalDataQuality, LocalRowQuality } from "./LocalDataQuality";
 import { LocalArchiveCapture } from "./LocalArchiveCapture";
 import { LocalArchivePanel } from "./LocalArchivePanel";
 import { LocalBackgroundSettings } from "./LocalBackgroundSettings";
+import { LocalDataManagement } from "./LocalDataManagement";
 import { localPeriodKey } from "../local-archive";
+import {
+  draftGuardActions,
+  draftGuardText,
+  shouldBlockLeave,
+} from "../draft-guard";
 import {
   localTools,
   localProjects,
@@ -20,7 +26,7 @@ import {
   localSum,
   LocalRateTracker,
 } from "../local-usage";
-import type { LocalRow, LocalSnapshot, LocalUsageStatus } from "../local-usage";
+import type { LocalSnapshot, LocalUsageStatus } from "../local-usage";
 
 const tokens = (value: number | null) =>
   value == null ? "—" : fmtTokensShort(value);
@@ -164,20 +170,40 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
       setChanging(false);
     }
   };
-  const rows = snapshot?.rows ?? [];
-  const projects = localProjects(rows);
-  const scoped =
-    project == null
-      ? rows
-      : (projects.find((group) => group.key === project)?.rows ?? []);
-  const sessions = localSessions(scoped);
-  const selected =
-    session == null ? null : sessions.find((group) => group.key === session);
+  // 聚合与排序只在快照或选择变化时重算（评审 P2 性能）。
+  // 原先每秒时钟 tick 都会触发 `localProjects`/`localSessions` 重新分组并排序，
+  // 数据量大时是纯浪费；时钟只应影响「最近速度」那一小块读数。
+  const rows = React.useMemo(() => snapshot?.rows ?? [], [snapshot]);
+  const projects = React.useMemo(() => localProjects(rows), [rows]);
+  const scoped = React.useMemo(
+    () =>
+      project == null
+        ? rows
+        : (projects.find((group) => group.key === project)?.rows ?? []),
+    [project, projects, rows],
+  );
+  const sessions = React.useMemo(() => localSessions(scoped), [scoped]);
+  const selected = React.useMemo(
+    () =>
+      session == null ? null : sessions.find((group) => group.key === session),
+    [session, sessions],
+  );
   const recent = tracker.current.reading(clock);
-  const displayed: LocalRow[] =
-    session == null ? scoped : (selected?.rows ?? []);
+  const displayed = React.useMemo(
+    () => (session == null ? scoped : (selected?.rows ?? [])),
+    [session, scoped, selected],
+  );
   const scope =
     session != null ? "session" : project != null ? "project" : "all";
+  // 汇总值同样只在选择变化时重算，避免时钟 tick 反复遍历行。
+  const displayedTokens = React.useMemo(
+    () => localSum(displayed, "totalTokens"),
+    [displayed],
+  );
+  const displayedRate = React.useMemo(
+    () => localAverageRate(displayed),
+    [displayed],
+  );
   React.useEffect(() => {
     setExportStatus("");
     setIncludePaths(false);
@@ -200,8 +226,17 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
     );
     setExportStatus(`已发起 ${format.toUpperCase()} 下载`);
   };
+  // 采集目录草稿的离开保护（评审 P2）：切页会卸载组件，未保存的目录修改会丢失。
+  const [sourceDirty, setSourceDirty] = React.useState(false);
+  const [pendingLeave, setPendingLeave] = React.useState<(() => void) | null>(
+    null,
+  );
+  const guarded = (action: () => void) => {
+    if (shouldBlockLeave(sourceDirty)) setPendingLeave(() => action);
+    else action();
+  };
   const back = () => {
-    if (workspace !== "stats") setWorkspace("stats");
+    if (workspace !== "stats") guarded(() => setWorkspace("stats"));
     else if (session != null) setSession(null);
     else if (project != null) setProject(null);
     else onBack();
@@ -372,9 +407,7 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
                             ? "项目 Tokens"
                             : "本月 Tokens"}
                     </span>
-                    <strong>
-                      {tokens(localSum(displayed, "totalTokens"))}
-                    </strong>
+                    <strong>{tokens(displayedTokens)}</strong>
                   </article>
                   <article className="card">
                     <span>
@@ -387,7 +420,7 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
                     <strong className="local-rate">
                       {speed(
                         selected || project != null || !recent
-                          ? localAverageRate(displayed)
+                          ? displayedRate
                           : recent.rate,
                       )}
                     </strong>
@@ -497,8 +530,42 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
             </>
           )}
         </div>
+        {pendingLeave && (
+          <div className="history-message warning" role="alert">
+            <p>{draftGuardText("采集目录")}</p>
+            <div className="disclosure-actions">
+              <button
+                className="secondary"
+                onClick={() => {
+                  setPendingLeave(null);
+                  setWorkspace("settings");
+                }}
+              >
+                {draftGuardActions.save}
+              </button>
+              <button
+                className="secondary"
+                onClick={() => {
+                  const action = pendingLeave;
+                  setPendingLeave(null);
+                  setSourceDirty(false);
+                  action();
+                }}
+              >
+                {draftGuardActions.discard}
+              </button>
+              <button
+                className="secondary"
+                onClick={() => setPendingLeave(null)}
+              >
+                {draftGuardActions.cancel}
+              </button>
+            </div>
+          </div>
+        )}
         <div hidden={workspace !== "settings"}>
           <LocalSourceSettings
+            onDirtyChanged={setSourceDirty}
             onSaved={() => {
               control.current.sequence++;
               tracker.current.reset();
@@ -623,6 +690,7 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
             localEnabled={enabled}
             onMode={backgroundMode}
           />
+          <LocalDataManagement />
           <details className="history-details local-explanation">
             <summary>关于本地数据与速度</summary>
             <p>

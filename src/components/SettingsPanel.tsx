@@ -297,12 +297,14 @@ function SettingsPanel({
           </details>
           <button
             className="link-button"
+            aria-expanded={showManualPaste}
+            aria-controls="manual-token-panel"
             onClick={() => setShowManualPaste((value) => !value)}
           >
             {showManualPaste ? "收起手动粘贴" : "方式二：手动粘贴 token"}
           </button>
           {showManualPaste && (
-            <>
+            <div id="manual-token-panel">
               <p className="muted">
                 获取：浏览器登录 platform.deepseek.com，按 F12 打开开发者工具，
                 切到「控制台 / Console」标签，在 ❯ 提示符后输入
@@ -348,7 +350,7 @@ function SettingsPanel({
                   粘贴
                 </button>
               </div>
-            </>
+            </div>
           )}
         </SettingsSection>
 
@@ -488,10 +490,16 @@ function SettingsPanel({
             </p>
           )}
           {autoRefresh && (
-            <div className="segmented">
+            <div
+              className="segmented"
+              role="radiogroup"
+              aria-label="自动刷新间隔"
+            >
               {refreshOptions.map((option) => (
                 <button
                   key={option.value}
+                  role="radio"
+                  aria-checked={refresh === option.value}
                   className={refresh === option.value ? "selected" : ""}
                   onClick={() => saveRefreshInterval(option.value)}
                   disabled={busy}

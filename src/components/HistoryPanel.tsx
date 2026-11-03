@@ -74,22 +74,67 @@ export function HistoryPanel({
     historyCache.subscribe,
     historyCache.epoch,
   );
+  React.useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
   const date = todayStr();
   const sequence = React.useRef({ value: 0 });
+  // 全部历史分批加载（评审 P2）：先查最近一批，明确「还有更早月份未加载」，
+  // 不把未加载误当成「平台没有记录」。`loadedFrom` 记录已请求到的最早月份。
+  const BATCH_MONTHS = 12;
+  // 用 ref 而非 state：它只影响「继续加载」的目标范围，不需要触发重渲染，
+  // 也避免把它放进 request 依赖后与重置 effect 形成循环。
+  const loadedFrom = React.useRef<string | null>(null);
+  // 快照也走 ref：继续加载时需要读上一批结果，但不应让 request 依赖它而重置列表。
+  const snapshotRef = React.useRef<HistorySnapshot | null>(null);
   const request = React.useCallback(
-    async (force = false, monthsOnly: string[] | null = null) => {
+    async (
+      force = false,
+      monthsOnly: string[] | null = null,
+      older = false,
+    ) => {
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
       const window = historyWindow(range, date, selectedMonth);
-      // 只重试失败月份时，区间与汇总仍按完整窗口，但只请求指定月份。
-      const targets = monthsOnly
-        ? failedMonthsOnly(monthsOnly, window.months)
-        : window.months;
+      // 三种模式：
+      // - 默认：`all` 只请求最近一批；其他区间请求整个窗口。
+      // - `monthsOnly`：只重试失败月份。
+      // - `older=true`：把已加载范围再往前扩一批。
+      let targets: string[];
+      if (monthsOnly) {
+        targets = failedMonthsOnly(monthsOnly, window.months);
+      } else if (range === "all") {
+        const alreadyLoaded = loadedFrom.current;
+        targets = older
+          ? window.months
+              .filter((month) => alreadyLoaded != null && month < alreadyLoaded)
+              .slice(-BATCH_MONTHS)
+          : window.months.slice(-BATCH_MONTHS);
+      } else {
+        targets = window.months;
+      }
+      // 未加载月份 = 窗口内既不在本次目标、也还没查过的月份。
+      const requested = new Set(targets);
+      const previousLoaded = loadedFrom.current;
+      const unloaded = window.months.filter(
+        (month) =>
+          !requested.has(month) &&
+          // 旧批次里已查过的月份不算未加载。
+          !(
+            previousLoaded != null &&
+            month >= previousLoaded &&
+            range === "all" &&
+            !older
+          ),
+      );
       setBusy(true);
       setError("");
       setRecovery(null);
       setExportStatus("");
-      const successful: HistorySnapshot["months"] = [];
+      // 继续加载更早月份时，保留已加载的月份，只追加新结果。
+      const kept =
+        older && snapshotRef.current ? snapshotRef.current.months : [];
+      const successful: HistorySnapshot["months"] = [...kept];
       const failed: string[] = [];
       setProgress({ done: 0, total: targets.length });
       for (const month of [...targets].reverse()) {
@@ -119,7 +164,9 @@ export function HistoryPanel({
             });
             if (successful.length) {
               snapshotEpoch.current = requestedEpoch;
-              setSnapshot(buildHistory(window, [...successful], [...failed]));
+              setSnapshot(
+                buildHistory(window, [...successful], [...failed], unloaded),
+              );
             }
             setFailed(failed);
             setRecovery(outcome.recovery);
@@ -139,8 +186,14 @@ export function HistoryPanel({
         });
         if (successful.length) {
           snapshotEpoch.current = requestedEpoch;
-          setSnapshot(buildHistory(window, [...successful], [...failed]));
+          setSnapshot(
+            buildHistory(window, [...successful], [...failed], unloaded),
+          );
         }
+      }
+      // 记录本次已加载到的最早月份，供「继续加载更早月份」使用。
+      if (targets.length && !monthsOnly && range === "all") {
+        loadedFrom.current = targets[0];
       }
       setFailed(failed);
       if (failed.length) {
@@ -155,6 +208,7 @@ export function HistoryPanel({
   React.useEffect(() => {
     setSnapshot(null);
     setSelected("");
+    loadedFrom.current = null;
     void request();
     const owner = sequence.current;
     return () => {
@@ -322,7 +376,21 @@ export function HistoryPanel({
         </label>
       )}
       {range === "all" && (
-        <p className="history-all-note">2020年起平台可返回记录 · 逐月加载</p>
+        <p className="history-all-note">
+          2020年起平台可返回记录 · 先加载最近 {BATCH_MONTHS} 个月
+          {snapshot?.unloadedMonths.length
+            ? ` · 还有 ${snapshot.unloadedMonths.length} 个月未加载`
+            : ""}
+          {snapshot?.unloadedMonths.length ? (
+            <button
+              className="link-button"
+              disabled={busy}
+              onClick={() => void request(false, null, true)}
+            >
+              继续加载更早月份 ›
+            </button>
+          ) : null}
+        </p>
       )}
       <div className="history-scroll">
         {onLocalUsage && (

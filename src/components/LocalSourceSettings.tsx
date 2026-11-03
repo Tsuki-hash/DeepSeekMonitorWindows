@@ -5,7 +5,14 @@ import { errorMessage } from "../error-state";
 import { sourceOptions, wslStateLabel, toolPathLabels } from "../local-sources";
 import type { SourceOptions, WslStatus, ToolPath } from "../local-sources";
 
-export function LocalSourceSettings({ onSaved }: { onSaved: () => void }) {
+export function LocalSourceSettings({
+  onSaved,
+  onDirtyChanged,
+}: {
+  onSaved: () => void;
+  /** 把「有未保存修改」上报给父级，用于离开前拦截（评审 P2）。 */
+  onDirtyChanged?: (dirty: boolean) => void;
+}) {
   const [options, setOptions] = React.useState<SourceOptions | null>(null);
   const [includeDefault, setIncludeDefault] = React.useState(true);
   const [homes, setHomes] = React.useState("");
@@ -48,6 +55,11 @@ export function LocalSourceSettings({ onSaved }: { onSaved: () => void }) {
     (includeDefault !== options.includeDefault ||
       homes !== options.homes.join("\n") ||
       JSON.stringify(toolPaths) !== JSON.stringify(options.toolPaths || []));
+  // 把脏状态同步给父级：页面切换前需要据此决定是否拦截。
+  React.useEffect(() => {
+    onDirtyChanged?.(Boolean(dirty));
+  }, [dirty, onDirtyChanged]);
+  React.useEffect(() => () => onDirtyChanged?.(false), [onDirtyChanged]);
   const save = async (reset = false) => {
     setError("");
     setMessage("");
