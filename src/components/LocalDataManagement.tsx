@@ -34,9 +34,15 @@ const countText = (value: number | null, unit: string) =>
 export function LocalDataManagement({
   onClearArchives,
   onClearRetention,
+  /** 采集状态或快照变化时变化的信号：驱动 overview 重新读取（复评 T06）。 */
+  refreshSignal,
+  /** 打开归档/留存管理页（复评 T07：读取错误的恢复指引必须可达）。 */
+  onOpenArchiveManager,
 }: {
   onClearArchives?: () => void;
   onClearRetention?: () => void;
+  refreshSignal?: string;
+  onOpenArchiveManager?: () => void;
 }) {
   const [overview, setOverview] = React.useState<LocalDataOverview | null>(
     null,
@@ -45,17 +51,30 @@ export function LocalDataManagement({
   const [message, setMessage] = React.useState("");
   const [error, setError] = React.useState("");
   const [confirmCache, setConfirmCache] = React.useState(false);
+  const [open, setOpen] = React.useState(false);
+  // 复评 T06：overview 原先只在挂载时读一次，而组件在 hidden 分区保持挂载 ——
+  // 采集启停、新快照都不会刷新，清缓存按钮可能被过期的 localCollecting 永久禁用。
+  // 用代际丢弃迟到响应：两次刷新并发时，只有最新一次的结果允许写入。
+  const loadGeneration = React.useRef(0);
   const load = React.useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
-      setOverview(await invoke<LocalDataOverview>("get_local_data_overview"));
+      const value = await invoke<LocalDataOverview>("get_local_data_overview");
+      if (generation !== loadGeneration.current) return; // 迟到的旧结果，丢弃
+      setOverview(value);
       setError("");
     } catch (failure) {
+      if (generation !== loadGeneration.current) return;
       setError(errorMessage(failure));
     }
   }, []);
   React.useEffect(() => {
     void load();
   }, [load]);
+  // 复评 T06：展开时与采集/快照状态变化时都重新读取。
+  React.useEffect(() => {
+    if (open) void load();
+  }, [open, load, refreshSignal]);
   const clearCache = async () => {
     setBusy(true);
     setMessage("");
@@ -72,7 +91,11 @@ export function LocalDataManagement({
     }
   };
   return (
-    <details className="history-details local-data-management">
+    <details
+      className="history-details local-data-management"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary>
         <Database size={14} aria-hidden="true" /> 本机数据管理
       </summary>
@@ -173,7 +196,14 @@ export function LocalDataManagement({
           {overview.archiveError && `手动快照：${overview.archiveError}`}
           {overview.archiveError && overview.retentionError ? "；" : ""}
           {overview.retentionError && `自动留存：${overview.retentionError}`}
-          。数据可能仍在磁盘上，可用下方清理入口重置。
+          。数据可能仍在磁盘上。
+          {onOpenArchiveManager ? (
+            <button className="link-button" onClick={onOpenArchiveManager}>
+              打开归档与留存管理 ›
+            </button>
+          ) : (
+            <span>可在「数据」页的归档/留存列表删除或清空（有二次确认）。</span>
+          )}
         </p>
       )}
       {message && <p role="status">{message}</p>}
