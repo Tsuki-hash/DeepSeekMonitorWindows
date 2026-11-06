@@ -138,8 +138,9 @@ const versionEvidence = () => {
   if (scenario === "version-runtime-missing") header = "";
   if (scenario === "version-runtime-duplicate") header += header;
   let suites = scenario === "version-missing-suite" ? versionSuites.slice(0, -1) : versionSuites;
+  if (scenario === "version-byte-suite-absent") suites = versionSuites.filter(suite => suite !== "pe-bytes");
   if (scenario === "version-zero-tests") suites = [];
-  const rows = suites.map((suite, i) => ({ index: i + 1, suite, label: "synthetic " + suite, status: scenario === "version-failed-assertion" && i === 0 ? "FAIL" : "PASS" }));
+  const rows = suites.map((suite, i) => ({ index: i + 1, suite, label: "synthetic " + suite, status: (scenario === "version-failed-assertion" && i === 0) || (scenario === "version-byte-failed-assertion" && suite === "pe-bytes") ? "FAIL" : "PASS" }));
   if (scenario === "version-row-index") rows[0].index = 9;
   const summary = {
     schemaVersion: 1,
@@ -175,6 +176,8 @@ cp.spawnSync = (command, args, options) => {
   if (command === "pwsh") {
     if (scenario === "version-tool-error") return { ...ok(), status: null, error: new Error("synthetic pwsh ENOENT") };
     if (scenario === "version-missing-script") return { ...ok(), status: 64, stderr: "synthetic script not found\\n" };
+    if (scenario === "version-missing-byte-script") return { ...ok(), status: 64, stderr: "synthetic byte script not found\\n" };
+    if (scenario === "version-byte-compile-error") return { ...ok(), status: 65, stderr: "synthetic byte parser compile failure\\n" };
     if (scenario === "version-signal") return { ...ok(), status: null, signal: "SIGTERM" };
     if (scenario === "version-fail") return { ...ok(versionEvidence()), status: 17, stderr: "synthetic assertion failure\\n" };
     if (scenario === "version-stderr-evidence") return { ...ok(), stderr: versionEvidence() };
@@ -550,7 +553,7 @@ test("release: simulated complete Windows result records full coverage, not inst
   assert.match(result.report, /\| cargo test \| PASS \| 0 \|/);
   assert.match(
     result.report,
-    /\| 发行版本纯函数回归 \| PASS \| 0 \|[^\n]*assertions=3 executed=3/,
+    /\| 发行版本纯函数回归 \| PASS \| 0 \|[^\n]*assertions=4 executed=4/,
   );
   assert.match(result.report, /FAIL=0；NOT RUN=0/);
   assert.match(result.report, /门禁命令全部通过，但安装包未校验/);
@@ -618,6 +621,8 @@ const versionErrorScenarios = [
   "version-count-mismatch",
   "version-failed-assertion",
   "version-missing-suite",
+  "version-byte-suite-absent",
+  "version-byte-failed-assertion",
   "version-incomplete",
   "version-stderr-evidence",
 ];
@@ -636,6 +641,8 @@ for (const scenario of versionErrorScenarios) {
 for (const [scenario, exitCode] of [
   ["version-fail", 17],
   ["version-missing-script", 64],
+  ["version-missing-byte-script", 64],
+  ["version-byte-compile-error", 65],
 ]) {
   test(`pure version gate preserves native failure before output claims: ${scenario}`, () => {
     const result = execute("run-release-version-tests.mjs", scenario);
@@ -651,7 +658,7 @@ for (const [scenario, exitCode] of [
     assert.ok(release.report.includes(`"code": ${exitCode}`));
     assert.match(
       release.report,
-      /synthetic (?:assertion failure|script not found)/,
+      /synthetic (?:assertion failure|script not found|byte script not found|byte parser compile failure)/,
     );
   });
 }
@@ -739,6 +746,36 @@ test("pure version assertions preserve failure propagation and completion protoc
   assert.match(source, /RELEASE_VERSION_SUMMARY \$summary/);
   for (const suite of REQUIRED_VERSION_SUITES)
     assert.ok(source.includes(`$script:AssertionSuite = '${suite}'`));
+  assert.match(
+    source,
+    /@\(& \(Join-Path \$PSScriptRoot 'verify-release-pe-bytes\.static-tests\.ps1'\) -PassThru\)/,
+  );
+  assert.match(source, /\$byteAssertions\.Count -le 0/);
+  assert.match(source, /\$byteSummary\.kind -cne 'release-pe-byte-summary'/);
+  assert.match(source, /\$byteSummary\.assertions -ne \$byteAssertions\.Count/);
+  assert.match(source, /\$global:LASTEXITCODE = 0/);
+  assert.match(
+    source,
+    /Get-CompletedPeByteAssertions -Execution \$byteExecution -ExitCode \$byteExitCode/,
+  );
+  assert.match(source, /if \(\$ExitCode -ne 0\) \{ throw/);
+  assert.match(
+    source,
+    /Assert-Equal \$assertion\.passed \$true \$assertion\.label/,
+  );
+  assert.ok(
+    source.indexOf("verify-release-pe-bytes.static-tests.ps1") <
+      source.indexOf("RELEASE_VERSION_SUMMARY $summary"),
+  );
+  const byteSource = readFileSync(
+    join(root, "scripts", "verify-release-pe-bytes.static-tests.ps1"),
+    "utf8",
+  );
+  assert.match(byteSource, /param\(\[switch\]\$PassThru\)/);
+  assert.match(byteSource, /kind = 'release-pe-byte-assertion'/);
+  assert.match(byteSource, /if \(\$PassThru\) \{ \$record \}/);
+  assert.match(byteSource, /if \(\$PassThru\) \{ \$byteSummary \}/);
+  assert.match(byteSource, /PeVersionSnapshot\]::Read\(/);
   assert.match(source, /Parser\]::ParseFile/);
   assert.match(source, /\$matches\.Count -ne 1/);
   assert.match(source, /^#requires -Version 7\.0/);

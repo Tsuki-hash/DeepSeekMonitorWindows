@@ -63,6 +63,7 @@ export function HistoryPanel({
   );
   const [showUnused, setShowUnused] = React.useState(false);
   const [selected, setSelected] = React.useState("");
+  const missingModelHintId = React.useId();
   const [snapshot, setSnapshot] = React.useState<HistorySnapshot | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -437,6 +438,12 @@ export function HistoryPanel({
       ]
     : [];
   const allModels = [...summaryModels, ...sourceOnly];
+  // A refresh/date rollover may remove the selected model from this snapshot.
+  // Keep its raw value as an explicit option in the same render as the filtered
+  // rows. Never clear it in an effect: that could overwrite a newer user choice
+  // and let a native select display "all" while the data still filters a model.
+  const selectedUnavailable =
+    selected !== "" && !allModels.some((model) => model.model === selected);
   const models = selected
     ? summaryModels.filter((model) => model.model === selected)
     : summaryModels;
@@ -610,10 +617,16 @@ export function HistoryPanel({
           模型
           <select
             aria-label="历史模型"
+            aria-describedby={
+              selectedUnavailable ? missingModelHintId : undefined
+            }
             value={selected}
             onChange={(event) => setSelected(event.target.value)}
           >
             <option value="">全部模型</option>
+            {selectedUnavailable && (
+              <option value={selected}>{selected}（当前范围未返回）</option>
+            )}
             {allModels.map((model) => (
               <option key={model.model} value={model.model}>
                 {model.model}
@@ -621,6 +634,12 @@ export function HistoryPanel({
             ))}
           </select>
         </label>
+        {selectedUnavailable && (
+          <p id={missingModelHintId} className="history-message" role="status">
+            仍按“{selected}”筛选；当前范围未取得此模型记录，不代表零用量。
+            可选择“全部模型”查看其他模型。
+          </p>
+        )}
         <div className="history-metrics">
           <article className="card">
             <span>已返回日记录 Tokens</span>

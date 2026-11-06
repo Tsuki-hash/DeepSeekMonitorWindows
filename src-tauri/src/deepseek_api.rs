@@ -286,30 +286,20 @@ pub async fn verify_usage_token(token: &str, month: u32, year: u32) -> Result<()
             let body = read_bounded_body(resp, MAX_RESPONSE_BYTES)
                 .await
                 .map_err(|_| VerifyFailure::Transient)?;
-            let parsed: AmountResp =
-                serde_json::from_str(&body).map_err(|_| VerifyFailure::Transient)?;
-            let valid = parsed
-                .data
-                .biz_data
-                .total
-                .iter()
-                .chain(parsed.data.biz_data.days.iter().flat_map(|d| d.data.iter()))
-                .flat_map(|m| m.usage.iter())
-                .all(|e| {
-                    e.amount
-                        .parse::<f64>()
-                        .is_ok_and(|n| n.is_finite() && n >= 0.0 && n < u64::MAX as f64)
-                });
-            if valid {
-                Ok(())
-            } else {
-                Err(VerifyFailure::Transient)
-            }
+            verify_usage_body(&body)
         }
         // 401/403 是对凭据本身的明确拒绝，与查询月份无关
         401 | 403 => Err(VerifyFailure::Definitive),
         _ => Err(VerifyFailure::Transient),
     }
+}
+
+/// R21：验证与读取共用原始数值入口，不能把 -1e-400 下溢成的 -0 当合法零。
+/// 这里仍只验证 amount 响应的结构和值域，不要求计数完整、费用齐全或无质量警告；
+/// 响应异常不证明 Token 失效，保持 Transient，允许上月探针或稍后重试。
+pub(crate) fn verify_usage_body(body: &str) -> Result<(), VerifyFailure> {
+    let parsed: AmountResp = serde_json::from_str(body).map_err(|_| VerifyFailure::Transient)?;
+    validate_usage_values(amount_entries(&parsed)).map_err(|_| VerifyFailure::Transient)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1065,19 +1055,29 @@ pub async fn fetch_usage_with_token(
     Ok(build_usage_result_for_period(&amount, &cost, period))
 }
 
-fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), String> {
-    let entries = amount
+fn amount_entries(amount: &AmountResp) -> impl Iterator<Item = &Entry> {
+    amount
         .data
         .biz_data
         .total
         .iter()
         .chain(amount.data.biz_data.days.iter().flat_map(|d| d.data.iter()))
-        .chain(cost.data.biz_data.iter().flat_map(|b| {
-            b.total
-                .iter()
-                .chain(b.days.iter().flat_map(|d| d.data.iter()))
-        }))
-        .flat_map(|m| m.usage.iter());
+        .flat_map(|model| model.usage.iter())
+}
+
+fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), String> {
+    let cost_entries = cost.data.biz_data.iter().flat_map(|b| {
+        b.total
+            .iter()
+            .chain(b.days.iter().flat_map(|d| d.data.iter()))
+            .flat_map(|model| model.usage.iter())
+    });
+    validate_usage_values(amount_entries(amount).chain(cost_entries))
+}
+
+/// 源响应级值域校验，不替代数量整数/presence 或预算十进制质量判断。
+/// 保留 R20 的原始尾数负号判定及既有语法/范围，供 Token 探针和用量读取共用。
+fn validate_usage_values<'a>(entries: impl Iterator<Item = &'a Entry>) -> Result<(), String> {
     for entry in entries {
         let n = entry
             .amount
@@ -1098,6 +1098,27 @@ fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), St
 #[cfg(test)]
 pub(crate) mod regression_samples {
     use super::*;
+
+    /// 探针与读取测试共用原始 JSON，确保覆盖生产反序列化而不只手工组装结构体。
+    pub(crate) fn amount_body(value: &str, daily: bool) -> String {
+        let model = serde_json::json!({
+            "model": "deepseek-flash",
+            "usage": [
+                { "type": "RESPONSE_TOKEN", "amount": "1" },
+                { "type": "RESPONSE_TOKEN", "amount": value },
+                { "type": "REQUEST", "amount": "1" }
+            ]
+        });
+        let (total, days) = if daily {
+            (
+                serde_json::json!([]),
+                serde_json::json!([{ "date": "2026-11-01", "data": [model] }]),
+            )
+        } else {
+            (serde_json::json!([model]), serde_json::json!([]))
+        };
+        serde_json::json!({ "data": { "biz_data": { "total": total, "days": days } } }).to_string()
+    }
 
     /// 与生产请求相同的数值验证 → 日期范围聚合链路，不发网络请求。
     pub(crate) fn checked_result(
@@ -1236,12 +1257,98 @@ pub(crate) mod regression_samples {
 #[cfg(test)]
 mod tests {
     use super::regression_samples::{
-        append_daily_model, checked_result, complete_month, missing_month_token_rows, period, row,
+        amount_body, append_daily_model, checked_result, complete_month, missing_month_token_rows,
+        period, row,
     };
     use super::*;
 
     const MONTH_COVERAGE_WARNING: &str =
         "本月数量或费用汇总缺少已有日用量的原始模型，请稍后刷新核对";
+
+    #[test]
+    fn r21_探针与用量读取拒绝同一数值_覆盖月汇总和日明细() {
+        for raw in [
+            "",
+            "invalid",
+            "NaN",
+            "inf",
+            "-inf",
+            "-1",
+            "-1e-400",
+            "-0.0001e-400",
+            "-1E-400",
+            "1e40",
+            "18446744073709551615",
+            " 1",
+            "1 ",
+        ] {
+            for daily in [false, true] {
+                let body = amount_body(raw, daily);
+                let amount: AmountResp = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    verify_usage_body(&body),
+                    Err(VerifyFailure::Transient),
+                    "响应坏值不能证明凭据失效：{raw}，daily={daily}"
+                );
+                assert!(
+                    validate_usage_entries(&amount, &cost_sample()).is_err(),
+                    "读取必须拒绝同一坏值：{raw}，daily={daily}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r21_探针保留负零科学计数法与源数值合法但计数未知的语义() {
+        for raw in [
+            "0",
+            "-0",
+            "-0.0",
+            "-0e-400",
+            "-0.00E+400",
+            "100.0",
+            "1e3",
+            "1E+3",
+            "+1.5",
+            "0.25",
+            "1e-400",
+            "9007199254740992",
+        ] {
+            for daily in [false, true] {
+                let body = amount_body(raw, daily);
+                let amount: AmountResp = serde_json::from_str(&body).unwrap();
+                assert_eq!(verify_usage_body(&body), Ok(()), "{raw}，daily={daily}");
+                assert!(
+                    validate_usage_entries(&amount, &cost_sample()).is_ok(),
+                    "{raw}，daily={daily}"
+                );
+            }
+        }
+        // 探针不是计数质量门禁：科学计数法/小数等仍由后续 count/presence 显示未知。
+        assert_eq!(crate::usage::count("1e3"), None);
+        assert_eq!(crate::usage::count("0.25"), None);
+        assert_eq!(crate::usage::count("1e-400"), None);
+    }
+
+    #[test]
+    fn r21_探针保留空业务成功但拒绝缺失结构() {
+        for body in [
+            r#"{"data":{"biz_data":{"total":[],"days":[]}}}"#,
+            r#"{"data":{"biz_data":{"total":[{"model":"deepseek-flash","usage":[]}],"days":[]}}}"#,
+            r#"{"data":{"biz_data":{"total":[{"model":"deepseek-flash","usage":[{"type":"REQUEST","amount":"0"}]}],"days":[]}}}"#,
+        ] {
+            assert_eq!(verify_usage_body(body), Ok(()), "{body}");
+        }
+        for body in [
+            "not-json",
+            "{}",
+            r#"{"data":{"biz_data":{}}}"#,
+            r#"{"data":{"biz_data":{"total":[],"days":null}}}"#,
+            r#"{"data":{"biz_data":{"total":[{"model":"deepseek-flash","usage":[{"type":"REQUEST","amount":0}]}],"days":[]}}}"#,
+        ] {
+            assert_eq!(verify_usage_body(body), Err(VerifyFailure::Transient));
+        }
+    }
 
     #[test]
     fn r20_十进制预算不放宽生产数值入口_非法费用仍拒绝() {

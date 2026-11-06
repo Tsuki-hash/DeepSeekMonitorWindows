@@ -80,6 +80,7 @@ fn verify_probe_months(now: SystemTime) -> Vec<(u32, u32)> {
 
 /// 探针结果：通过 / 明确拒绝（401/403，与探针月份无关）/ 暂不可用（网络、
 /// 服务端或路由类失败，值得换探针月或稍后重试）。
+#[derive(Debug, PartialEq, Eq)]
 enum ProbeOutcome {
     Passed,
     Rejected,
@@ -87,8 +88,18 @@ enum ProbeOutcome {
 }
 
 async fn probe_token(token: &str, probes: &[(u32, u32)]) -> ProbeOutcome {
+    probe_token_with(probes, |month, year| verify_usage_token(token, month, year)).await
+}
+
+/// 手动保存、登录 IPC 和缓存候选共用同一个探针循环。
+/// 测试只替换单月请求，顺序、短路与错误优先级仍由生产循环决定。
+async fn probe_token_with<F, Fut>(probes: &[(u32, u32)], mut verify: F) -> ProbeOutcome
+where
+    F: FnMut(u32, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), VerifyFailure>>,
+{
     for (month, year) in probes {
-        match verify_usage_token(token, *month, *year).await {
+        match verify(*month, *year).await {
             Ok(()) => return ProbeOutcome::Passed,
             // 对凭据本身的拒绝与查询月份无关，无需再试其他探针月
             Err(VerifyFailure::Definitive) => return ProbeOutcome::Rejected,
@@ -221,14 +232,11 @@ pub(crate) async fn prescan_cached_token(
 /// 可能把有效 Token 误判失效）。
 pub(crate) async fn verify_token_with_probes(token: &str) -> Result<(), String> {
     let probes = verify_probe_months(SystemTime::now());
-    for (month, year) in probes {
-        match verify_usage_token(token, month, year).await {
-            Ok(()) => return Ok(()),
-            Err(VerifyFailure::Definitive) => return Err(VerifyFailure::Definitive.message()),
-            Err(VerifyFailure::Transient) => {}
-        }
+    match probe_token(token, &probes).await {
+        ProbeOutcome::Passed => Ok(()),
+        ProbeOutcome::Rejected => Err(VerifyFailure::Definitive.message()),
+        ProbeOutcome::Unavailable => Err(VerifyFailure::Transient.message()),
     }
-    Err(VerifyFailure::Transient.message())
 }
 
 /// 登录窗口的 IPC 校验也响应会话撤销；手动保存继续使用上面的独立探针。
@@ -482,6 +490,104 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 仅替换单月 HTTP 请求；JSON 解析/值域与多月决策均调用生产实现。
+    async fn probe_response_bodies(
+        current: &str,
+        previous: &str,
+    ) -> (ProbeOutcome, Vec<(u32, u32)>) {
+        let probes = verify_probe_months(at(1_793_491_200)); // 2026-11-01 00:00 UTC
+        assert_eq!(probes, vec![(11, 2026), (10, 2026)]);
+        let previous = previous.replace("2026-11-01", "2026-10-01");
+        let mut visited = Vec::new();
+        let result = probe_token_with(&probes, |month, year| {
+            visited.push((month, year));
+            let body = if (month, year) == probes[0] {
+                current
+            } else {
+                previous.as_str()
+            };
+            std::future::ready(crate::deepseek_api::verify_usage_body(body))
+        })
+        .await;
+        (result, visited)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r21_当前月上月均含负下溢坏值时探针整体暂不可用() {
+        for current_daily in [false, true] {
+            for previous_daily in [false, true] {
+                let current =
+                    crate::deepseek_api::regression_samples::amount_body("-1e-400", current_daily);
+                let previous =
+                    crate::deepseek_api::regression_samples::amount_body("-1e-400", previous_daily);
+                let (result, visited) = probe_response_bodies(&current, &previous).await;
+                assert_eq!(result, ProbeOutcome::Unavailable);
+                assert_eq!(visited, vec![(11, 2026), (10, 2026)]);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r21_任一合法探针成功即可通过_不把单月坏值断言为整体失败() {
+        let bad = crate::deepseek_api::regression_samples::amount_body("-1e-400", true);
+        let good = crate::deepseek_api::regression_samples::amount_body("-0e-400", true);
+        let empty = r#"{"data":{"biz_data":{"total":[],"days":[]}}}"#;
+        for valid in [good.as_str(), empty] {
+            let (result, visited) = probe_response_bodies(&bad, valid).await;
+            assert_eq!(result, ProbeOutcome::Passed, "上月合法成功仍可接受候选");
+            assert_eq!(visited, vec![(11, 2026), (10, 2026)]);
+
+            let (result, visited) = probe_response_bodies(valid, &bad).await;
+            assert_eq!(result, ProbeOutcome::Passed);
+            assert_eq!(visited, vec![(11, 2026)], "当前月成功后不再请求上月");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r21_探针保持明确拒绝短路及暂时失败兜底顺序() {
+        let probes = [(11, 2026), (10, 2026)];
+        for (responses, expected, count) in [
+            (
+                [Err(VerifyFailure::Definitive), Ok(())],
+                ProbeOutcome::Rejected,
+                1,
+            ),
+            (
+                [
+                    Err(VerifyFailure::Transient),
+                    Err(VerifyFailure::Definitive),
+                ],
+                ProbeOutcome::Rejected,
+                2,
+            ),
+            (
+                [Err(VerifyFailure::Transient), Ok(())],
+                ProbeOutcome::Passed,
+                2,
+            ),
+            (
+                [Ok(()), Err(VerifyFailure::Definitive)],
+                ProbeOutcome::Passed,
+                1,
+            ),
+            (
+                [Err(VerifyFailure::Transient), Err(VerifyFailure::Transient)],
+                ProbeOutcome::Unavailable,
+                2,
+            ),
+        ] {
+            let mut visited = Vec::new();
+            let result = probe_token_with(&probes, |month, year| {
+                let response = responses[visited.len()];
+                visited.push((month, year));
+                std::future::ready(response)
+            })
+            .await;
+            assert_eq!(result, expected);
+            assert_eq!(visited, probes[..count]);
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn 取消同步中止挂起校验_无需等网络超时() {

@@ -15,8 +15,8 @@
 两条完整入口 `npm run verify` 和 `npm run release:record -- ...` 均通过 `scripts/run-release-version-tests.mjs` 调用 `pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1`，无需维护者额外记住单独命令。要求 PowerShell 7+ 可用；缺少 pwsh、脚本或被提取的函数均阻断，不允许跳过后继续报通过。
 
 - `verify.ps1` 和纯函数脚本均有 `#requires -Version 7.0`，并在开始工作前检查当前进程的 `$PSVersionTable.PSVersion` 和 Core edition。纯函数脚本先输出唯一的 `RELEASE_VERSION_RUNTIME`：版本及各数值段、版本来源、当前进程实际可执行文件路径及取值来源。共享入口核对主版本至少为 7、版本文本与数值段一致、来源及路径有效；缺失／损坏／重复／迟到的运行时证据不能通过。取值失败直接阻断，不能只因命令名是 pwsh 就视作 PowerShell 7，也不能用另一个 `pwsh --version` 进程代替。
-- 原脚本仅从 `verify-release.ps1` 的 AST 提取纯函数，对文件名版本、内存 PE 头、合成版本资源三组输入执行断言，不运行发行校验主流程。
-- 每次断言输出一行 `RELEASE_VERSION_ASSERT`，完整结束后输出唯一的 `RELEASE_VERSION_SUMMARY`。共享入口要求顺序编号、三组各有非零执行、计数一致、全部成功和真实退出码 0。零断言、只有汇总、旧的一句 PASS、未完成、重复／损坏的汇总都不能通过。
+- 前三组从 `verify-release.ps1` 的 AST 提取纯函数，检查文件名版本、内存 PE 头、合成版本字段。第 21 轮新增第四组 `pe-bytes`：同一 pwsh 进程实际执行 `verify-release-pe-bytes.static-tests.ps1`，编译并调用真实 C# 字节解析器，以合成 PE 运行断言；不是只检查脚本存在，也不是只提取 AST。四组均不运行发行校验主流程。
+- 纯字节子脚本逐次输出 `PE_BYTE_ASSERT` 并以 `-PassThru` 返回带序号的真实断言对象，只有完整结束才在末尾返回唯一完成对象（scope、completed、assertions/passed/failed）。父脚本先清空再核对子脚本的 `LASTEXITCODE`，校验末尾完成记录、逐断言顺序和计数后才汇入 `RELEASE_VERSION_ASSERT`，最后输出唯一 `RELEASE_VERSION_SUMMARY`。共享入口要求顺序编号、四组各有非零执行、计数一致、全部成功和真实退出码 0。子脚本缺失、C# 编译/解析回归失败、部分记录后提前返回、显式非零 exit、重复/非末尾完成、计数不符、零记录、缺第四组或旧三组证据均不能通过。子脚本在同一已报告运行时执行，不另用一个 pwsh 版本查询冒充运行时证据。
 - 真实非零退出、启动错误或信号优先于输出里的成功声明；`NOT RUN:` 与旧中文 `跳过：` 在 stdout/stderr 中均被识别，不能降级为 PASS。
 - 纯函数可在装有 pwsh 的非 Windows 环境执行；它的 PASS 不改变 Windows 原生门禁的 NOT RUN，也不代表真实 PE 版本、安装包来源、安装或升级已验收。
 
@@ -41,7 +41,11 @@
 - 发行记录重新解析原始输出，并核对本机平台、命令、范围、清单、结论与计数。旧 schema、缺日志、损坏 UTF-8／JSON、篡改／不一致的字段都记为 `ERROR`，不以原文件自称的 PASS 放行。
 - 源码门禁、安装包哈希、实际包来源及安装使用验收是不同证据。即使门禁 PASS 且记录哈希，也不能声称安装／升级或全部真机交互已验收。
 
-发行版本共享入口的 `--log-file` 另生成 schema v2 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与三组执行数，以及 `powershell.runtime` 内同一执行进程的版本和来源。发行记录重新解析原始记录并核对运行时、结论、命令、退出状态与计数，缺日志、旧 schema（含 v1）或字段不一致记为 ERROR。运行时行和完成汇总各自的协议版本仍为 1，不等同于外层日志的 schema v2。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
+发行版本共享入口的 `--log-file` 另生成 schema v2 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与四组执行数，以及 `powershell.runtime` 内同一执行进程的版本和来源。沿用历史 scope 和未改变结构的 schema，但 `requiredSuites` 必须精确包含新增 `pe-bytes`；旧三组日志即使自称 schema v2 也不能通过。发行记录重新解析原始记录并核对运行时、结论、命令、退出状态与计数，缺日志、旧 schema（含 v1）或字段不一致记为 ERROR。运行时行和完成汇总各自的协议版本仍为 1，不等同于外层日志的 schema v2。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
+
+### 必需的 Windows 文件快照验收
+
+四组源码门禁可跨平台执行，但不提供 Windows 文件共享/目录锁证据。发布前还必须在本机 NTFS 上按 [第 21 轮说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md) 执行 `verify-release-snapshot.windows-tests.ps1`，使用真实当前版本 PE，完成哈希后/版本前双屏障和句柄释放回归。这是独立的必需发行验收，不自动纳入源码纯函数计数；非 Windows 必须标为未执行，不能从四组源码 PASS 或合成故障注入推导它已通过。
 
 ### 原始证据保全与清理条件
 

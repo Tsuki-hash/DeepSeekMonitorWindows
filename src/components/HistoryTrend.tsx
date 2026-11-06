@@ -2,6 +2,117 @@ import React from "react";
 import { mmdd } from "../format";
 
 type Day = { date: string; value: number | null };
+type ViewportBar = { date: string; left: number; width: number };
+type MonthViewport = {
+  left: number;
+  width: number;
+  scrollWidth: number;
+  bars: ViewportBar[];
+};
+// 浏览器提交后、绘制前保持阅读位置；无 DOM 的渲染环境不访问全局 document。
+const useViewportLayoutEffect =
+  typeof window === "undefined" ? React.useEffect : React.useLayoutEffect;
+const rightEdge = (viewport: MonthViewport) =>
+  Math.max(0, viewport.scrollWidth - viewport.width);
+const isVisible = (bar: ViewportBar, viewport: MonthViewport) =>
+  bar.left + bar.width > viewport.left &&
+  bar.left < viewport.left + viewport.width;
+
+function readViewport(
+  element: HTMLDivElement,
+  days: Day[],
+  buttons: Map<string, HTMLButtonElement>,
+): MonthViewport | null {
+  if (
+    !Number.isFinite(element.clientWidth) ||
+    element.clientWidth <= 0 ||
+    !Number.isFinite(element.scrollWidth) ||
+    !Number.isFinite(element.scrollLeft) ||
+    typeof element.getBoundingClientRect !== "function"
+  )
+    return null;
+  const origin = element.getBoundingClientRect().left + element.clientLeft;
+  if (!Number.isFinite(origin)) return null;
+  const bars = days.flatMap(({ date }) => {
+    const button = buttons.get(date);
+    if (typeof button?.getBoundingClientRect !== "function") return [];
+    const rect = button.getBoundingClientRect();
+    return Number.isFinite(rect.left) &&
+      Number.isFinite(rect.width) &&
+      rect.width > 0
+      ? [
+          {
+            date,
+            left: rect.left - origin + element.scrollLeft,
+            width: rect.width,
+          },
+        ]
+      : [];
+  });
+  return bars.length
+    ? {
+        left: element.scrollLeft,
+        width: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        bars,
+      }
+    : null;
+}
+
+function restoreViewport(
+  element: HTMLDivElement,
+  current: MonthViewport,
+  snapshot: MonthViewport | null,
+  pinnedDate: string | null,
+  buttons: Map<string, HTMLButtonElement>,
+) {
+  const focusedDate = current.bars.find(
+    ({ date }) => buttons.get(date) === element.ownerDocument?.activeElement,
+  )?.date;
+  // Escape 收起明细后，实际焦点仍可能在旧柱上；渲染 ref / focus 请求都不算焦点。
+  const protectedDates = [pinnedDate, focusedDate].filter(
+    (date): date is string =>
+      date != null && current.bars.some((bar) => bar.date === date),
+  );
+  // 原生横滚／焦点滚动可先于 scroll 事件，也可紧挨着新快照提交。
+  // 排除新布局自然夹紧旧位置的情况后，先尊重这个尚未记录的阅读位置。
+  const previous =
+    snapshot &&
+    Math.abs(current.left - Math.min(snapshot.left, rightEdge(current))) > 0.5
+      ? { ...snapshot, left: current.left }
+      : snapshot;
+  let left = previous?.left ?? rightEdge(current);
+  if (previous) {
+    if (
+      Math.abs(rightEdge(previous) - previous.left) <= 1 &&
+      protectedDates.length === 0
+    ) {
+      left = rightEdge(current);
+    } else {
+      // 优先保留首个可见日期的像素位置，而非旧 scrollLeft；左侧补月不会换读到的内容。
+      const retained = previous.bars.filter((old) =>
+        current.bars.some((bar) => bar.date === old.date),
+      );
+      const anchor =
+        retained.find((bar) => isVisible(bar, previous)) ?? retained[0];
+      const moved = current.bars.find((bar) => bar.date === anchor?.date);
+      if (anchor && moved) left = previous.left + moved.left - anchor.left;
+      // 缩窄窗口时保住原本可见的固定柱／真实焦点。两者放不下时真实焦点优先。
+      // 用户自行滚出视口的旧选择不拉回，也不调用 focus / scrollIntoView。
+      for (const date of protectedDates) {
+        const old = previous.bars.find((bar) => bar.date === date);
+        const bar = current.bars.find((bar) => bar.date === date);
+        if (old && bar && isVisible(old, previous)) {
+          left = Math.max(left, bar.left + bar.width - current.width);
+          left = Math.min(left, bar.left);
+        }
+      }
+    }
+  }
+  left = Math.max(0, Math.min(rightEdge(current), left));
+  if (Math.abs(element.scrollLeft - left) > 0.5) element.scrollLeft = left;
+}
+
 export function HistoryTrend({
   days,
   metric,
@@ -33,11 +144,61 @@ export function HistoryTrend({
     setPinnedDate(retainVisible);
   }, [days]);
   const chart = React.useRef<HTMLDivElement>(null);
-  React.useEffect(() => {
-    if (monthly && chart.current)
-      chart.current.scrollLeft = chart.current.scrollWidth;
-  }, [monthly, days.length]);
   const buttons = React.useRef(new Map<string, HTMLButtonElement>());
+  const viewport = React.useRef<MonthViewport | null>(null);
+  const syncViewport = React.useRef<() => void>(() => {});
+  useViewportLayoutEffect(() => {
+    // 每次提交才更新闭包，放弃的并发 render 不改变已提交的滚动策略。
+    syncViewport.current = () => {
+      const element = chart.current;
+      if (!monthly || days.length === 0) {
+        viewport.current = null;
+        return;
+      }
+      if (!element) return;
+      const current = readViewport(element, days, buttons.current);
+      if (!current) return; // 隐藏／零宽／非 DOM 环境，等下一次有效布局。
+      const previous = viewport.current;
+      const layoutChanged =
+        !previous ||
+        current.width !== previous.width ||
+        current.scrollWidth !== previous.scrollWidth ||
+        current.bars.length !== previous.bars.length ||
+        current.bars.some((bar, index) => {
+          const old = previous.bars[index];
+          return (
+            old.date !== bar.date ||
+            Math.abs(old.left - bar.left) > 0.5 ||
+            Math.abs(old.width - bar.width) > 0.5
+          );
+        });
+      // 单纯 focus / hover / pin 提交不能撤销浏览器刚完成的键盘滚入视野。
+      if (layoutChanged)
+        restoreViewport(
+          element,
+          current,
+          previous,
+          pinnedDate,
+          buttons.current,
+        );
+      viewport.current = readViewport(element, days, buttons.current);
+    };
+    syncViewport.current();
+  });
+  React.useEffect(() => {
+    const element = chart.current;
+    if (!monthly || !element) return;
+    const sync = () => syncViewport.current();
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(sync);
+      observer.observe(element);
+      for (const button of buttons.current.values()) observer.observe(button);
+      return () => observer.disconnect();
+    }
+    const view = element.ownerDocument?.defaultView;
+    view?.addEventListener("resize", sync);
+    return () => view?.removeEventListener("resize", sync);
+  }, [monthly, days]);
   const label = (day: Day) => dateLabel(day.date);
   const maximum = Math.max(...days.map((day) => day.value ?? 0), 1);
   const value = (day: Day) =>
@@ -71,6 +232,12 @@ export function HistoryTrend({
         ref={chart}
         role="group"
         aria-label={monthly ? "每月趋势数据" : "每日趋势数据"}
+        onScroll={() => {
+          if (monthly && days.length && chart.current) {
+            const current = readViewport(chart.current, days, buttons.current);
+            if (current) viewport.current = current;
+          }
+        }}
         onMouseLeave={() => setHoveredDate(null)}
       >
         {days.map((day, index) => (

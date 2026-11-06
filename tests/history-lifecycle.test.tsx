@@ -158,6 +158,67 @@ const deferredUsage = () => {
   });
   return { promise, resolve, reject };
 };
+const chooseModel = async (value: string) => {
+  assert.ok(
+    select()
+      .findAllByType("option")
+      .some((option: any) => option.props.value === value),
+    `model must be selectable before a user chooses it: ${value}`,
+  );
+  await act(async () => {
+    select().props.onChange({ target: { value } });
+    await flush();
+  });
+};
+const assertModelSelection = (value: string, unavailable = false) => {
+  assert.equal(select().props.value, value);
+  const options = select().findAllByType("option");
+  const matching = options.filter(
+    (option: any) => option.props.value === value,
+  );
+  assert.equal(
+    matching.length,
+    1,
+    "the controlled value has exactly one option",
+  );
+  assert.equal(
+    text(matching[0]),
+    unavailable ? `${value}（当前范围未返回）` : value || "全部模型",
+  );
+  assert.notEqual(matching[0].props.disabled, true);
+  assert.notEqual(matching[0].props.hidden, true);
+  assert.equal(
+    new Set(options.map((option: any) => option.props.value)).size,
+    options.length,
+    "fallback and returned options cannot duplicate raw model values",
+  );
+  if (unavailable) {
+    const hint = view.root.findByProps({
+      id: select().props["aria-describedby"],
+    });
+    assert.equal(hint.props.role, "status");
+    assert.ok(text(hint).includes(`仍按“${value}”筛选`));
+    assert.ok(text(hint).includes("不代表零用量"));
+  } else {
+    assert.equal(select().props["aria-describedby"], undefined);
+  }
+};
+const assertNoFilteredUsage = () => {
+  assert.deepEqual(metrics(), ["—", "—"]);
+  assert.ok(trend().every((item) => item.value === null));
+  assert.equal(
+    view.root
+      .findByProps({ className: "history-models" })
+      .findAllByType("details").length,
+    0,
+  );
+  assert.ok(
+    view.root
+      .findAllByType("tbody")
+      .every((body: any) => body.findAllByType("tr").length === 0),
+    "daily rows and independent source rows use the same selected raw value",
+  );
+};
 async function fixture(
   concurrent: boolean,
   inspect: () => Promise<void>,
@@ -1148,6 +1209,314 @@ for (const concurrent of [false, true]) {
           throw { code: "invalid_data" };
         },
       );
+    });
+  }
+}
+
+// Round 21: a retained model filter must always have an explicit native option.
+// Renderer assertions cover the controlled value/option/data contract only;
+// Windows WebView2's collapsed select and native popup require manual checks.
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+
+  for (const range of ["本月", "历史月份"]) {
+    test(`R21 history (${mode}): ${range} snapshot A to B to A keeps the filter explicit without changing source values`, async () => {
+      await fixture(concurrent, async () => {
+        await click(range);
+        await chooseModel("A-one");
+        assertModelSelection("A-one");
+        assert.deepEqual(metrics(), ["10", "¥1.00"]);
+        const pending = deferredUsage();
+        load = () => pending.promise;
+        await click("重新查询历史");
+        assertModelSelection("A-one");
+        assert.deepEqual(metrics(), ["10", "¥1.00"]);
+        await act(async () => {
+          pending.resolve(usage("2026-10", "B"));
+          await flush();
+        });
+        assertModelSelection("A-one", true);
+        assertNoFilteredUsage();
+        if (range === "历史月份") {
+          const before = calls.length;
+          await visibility(false);
+          await tick("2026-10-31T16:01:00Z");
+          await visibility(true);
+          assert.equal(
+            calls.length,
+            before,
+            "the fixed month stays in October",
+          );
+          assertModelSelection("A-one", true);
+          assertNoFilteredUsage();
+        }
+        const json = await exportJson();
+        assert.equal(json.from, "2026-10-01");
+        assert.equal(json.to, "2026-10-31");
+        assert.deepEqual(
+          json.daily.map((row: RawModelUsage) => row.model),
+          ["B-one", "B-two"],
+        );
+        assert.equal(json.sourceMonthlySnapshots[0].models[0].totalTokens, 900);
+        assert.equal(JSON.stringify(json).includes("当前范围未返回"), false);
+        await click("费用");
+        assertNoFilteredUsage();
+        load = async (month) => usage(month);
+        await click("重新查询历史");
+        assertModelSelection("A-one");
+        assert.deepEqual(metrics(), ["10", "¥1.00"]);
+        assert.equal(trend().find((item) => item.value !== null)?.value, 1);
+        assert.equal(
+          view.root.findAllByType("tbody")[0].findAllByType("tr").length,
+          1,
+        );
+      });
+    });
+  }
+
+  for (const scenario of [
+    { range: "本月", at: "2026-10-31T16:01:00Z", show: false },
+    { range: "本月", at: "2026-10-31T16:01:00Z", show: true },
+    { range: "上月", at: "2026-10-31T16:01:00Z", show: false },
+    { range: "近30天", at: "2026-11-30T16:01:00Z", show: false },
+  ]) {
+    test(`R21 history (${mode}): ${scenario.range} rollover ${scenario.show ? "show" : "refresh"} never displays all while filtering a missing model`, async () => {
+      await fixture(concurrent, async () => {
+        await click(scenario.range);
+        await chooseModel("A-one");
+        const before = calls.length;
+        load = async (month) => usage(month, "B");
+        if (scenario.show) await visibility(false);
+        await tick(scenario.at);
+        assert.equal(calls.length, before);
+        assertModelSelection("A-one");
+        if (scenario.show) await visibility(true);
+        else await click("重新查询历史");
+        assertModelSelection("A-one", true);
+        assertNoFilteredUsage();
+        await chooseModel("B-two");
+        assertModelSelection("B-two");
+        assert.deepEqual(metrics(), ["20", "¥2.00"]);
+        assert.equal(
+          select()
+            .findAllByType("option")
+            .some((option: any) => option.props.value === "A-one"),
+          false,
+          "only the active absent selection is retained, not an old model cache",
+        );
+        await chooseModel("");
+        assertModelSelection("");
+        assert.deepEqual(metrics(), ["30", "¥3.00"]);
+      });
+    });
+  }
+
+  for (const result of ["empty", "failed"] as const) {
+    test(`R21 history (${mode}): rollover to ${result} data keeps the missing model distinct from all and zero`, async () => {
+      await fixture(concurrent, async () => {
+        await chooseModel("A-one");
+        await tick("2026-10-31T16:01:00Z");
+        load = async (month) => {
+          if (result === "failed") throw { code: "invalid_data" };
+          return { ...usage(month), rawModels: [], days: [] };
+        };
+        await click("重新查询历史");
+        assertModelSelection("A-one", true);
+        assertNoFilteredUsage();
+        assert.equal(select().findAllByType("option").length, 2);
+        const json = await exportJson();
+        assert.deepEqual(
+          json.failedMonths,
+          result === "failed" ? ["2026-11"] : [],
+        );
+        assert.deepEqual(json.daily, []);
+        assert.deepEqual(json.unloadedMonths, []);
+        load = async (month) => usage(month);
+        await click(
+          result === "failed" ? "只重试失败月份（1）" : "重新查询历史",
+        );
+        assertModelSelection("A-one");
+        assert.deepEqual(metrics(), ["10", "¥1.00"]);
+      });
+    });
+  }
+
+  test(`R21 history (${mode}): failed refresh keeps an actually retained model available`, async () => {
+    await fixture(concurrent, async () => {
+      await chooseModel("A-one");
+      load = async () => {
+        throw { code: "invalid_data" };
+      };
+      await click("重新查询历史");
+      assertModelSelection("A-one");
+      assert.deepEqual(metrics(), ["10", "¥1.00"]);
+      assert.deepEqual((await exportJson()).failedMonths, ["2026-10"]);
+    });
+  });
+
+  test(`R21 history (${mode}): source-only and raw model names are never changed by the missing-option label`, async () => {
+    const rawName = "vendor/Model A:v1（当前范围未返回）";
+    await fixture(concurrent, async () => {
+      load = async (month) => ({
+        ...usage(month),
+        rawModels: [raw(rawName, 321, 3.21)],
+        days: [],
+      });
+      await click("重新查询历史");
+      await chooseModel(rawName);
+      assertModelSelection(rawName);
+      assert.deepEqual(metrics(), ["—", "—"]);
+      assert.equal(
+        view.root
+          .findByProps({ className: "history-models" })
+          .findAllByType("details").length,
+        1,
+        "a model returned only by the source month is available, with unknown daily totals",
+      );
+      load = async (month) => usage(month, "B");
+      await click("重新查询历史");
+      assertModelSelection(rawName, true);
+      assertNoFilteredUsage();
+      await chooseModel("");
+      assertModelSelection("");
+      assert.deepEqual(metrics(), ["30", "¥3.00"]);
+    });
+  });
+
+  test(`R21 history (${mode}): all retains earlier models and unloaded holes, then replaces the missing option when older data returns it`, async () => {
+    await fixture(concurrent, async () => {
+      load = async (month) => usage(month, month === "2026-10" ? "A" : "B");
+      await click("全部");
+      await chooseModel("A-one");
+      const first = await exportJson();
+      await tick("2026-10-31T16:01:00Z");
+      load = async (month) => usage(month, "B");
+      await click("继续加载更早月份 ›");
+      assertModelSelection("A-one");
+      assert.deepEqual(metrics(), ["10", "¥1.00"]);
+      const expanded = await exportJson();
+      assert.equal(expanded.monthly.length, 24);
+      assert.ok(expanded.unloadedMonths.includes("2026-11"));
+      assert.ok(
+        first.monthly.every((month: any) =>
+          expanded.monthly.some((item: any) => item.month === month.month),
+        ),
+      );
+      await click("重新查询历史");
+      assertModelSelection("A-one", true);
+      assertNoFilteredUsage();
+      const replaced = await exportJson();
+      assert.equal(replaced.monthly.length, 25);
+      assert.ok(replaced.unloadedMonths.length > 0);
+      assert.equal(replaced.unloadedMonths.includes("2026-11"), false);
+      const oldest = replaced.monthly[0].month;
+      assert.ok(
+        replaced.monthly.some(
+          (month: any) => month.month === expanded.monthly[0].month,
+        ),
+      );
+      load = async (month) => usage(month);
+      await click("继续加载更早月份 ›");
+      assertModelSelection("A-one");
+      assert.equal(trend().filter((item) => item.value !== null).length, 12);
+      assert.ok(
+        (await exportJson()).monthly.some(
+          (month: any) => month.month === oldest,
+        ),
+      );
+    });
+  });
+
+  for (const choice of ["", "A-two"]) {
+    test(`R21 history (${mode}): a user choice ${choice || "all"} batched with refresh completion is not overwritten`, async () => {
+      await fixture(concurrent, async () => {
+        await chooseModel("A-one");
+        const pending = deferredUsage();
+        load = () => pending.promise;
+        await click("重新查询历史");
+        await act(async () => {
+          pending.resolve(usage("2026-10", "B"));
+          select().props.onChange({ target: { value: choice } });
+          await flush();
+        });
+        assertModelSelection(choice, choice !== "");
+        if (choice) assertNoFilteredUsage();
+        else assert.deepEqual(metrics(), ["30", "¥3.00"]);
+        const next = deferredUsage();
+        load = () => next.promise;
+        await click("重新查询历史");
+        await chooseModel("B-two");
+        assertModelSelection("B-two");
+        await act(async () => {
+          next.resolve(usage("2026-10"));
+          await flush();
+        });
+        assertModelSelection("B-two", true);
+        assertNoFilteredUsage();
+        await chooseModel("");
+        assertModelSelection("");
+        assert.deepEqual(metrics(), ["30", "¥3.00"]);
+      });
+    });
+  }
+
+  for (const change of [
+    "range",
+    "custom-month",
+    "account-visible",
+    "account-hidden",
+  ] as const) {
+    test(`R21 history (${mode}): ${change} clears the missing selection and rejects the old pending result`, async () => {
+      await fixture(concurrent, async () => {
+        if (change === "custom-month") await click("历史月份");
+        await chooseModel("A-one");
+        load = async (month) => usage(month, "B");
+        await click("重新查询历史");
+        assertModelSelection("A-one", true);
+        const pending = deferredUsage();
+        load = () => pending.promise;
+        await click("重新查询历史");
+        load = async (month) => usage(month, "C");
+        if (change === "range") await click("上月");
+        else if (change === "custom-month") {
+          await act(async () => {
+            view.root.findByProps({ type: "month" }).props.onChange({
+              target: { value: "2024-02" },
+            });
+            await flush();
+          });
+          await act(flush);
+        } else {
+          if (change === "account-hidden") await visibility(false);
+          await act(async () => {
+            historyCache.invalidate();
+            await flush();
+          });
+          assertModelSelection("");
+          assert.equal(text(view.toJSON()).includes("A-one"), false);
+          if (change === "account-hidden") {
+            assert.equal(select().findAllByType("option").length, 1);
+            assert.equal(button("JSON").props.disabled, true);
+            await visibility(true);
+          }
+        }
+        assertModelSelection("");
+        const current = await exportJson();
+        assert.ok(current.daily.length > 0);
+        assert.ok(
+          current.daily.every((row: RawModelUsage) =>
+            row.model.startsWith("C-"),
+          ),
+        );
+        await act(async () => {
+          pending.resolve(usage("2026-10", "A"));
+          await flush();
+        });
+        assertModelSelection("");
+        assert.equal(text(view.toJSON()).includes("A-one"), false);
+        assert.equal(text(view.toJSON()).includes("B-one"), false);
+        assert.deepEqual((await exportJson()).daily, current.daily);
+      });
     });
   }
 }

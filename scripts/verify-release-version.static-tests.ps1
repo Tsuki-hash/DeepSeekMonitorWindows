@@ -1,7 +1,8 @@
 #requires -Version 7.0
-# 独立回归：只从 verify-release.ps1 的 AST 提取纯函数，不运行发行校验主流程、
+# 源码回归：从 verify-release.ps1 的 AST 提取规则纯函数，另执行同进程纯字节解析回归，
+# 不运行发行校验主流程、
 # 不启动/安装应用，不构建，不调用 Get-FileHash 或 FileVersionInfo 读取真实安装包。
-# 本文件在第 18/19/20 轮修改时仅编写/静态审阅，未执行。
+# 本文件在第 18/19/20/21 轮修改时仅编写/静态审阅，未执行。
 # 用户本机运行：pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
@@ -58,6 +59,28 @@ function Assert-Equal($Actual, $Expected, [string]$Label) {
     } | ConvertTo-Json -Compress
     Write-Host "RELEASE_VERSION_ASSERT $row"
     if (-not $passed) { throw "${Label}：期望 [$Expected]，实际 [$Actual]" }
+}
+function Get-CompletedPeByteAssertions {
+    param([object[]]$Execution, [int]$ExitCode)
+    if ($ExitCode -ne 0) { throw "纯字节解析子脚本非零退出：$ExitCode" }
+    if ($Execution.Count -lt 2) { throw '纯字节解析回归缺少断言或完成记录。' }
+    $byteSummary = $Execution[-1]
+    $byteAssertions = @($Execution[0..($Execution.Count - 2)])
+    if ($byteSummary.kind -cne 'release-pe-byte-summary' -or $byteSummary.schemaVersion -ne 1 -or
+        $byteSummary.scope -cne 'release-pe-byte-parser' -or $byteSummary.completed -isnot [bool] -or
+        -not $byteSummary.completed -or $byteSummary.assertions -ne $byteAssertions.Count -or
+        $byteSummary.passed -ne $byteAssertions.Count -or $byteSummary.failed -ne 0) {
+        throw '纯字节解析回归未完整完成或记录计数不一致。'
+    }
+    if ($byteAssertions.Count -le 0) { throw '纯字节解析回归没有实际执行断言。' }
+    for ($index = 0; $index -lt $byteAssertions.Count; $index++) {
+        $assertion = $byteAssertions[$index]
+        if ($assertion.kind -cne 'release-pe-byte-assertion' -or $assertion.index -ne $index + 1 -or
+            $assertion.passed -isnot [bool] -or -not $assertion.passed -or [string]::IsNullOrWhiteSpace($assertion.label)) {
+            throw '纯字节解析回归返回了失败或无法确认的断言记录。'
+        }
+    }
+    return $byteAssertions
 }
 function New-VersionFixture {
     [pscustomobject]@{
@@ -133,7 +156,19 @@ foreach ($version in @('1.3.1-beta.1', '1.3.1+build', '1.3.1.0', '01.3.1', '6553
     Assert-Equal (@(Get-PeReleaseVersionIssues (New-VersionFixture) $version).Count -gt 0) $true "不猜测源码版本映射 $version"
 }
 
-# 只有真正走完所有断言才输出完成记录；旧的一句 PASS 不是执行证据。
+# 在同一已报告运行时的 pwsh 进程真正执行纯字节解析断言，而不只检查文件存在。
+# 子脚本返回逐次真实断言记录；成功返回后再汇入同一协议，避免跨脚本作用域
+# 修改计数器。抛错/缺文件/编译错误会阻止本脚本完成，零记录也不能放行。
+$script:AssertionSuite = 'pe-bytes'
+$global:LASTEXITCODE = 0
+$byteExecution = @(& (Join-Path $PSScriptRoot 'verify-release-pe-bytes.static-tests.ps1') -PassThru)
+$byteExitCode = $global:LASTEXITCODE
+$byteAssertions = @(Get-CompletedPeByteAssertions -Execution $byteExecution -ExitCode $byteExitCode)
+foreach ($assertion in $byteAssertions) {
+    Assert-Equal $assertion.passed $true $assertion.label
+}
+
+# 只有真正走完四组所有断言才输出完成记录；旧的一句 PASS 不是执行证据。
 if ($script:AssertionCount -le 0 -or $script:FailedAssertions -ne 0) {
     throw '纯函数回归没有非零成功执行，不能生成完成记录。'
 }

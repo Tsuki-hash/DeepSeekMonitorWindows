@@ -16,7 +16,12 @@ const args = [
   "-File",
   "scripts/verify-release-version.static-tests.ps1",
 ];
-export const REQUIRED_VERSION_SUITES = ["filename", "pe-header", "pe-version"];
+export const REQUIRED_VERSION_SUITES = [
+  "filename",
+  "pe-header",
+  "pe-version",
+  "pe-bytes",
+];
 
 function validRuntime(runtime) {
   const version =
@@ -127,7 +132,7 @@ function evaluate(result) {
     );
   if (!execution.valid || coverage.some((item) => item.executed === 0))
     reasons.push(
-      "ERROR: require sequential assertion rows, nonzero execution in all three suites, and one matching completion summary.",
+      "ERROR: require sequential assertion rows, nonzero execution in all four suites (including PE byte parsing), and one matching completion summary.",
     );
   if (hasNotRun(`${result.stdout}\n${result.stderr}`))
     reasons.push("NOT RUN: output contains an unexecuted-scenario marker.");

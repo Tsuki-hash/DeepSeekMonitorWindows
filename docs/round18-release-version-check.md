@@ -1,5 +1,7 @@
 # 第 18 轮：安装包静态版本检查
 
+> 第 21 轮已进一步修复校验期间的并发替换：持有 Windows 本机 NTFS 拒写/拒删句柄，哈希、PE/仓库及 RT_VERSION 全部取同一字节快照；不再通过可能合并外部 MUI 的 FileVersionInfo 读取正式校验字段。新的限制、独立回归和未执行的 Windows 验收见 [同一文件快照回归说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)。下面提及 FileVersionInfo 的历史实现和人工观察步骤，不代表当前主流程仍使用该 API。
+
 ## 修复范围与验收状态
 
 `scripts/verify-release.ps1` 原先使用无边界的文件名子串匹配，源码 `1.3.1` 会误认 `1.3.10`。文件名、哈希和明文仓库地址都符合时，即使输入不是 PE 或没有版本资源，也可能得到静态 PASS。

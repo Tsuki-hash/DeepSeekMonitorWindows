@@ -18,7 +18,7 @@
 
 - [ ] 三处应用版本一致为 1.3.1，锁文件与提交对应。
 - [ ] 干净安装依赖后，执行当前 `package.json` 与 `scripts/verify.ps1` 定义的前端类型／单测、组件回归、发行版本纯函数回归、脚本门禁、lint、格式、构建及 Rust 校验。
-- [ ] `npm run verify` 与 `npm run release:record -- ...` 均实际执行 `scripts/run-release-version-tests.mjs`，由其启动 `verify-release-version.static-tests.ps1`；核对三组非零断言、唯一完成汇总及原生退出码 0。两个 PowerShell 入口要求当前进程为 PowerShell 7+ Core；核对实际断言进程输出的唯一运行时版本、取值来源和可执行文件路径，不能用命令名或另一次版本查询代替。低于 7、版本无法取得、缺 pwsh／脚本、非零退出、零断言、旧 PASS 文案或缺证据均不能通过。
+- [ ] `npm run verify` 与 `npm run release:record -- ...` 均实际执行 `scripts/run-release-version-tests.mjs`，由其启动 `verify-release-version.static-tests.ps1`；核对四组非零断言、唯一完成汇总及原生退出码 0，第四组 `pe-bytes` 必须同进程真正运行纯字节脚本和 C# 解析器。两个 PowerShell 入口要求当前进程为 PowerShell 7+ Core；核对实际断言进程输出的唯一运行时版本、取值来源和可执行文件路径，不能用命令名或另一次版本查询代替。低于 7、版本无法取得、缺 pwsh／脚本、非零退出、零断言、旧三组或旧 PASS 文案、缺证据均不能通过。
 - [ ] 发行记录保留版本纯函数的完整 stdout/stderr、真实 pwsh 退出码、信号／启动错误、运行时信息与 schema v2 日志；表格的入口退出码不冒充原生退出码。纯函数计数以 assertions 标注，不能作为真实安装包或安装升级的验收证据。
 - [ ] Rust 与版本日志使用同一字节快照校验和归档；缺失／损坏／旧 schema／篡改均为 ERROR。被拒绝文件以明确不可信的完整 Base64 字节、字节数和 SHA-256 留在报告中，不只写“缺失”。缺文件、读失败和零字节文件的记录须可区分。
 - [ ] 只有 `--out` 写入、flush 和逐字节读回成功后才清理已归档且未变化的临时原件。用合成证据检查写入／部分写入／flush／读回失败、stdout-only 和日志读失败时原件保留。以最终退出码及 stderr 确认报告生成状态，不以文件中的 PASS 文案替代；失败保留位置见 stderr。
@@ -86,6 +86,7 @@
 
 - [ ] 所有必需项都有本次提交对应的结果；失败项已修复并重新验证，或明确作为未解决阻断。
 - [ ] 对实际安装包检查版本、资源与哈希，而不是只检查源码配置。
+- [ ] 在本机 NTFS 上完成 [第 21 轮文件快照双屏障主流程回归](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)，保留真实退出码和证据目录。源码纯字节门禁、helper-only 断言或非 Windows 结果不能代替必需的 Windows 主流程验收。
 - [ ] 用无真实账户信息的演示状态重截当前截图，覆盖账户、历史与设置；不复用旧导航截图冒充新版。
 - [ ] README、升级说明与实际行为一致，仍保留 MIT 版权和上游归属。
 - [ ] 只有在发布真实完成后才更新“未发布”状态；验收结论独立记录，不能由打标签或上传附件推导。

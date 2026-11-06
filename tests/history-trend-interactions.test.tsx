@@ -2,15 +2,14 @@ import React from "react";
 import Renderer, { act } from "react-test-renderer";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { HistoryTrend } from "../src/components/HistoryTrend";
-import { HistoryPanel } from "../src/components/HistoryPanel";
+import { readFileSync } from "node:fs";
 import { historyCache } from "../src/history-cache";
 import type { RawModelUsage, UsageResult } from "../src/types";
 
 // Synthetic component events and ref requests only. No browser is started:
 // .focus() mocks record requests, never pretend to deliver native focus events.
 // Real Tab/Enter/Space, activeElement, live announcements and Windows/WebView2
-// still require docs/REVIEW20_HISTORY_TREND_REGRESSIONS.md manual acceptance.
+// still require docs/REVIEW21_HISTORY_VIEWPORT_REGRESSIONS.md manual acceptance.
 const g = globalThis as any;
 g.IS_REACT_ACT_ENVIRONMENT = true;
 const NativeDate = Date;
@@ -24,6 +23,16 @@ g.Date = class extends NativeDate {
   }
 };
 const timers = new Set<number>();
+const resizeCallbacks = new Set<() => void>();
+g.ResizeObserver = class {
+  constructor(private callback: () => void) {}
+  observe() {
+    resizeCallbacks.add(this.callback);
+  }
+  disconnect() {
+    resizeCallbacks.delete(this.callback);
+  }
+};
 const listeners = new Map<string, Set<() => void>>();
 let nextTimer = 1;
 g.window = {
@@ -44,6 +53,10 @@ g.document = {
   removeEventListener: (name: string, run: () => void) =>
     listeners.get(name)?.delete(run),
 };
+// Import after the window substitute exists: exercise the production layout-effect
+// branch, rather than selecting the server/passive branch during static imports.
+const { HistoryTrend } = await import("../src/components/HistoryTrend");
+const { HistoryPanel } = await import("../src/components/HistoryPanel");
 const dates = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 type Day = React.ComponentProps<typeof HistoryTrend>["days"][number];
 const initial: Day[] = dates.map((date, index) => ({
@@ -122,6 +135,7 @@ async function render(
     focusRequests: string[],
     blurRequests: string[],
   ) => Promise<void>,
+  createNodeMock?: (node: any) => any,
 ) {
   let view: any;
   const focusRequests: string[] = [];
@@ -129,13 +143,15 @@ async function render(
   await act(async () => {
     view = Renderer.create(<React.StrictMode>{element}</React.StrictMode>, {
       unstable_isConcurrent: concurrent,
-      createNodeMock: (node: any) =>
-        node.type === "button"
-          ? {
-              focus: () => focusRequests.push(node.props["aria-label"]),
-              blur: () => blurRequests.push(node.props["aria-label"]),
-            }
-          : { scrollLeft: 0, scrollWidth: 400 },
+      createNodeMock:
+        createNodeMock ??
+        ((node: any) =>
+          node.type === "button"
+            ? {
+                focus: () => focusRequests.push(node.props["aria-label"]),
+                blur: () => blurRequests.push(node.props["aria-label"]),
+              }
+            : { scrollLeft: 0, scrollWidth: 400 }),
     } as any);
   });
   try {
@@ -143,8 +159,403 @@ async function render(
   } finally {
     await act(async () => view.unmount());
     assert.equal(timers.size, 0);
+    assert.equal(resizeCallbacks.size, 0);
     for (const entries of listeners.values()) assert.equal(entries.size, 0);
   }
+}
+
+// 数值几何替身，不提供 CSS 布局或真实浏览器焦点。只有测试显式设置 activeElement
+// 才表示模拟的原生焦点；ref 创建和 .focus() 请求都不会自动成功。
+function monthlyViewport(initialDays: Day[], initialWidth = 81) {
+  let days = initialDays;
+  let width = initialWidth;
+  let left = 0;
+  let barWidth = 24;
+  const gap = 3;
+  const nodes = new Map<string, any>();
+  const writes: number[] = [];
+  const focusRequests: string[] = [];
+  const resizeListeners = new Set<() => void>();
+  const ownerDocument: any = {
+    activeElement: null,
+    defaultView: {
+      addEventListener: (name: string, fn: () => void) => {
+        assert.equal(name, "resize");
+        resizeListeners.add(fn);
+      },
+      removeEventListener: (name: string, fn: () => void) => {
+        assert.equal(name, "resize");
+        resizeListeners.delete(fn);
+      },
+    },
+  };
+  const maximum = () =>
+    Math.max(0, days.length * (barWidth + gap) - gap - width);
+  const container = {
+    clientLeft: 0,
+    ownerDocument,
+    get clientWidth() {
+      return width;
+    },
+    get scrollWidth() {
+      return Math.max(width, days.length * (barWidth + gap) - gap);
+    },
+    get scrollLeft() {
+      return left;
+    },
+    set scrollLeft(value: number) {
+      left = Math.max(0, Math.min(maximum(), value));
+      writes.push(left);
+    },
+    getBoundingClientRect: () => ({ left: 100, width }),
+  };
+  return {
+    container,
+    writes,
+    focusRequests,
+    resizeListeners,
+    maximum,
+    node: (date: string) => nodes.get(date),
+    setDays(next: Day[]) {
+      days = next;
+      left = Math.min(left, maximum());
+    },
+    setWidth(next: number) {
+      width = next;
+      left = Math.min(left, maximum());
+    },
+    setBarWidth(next: number) {
+      barWidth = next;
+    },
+    actualFocus(date: string | null) {
+      ownerDocument.activeElement = date == null ? null : nodes.get(date);
+    },
+    resize() {
+      for (const run of resizeCallbacks) run();
+      for (const run of resizeListeners) run();
+    },
+    createNodeMock(node: any) {
+      if (node.type === "div" && node.props.className?.includes("history-bars"))
+        return container;
+      if (node.type !== "button") return {};
+      const date = node.props["aria-label"].split("：")[0];
+      if (!nodes.has(date)) {
+        nodes.set(date, {
+          ownerDocument,
+          focus: () => focusRequests.push(date),
+          blur: () =>
+            assert.fail("viewport reconciliation must not blur a button"),
+          getBoundingClientRect: () => ({
+            left:
+              100 +
+              days.findIndex((day) => day.date === date) * (barWidth + gap) -
+              left,
+            width: barWidth,
+          }),
+        });
+      }
+      return nodes.get(date);
+    },
+  };
+}
+
+const months: Day[] = Array.from({ length: 12 }, (_, index) => ({
+  date: `2026-${String(index + 1).padStart(2, "0")}-01`,
+  value: index + 1,
+}));
+const nextMonth: Day = { date: "2027-01-01", value: 13 };
+const previousMonth: Day = { date: "2025-12-01", value: 0 };
+const monthChart = (days = months) => chart(days, { monthly: true });
+
+test("R21 history: only active owns the selection inset; keyboard focus stays distinct", () => {
+  // Source-contract assertion only: computed CSS and WebView2 paint remain manual.
+  const css = readFileSync("src/styles.css", "utf8");
+  const selectionRules = [
+    ...css.matchAll(/([^{}]+)\{[^{}]*box-shadow:\s*inset[^{}]*\}/g),
+  ]
+    .map((match) => match[1].trim())
+    .filter((selector) => selector.includes("history-bars"));
+  assert.equal(selectionRules.length, 1);
+  assert.match(selectionRules[0], /\.history-bars > button\.active i$/);
+  assert.doesNotMatch(selectionRules[0], /:hover/);
+  assert.match(
+    css,
+    /\.history-bars > button:focus-visible\s*\{\s*outline: 2px solid var\(--focus-ring\);\s*outline-offset: -2px;/,
+  );
+  assert.match(css, /\.history-bars\.monthly\s*\{[^}]*overflow-anchor: none;/);
+});
+
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+  test(`R21 monthly: first layout tails once, updates only follow a reader already at the end (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        assert.equal(viewport.writes.length, 1);
+        await act(async () => viewport.resize());
+        await update(
+          view,
+          monthChart(months.map((day) => ({ ...day, value: 99 }))),
+        );
+        assert.equal(
+          viewport.writes.length,
+          1,
+          "replayed unchanged layout does not jump again",
+        );
+        let days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        viewport.container.scrollLeft = 54;
+        await act(async () => group(view).props.onScroll());
+        days = [...days, { date: "2027-02-01", value: 14 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(
+          viewport.container.scrollLeft,
+          54,
+          "reading older months stays put",
+        );
+        assert.deepEqual(viewport.focusRequests, []);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  for (const selection of ["pin", "actual-focus", "escape-focus"] as const) {
+    test(`R21 monthly: ${selection} blocks append from evicting the old date (${mode})`, async () => {
+      const viewport = monthlyViewport(months);
+      await render(
+        monthChart(),
+        concurrent,
+        async (view) => {
+          const date = months[9].date;
+          const oldLeft = viewport.container.scrollLeft;
+          if (selection === "pin") {
+            await act(async () => button(view, date).props.onClick());
+          } else {
+            viewport.actualFocus(date);
+            await act(async () => button(view, date).props.onFocus());
+            if (selection === "escape-focus") {
+              await key(button(view, date), "Escape");
+              assertDismissed(view);
+            }
+          }
+          const days = [...months, nextMonth];
+          viewport.setDays(days);
+          await update(view, monthChart(days));
+          assert.equal(viewport.container.scrollLeft, oldLeft);
+          assert.ok(viewport.node(date).getBoundingClientRect().left >= 100);
+          if (selection === "escape-focus") assertDismissed(view);
+          else assertSelected(view, date, selection === "pin");
+          if (selection !== "pin")
+            assert.equal(
+              viewport.container.ownerDocument.activeElement,
+              viewport.node(date),
+            );
+          assert.deepEqual(viewport.focusRequests, []);
+        },
+        viewport.createNodeMock,
+      );
+    });
+  }
+
+  test(`R21 monthly: rendered refs, focus requests and stale focus state are not actual focus (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await key(button(view, months[9].date), "ArrowRight");
+        assert.deepEqual(viewport.focusRequests, [months[10].date]);
+        await act(async () => button(view, months[9].date).props.onFocus());
+        // Explicitly no activeElement: an event/state or .focus() request alone is not evidence.
+        const days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R21 monthly: pending native scroll wins even when a data commit changes layout (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        viewport.container.scrollLeft = 54; // Its browser scroll event has not arrived.
+        let days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 54);
+        viewport.container.scrollLeft = 81; // Another pending scroll, then prepend.
+        days = [previousMonth, ...days];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 108);
+        // Actual focus moved the viewport without a scroll event or React focus state.
+        viewport.container.scrollLeft = 27;
+        viewport.actualFocus(months[0].date);
+        days = [...days, { date: "2027-02-01", value: 14 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 27);
+        assert.equal(
+          viewport.node(months[0].date).getBoundingClientRect().left,
+          100,
+        );
+        assert.deepEqual(viewport.focusRequests, []);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R21 monthly: prepend, simultaneous append and bar-size changes preserve the date anchor (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        viewport.container.scrollLeft = 55;
+        await act(async () => group(view).props.onScroll());
+        const anchor = months[2].date;
+        const oldPixel = viewport.node(anchor).getBoundingClientRect().left;
+        let days = [previousMonth, ...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(
+          viewport.node(anchor).getBoundingClientRect().left,
+          oldPixel,
+        );
+        assert.equal(viewport.container.scrollLeft, 82);
+        viewport.setBarWidth(30);
+        await act(async () => viewport.resize());
+        assert.equal(
+          viewport.node(anchor).getBoundingClientRect().left,
+          oldPixel,
+        );
+        days = days.slice(1); // Removing a leading month uses the same surviving identity.
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(
+          viewport.node(anchor).getBoundingClientRect().left,
+          oldPixel,
+        );
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R21 monthly: resizing preserves reading and actual focus; state commits respect native focus scrolling (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        viewport.container.scrollLeft = 54;
+        await act(async () => group(view).props.onScroll());
+        viewport.setWidth(108);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 54);
+        const date = months[5].date;
+        viewport.actualFocus(date);
+        await act(async () => button(view, date).props.onFocus());
+        viewport.setWidth(54);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 105);
+        assert.equal(
+          viewport.node(date).getBoundingClientRect().left + 24,
+          154,
+        );
+        // Browser focus may scroll before its scroll event is dispatched. A state-only
+        // render must capture that position, not restore the previous reading anchor.
+        const target = months[10].date;
+        viewport.container.scrollLeft = 240;
+        viewport.actualFocus(target);
+        await act(async () => button(view, target).props.onFocus());
+        assert.equal(viewport.container.scrollLeft, 240);
+        assertSelected(view, target);
+        viewport.container.scrollLeft = 27;
+        await act(async () => group(view).props.onScroll());
+        const days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(
+          viewport.container.scrollLeft,
+          27,
+          "manual scrolling away from focus is not undone",
+        );
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R21 monthly: zero width, empty data, reentry and daily mode are safe (${mode})`, async () => {
+    const viewport = monthlyViewport([], 0);
+    await render(
+      monthChart([]),
+      concurrent,
+      async (view) => {
+        viewport.setDays(months);
+        await update(view, monthChart());
+        assert.deepEqual(viewport.writes, []);
+        viewport.setWidth(81);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        viewport.setDays([]);
+        await update(view, monthChart([]));
+        assertDismissed(view);
+        viewport.setDays(months);
+        await update(view, monthChart());
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        await update(view, chart(months));
+        assert.equal(resizeCallbacks.size, 0);
+        viewport.container.scrollLeft = 0;
+        const days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, chart(days));
+        assert.equal(
+          viewport.container.scrollLeft,
+          0,
+          "daily mode does not manage horizontal scroll",
+        );
+      },
+      viewport.createNodeMock,
+    );
+    // Existing ref-only renderer supplies no clientWidth, rects or ownerDocument.
+    await render(monthChart(), concurrent, async (view) => {
+      await update(view, monthChart([...months, nextMonth]));
+      await update(view, monthChart([]));
+      assertDismissed(view);
+    });
+  });
+
+  test(`R21 monthly: resize fallback removes its listener on unmount (${mode})`, async () => {
+    const observer = g.ResizeObserver;
+    delete g.ResizeObserver;
+    const viewport = monthlyViewport(months);
+    try {
+      await render(
+        monthChart(),
+        concurrent,
+        async () => {
+          assert.equal(viewport.resizeListeners.size, 1);
+          viewport.setWidth(108);
+          await act(async () => viewport.resize());
+          assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        },
+        viewport.createNodeMock,
+      );
+      assert.equal(viewport.resizeListeners.size, 0);
+    } finally {
+      g.ResizeObserver = observer;
+    }
+  });
 }
 
 for (const concurrent of [false, true]) {

@@ -1,3 +1,4 @@
+#requires -Version 7.0
 # 校验**实际安装包**，而不只是源码。
 #
 # 背景（评审 P2）：v1.3.0 标签中的更新端点仍是旧仓库名，而更新检查禁止重定向；
@@ -12,6 +13,8 @@
 #
 # 注意：这里只做静态检查。真正的「检查更新能否成功」需要安装后手工点一次，
 # 脚本无法替代那一步。
+# 同一只读拒写/拒删句柄覆盖全部检查；只支持能确认身份的 Windows 本机 NTFS。
+# 哈希、PE 基本结构和仓库检索共用一个字节快照，版本资源绑定该被锁文件。
 
 param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
@@ -34,7 +37,7 @@ function Test-ReleaseFileNameVersion {
 function Test-PortableExecutableHeader {
     param([byte[]]$Bytes)
 
-    # FileVersionInfo 的空值/零值不能证明输入是 PE；先核对 DOS、PE/COFF、
+    # 版本资源的空值/零值不能证明输入是 PE；先核对 DOS、PE/COFF、
     # optional header 和 section table 的基本结构。这里只读，不加载或执行文件。
     if ($null -eq $Bytes -or $Bytes.Length -lt 64) { return $false }
     if ($Bytes[0] -ne 0x4D -or $Bytes[1] -ne 0x5A) { return $false }
@@ -93,16 +96,28 @@ function Get-PeReleaseVersionIssues {
     if ($VersionInfo.IsPreRelease) { 'PE 标记为预发行版，不能确认为源码声明的 stable 版本' }
 }
 
-$installer = Get-Item -LiteralPath $InstallerPath
-if (-not $installer.Exists) { throw "安装包不存在：$InstallerPath" }
-
-$hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Host "文件：$($installer.FullName)"
-Write-Host "大小：$([math]::Round($installer.Length / 1MB, 2)) MiB"
-Write-Host "SHA-256：$hash"
-
 $failed = $false
 $inconclusive = @()
+$snapshot = $null
+try {
+if (-not $IsWindows) { throw '实际安装包校验要求 Windows 本机 NTFS；不能在未确认锁语义的平台上给出 PASS' }
+$installer = Get-Item -LiteralPath $InstallerPath
+if (-not $installer.Exists -or $installer.PSIsContainer) { throw "安装包不是可读文件：$InstallerPath" }
+Add-Type -Path @((Join-Path $PSScriptRoot 'release-file-snapshot.cs'), (Join-Path $PSScriptRoot 'release-pe-version.cs'))
+$snapshot = [DeepSeekMonitor.ReleaseVerification.LockedFileSnapshot]::Open($installer.FullName)
+$bytes = $snapshot.Bytes
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $hash = [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+}
+finally { $sha256.Dispose() }
+# RELEASE_SNAPSHOT_TEST_BARRIER_AFTER_HASH (test copies only; no runtime bypass)
+Write-Host "输入路径：$($installer.FullName)"
+Write-Host "被锁文件：$($snapshot.LockedPath)"
+Write-Host "文件身份（NTFS volume:file index）：$($snapshot.Identity)"
+Write-Host "大小：$([math]::Round($bytes.LongLength / 1MB, 2)) MiB"
+Write-Host "SHA-256：$hash"
+
 if ($ExpectedSha256) {
     $expected = $ExpectedSha256.ToLowerInvariant()
     if ($hash -ne $expected) {
@@ -120,7 +135,6 @@ else {
 }
 
 # 在二进制中检索仓库名。NSIS 安装包内嵌了前端 bundle，字符串以 UTF-8 出现。
-$bytes = [IO.File]::ReadAllBytes($installer.FullName)
 $text = [Text.Encoding]::UTF8.GetString($bytes)
 
 $currentRepo = 'Tsuki-hash/DeepSeekMonitorWindows'
@@ -170,11 +184,17 @@ if (-not (Test-PortableExecutableHeader -Bytes $bytes)) {
 }
 else {
     try {
-        $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($installer.FullName)
-        Write-Host "PE FileVersion：$($versionInfo.FileVersion)"
-        Write-Host "PE 固定 FileVersion：$($versionInfo.FileMajorPart).$($versionInfo.FileMinorPart).$($versionInfo.FileBuildPart).$($versionInfo.FilePrivatePart)"
-        Write-Host "PE ProductVersion：$($versionInfo.ProductVersion)"
-        $peVersionIssues += @(Get-PeReleaseVersionIssues -VersionInfo $versionInfo -ExpectedVersion $packageVersion)
+        # RELEASE_SNAPSHOT_TEST_BARRIER_BEFORE_VERSION (test copies only; no runtime bypass)
+        # FileVersionInfo 可能从未锁定的 .mui 合并字符串；直接解析同一 bytes 的
+        # RT_VERSION，所有语言/字符串表均须一致，绝不重新按输入路径读取资源。
+        $versionInfos = [DeepSeekMonitor.ReleaseVerification.PeVersionSnapshot]::Read($bytes)
+        foreach ($versionInfo in $versionInfos) {
+            Write-Host "PE 版本资源：$($versionInfo.Resource)"
+            Write-Host "PE FileVersion：$($versionInfo.FileVersion)"
+            Write-Host "PE 固定 FileVersion：$($versionInfo.FileMajorPart).$($versionInfo.FileMinorPart).$($versionInfo.FileBuildPart).$($versionInfo.FilePrivatePart)"
+            Write-Host "PE ProductVersion：$($versionInfo.ProductVersion)"
+            $peVersionIssues += @(Get-PeReleaseVersionIssues -VersionInfo $versionInfo -ExpectedVersion $packageVersion)
+        }
     }
     catch {
         $peVersionIssues += "无法读取或核对 PE 版本资源：$($_.Exception.Message)"
@@ -190,6 +210,15 @@ else {
     Write-Host "✅ PE 文件版本资源与源码声明版本一致（仅限静态元数据）" -ForegroundColor Green
 }
 Write-Host "版本名与 PE 元数据均不能证明安装包绑定当前提交，也不代表安装/更新验收通过。"
+}
+catch {
+    # 锁冲突、读取/身份确认失败和不支持的平台均失败封闭。
+    # 保留已经发现的确定错误，不能因后续 I/O 故障把 FAIL 降为 INCONCLUSIVE。
+    $inconclusive += "无法完成同一安装包快照的校验：$($_.Exception.Message)"
+}
+finally {
+    if ($null -ne $snapshot) { $snapshot.Dispose() }
+}
 
 if ($failed) {
     Write-Host "`n结论：FAIL。发现确定的错误，不能放行。" -ForegroundColor Red

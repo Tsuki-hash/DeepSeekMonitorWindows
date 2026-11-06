@@ -545,7 +545,7 @@ lines.push(
   "- Rust 发布门禁必须在 Windows 本机用明确 MSVC 目标执行；逐项验证 DPAPI、迁移、同秘密重加密语义身份、凭据提交版本和缓存监听。非 Windows、跳过、过滤或缺失必需测试均不构成发布 PASS。",
 );
 lines.push(
-  "- Rust executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。发行版本纯函数回归单独标记 assertions，要求文件名、PE 头、版本资源三组非零断言及唯一完成汇总；它不读取或验证真实安装包。NOT RUN 的原始 passed 不纳入可信通过计数。",
+  "- Rust executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。发行版本纯函数回归单独标记 assertions，要求文件名、PE 头、版本规则、PE 字节解析四组非零断言及唯一完成汇总；它不读取或验证真实安装包。NOT RUN 的原始 passed 不纳入可信通过计数。Windows 文件快照双屏障主流程回归仍是必需的本机发行验收，源码门禁不能代替它。",
 );
 lines.push(
   "- 多工具 Agent 统计已移除：引擎集成、WSL/SQLite 工具扫描与目录链接能力探针不再执行，不计为 PASS 或 NOT RUN。",
