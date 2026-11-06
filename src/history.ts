@@ -120,15 +120,47 @@ const fields = [
 ] as const;
 export function sumModels(models: RawModelUsage[]): RawModelUsage[] {
   const sums = new Map<string, RawModelUsage>();
+  // 复评 F14：计数按 Token 规则（安全整数、非负）保护，金额只要求有限 ——
+  // 不能把 Token 的整数约束套到金额上。溢出时该字段置 null 并留下
+  // dataWarning，而不是返回一个超过 MAX_SAFE_INTEGER 的伪值。
+  const overflowed = new Set<string>();
+  const addCount = (
+    existing: number | null | undefined,
+    incoming: number | null | undefined,
+  ): number | null => {
+    if (existing == null || incoming == null) return null;
+    const sum = existing + incoming;
+    if (!Number.isSafeInteger(sum) || sum < 0) return null;
+    return sum;
+  };
   for (const model of models) {
     const existing = sums.get(model.model);
-    if (!existing) sums.set(model.model, { ...model });
-    else
-      for (const field of fields)
-        existing[field] =
-          existing[field] == null || model[field] == null
+    if (!existing) {
+      sums.set(model.model, { ...model });
+      continue;
+    }
+    for (const field of fields) {
+      const next =
+        field === "cost"
+          ? // 金额：只要有限即可（允许小数），非有限或缺失才是未知。
+            existing[field] == null || model[field] == null
             ? null
-            : existing[field]! + model[field]!;
+            : Number.isFinite(existing[field]! + model[field]!)
+              ? existing[field]! + model[field]!
+              : null
+          : addCount(existing[field], model[field]);
+      if (next == null && existing[field] != null && model[field] != null)
+        overflowed.add(model.model);
+      existing[field] = next;
+    }
+    // 复评 F14：后出现条目的质量警告必须传播到合并结果 ——
+    // 旧实现只保留首条对象的 warning，后续 warning 静默丢失。
+    if (model.dataWarning && !existing.dataWarning)
+      existing.dataWarning = model.dataWarning;
+  }
+  for (const model of sums.values()) {
+    if (overflowed.has(model.model) && !model.dataWarning)
+      model.dataWarning = "跨模型合计超出安全整数，相关字段保留为未知";
   }
   return [...sums.values()];
 }
@@ -176,12 +208,40 @@ export function historyExport(
     date: row.date,
     ...cleanModel(row.model),
   }));
-  const monthly = snapshot.months.map((month) => ({
+  // 复评 F06：`monthly` 必须与顶层 from/to 声称的**窗口口径**一致 ——
+  // 旧实现直接取 API 返回的整月 rawModels，于是「近 30 天」导出的
+  // daily/CSV 合计 3000 而 monthly 合计 3500（窗口外日期也被算进去），
+  // 且 schema 没有标注两者口径不同。现在：
+  // - `monthly`：按窗口内的 daily 重算的按月聚合（与页面/CSV 同源）；
+  // - `sourceMonthlySnapshots`：原始整月来源数据，**显式**标注完整月边界
+  //   与 `aggregationScope: "full-source-month"`，消费者不会误当窗口合计。
+  const monthly = snapshot.months.map((month) => {
+    const inWindow = snapshot.rows.filter(
+      (row) => row.date.slice(0, 7) === month.month,
+    );
+    return {
+      month: month.month,
+      scope: "window",
+      aggregationScope: "selected-window" as const,
+      // 复评 F06：窗口内该月的日期覆盖情况显式给出，缺失日期不折算成 0。
+      coveredDates: inWindow.length,
+      missingDates: snapshot.missingDates.filter((date) =>
+        date.startsWith(month.month),
+      ),
+      sourceSchemaVersion: month.usage.schemaVersion ?? 1,
+      modelMappingVersion: month.usage.modelMappingVersion ?? null,
+      fetchedAt: new Date(month.fetchedAt).toISOString(),
+      warnings: month.usage.warnings ?? [],
+      models: sumModels(inWindow.map((row) => row.model)).map(cleanModel),
+    };
+  });
+  const sourceMonthlySnapshots = snapshot.months.map((month) => ({
     month: month.month,
-    sourceSchemaVersion: month.usage.schemaVersion ?? 1,
-    modelMappingVersion: month.usage.modelMappingVersion ?? null,
+    scope: "full-source-month",
+    aggregationScope: "full-source-month" as const,
+    fullMonthFrom: `${month.month}-01`,
+    fullMonthTo: `${month.month}-31`,
     fetchedAt: new Date(month.fetchedAt).toISOString(),
-    warnings: month.usage.warnings ?? [],
     models: (month.usage.rawModels ?? []).map(cleanModel),
   }));
   const header = [
@@ -226,7 +286,11 @@ export function historyExport(
       String(a[1]).localeCompare(String(b[1])),
   );
   return {
-    json: JSON.stringify({ ...metadata, daily, monthly }, null, 2),
+    json: JSON.stringify(
+      { ...metadata, daily, monthly, sourceMonthlySnapshots },
+      null,
+      2,
+    ),
     csv:
       "\uFEFF" +
       [header, ...records]

@@ -83,7 +83,10 @@ test("导出白名单排除凭据，保留未知与查询来源", () => {
   const result = historyExport(snapshot, 0, true);
   assert.equal(result.json.includes("TOP_SECRET"), false);
   const parsed = JSON.parse(result.json);
-  assert.equal(parsed.monthly[0].models[0].cost, null);
+  // 复评 F06：原始整月来源数据改名为 sourceMonthlySnapshots；
+  // 未知值（cost=null）与白名单字段在这条路径上同样必须保留。
+  assert.equal(parsed.sourceMonthlySnapshots[0].models[0].cost, null);
+  assert.equal(parsed.monthly[0].aggregationScope, "selected-window");
   assert.equal(parsed.currency, "CNY");
   assert.equal(parsed.stale, true);
   assert.ok(result.csv.startsWith("\uFEFF"));
@@ -238,4 +241,130 @@ test("历史展示隐藏明确零用量，不隐藏未知、费用、请求或�
   ])
     assert.equal(isUnusedHistoryModel({ ...zero, ...changed }), false);
   assert.equal(isUnusedHistoryModel({ ...zero, totalTokens: 123 }), false);
+});
+
+// ---------- 第七轮复评 F06：JSON 的 monthly 必须是窗口口径 ----------
+
+const usageModel = (
+  tokens: number,
+  cost: number | null = 0,
+): RawModelUsage => ({
+  model: "deepseek-flash",
+  groupKey: "flash",
+  totalTokens: tokens,
+  requestCount: 1,
+  cacheHitTokens: 0,
+  cacheMissTokens: 0,
+  responseTokens: tokens,
+  otherTokens: 0,
+  cost,
+});
+
+const usageMonth = (
+  month: string,
+  total: number,
+  days: Array<[string, number]>,
+) => ({
+  month,
+  fetchedAt: Date.parse("2026-11-04T08:00:00Z"),
+  usage: {
+    schemaVersion: 2,
+    models: [],
+    rawModels: [usageModel(total)],
+    monthCost: 0,
+    days: days.map(([date, tokens]) => ({
+      date,
+      rawModels: [usageModel(tokens)],
+    })),
+  } as unknown as UsageResult,
+});
+
+test("F06：近30天 JSON 的 monthly 与页面/CSV 窗口合计一致", () => {
+  const now = Date.parse("2026-11-04T08:00:00Z");
+  const snapshot = buildHistory(
+    historyWindow("30days", "2026-11-04"),
+    [
+      // 10 月整月 3100，其中 10-01 的 500 在窗口外。
+      usageMonth("2026-10", 3100, [
+        ["2026-10-01", 500],
+        ["2026-10-06", 2600],
+      ]),
+      usageMonth("2026-11", 400, [["2026-11-04", 400]]),
+    ],
+    [],
+  );
+  const pageTokens = sumModels(snapshot.rows.map((row) => row.model))[0]
+    .totalTokens;
+  const json = JSON.parse(historyExport(snapshot, now).json);
+  const monthlyTokens = json.monthly
+    .flatMap((month: { models: RawModelUsage[] }) => month.models)
+    .reduce(
+      (sum: number, model: RawModelUsage) => sum + (model.totalTokens ?? 0),
+      0,
+    );
+  const dailyTokens = json.daily.reduce(
+    (sum: number, row: RawModelUsage) => sum + (row.totalTokens ?? 0),
+    0,
+  );
+  assert.equal(pageTokens, 3000, "页面合计只含窗口内日期");
+  assert.equal(dailyTokens, 3000, "daily 与页面同源");
+  assert.equal(
+    monthlyTokens,
+    3000,
+    "monthly 必须与窗口口径一致，不能是整月 3500",
+  );
+  for (const month of json.monthly)
+    assert.equal(month.aggregationScope, "selected-window");
+  // 原始整月来源必须显式独立标记，消费者不会误当窗口合计。
+  const source = json.sourceMonthlySnapshots;
+  assert.ok(source.length > 0, "原始来源月快照保留但独立命名");
+  for (const month of source) {
+    assert.equal(month.aggregationScope, "full-source-month");
+    assert.equal(month.scope, "full-source-month");
+  }
+  assert.equal(
+    source
+      .flatMap((month: { models: RawModelUsage[] }) => month.models)
+      .reduce(
+        (sum: number, model: RawModelUsage) => sum + (model.totalTokens ?? 0),
+        0,
+      ),
+    3500,
+    "原始来源保留整月数值，但与窗口口径分开标注",
+  );
+});
+
+// ---------- 第七轮复评 F14：安全整数与 warning 传播 ----------
+
+test("F14：跨模型合计溢出为未知而不是不安全整数", () => {
+  const summed = sumModels([usageModel(9007199254740990), usageModel(3)]);
+  assert.equal(
+    summed[0].totalTokens,
+    null,
+    "超过 MAX_SAFE_INTEGER 的合计必须置未知",
+  );
+  assert.ok(summed[0].dataWarning, "溢出必须留下质量提示，而不是静默返回伪值");
+  // 未溢出时正常相加。
+  const normal = sumModels([usageModel(100), usageModel(20)]);
+  assert.equal(normal[0].totalTokens, 120);
+});
+
+test("F14：金额保留小数且不套用整数规则", () => {
+  const summed = sumModels([usageModel(10, 0.1), usageModel(10, 0.2)]);
+  assert.ok(
+    Math.abs((summed[0].cost ?? 0) - 0.3) < 1e-9,
+    "金额按有限数规则相加，允许小数",
+  );
+});
+
+test("F14：后出现条目的质量警告传播到合并结果", () => {
+  const summed = sumModels([
+    usageModel(10),
+    { ...usageModel(10), dataWarning: "later-month-warning" },
+  ]);
+  assert.equal(
+    summed[0].dataWarning,
+    "later-month-warning",
+    "后续条目的 warning 不能被丢弃",
+  );
 });

@@ -21,7 +21,19 @@ export function AlertSettings({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [message, setMessage] = React.useState("");
-  const control = React.useRef({ active: true, sequence: 0 });
+  // 复评 F07：**读取代际与写操作所有权分开**。
+  // 旧实现把 save 与 reload 共用一个 sequence，且 save 失败时在 catch 里
+  // 启动 reload —— reload 在第一个 await 前就递增 sequence，于是 save 的
+  // finally 发现序号已变、不再 `setBusy(false)`；reload 自己也不负责清 busy，
+  // 结果整个提醒表单永久停在「处理中…」。
+  // 现在：`readSequence` 只保护读取回填，`writeSequence` 只保护写入的
+  // busy/成功/错误；reload 永不触碰 busy，save 的 finally 只按自己的写令牌
+  // 释放 busy。
+  const control = React.useRef({
+    active: true,
+    readSequence: 0,
+    writeSequence: 0,
+  });
   const accept = React.useCallback((value: AlertStatus, reset: boolean) => {
     setStatus(value);
     if (reset) {
@@ -33,13 +45,13 @@ export function AlertSettings({
   }, []);
   const reload = React.useCallback(
     async (reset = false) => {
-      const sequence = ++control.current.sequence;
+      const sequence = ++control.current.readSequence;
       try {
         const value = await invoke<AlertStatus>("get_alert_status");
-        if (control.current.active && sequence === control.current.sequence)
+        if (control.current.active && sequence === control.current.readSequence)
           accept(value, reset);
       } catch (failure) {
-        if (control.current.active && sequence === control.current.sequence)
+        if (control.current.active && sequence === control.current.readSequence)
           setError(errorMessage(failure));
       }
     },
@@ -51,7 +63,8 @@ export function AlertSettings({
     void reload(true);
     return () => {
       current.active = false;
-      current.sequence++;
+      current.readSequence++;
+      current.writeSequence++;
     };
   }, [reload]);
   const ready = status !== null;
@@ -87,12 +100,15 @@ export function AlertSettings({
       return false;
     }
     setBusy(true);
-    const sequence = ++control.current.sequence;
+    const sequence = ++control.current.writeSequence;
     try {
       const value = await invoke<AlertStatus>("save_alert_options", {
         options,
       });
-      if (control.current.active && sequence === control.current.sequence) {
+      if (
+        control.current.active &&
+        sequence === control.current.writeSequence
+      ) {
         accept(value, true);
         setMessage("提醒设置已保存");
         return true;
@@ -100,14 +116,19 @@ export function AlertSettings({
       // 组件已卸载或更新操作已取代当前保存：不算当前设置实例的成功。
       return false;
     } catch (failure) {
-      if (control.current.active && sequence === control.current.sequence) {
+      if (
+        control.current.active &&
+        sequence === control.current.writeSequence
+      ) {
         setError(errorMessage(failure));
+        // 复评 F07：回读**不得**影响写操作的 busy —— 它有自己的读取代际。
         void reload();
       }
       return false;
     } finally {
-      // R01：旧保存迟到时不得解除新保存的 busy。
-      if (control.current.active && sequence === control.current.sequence)
+      // 复评 F07：只按**写令牌**释放自己的 busy。旧实现用共享序号，
+      // catch 里的 reload 一递增就永远进不来，表单卡在「处理中…」。
+      if (control.current.active && sequence === control.current.writeSequence)
         setBusy(false);
     }
   };
@@ -138,17 +159,23 @@ export function AlertSettings({
     setBusy(true);
     setError("");
     setMessage("");
-    ++control.current.sequence;
+    // 复评 F07：测试通知也是写操作，用写令牌保护自己的 busy。
+    const sequence = ++control.current.writeSequence;
     try {
       await invoke("test_alert_notification");
-      if (control.current.active) {
+      if (
+        control.current.active &&
+        sequence === control.current.writeSequence
+      ) {
         setMessage("已提交 Windows，请查看通知中心");
         void reload();
       }
     } catch (failure) {
-      if (control.current.active) setError(errorMessage(failure));
+      if (control.current.active && sequence === control.current.writeSequence)
+        setError(errorMessage(failure));
     } finally {
-      if (control.current.active) setBusy(false);
+      if (control.current.active && sequence === control.current.writeSequence)
+        setBusy(false);
     }
   };
   const change = (value: Partial<AlertOptions>) => {

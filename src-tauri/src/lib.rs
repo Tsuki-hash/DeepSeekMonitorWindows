@@ -73,6 +73,7 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
+            commands::confirm_quit,
             commands::is_main_window_visible,
             commands::set_panel_mode,
             commands::get_app_config,

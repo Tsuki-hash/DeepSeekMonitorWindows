@@ -28,7 +28,14 @@ export function LocalSourceSettings({
   const [error, setError] = React.useState("");
   const [message, setMessage] = React.useState("");
   const [wsl, setWsl] = React.useState<WslStatus | null>(null);
+  // 复评 F10：目录读取/保存 与 WSL 查询使用**独立**的请求所有权。
+  // 旧实现共用 owner.sequence：初次 get_local_sources 还在途时点「读取 WSL」，
+  // WSL 递增同一序号 → 随后成功的目录配置被当旧结果丢弃，options 永远为
+  // null（编辑/添加/保存全禁用），且没有错误时连重试入口都不出现。
   const owner = React.useRef({ active: true, sequence: 0 });
+  const wslOwner = React.useRef({ active: true, sequence: 0 });
+  // 目录读取的显式加载态：失败时总有可达的重试入口，不被无关查询抹除。
+  const [loadingOptions, setLoadingOptions] = React.useState(true);
   const accept = React.useCallback((value: SourceOptions) => {
     setOptions(value);
     setIncludeDefault(value.includeDefault);
@@ -37,24 +44,32 @@ export function LocalSourceSettings({
   }, []);
   const reload = React.useCallback(async () => {
     const sequence = ++owner.current.sequence;
+    setLoadingOptions(true);
     try {
       const value = await invoke<SourceOptions>("get_local_sources");
       if (owner.current.active && sequence === owner.current.sequence) {
         accept(value);
         setError("");
+        setLoadingOptions(false);
       }
     } catch (failure) {
-      if (owner.current.active && sequence === owner.current.sequence)
+      if (owner.current.active && sequence === owner.current.sequence) {
         setError(errorMessage(failure));
+        setLoadingOptions(false);
+      }
     }
   }, [accept]);
   React.useEffect(() => {
     const current = owner.current;
+    const wslState = wslOwner.current;
     current.active = true;
+    wslState.active = true;
     void reload();
     return () => {
       current.active = false;
       current.sequence++;
+      wslState.active = false;
+      wslState.sequence++;
     };
   }, [reload]);
   const dirty =
@@ -115,18 +130,21 @@ export function LocalSourceSettings({
   }, [onSaveRequested]);
   const listWsl = async () => {
     setBusy(true);
-    // 复评 Q04：listWsl 与 save 共享 busy，同样按序号防旧操作迟到解除。
-    const sequence = ++owner.current.sequence;
+    // 复评 F10：WSL 查询只用**自己的**代际，绝不递增目录读取的序号 ——
+    // 否则一次 WSL 查询就会作废在途的目录初读。
+    const sequence = ++wslOwner.current.sequence;
     setError("");
     setMessage("");
     setWsl(null);
     try {
       const value = await invoke<WslStatus>("list_running_wsl");
-      if (owner.current.active) setWsl(value);
+      if (wslOwner.current.active && sequence === wslOwner.current.sequence)
+        setWsl(value);
     } catch (failure) {
-      if (owner.current.active) setError(errorMessage(failure));
+      if (wslOwner.current.active && sequence === wslOwner.current.sequence)
+        setError(errorMessage(failure));
     } finally {
-      if (owner.current.active && sequence === owner.current.sequence)
+      if (wslOwner.current.active && sequence === wslOwner.current.sequence)
         setBusy(false);
     }
   };
@@ -267,7 +285,9 @@ export function LocalSourceSettings({
         </button>
         <button
           className="secondary"
-          disabled={busy}
+          // 复评 F10：目录配置还没读到时禁用 WSL 查询，避免在「不知道
+          // 当前设置」的状态下发起无关查询；读取完成后自动可用。
+          disabled={busy || !options}
           onClick={() => void listWsl()}
         >
           读取运行中的 WSL
@@ -281,7 +301,12 @@ export function LocalSourceSettings({
           {error}
         </p>
       )}
-      {!options && error && (
+      {loadingOptions && !options && (
+        <p className="muted" role="status">
+          正在读取目录设置…
+        </p>
+      )}
+      {!options && !loadingOptions && (
         <div className="disclosure-actions">
           <button
             className="secondary"

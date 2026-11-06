@@ -11,6 +11,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyReadConfig,
+  getCommitRevision,
   getCommittedConfig,
   setCommittedConfig,
   subscribeCommittedConfig,
@@ -63,5 +65,55 @@ test("R10：取消订阅后不再收到通知_取消可重复", () => {
   off();
   setCommittedConfig(config({ usageTokenConfigured: true }));
   assert.equal(calls, 0);
+  setCommittedConfig(null);
+});
+
+// ---------- 第七轮复评 F08：旧读取不得回滚新提交 ----------
+
+test("F08：读取发起后有新提交_旧读取结果被丢弃", () => {
+  setCommittedConfig(config());
+  // 旧 GET 发起：捕获当时的提交代际。
+  const startedAt = getCommitRevision();
+  // 用户在此期间保存了凭据（提交递增）。
+  setCommittedConfig(config({ apiKeyConfigured: true }));
+  // 旧 GET 这时才返回「未配置」——必须被拒绝。
+  const accepted = applyReadConfig(config(), startedAt);
+  assert.equal(accepted, false, "旧读取不得覆盖新提交");
+  assert.equal(
+    getCommittedConfig()?.apiKeyConfigured,
+    true,
+    "已保存的凭据状态必须保留",
+  );
+  setCommittedConfig(null);
+});
+
+test("F08：读取发起后无新提交_读取结果正常接受", () => {
+  setCommittedConfig(null);
+  const startedAt = getCommitRevision();
+  const accepted = applyReadConfig(
+    config({ usageTokenConfigured: true }),
+    startedAt,
+  );
+  assert.equal(accepted, true);
+  assert.equal(getCommittedConfig()?.usageTokenConfigured, true);
+  setCommittedConfig(null);
+});
+
+test("F08：两个写入交错_提交后发起的读取仍然有效", () => {
+  setCommittedConfig(config());
+  const beforeCommit = getCommitRevision();
+  setCommittedConfig(config({ apiKeyConfigured: true }));
+  const afterCommit = getCommitRevision();
+  // 提交**之前**发起的读取被丢弃（会回滚新提交）。
+  assert.equal(applyReadConfig(config(), beforeCommit), false);
+  // 提交**之后**发起的读取是新鲜的，允许接受（它反映更晚的后端状态）。
+  assert.equal(
+    applyReadConfig(
+      config({ apiKeyConfigured: true, usageTokenConfigured: true }),
+      afterCommit,
+    ),
+    true,
+  );
+  assert.equal(getCommittedConfig()?.usageTokenConfigured, true);
   setCommittedConfig(null);
 });

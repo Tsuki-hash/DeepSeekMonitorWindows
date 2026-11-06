@@ -14,6 +14,8 @@ import {
   isCurrentApiKeyOperation,
 } from "./api-key-operation";
 import {
+  applyReadConfig,
+  getCommitRevision,
   getCommittedConfig,
   setCommittedConfig,
   subscribeCommittedConfig,
@@ -126,28 +128,42 @@ export function useSettingsState(handlers: {
     config?.configPath ?? "%APPDATA%\\DeepSeekMonitorWindows\\config.json";
 
   React.useEffect(() => {
+    // 复评 F09：订阅时必须把**全部**由配置派生的控件状态一起收敛 ——
+    // 旧实现只 setConfig，自动刷新/间隔/自启这些局部 state 仍停留在旧值，
+    // 于是后端已开启自动刷新、设置页开关却显示关闭（再点一次还会重复开启）。
+    const syncFromCommitted = (next: AppConfig) => {
+      setConfig(next);
+      setRefresh(next.refreshIntervalSeconds || 60);
+      setAutoRefresh(next.autoRefreshEnabled);
+      setAutostart(next.autostart);
+      setStatus(
+        next.apiKeyConfigured
+          ? next.apiKeyPreview
+            ? `已配置 ${next.apiKeyPreview}`
+            : "API Key 已配置"
+          : "未配置 API Key",
+      );
+      setUsageStatus(
+        next.usageTokenConfigured ? "用量 Token 已配置" : "未配置用量 Token",
+      );
+    };
     const unsubscribe = subscribeCommittedConfig(() => {
       const committed = getCommittedConfig();
-      if (committed) setConfig(committed);
+      if (committed) syncFromCommitted(committed);
     });
+    // 复评 F08：挂载时的读取只是**读取**，不能无条件覆盖已提交配置。
+    // 发起时捕获提交代际，返回时若已有新提交（保存/清除/事件）就丢弃，
+    // 避免「旧 GET 最后到达」把已保存凭据回滚成未配置。
+    const startedAt = getCommitRevision();
     void invoke<AppConfig>("get_app_config")
       .then((nextConfig) => {
-        setCommittedConfig(nextConfig);
-        setRefresh(nextConfig.refreshIntervalSeconds || 60);
-        setAutoRefresh(nextConfig.autoRefreshEnabled);
-        setAutostart(nextConfig.autostart);
-        setStatus(
-          nextConfig.apiKeyConfigured
-            ? nextConfig.apiKeyPreview
-              ? `已配置 ${nextConfig.apiKeyPreview}`
-              : "API Key 已配置"
-            : "未配置 API Key",
-        );
-        setUsageStatus(
-          nextConfig.usageTokenConfigured
-            ? "用量 Token 已配置"
-            : "未配置用量 Token",
-        );
+        if (!applyReadConfig(nextConfig, startedAt)) {
+          // 已有更新的提交：用当前已提交配置收敛，不使用这份过期读取。
+          const committed = getCommittedConfig();
+          if (committed) syncFromCommitted(committed);
+          return;
+        }
+        syncFromCommitted(nextConfig);
       })
       .catch((error) => {
         // 只有"根本没有 Tauri IPC"才是浏览器预览，属预期情况；真机上失败一律是真实错误，

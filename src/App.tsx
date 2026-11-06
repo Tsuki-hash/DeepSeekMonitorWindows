@@ -42,7 +42,11 @@ import { attemptLeave, useLeaveGuard } from "./leave-guard";
 import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
 import { LeavePromptDialog } from "./components/LeavePromptDialog";
-import { setCommittedConfig } from "./config-store";
+import {
+  applyReadConfig,
+  getCommitRevision,
+  getCommittedConfig,
+} from "./config-store";
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
@@ -309,11 +313,25 @@ function App() {
   // 配置状态必须能被重新读取：保存/清除凭据、开启本地统计后，
   // 首次引导与历史页的恢复文案都依赖它（复评 F12）。
   const reloadConfig = React.useCallback(() => {
+    // 复评 F08：App 的读取同样受提交代际约束 —— 旧 GET 迟到时不得把
+    // autoRefreshEnabled/refreshIntervalSeconds 回退成旧值（那会影响本会话调度）。
+    const startedAt = getCommitRevision();
     return invoke<AppConfig>("get_app_config")
       .then((config) => {
-        // 复评 R10：已提交配置写入共享 store，跨设置页卸载/重挂载的
-        // 当前实例据此收敛，而不是各自停留在旧快照。
-        setCommittedConfig(config);
+        if (!applyReadConfig(config, startedAt)) {
+          // 已有更新的提交：用已提交配置收敛，不使用这份过期读取。
+          const committed = getCommittedConfig();
+          if (committed) {
+            setRefreshIntervalSeconds(committed.refreshIntervalSeconds || 60);
+            setAutoRefreshEnabled(committed.autoRefreshEnabled);
+            setConfigSnapshot({
+              apiKeyConfigured: committed.apiKeyConfigured,
+              usageTokenConfigured: committed.usageTokenConfigured,
+            });
+            return committed;
+          }
+          return null;
+        }
         setRefreshIntervalSeconds(config.refreshIntervalSeconds || 60);
         setAutoRefreshEnabled(config.autoRefreshEnabled);
         setConfigSnapshot({
@@ -455,6 +473,23 @@ function App() {
     },
     [leaveBlocker],
   );
+
+  // 复评 F11：托盘「退出」不再直接结束进程 —— 它先唤出窗口并发出唯一
+  // quit intent，这里把它当作一次导航意图交给草稿会话：无草稿直接退出，
+  // 有草稿则三选一，保存/放弃成功后才由 confirm_quit 真正退出。
+  React.useEffect(() => {
+    const confirmQuit = () => {
+      void invoke("confirm_quit").catch(() => {
+        // 浏览器预览没有 Tauri IPC。
+      });
+    };
+    const unlisten = listen("quit-requested", () =>
+      navigate(() => confirmQuit()),
+    );
+    return () => {
+      void unlisten.then((off) => off()).catch(() => undefined);
+    };
+  }, [navigate]);
 
   const decideLeave = React.useCallback(
     (decision: LeaveDecision) => {

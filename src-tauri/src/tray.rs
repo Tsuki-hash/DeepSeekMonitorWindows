@@ -179,6 +179,10 @@ fn position_near_tray(window: &WebviewWindow) -> tauri::Result<()> {
 /// 把主面板当前物理位置写入配置（隐藏到托盘与退出时调用），供下次唤出/启动时
 /// 恢复到用户拖动后停留的位置。位置记忆是体验优化而非关键数据：任何失败都
 /// 静默忽略，不影响显隐主流程。
+pub(crate) fn persist_position_for_exit(window: &WebviewWindow) {
+    persist_main_window_position(window);
+}
+
 fn persist_main_window_position(window: &WebviewWindow) {
     let Ok(position) = window.outer_position() else {
         return;
@@ -251,6 +255,26 @@ pub(crate) fn hide_main_window_inner(window: &WebviewWindow) -> Result<(), Strin
     Ok(())
 }
 
+/// 复评 F11：退出意图事件 —— 托盘退出不再直接 `app.exit(0)`。
+///
+/// 旧实现从托盘右键「退出」直接结束进程，前端已经建立的
+/// 「保存/放弃/留在此页」草稿协商完全被绕过：未保存的提醒阈值或采集目录
+/// 被静默丢弃。现在托盘先唤出主窗口、发出**唯一** quit intent，由前端
+/// 草稿会话处理；用户确认（无草稿 / 已保存 / 已放弃）后由受主窗口权限
+/// 限制的 `confirm_quit` 命令真正退出。
+pub(crate) const EVENT_QUIT_REQUESTED: &str = "quit-requested";
+
+/// 复评 F11：请求退出 —— 唤出窗口并交给前端协商。
+pub(crate) fn request_quit(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        // 没有主窗口可协商（极端情况）：保持原行为，避免退出无界等待。
+        app.exit(0);
+        return;
+    };
+    show_main_window(&window);
+    let _ = window.emit(EVENT_QUIT_REQUESTED, ());
+}
+
 /// 装配托盘图标与菜单（lib.rs 的 setup 调用）。
 pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "显示主面板", true, None::<&str>)?;
@@ -273,11 +297,8 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 }
             }
             "quit" => {
-                // 退出前记住主面板位置，下次启动回到原位
-                if let Some(window) = app.get_webview_window("main") {
-                    persist_main_window_position(&window);
-                }
-                app.exit(0);
+                // 复评 F11：先协商草稿，不再直接结束进程。
+                request_quit(app);
             }
             _ => {}
         })

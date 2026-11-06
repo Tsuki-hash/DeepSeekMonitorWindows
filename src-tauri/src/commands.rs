@@ -547,6 +547,19 @@ pub(crate) fn hide_main_window(window: WebviewWindow) -> Result<(), String> {
     hide_main_window_inner(&window)
 }
 
+/// 复评 F11：前端完成草稿协商后由主窗口确认退出。
+///
+/// 托盘「退出」只发 quit intent（`tray::request_quit`），真正结束进程走这里 ——
+/// 受 `require_main` 限制，只能由主窗口调用；无草稿或用户已保存/放弃时才到达。
+#[tauri::command]
+pub(crate) fn confirm_quit(window: WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_main(&window)?;
+    // 退出前记住主面板位置，下次启动回到原位。
+    crate::tray::persist_position_for_exit(&window);
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) fn is_main_window_visible(window: WebviewWindow) -> Result<bool, String> {
     require_main(&window)?;
