@@ -11,11 +11,13 @@ export type LocalDataOverview = {
   archiveEntries: number;
   retentionEntries: number;
   retentionBytes: number;
-  engineCacheBytes: number;
+  /** null 表示读取失败或超出预算：显示「未知」，不能显示 0 KiB。 */
+  engineCacheBytes: number | null;
   engineCacheMayHoldTitles: boolean;
 };
 
-const kib = (bytes: number) => `${(bytes / 1024).toFixed(0)} KiB`;
+const kib = (bytes: number | null) =>
+  bytes == null ? "未知" : `${(bytes / 1024).toFixed(0)} KiB`;
 
 /**
  * 统一的本机数据管理入口。
