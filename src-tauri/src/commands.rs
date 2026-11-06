@@ -136,23 +136,64 @@ pub(crate) struct LocalDataOverview {
     archive_entries: usize,
     retention_entries: usize,
     retention_bytes: u64,
-    engine_cache_bytes: u64,
+    /// `None` 表示读取失败或超出扫描预算 —— 不能显示成 0 KiB。
+    engine_cache_bytes: Option<u64>,
     /// 引擎缓存可能包含源会话标题；停止采集不代表缓存被删。
     engine_cache_may_hold_titles: bool,
 }
 
-fn directory_size(path: &std::path::Path) -> u64 {
-    // 只统计一层目录内的普通文件，避免递归遍历大目录拖慢界面。
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.metadata().ok())
-                .filter(|meta| meta.is_file())
-                .map(|meta| meta.len())
-                .sum()
-        })
-        .unwrap_or(0)
+/// 引擎缓存大小的统计结果。
+///
+/// 复评 F13：缓存实际分布在「来源子目录」里，只看根目录会误报 0 KiB，
+/// 让用户以为没有保留任何缓存。同时读取失败不能折算成 0 —— 那是「未知」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheSize {
+    Known(u64),
+    Unknown,
+}
+
+const CACHE_SCAN_MAX_ENTRIES: usize = 4096;
+const CACHE_SCAN_MAX_DEPTH: usize = 4;
+
+fn directory_size(path: &std::path::Path) -> CacheSize {
+    // 有预算地递归统计：限制条目数与深度，且不跟随符号链接/junction，
+    // 避免为了显示大小反而引入卡顿或越界扫描。
+    fn walk(dir: &std::path::Path, depth: usize, entries_left: &mut usize) -> Result<u64, ()> {
+        if depth > CACHE_SCAN_MAX_DEPTH || *entries_left == 0 {
+            return Ok(0);
+        }
+        let reader = std::fs::read_dir(dir).map_err(|_| ())?;
+        let mut total = 0u64;
+        for entry in reader {
+            if *entries_left == 0 {
+                return Err(());
+            }
+            *entries_left -= 1;
+            let entry = entry.map_err(|_| ())?;
+            let file_type = entry.file_type().map_err(|_| ())?;
+            // 不跟随链接：junction/symlink 可能指向任意位置。
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                total = total.saturating_add(walk(&entry.path(), depth + 1, entries_left)?);
+            } else if file_type.is_file() {
+                let meta = entry.metadata().map_err(|_| ())?;
+                total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(total)
+    }
+    match std::fs::metadata(path) {
+        // 目录不存在：确实是 0 字节缓存（不是读取失败）。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheSize::Known(0),
+        Err(_) => CacheSize::Unknown,
+        Ok(meta) if !meta.is_dir() => CacheSize::Unknown,
+        Ok(_) => {
+            let mut budget = CACHE_SCAN_MAX_ENTRIES;
+            walk(path, 0, &mut budget).map_or(CacheSize::Unknown, CacheSize::Known)
+        }
+    }
 }
 
 fn engine_cache_path() -> Result<std::path::PathBuf, String> {
@@ -182,10 +223,13 @@ pub(crate) fn get_local_data_overview(
             .unwrap_or(0),
         retention_entries: capacity.as_ref().map(|value| value.entries).unwrap_or(0),
         retention_bytes: capacity.as_ref().map(|value| value.bytes).unwrap_or(0),
-        engine_cache_bytes: engine_cache_path()
-            .ok()
-            .map(|path| directory_size(&path))
-            .unwrap_or(0),
+        engine_cache_bytes: match engine_cache_path() {
+            Ok(path) => match directory_size(&path) {
+                CacheSize::Known(bytes) => Some(bytes),
+                CacheSize::Unknown => None,
+            },
+            Err(_) => None,
+        },
         engine_cache_may_hold_titles: true,
     })
 }
@@ -202,18 +246,34 @@ pub(crate) fn clear_local_engine_cache(
 ) -> Result<(), String> {
     require_main(&window)?;
     let collector = app.state::<crate::local_usage::LocalCollector>();
-    {
-        let state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    let path = {
+        // 复评 F14：检查与删除必须共享同一把锁，否则释放后再删除的窗口里，
+        // 后台采集可以开始写缓存，形成删除与写入竞态。
+        // 这里在锁内把 busy 置位（占用采集槽位），删除完成后再释放。
+        let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
         if state.busy {
             return Err("正在采集，请等待本轮结束后再清理引擎缓存".into());
         }
-    }
-    let path = engine_cache_path()?;
-    match std::fs::remove_dir_all(&path) {
+        // 占用采集槽位：后续 collect_local_usage 会因 busy 而拒绝启动。
+        state.busy = true;
+        state.generation = state.generation.wrapping_add(1);
+        if let Some(cancel) = state.cancel.take() {
+            cancel.notify_one();
+        }
+        engine_cache_path()?
+    };
+    // 删除在锁外进行（避免跨 IO 持有同步 Mutex），但 busy 已置位，采集无法插队。
+    let outcome = match std::fs::remove_dir_all(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err("引擎缓存无法清理，请稍后重试".into()),
-    }
+    };
+    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    state.busy = false;
+    state.snapshot = None;
+    state.last_error = None;
+    state.last_scan_failed = false;
+    outcome
 }
 
 fn local_preference_path() -> Result<std::path::PathBuf, String> {
