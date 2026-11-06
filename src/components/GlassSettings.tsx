@@ -1,23 +1,58 @@
 import React from "react";
+import {
+  alphaFromTransparency,
+  clampGlass,
+  DEFAULT_GLASS,
+  resolveTransparency,
+  transparencyFromAlpha,
+} from "../glass-preference";
+
 export const GLASS_KEY = "ui-glass-transparency";
+export { DEFAULT_GLASS };
+
+/**
+ * 读取当前**生效**的透明度（百分比）。
+ *
+ * 复评 F21：存储被清空时（「退出并忘记账户」会清 WebView 数据），
+ * 旧实现直接回退默认值 5，用户自定义的透明度因此丢失。
+ * 这里先从 CSS 变量反推当前生效值，再从 DOM 属性兜底，
+ * 只有在完全没有痕迹时才使用默认值。
+ */
+export function readEffectiveGlass(): number {
+  const root = document.documentElement;
+  const fromAlpha = transparencyFromAlpha(
+    root.style.getPropertyValue("--glass-alpha"),
+  );
+  if (fromAlpha != null) return fromAlpha;
+  const dataValue = root.getAttribute("data-glass-transparency");
+  if (dataValue != null) {
+    const parsed = Number(dataValue);
+    if (Number.isFinite(parsed)) return clampGlass(parsed);
+  }
+  return DEFAULT_GLASS;
+}
+
 /**
  * 应用已保存的透明度。
  *
- * 存储被清空时（例如「退出并忘记账户」清理了 WebView 数据）回退到默认值，
- * 并**立即写回**，避免清理后偏好被静默重置、用户以为设置丢了。
+ * 存储被清空时用**当前生效值**恢复并写回，而不是静默重置为默认值；
+ * 同时把生效值写进 `data-glass-transparency`，供清理后再次读取。
  */
 export function applyStoredGlass() {
   const raw = localStorage.getItem(GLASS_KEY);
-  const parsed = raw == null ? NaN : Number(raw);
-  const transparency = Number.isFinite(parsed)
-    ? Math.max(0, Math.min(70, parsed))
-    : 5;
-  if (raw == null || !Number.isFinite(parsed)) {
+  const effective = readEffectiveGlass();
+  const transparency = resolveTransparency(raw, effective);
+  if (raw == null || !Number.isFinite(Number(raw))) {
+    // 写回，避免清理后偏好被反复重置。
     localStorage.setItem(GLASS_KEY, String(transparency));
   }
   document.documentElement.style.setProperty(
     "--glass-alpha",
-    String(1 - transparency / 100),
+    String(alphaFromTransparency(transparency)),
+  );
+  document.documentElement.setAttribute(
+    "data-glass-transparency",
+    String(transparency),
   );
   return transparency;
 }
