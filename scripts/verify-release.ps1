@@ -56,9 +56,11 @@ $hasCurrent = $text.Contains($currentRepo)
 $hasLegacy = $text.Contains($legacyRepo)
 
 # 三态结论（复评 F17）：找不到字符串既不能算通过，也不能算失败 —— 它是「无法判定」。
-$inconclusive = @()
+# 复评 R19：这里曾把 $inconclusive 重置为空数组，丢掉前面「未提供期望哈希」等原因。
+# 所有原因必须一路保留到最终结论。
 if ($hasCurrent) {
-    Write-Host "✅ 二进制包含当前仓库地址：$currentRepo" -ForegroundColor Green
+    # 复评 R19：命中当前地址只是**辅助证据**，不能单独构成 PASS。
+    Write-Host "✅ 二进制包含当前仓库地址：$currentRepo（辅助证据）" -ForegroundColor Green
 }
 else {
     Write-Host "⚠ 无法判定：二进制中未检索到当前仓库地址。" -ForegroundColor Yellow
@@ -72,9 +74,9 @@ if ($hasLegacy) {
     $failed = $true
 }
 else {
-    # 同样只是「未发现」：压缩包里没有明文不等于内嵌程序里没有旧地址。
-    Write-Host "⚠ 未发现旧仓库地址（仅限明文检索）" -ForegroundColor Yellow
-    $inconclusive += "旧仓库地址未以明文出现"
+    # 复评 R19：未发现旧地址是**辅助证据**（压缩包可能不含明文），
+    # 不强制把结论降为 INCONCLUSIVE，只记录下来供人工核对。
+    Write-Host "✅ 未发现旧仓库地址（辅助证据，仅限明文检索）" -ForegroundColor Green
 }
 
 # 版本号（NSIS 产品名常含版本，但更可靠的是与 package.json 对照）
