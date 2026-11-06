@@ -21,6 +21,16 @@ const ENGINE_MANIFEST: &str = include_str!("../../scripts/local-usage-engine.jso
 pub struct LocalRow {
     pub id: String,
     pub tool: String,
+    /// 复评 N01：**稳定 client 身份**（引擎输出的原始 client，如
+    /// `claude` / `claude-mirror` / `cc-mirror:xxx`）。
+    ///
+    /// `tool` 是展示槽位（镜像归到 claude），而 client_id 才是会话归属的
+    /// 真实身份。分组、留存 ID、归档与导出都必须用它，否则同 source 下
+    /// 原生 Claude 与多个 mirror 的同名 sessionId 会被合并成一条记录，
+    /// 后一轮只有一个 variant 出现时还会**覆盖**其它会话的留存（历史丢失）。
+    /// 旧 schema 无此字段时按 `tool` 回填（未知身份不猜拆）。
+    #[serde(default)]
+    pub client_id: String,
     pub session_id: String,
     pub project_key: Option<String>,
     pub project_path: Option<String>,
@@ -76,6 +86,13 @@ pub struct LocalSnapshot {
     pub sources: Vec<SourceHealth>,
     #[serde(default = "complete_default")]
     pub complete: bool,
+    /// 复评 N03：**质量证据**（脱敏、稳定 code），与 `complete`（读取是否
+    /// 完整）分开。已知重叠时 `complete` 仍为 true，但去重可信度下降 ——
+    /// 旧实现只写一句来源 message，导出/留存/归档都拿不到这条结论，
+    /// 用户看到 complete=true 就会把重复合计当成准确值。
+    /// 只放 code 与可读说明，不放可能含路径的原始 message。
+    #[serde(default)]
+    pub quality_warnings: Vec<String>,
 }
 fn native_source() -> String {
     "native".into()
@@ -244,6 +261,7 @@ pub fn normalize_report(value: &Value, collected_at: u64) -> Result<LocalSnapsho
             LocalRow {
                 id,
                 tool: tool.to_string(),
+                client_id: identity.to_string(),
                 session_id,
                 project_key,
                 project_path,
@@ -281,6 +299,7 @@ pub fn normalize_report(value: &Value, collected_at: u64) -> Result<LocalSnapsho
         rows: rows.into_values().collect(),
         sources: vec![],
         complete: true,
+        quality_warnings: Vec::new(),
     })
 }
 
@@ -543,7 +562,8 @@ pub async fn collect_sources(
                 // 也不拒绝（R04：以链接类型区分，不再误拒目录链接）。
                 // 预审不完整（目录过大/不可读，复评 R06）按未验证状态处理：
                 // 继续采集但把结论写进来源健康信息，不冒充已校验。
-                let mut audit_note: Option<&'static str> = None;
+                // 复评 N07：预审不完整现在直接拒绝该来源，因此不再需要
+                // 把它降级成「未验证」提示的槽位。
                 if directory {
                     // 复评 R07：链接预审是**同步 IO**（read_dir / metadata /
                     // canonicalize），放在 async poll 内时外层 60 秒 timeout
@@ -556,7 +576,13 @@ pub async fn collect_sources(
                     let audit = run_audit_in_worker(audit_home, audit_root, origin).await?;
                     match audit {
                         ReparseAudit::Clean => {}
-                        ReparseAudit::Incomplete(reason) => audit_note = Some(reason),
+                        ReparseAudit::Incomplete(reason) => {
+                            // 复评 N07：安全检查**没做完**时不能继续受限读取 ——
+                            // 旧实现只提示后照常启动引擎，引擎仍会跟随未审区域的
+                            // 文件链接。这里拒绝该来源（其他已验来源继续），
+                            // 不通过取消上限来换「通过」。
+                            return Err(format!("{reason}，已拒绝该来源以保证读取边界"));
+                        }
                     }
                 }
                 // 复评 Q06/R03/R06：引擎 settings 的扩展根在采集时直接生效，
@@ -564,6 +590,15 @@ pub async fn collect_sources(
                 // 逐根校验，任一不合规立即拒绝该来源（失败关闭）。
                 // 复评 R01：传来源真实 origin —— WSL 来源不能被当成 Native 拒绝。
                 // 复评 R06：单工具来源用隔离 home 执行，不检查用户 settings。
+                // 复评 N06：辅助配置文件同样被引擎读取，必须纳入预审。
+                if tool_path.is_none() {
+                    let aux = audit_engine_aux_configs(&canonical, origin)?;
+                    if !aux.is_empty() {
+                        if let Ok(mut map) = engine_settings_notice.lock() {
+                            map.insert(id.clone(), aux[0]);
+                        }
+                    }
+                }
                 let registered_roots = validate_engine_extra_roots(
                     &canonical,
                     origin,
@@ -629,12 +664,7 @@ pub async fn collect_sources(
                 // 复评 T13/Q06/R06：settings 扩展根校验结论与链接预审结论都
                 // 写进来源健康信息（采集成功后可见），不只在日志里。
                 if let Ok(mut map) = engine_settings_notice.lock() {
-                    if let Some(reason) = audit_note {
-                        map.insert(
-                            id.clone(),
-                            reason, // 形如「…链接预审未完整」，按未验证状态披露
-                        );
-                    } else if tool_path.is_none() {
+                    if tool_path.is_none() {
                         if let Some(count) = validated_count {
                             map.insert(
                                 id.clone(),
@@ -657,7 +687,7 @@ pub async fn collect_sources(
                             for entry in registered {
                                 if let Ok(resolved) = crate::local_sources::resolve_layout_root(
                                     &entry.path,
-                                    origin,
+                                    entry.origin,
                                     entry.expect,
                                 ) {
                                     roots.entry(entry.tool.clone()).or_default().insert(
@@ -736,6 +766,19 @@ pub async fn collect_sources(
     if rows.len() > 50000 {
         return Err("合并记录过多，请缩小采集目录范围".into());
     }
+    // 复评 N03：已知重叠必须作为**质量证据**贯穿输出（导出/留存/归档），
+    // 而不是只写一句来源 message。这里收集稳定 code，`complete` 语义保持
+    // 「读取是否完整」，不因去重不确定而变 false。
+    let mut quality_warnings: Vec<String> = Vec::new();
+    if sources.iter().any(|source| {
+        source
+            .message
+            .as_deref()
+            .is_some_and(|text| text.contains("部分重叠"))
+    }) {
+        quality_warnings.push("overlap_partial".into());
+    }
+
     let complete = sources.iter().all(|s| s.state != "unavailable");
     let collected_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -761,6 +804,7 @@ pub async fn collect_sources(
         rows,
         sources,
         complete,
+        quality_warnings,
     })
 }
 fn tool_source_id(entry: &crate::local_sources::ToolPath) -> String {
@@ -825,15 +869,7 @@ async fn run_audit_in_worker(
     root: std::path::PathBuf,
     origin: crate::local_sources::SourceOrigin,
 ) -> Result<ReparseAudit, String> {
-    static AUDIT_PERMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
-        std::sync::OnceLock::new();
-    let permit = AUDIT_PERMIT
-        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| "链接预审仍在进行，请稍后重试")?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    run_bounded_io(move || {
         if home_source {
             audit_home_layout_roots(&root, origin)
         } else {
@@ -841,7 +877,37 @@ async fn run_audit_in_worker(
         }
     })
     .await
-    .map_err(|_| "链接预审任务失败".to_string())?
+    .and_then(|outcome| outcome)
+}
+
+/// 复评 N08：**所有**同步文件系统发现/读取/校验都走这一个有界 IO 层。
+///
+/// 旧实现只把标准布局预审放进 worker，配置读取、镜像发现、扩展根审计与
+/// 事后登记仍在 async poll 里同步执行 —— 一次慢盘/WSL/过滤驱动阻塞就能让
+/// 外层 60 秒预算迟返。这里统一：
+/// 1. 共享**单许可**信号量：同一时刻只有一个同步任务在跑，重复刷新不会
+///    堆积阻塞线程；
+/// 2. `spawn_blocking` 承载同步调用，async 侧可正常被取消；
+/// 3. 许可随任务结束释放 —— OS 调用本身无法被抢占，这一点如实保留，
+///    不宣称已中止 IO，也不在调用未返时释放许可。
+async fn run_bounded_io<F, T>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    static PERMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = PERMIT
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "文件系统检查仍在进行，请稍后重试")?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|_| "文件系统检查任务失败".to_string())
 }
 
 /// 复评 Q07：审计来源根内的**文件符号链接**。
@@ -911,6 +977,21 @@ fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
                             "来源目录内的目录链接（{}）目标越界：{error}",
                             entry.path().display()
                         ));
+                    }
+                    // 复评 N05：只验首跳不够 —— 固定引擎的专用数据库发现会
+                    // **进入**这个链接目录，再沿着目标内部的第二跳/库文件
+                    // 继续读。这里对目标内部再跑一次完整链路 + 文件链接审计
+                    //（不跟随未批准目标），确保不会「允许目录 → 第二跳禁止
+                    // 目标」。
+                    match audit_root_for_reparse(&absolute) {
+                        Ok(ReparseAudit::Clean) => {}
+                        Ok(ReparseAudit::Incomplete(reason)) => {
+                            return Err(format!(
+                                "来源目录内的目录链接（{}）目标内部预审未完整：{reason}",
+                                entry.path().display()
+                            ));
+                        }
+                        Err(error) => return Err(error),
                     }
                     continue;
                 }
@@ -1019,6 +1100,49 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// 复评 N06：固定引擎在 `--home` 模式下**仍会读取**辅助配置文件。
+///
+/// 上游 `opencode_model_name` 会读 `.config/opencode/opencode.json`、
+/// `.config/opencode/opencode.jsonc`、`.opencode/opencode.json`、
+/// `.opencode/opencode.jsonc` 四个文件来解析模型显示名，且没有体积上限。
+/// 应用只覆盖了 `.local/share/opencode` 扫描根 —— 这些辅助文件的父链/文件
+/// 链接可以触达禁止目标，读取本身也不受限。
+///
+/// 这里在启动引擎前对四个文件逐个：先验链（不访问越界目标）、再有界读取
+/// 并校验 JSON 形态。任一越界即拒绝该来源；不存在/超限/非法只作为「显示名
+/// 不可用」的质量提示（不影响用量数据本身）。
+fn audit_engine_aux_configs(
+    home: &Path,
+    origin: crate::local_sources::SourceOrigin,
+) -> Result<Vec<&'static str>, String> {
+    const AUX: &[&str] = &[
+        ".config/opencode/opencode.json",
+        ".config/opencode/opencode.jsonc",
+        ".opencode/opencode.json",
+        ".opencode/opencode.jsonc",
+    ];
+    let mut warnings = Vec::new();
+    for relative in AUX {
+        let path = home.join(relative.replace('/', "\\"));
+        // 越界目标在访问前拒绝该来源。
+        crate::local_sources::check_link_chain(&path, origin)
+            .map_err(|error| format!("引擎辅助配置（{relative}）路径未通过检查：{error}"))?;
+        match read_bounded(&path, 256 * 1024) {
+            Ok(text) => {
+                if text.len() > 256 * 1024 {
+                    warnings.push("辅助配置超过上限，显示名未采用");
+                } else if serde_json::from_slice::<serde_json::Value>(&text).is_err() {
+                    // jsonc 允许注释，这里只记录「无法解析」，不拒绝来源。
+                    warnings.push("辅助配置无法解析，显示名未采用");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => warnings.push("辅助配置不可读，显示名未采用"),
+        }
+    }
+    Ok(warnings)
+}
+
 /// 复评 Q06/R03：引擎 settings 的 extraScanPaths 与 opencodeDbPaths（含
 /// 备用配置文件）在采集时**直接生效**，事后的提示修不回已经发生的读取。
 /// 启动引擎前解析所有配置文件，对每个扩展根执行与应用入口一致的校验：
@@ -1033,32 +1157,31 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 /// 判定「路径指向 WSL，未访问」而整类拒绝 —— 合法 WSL 来源全部失效。
 /// 另外单工具来源执行时用的是隔离 home（`run_tool_source` 用独立 profile），
 /// 用户工具根下的 settings 并不生效，不应据此阻断（复评 R06）。
-async fn validate_engine_extra_roots(
+/// 复评 N08：**同步**读取引擎配置与镜像声明，返回尚未做来源策略校验的根清单。
+///
+/// 旧实现把 `check_link_chain`、`read_bounded`、`read_dir` 都放在 async poll
+/// 里，一次慢盘调用就能越过外层预算。这里把纯同步的发现/读取收进一个函数，
+/// 由调用方通过 `run_bounded_io`（单许可 blocking worker）执行；随后再在
+/// async 上下文里做需要查 WSL 状态的来源策略校验。
+fn read_engine_config_roots(
     home: &Path,
     origin: crate::local_sources::SourceOrigin,
     uses_user_settings: bool,
-    wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
 ) -> Result<Option<Vec<RegisteredRoot>>, String> {
-    // 复评 R06：单工具来源用隔离 home 执行引擎，用户 home 下的 settings 不参与，
-    // 这里既不校验也不登记（否则无关的坏配置会阻断合法采集）。
+    // 复评 R06：单工具来源用隔离 home 执行引擎，用户 home 下的 settings 不参与。
     if !uses_user_settings {
         return Ok(None);
     }
-    // 复评 R03：上游 load_for_home_override 在**主配置读取失败**时才回退到
-    // Library/Application Support 路径。复评 R06：主配置有效时不读备用 ——
-    // 旧实现把两份都校验，一份陈旧备用配置里的非法根就能阻断合法来源。
+    // 复评 R03/N09：上游按**读取结果**选择备用（主文件 read 失败才 fallback）。
     let primary = ["AppData", "Roaming", "tokscale", "settings.json"]
         .iter()
         .fold(home.to_path_buf(), |base, part| base.join(part));
-    // 复评 F02-C：配置文件**自身**与父链也必须在任何存在性判断前按同一策略
-    // 检查（用来源真实 origin，WSL 来源不能被当成 Native 拒绝）。
     crate::local_sources::check_link_chain(&primary, origin)
         .map_err(|error| format!("引擎配置（{}）路径未通过检查：{error}", primary.display()))?;
     let mut configs: Vec<std::path::PathBuf> = Vec::new();
-    if primary.is_file() {
+    if std::fs::File::open(&primary).is_ok() {
         configs.push(primary);
     } else {
-        // 主配置不存在/不可读 → 才考虑备用（与上游语义一致）。
         let fallback = [
             "Library",
             "Application Support",
@@ -1078,21 +1201,8 @@ async fn validate_engine_extra_roots(
         }
     }
     let mut roots: Vec<RegisteredRoot> = Vec::new();
-    if configs.is_empty() {
-        // 复评 R02：没有 settings 时**仍要**发现并预检 cc-mirror 根 ——
-        // 旧实现在这里直接 return None，跳过 mirror 预检，而引擎照样会读它。
-        for root in discover_cc_mirror_roots(home, origin, wsl).await? {
-            roots.push(root);
-        }
-        return if roots.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(roots))
-        };
-    }
     for config in configs {
-        // 复评 F15：**有界**读取 —— 旧实现先 `std::fs::read` 整个文件再判
-        // 256KiB，异常大文件仍会先分配/读完。这里只读到上限 +1 字节。
+        // 复评 F15：有界读取（只读到上限 +1 字节）。
         let text =
             read_bounded(&config, 256 * 1024).map_err(|_| "无法读取采集引擎 settings.json")?;
         if text.len() > 256 * 1024 {
@@ -1100,15 +1210,11 @@ async fn validate_engine_extra_roots(
         }
         let value: serde_json::Value = serde_json::from_slice(&text)
             .map_err(|_| "采集引擎 settings.json 无法解析".to_string())?;
-        // 复评 R03：两个来源字段统一解析；形态非法时失败关闭。
         for (tool, raw, directory) in engine_config_roots(&value)? {
-            // 复评 R06：只校验**实际启用且受支持**的扩展根。上游按启用 client
-            // 过滤 extraScanPaths，一个未启用工具（例如 codex）的非法根不应该
-            // 阻断六工具采集；这类条目既不校验也不登记（引擎不会读它）。
+            // 复评 R06：只登记实际启用且受支持的扩展根。
             if !CLIENTS.contains(&tool.as_str()) {
                 continue;
             }
-            validate_engine_root(&tool, &raw, directory, wsl).await?;
             roots.push(RegisteredRoot {
                 tool,
                 path: std::path::PathBuf::from(&raw),
@@ -1117,16 +1223,42 @@ async fn validate_engine_extra_roots(
                 } else {
                     crate::local_sources::ResolvedExpect::File
                 },
+                // 复评 N02：扩展根按**自身**路径文本决定 origin。
+                origin: crate::local_sources::origin_for_path(&raw),
             });
         }
     }
-    // 复评 F01/R02：`cc-mirror` 按 `.cc-mirror/*/variant.json` 的
-    // `configDir` **动态**发现项目根（可能位于 home 之外），这些根同样会被
-    // 引擎读取，必须在启动前校验并登记。
-    for root in discover_cc_mirror_roots(home, origin, wsl).await? {
-        roots.push(root);
+    // 复评 R02/N04：镜像根独立于 settings 存在性发现（含缺省/相对/~/ 语义）。
+    roots.extend(read_cc_mirror_roots(home, origin)?);
+    Ok(if roots.is_empty() { None } else { Some(roots) })
+}
+
+async fn validate_engine_extra_roots(
+    home: &Path,
+    origin: crate::local_sources::SourceOrigin,
+    uses_user_settings: bool,
+    wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
+) -> Result<Option<Vec<RegisteredRoot>>, String> {
+    // 复评 N08：同步发现/读取走有界 IO 层（单许可 blocking worker）。
+    let home_path = home.to_path_buf();
+    let raw =
+        run_bounded_io(move || read_engine_config_roots(&home_path, origin, uses_user_settings))
+            .await
+            .and_then(|value| value)?;
+    let Some(roots) = raw else {
+        return Ok(None);
+    };
+    // 复评 R03/N04/N06：逐个根做来源策略校验（可能查 WSL 运行状态）。
+    let mut validated: Vec<RegisteredRoot> = Vec::new();
+    for entry in roots {
+        let directory = matches!(
+            entry.expect,
+            crate::local_sources::ResolvedExpect::Directory
+        );
+        validate_engine_root(&entry.tool, &entry.path.to_string_lossy(), directory, wsl).await?;
+        validated.push(entry);
     }
-    Ok(Some(roots))
+    Ok(Some(validated))
 }
 
 /// 复评 F01：一个会被引擎实际读取、并已通过来源策略校验的根。
@@ -1135,41 +1267,39 @@ pub(crate) struct RegisteredRoot {
     pub tool: String,
     pub path: std::path::PathBuf,
     pub expect: crate::local_sources::ResolvedExpect,
+    /// 复评 N02：根**自身**的 origin。旧实现登记时用外层 home 的 origin
+    /// 重算解析结果 —— Native home 里的合法 WSL 扩展根会因此漏登记
+    ///（随后被显式的 WSL 工具源再读一次，静默双计）。
+    pub origin: crate::local_sources::SourceOrigin,
 }
 
-/// 复评 F01：读取 `.cc-mirror/*/variant.json` 的 `configDir` 并逐个校验。
+/// 复评 F01/N04/N08：**同步**读取 `.cc-mirror/*/variant.json` 的根声明。
 ///
-/// 配置文本先解析（不访问目标），再走与其它入口相同的校验链：文本种类 →
-/// WSL 运行状态 → 链接链 → 解析后目标 → 目录内文件链接审计。
-/// 目录不可读时返回空清单（该 home 没有 cc-mirror 数据，不算越界）；
-/// 声明了 configDir 但校验失败时**失败关闭** —— 引擎会读到未经确认的根。
-async fn discover_cc_mirror_roots(
+/// 只做发现与解析（含缺省/相对/`~/` 语义），返回尚未做来源策略校验的精确
+/// `projects` 根；调用方经 `run_bounded_io`（单许可 blocking worker）执行，
+/// 随后在 async 上下文里做需要查 WSL 状态的策略校验。
+fn read_cc_mirror_roots(
     home: &Path,
     origin: crate::local_sources::SourceOrigin,
-    wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
 ) -> Result<Vec<RegisteredRoot>, String> {
     let mirror = home.join(crate::local_overlap::CC_MIRROR_DIR);
-    // 复评 R02：镜像容器本身也先验链（不跟随），越界即拒绝该来源，
-    // 而不是先 read_dir 再谈策略。
+    // 复评 R02：镜像容器本身也先验链（不跟随），越界即拒绝该来源。
     crate::local_sources::check_link_chain(&mirror, origin)
         .map_err(|error| format!("cc-mirror 目录路径未通过检查：{error}"))?;
     let entries = match std::fs::read_dir(&mirror) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Ok(Vec::new()),
     };
     let mut roots = Vec::new();
     for entry in entries.flatten() {
         let variant = entry.path().join("variant.json");
-        // 复评 R02：variant 文件与它所在目录同样先验链。
         crate::local_sources::check_link_chain(&variant, origin).map_err(|error| {
             format!(
                 "cc-mirror 配置（{}）路径未通过检查：{error}",
                 variant.display()
             )
         })?;
-        // 复评 R02：超限的 variant 不能被**截断后忽略** —— 上游仍可能整份读取，
-        // 其中的 configDir 就没被校验。超限即失败关闭。
+        // 复评 R02：超限 variant 不能截断后忽略（上游仍可能整份读取）。
         let text = match read_bounded(&variant, 256 * 1024) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1186,21 +1316,23 @@ async fn discover_cc_mirror_roots(
                 variant.display()
             ));
         }
-        let Some(config_dir) =
-            crate::local_overlap::cc_mirror_config_dir(&String::from_utf8_lossy(&text))
-        else {
-            continue;
+        // 复评 N04：等价于上游的解析（绝对 / 相对 variant 目录 / `~/` / 缺省）。
+        let Some(config_root) = crate::local_overlap::cc_mirror_resolve_root(
+            &String::from_utf8_lossy(&text),
+            entry.path().as_path(),
+            home,
+        ) else {
+            return Err(format!(
+                "cc-mirror 配置（{}）的 configDir 无法解析为绝对路径，拒绝采集",
+                variant.display()
+            ));
         };
-        // 复评 R02：上游真实入口是 `configDir/projects`，登记与校验都用精确根，
-        // 不用父目录冒充（否则 custom 兄弟会被误判已覆盖、projects 链接漏查）。
-        let projects = std::path::Path::new(&config_dir).join("projects");
-        validate_engine_root("claude", &projects.to_string_lossy(), true, wsl)
-            .await
-            .map_err(|error| format!("cc-mirror 配置的 projects 根未通过校验：{error}"))?;
+        let projects = config_root.join("projects");
         roots.push(RegisteredRoot {
             tool: "claude".to_string(),
-            path: projects,
+            path: projects.clone(),
             expect: crate::local_sources::ResolvedExpect::Directory,
+            origin: crate::local_sources::origin_for_path(&projects.to_string_lossy()),
         });
     }
     Ok(roots)
@@ -1845,21 +1977,35 @@ mod tests {
 
     // ---------- 第六轮复评 R04：目录链接不得被误当成文件链接 ----------
 
+    /// 复评 N19：Unix 上 `is_dir_link` 恒为 false（保守策略：无法不跟随地区分
+    /// 目录链接，一律按文件链接拒绝）。旧测试却断言 Clean —— 与实现矛盾。
+    /// 这里让断言匹配**保守拒绝**语义，并在链接创建失败时明确 NOT RUN。
     #[cfg(unix)]
     #[test]
-    fn r04_目录链接不被拒绝_文件链接仍拒绝() {
+    fn n19_unix目录链接按保守策略拒绝() {
         let base = std::env::temp_dir().join(format!("dsm-audit-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("real-dir")).unwrap();
         std::fs::write(base.join("real.log"), b"x").unwrap();
-        // 目录链接：引擎的通用遍历不跟随目录链接 → 不该拒绝整个来源。
-        std::os::unix::fs::symlink(base.join("real-dir"), base.join("dir-link")).unwrap();
-        assert!(
-            matches!(audit_root_for_reparse(&base), Ok(ReparseAudit::Clean)),
-            "目录链接不得导致整个来源被拒"
-        );
-        // 文件链接：引擎会跟随读取目标 → 必须拒绝。
-        std::os::unix::fs::symlink(base.join("real.log"), base.join("file-link.log")).unwrap();
-        assert!(audit_root_for_reparse(&base).is_err());
+        let dir_link = base.join("dir-link");
+        match std::os::unix::fs::symlink(base.join("real-dir"), &dir_link) {
+            Ok(()) => {
+                assert!(
+                    audit_root_for_reparse(&base).is_err(),
+                    "Unix 上目录链接按保守策略拒绝（无法不跟随地区分类型）"
+                );
+                std::fs::remove_file(&dir_link).ok();
+            }
+            Err(error) => eprintln!("NOT RUN：无法创建目录符号链接（{error}）"),
+        }
+        let file_link = base.join("file-link.log");
+        match std::os::unix::fs::symlink(base.join("real.log"), &file_link) {
+            Ok(()) => {
+                assert!(audit_root_for_reparse(&base).is_err(), "文件链接必须拒绝");
+                std::fs::remove_file(&file_link).ok();
+            }
+            Err(error) => eprintln!("NOT RUN：无法创建文件符号链接（{error}）"),
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

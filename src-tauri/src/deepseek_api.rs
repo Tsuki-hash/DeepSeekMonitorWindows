@@ -136,12 +136,32 @@ pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, ApiE
         }
     }
 
-    let text = response.text().await.map_err(|error| {
-        ApiError::new(ErrorKind::Unavailable, format!("读取余额响应失败：{error}"))
-    })?;
+    // 复评 N18：响应体必须有**字节上限**。旧实现直接 `response.text()`
+    // 整读，15 秒超时不限制体积；异常/超长响应会先吃满内存。
+    let text = read_bounded_body(response, MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            ApiError::new(ErrorKind::Unavailable, format!("读取余额响应失败：{error}"))
+        })?;
     let parsed = BalanceResponse::from_json(&text)
         .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
     parse_balance(parsed).map_err(|message| ApiError::new(ErrorKind::InvalidData, message))
+}
+
+/// 复评 N18：官方响应体的字节上限（16MiB，与采集输出同量级）。
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 复评 N18：按块读取响应体，超过上限立即失败。
+async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<String, String> {
+    let mut response = response;
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if buffer.len() + chunk.len() > limit {
+            return Err(format!("响应超过 {limit} 字节上限，已停止读取"));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buffer).map_err(|_| "响应不是有效 UTF-8".to_string())
 }
 
 /// 用量 Token 校验失败的性质。
@@ -440,7 +460,26 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     }
 
     let mut days = Vec::new();
-    let mut daily_source = amount.data.biz_data.days.clone();
+    // 复评 N10：**先按 date 合并所有片段**，再派生 summary / raw / 槽位。
+    // 旧实现直接 clone 数量侧的 days：平台若对同一天返回多个对象，就会
+    // 生成多条同日 summary，而 raw_models 却按整日合并 —— 图表取最后一项
+    // （只看到 20）、历史取全日（看到 30），同一份数据出现两个结论。
+    let mut merged_days: Vec<DayUsage> = Vec::new();
+    let mut day_index: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for day in &amount.data.biz_data.days {
+        match day_index.get(&day.date) {
+            Some(&index) => merged_days[index].data.extend(day.data.iter().cloned()),
+            None => {
+                day_index.insert(day.date.clone(), merged_days.len());
+                merged_days.push(DayUsage {
+                    date: day.date.clone(),
+                    data: day.data.clone(),
+                });
+            }
+        }
+    }
+    let mut daily_source = merged_days;
     let mut known_dates: std::collections::HashSet<_> =
         daily_source.iter().map(|d| d.date.clone()).collect();
     for date in cost_by_date.keys() {
@@ -777,7 +816,13 @@ async fn get_json<T: serde::de::DeserializeOwned>(
             return Err(ApiError::new(kind, message));
         }
     }
-    resp.json::<T>().await.map_err(|error| {
+    // 复评 N18：同上，用量响应也走有界读取后再解析。
+    let body = read_bounded_body(resp, MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            ApiError::new(ErrorKind::InvalidData, format!("读取用量数据失败：{error}"))
+        })?;
+    serde_json::from_slice::<T>(body.as_bytes()).map_err(|error| {
         ApiError::new(ErrorKind::InvalidData, format!("解析用量数据失败：{error}"))
     })
 }
@@ -1788,6 +1833,48 @@ mod tests {
                 .total_tokens,
             Some(110),
             "日总与历史 raw 必须一致"
+        );
+    }
+
+    // ---------- 第九轮复评 N10 ----------
+
+    #[test]
+    fn n10_同一天多个对象先合并_只生成一条summary() {
+        // 评审触发：平台对同一天返回两个 DayUsage 对象（10 与 20）。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"30"}]}],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"10"}]}
+                    ]},
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"20"}]}
+                    ]}
+                ]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[{"date":"2026-09-01","data":[
+                    {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}
+                ]}]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let same_day: Vec<_> = result
+            .days
+            .iter()
+            .filter(|day| day.date == "2026-09-01")
+            .collect();
+        assert_eq!(same_day.len(), 1, "同日多个对象必须合并成一条 summary");
+        assert_eq!(
+            same_day[0].total_tokens,
+            Some(30),
+            "10 + 20 应合并为 30（旧实现图表取最后一项只看 20）"
         );
     }
 

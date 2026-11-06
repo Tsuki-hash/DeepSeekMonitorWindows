@@ -34,9 +34,18 @@ struct Store {
     schema_version: u32,
     entries: Vec<ArchiveEntry>,
 }
-fn id(period: &str, source: &str, tool: &str, session: &str) -> Result<String, String> {
-    let value =
-        serde_json::to_vec(&(period, source, tool, session)).map_err(|_| "留存标识不可用")?;
+fn id(
+    period: &str,
+    source: &str,
+    tool: &str,
+    client: &str,
+    session: &str,
+) -> Result<String, String> {
+    // 复评 N01：留存标识必须包含**client 身份** —— 原生 Claude 与多个 mirror
+    // 可能在同一 source/tool 下有同名 sessionId；旧键会让它们共用一条留存，
+    // 后一轮只有一个 variant 出现时就把其它会话覆盖掉（历史归属丢失）。
+    let value = serde_json::to_vec(&(period, source, tool, client, session))
+        .map_err(|_| "留存标识不可用")?;
     Ok(format!("{:x}", Sha256::digest(value)))
 }
 fn load_enabled() -> Result<bool, String> {
@@ -78,10 +87,17 @@ fn valid(entry: &ArchiveEntry) -> bool {
         return false;
     }
     let row = &entry.rows[0];
+    // 复评 N01：校验也要含 client 身份（旧 schema 无 client_id 时回填 tool）。
+    let client = if row.client_id.is_empty() {
+        row.tool.as_str()
+    } else {
+        row.client_id.as_str()
+    };
     id(
         &entry.period_key,
         &row.source_id,
         &row.tool,
+        client,
         &row.session_id,
     )
     .is_ok_and(|id| id == entry.id)
@@ -89,6 +105,7 @@ fn valid(entry: &ArchiveEntry) -> bool {
             other.source_id == row.source_id
                 && other.tool == row.tool
                 && other.session_id == row.session_id
+                && other.client_id == row.client_id
         })
 }
 fn load() -> Result<Store, String> {
@@ -211,11 +228,18 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
     let mut store_size = serde_json::to_vec(&store)
         .map_err(|_| "留存数据无法编码")?
         .len();
-    let mut groups: BTreeMap<(&str, &str, &str), Vec<&crate::local_usage::LocalRow>> =
+    // 复评 N01：分组按 (source, tool, **client**, session) —— 镜像与原生
+    // 的同名会话各自独立成组、各自留存。
+    let mut groups: BTreeMap<(&str, &str, &str, &str), Vec<&crate::local_usage::LocalRow>> =
         BTreeMap::new();
     for row in &snapshot.rows {
+        let client = if row.client_id.is_empty() {
+            row.tool.as_str()
+        } else {
+            row.client_id.as_str()
+        };
         groups
-            .entry((&row.source_id, &row.tool, &row.session_id))
+            .entry((&row.source_id, &row.tool, client, &row.session_id))
             .or_default()
             .push(row);
     }
@@ -230,9 +254,9 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
     let mut shrink_or_same: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
     let mut grow: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
     let mut additions: Vec<ArchiveEntry> = Vec::new();
-    for ((source, tool, session), rows) in groups {
+    for ((source, tool, client, session), rows) in groups {
         let entry = ArchiveEntry {
-            id: id(&snapshot.period_key, source, tool, session)?,
+            id: id(&snapshot.period_key, source, tool, client, session)?,
             saved_at: snapshot.collected_at,
             collected_at: snapshot.collected_at,
             period_key: snapshot.period_key.clone(),
@@ -461,6 +485,57 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.rows[0].session_id == "s3"));
+    }
+
+    // ---------- 第九轮复评 N01：镜像会话身份贯穿留存 ----------
+
+    #[test]
+    fn n01_同源原生与两个镜像的同名会话各自留存() {
+        // 评审触发：同一 sourceId 下原生 Claude 与两个 mirror 有相同 sessionId。
+        // 旧实现按 (source, tool, session) 分组 → 3 行合并成 1 条留存，
+        // 后一轮只有 1 个 variant 出现时就把另外两个覆盖掉（历史丢失）。
+        let _dir = TempConfigDir::new("retention-client-id");
+        set_enabled(true).unwrap();
+        let snapshot = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"claude","sessionId":"s1","model":"deepseek-flash","input":10,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"claude-mirror","sessionId":"s1","model":"deepseek-flash","input":20,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"cc-mirror:variant-b","sessionId":"s1","model":"deepseek-flash","input":30,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[],"sessions":[]}),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(snapshot.rows.len(), 3, "三条行都必须被接受");
+        checkpoint(&snapshot).unwrap();
+        assert_eq!(
+            list().unwrap().len(),
+            3,
+            "原生 + 两个镜像的同名会话必须是 3 条独立留存"
+        );
+        // 后一轮只有其中一个 variant 出现：不得覆盖其它两条。
+        let partial = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"claude-mirror","sessionId":"s1","model":"deepseek-flash","input":25,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[],"sessions":[]}),
+            2000,
+        )
+        .unwrap();
+        checkpoint(&partial).unwrap();
+        let store = load().unwrap();
+        assert_eq!(store.entries.len(), 3, "缺席的会话不能被删除或合并");
+        let clients: std::collections::BTreeSet<_> = store
+            .entries
+            .iter()
+            .map(|entry| entry.rows[0].client_id.clone())
+            .collect();
+        assert_eq!(clients.len(), 3, "三个 client 身份各自保留");
+        // 只有 claude-mirror 那一条被更新。
+        let updated = store
+            .entries
+            .iter()
+            .find(|entry| entry.rows[0].client_id == "claude-mirror")
+            .unwrap();
+        assert_eq!(updated.collected_at, 2000);
     }
 
     // ---------- 第七轮复评 F03：旧更新优先于新增 ----------

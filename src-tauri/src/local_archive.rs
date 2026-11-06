@@ -30,6 +30,10 @@ pub struct ArchiveRow {
     pub source_id: String,
     pub source_label: String,
     pub tool: String,
+    /// 复评 N01：稳定 client 身份（镜像与原生同名会话各归各）。
+    /// 旧归档文件没有该字段时按空串读入，展示与校验回填 tool。
+    #[serde(default)]
+    pub client_id: String,
     pub session_id: String,
     pub model: String,
     pub project_ref: Option<String>,
@@ -275,6 +279,12 @@ pub(crate) fn sanitized_rows(
             source_id: row.source_id.clone(),
             source_label: row.source_label.clone(),
             tool: row.tool.clone(),
+            // 复评 N01：归档保留稳定 client 身份（空则回填展示 tool）。
+            client_id: if row.client_id.is_empty() {
+                row.tool.clone()
+            } else {
+                row.client_id.clone()
+            },
             session_id: row.session_id.clone(),
             model: row.model.clone(),
             project_ref: row.project_key.as_ref().map(|key| digest(key)),

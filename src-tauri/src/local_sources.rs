@@ -534,6 +534,19 @@ fn first_reparse_component(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, St
     Ok(None)
 }
 
+/// 复评 N02：按路径文本判定来源种类（不访问文件系统）。
+///
+/// WSL UNC 形态 → `Wsl`，其余 → `Native`。用于给配置声明的扩展根
+/// 选择正确的 origin：Native home 里指向 WSL 的根必须按 WSL 语义解析，
+/// 否则会被当成越界而漏登记。
+pub fn origin_for_path(value: &str) -> SourceOrigin {
+    if is_wsl_path(&normalize_resolved_str(value)) {
+        SourceOrigin::Wsl
+    } else {
+        SourceOrigin::Native
+    }
+}
+
 /// 复评 Q07：路径**文本**越界判定（不访问文件系统）。
 pub fn is_disallowed_local_target_text(value: &str) -> bool {
     let normalized = normalize_resolved_str(value);

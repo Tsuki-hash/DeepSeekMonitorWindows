@@ -365,8 +365,51 @@ fn backup_corrupt_config(path: &PathBuf) -> Result<PathBuf, String> {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let backup = path.with_extension(format!("json.corrupt-{stamp}-{seq}"));
-    fs::rename(path, &backup).map_err(|error| error.to_string())?;
+    // 复评 N17：损坏的**旧明文**配置里可能残留凭据。旧实现直接 rename，
+    // 明文凭据就以 `.corrupt-*` 副本长期留在磁盘上，且不随「清除 Key/Token」
+    // 删除 —— 用户以为已经清掉了。
+    // 现在：先按原文尝试脱敏（把疑似凭据字段替换为占位），再写回备份；
+    // 脱敏失败（非 UTF-8 等）则**不落盘备份**，只保留原文件不动，
+    // 由调用方按「无法备份」处理 —— 宁可没有恢复材料，也不静默复制明文。
+    let raw = fs::read(path).map_err(|error| error.to_string())?;
+    let scrubbed = scrub_corrupt_secrets(&raw);
+    match scrubbed {
+        Some(text) => {
+            fs::write(&backup, text).map_err(|error| error.to_string())?;
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        None => {
+            // 无法安全脱敏：不动原文件，返回错误让上层明确报告。
+            return Err("损坏配置含无法脱敏的内容，未生成明文备份".into());
+        }
+    }
     Ok(backup)
+}
+
+/// 复评 N17：把损坏配置文本里疑似凭据的值替换成占位符。
+///
+/// 只做**保守**的文本替换（不改结构、不尝试修复 JSON）：
+/// 匹配 `apiKey` / `usageToken` / `token` 一类字段的字符串值。无法解析为
+/// UTF-8 时返回 `None`（调用方不生成备份）。
+fn scrub_corrupt_secrets(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let looks_secret = ["\"apikey\"", "\"usagetoken\"", "\"token\""]
+            .iter()
+            .any(|key| lower.contains(key));
+        if looks_secret && line.contains(':') {
+            let (head, _) = line.split_once(':')?;
+            out.push_str(head);
+            out.push_str(": \"<已脱敏>\",");
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// 只接受界面上真实提供的那几档间隔，其余一律退回默认值。

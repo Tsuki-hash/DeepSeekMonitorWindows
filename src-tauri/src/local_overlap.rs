@@ -127,6 +127,42 @@ pub fn cc_mirror_config_dir(variant_json: &str) -> Option<String> {
     }
 }
 
+/// 复评 N04：把一个 `configDir` 声明解析成**绝对路径**。
+///
+/// 上游（`cc_mirror.rs`）支持三种写法，旧实现只处理绝对路径：
+/// - 绝对路径：原样使用；
+/// - `~/xxx` 与 `~`：展开到 home；
+/// - 相对路径：相对 **variant.json 所在目录**（上游回退到 variant/config 语义）。
+///
+/// 缺省（null / 缺失 / 空串）时回退到 `<variant 目录>/config`。
+///
+/// 返回绝对路径；任何无法解析的形态都返回 `None`（调用方按「无法确认」处理，
+/// 不假定完整）。
+pub fn cc_mirror_resolve_root(
+    variant_json: &str,
+    variant_dir: &std::path::Path,
+    home: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let declared = cc_mirror_config_dir(variant_json);
+    let resolved = match declared.as_deref() {
+        None => variant_dir.join("config"),
+        Some("~") => home.to_path_buf(),
+        Some(raw) if raw.starts_with("~/") || raw.starts_with("~\\") => {
+            home.join(raw[2..].replace('\\', "/").trim_start_matches('/'))
+        }
+        Some(raw) => {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_absolute() {
+                path
+            } else {
+                variant_dir.join(path)
+            }
+        }
+    };
+    let resolved = crate::local_sources::normalize_dot_segments(&resolved);
+    resolved.is_absolute().then_some(resolved)
+}
+
 /// 来源身份归一化（复评 T04）。
 ///
 /// 原实现把**整条路径**转小写，有两个后果：

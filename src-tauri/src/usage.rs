@@ -247,10 +247,15 @@ pub fn merge_model_slot(
 /// 展示级汇总（元、两位小数），不做财务入账；改整数分需同步改接口反序列化与前端
 /// 全部 `fmtMoney` 调用链，收益不抵成本。极端量级（>2^53 最小单位）的精度损失可接受。
 pub fn cost_sum(usage: &[Entry]) -> Option<f64> {
+    // 复评 N16：**每一步**都要检查累计值仍有限 —— 旧实现只校验各输入
+    // 有限，1e308 + 1e308 会得到 Infinity 并被当成正常金额展示。
     usage
         .iter()
         .filter(|entry| entry.kind != "REQUEST")
-        .try_fold(0.0, |total, entry| Some(total + amount(&entry.amount)?))
+        .try_fold(0.0, |total, entry| {
+            let next = total + amount(&entry.amount)?;
+            next.is_finite().then_some(next)
+        })
 }
 
 /// 复评 R09：费用求和的**presence 证据**版本。
@@ -263,12 +268,14 @@ pub fn cost_sum(usage: &[Entry]) -> Option<f64> {
 /// `Some(v)` 表示至少存在一个可解析的费用条目（v 可以是显式 0）。
 pub fn cost_sum_present(usage: &[Entry]) -> Option<f64> {
     let mut seen = false;
+    // 复评 N16：累计溢出（非有限）同样传播未知。
     let total = usage
         .iter()
         .filter(|entry| entry.kind != "REQUEST")
         .try_fold(0.0, |total, entry| {
             seen = true;
-            Some(total + amount(&entry.amount)?)
+            let next = total + amount(&entry.amount)?;
+            next.is_finite().then_some(next)
         })?;
     seen.then_some(total)
 }
