@@ -24,6 +24,8 @@ export type ArchiveSummary = {
   includesPaths: boolean;
   complete: boolean;
   stale: boolean;
+  /** 复评 T05：质量证据（脱敏 code）。旧档为空 → 展示「质量证据未记录」。 */
+  qualityWarnings?: string[];
   rowCount: number;
 };
 export type ArchiveEntry = Omit<ArchiveSummary, "rowCount"> & {
@@ -48,6 +50,9 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     "sourceId",
     "sourceLabel",
     "tool",
+    // 复评 T03：归档/留存导出必须保留 client 身份（实时导出已补，这里同步）。
+    // 旧档没有该字段时输出 `"legacy-unknown"`，不伪造原生身份。
+    "clientId",
     "sessionId",
     "model",
     "projectRef",
@@ -73,6 +78,8 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     "complete",
     "stale",
     "includesPaths",
+    // 复评 T05：质量证据随归档导出，下游才能区分「读取完整」与「去重可信」。
+    "qualityWarnings",
   ] as const;
   // 旧归档没有偏移字段：保持 null，不用导出时的电脑时区补写。
   const offset =
@@ -91,14 +98,25 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
         id: entry.id,
         engineVersion: entry.engineVersion,
         accountingUtcOffsetSeconds: offset,
-        ...Object.fromEntries(metadata.map((field) => [field, entry[field]])),
+        ...Object.fromEntries(
+          metadata.map((field) => [
+            field,
+            field === "qualityWarnings"
+              ? entry.qualityWarnings?.length
+                ? entry.qualityWarnings.join(";")
+                : "quality-evidence-not-recorded"
+              : entry[field],
+          ]),
+        ),
         rows: entry.rows.map((row) =>
           Object.fromEntries(
             [...fields, "firstActiveMs", "lastActiveMs"].map((field) => [
               field,
               field === "tokenAccuracy"
                 ? "unclassified"
-                : (row as Record<string, unknown>)[field],
+                : field === "clientId"
+                  ? (row as Record<string, unknown>)[field] || "legacy-unknown"
+                  : (row as Record<string, unknown>)[field],
             ]),
           ),
         ),
@@ -114,9 +132,17 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
           ...fields.map((field) =>
             field === "tokenAccuracy"
               ? "unclassified"
-              : (row as Record<string, unknown>)[field],
+              : field === "clientId"
+                ? (row as Record<string, unknown>)[field] || "legacy-unknown"
+                : (row as Record<string, unknown>)[field],
           ),
-          ...metadata.map((field) => entry[field]),
+          ...metadata.map((field) =>
+            field === "qualityWarnings"
+              ? entry.qualityWarnings?.length
+                ? entry.qualityWarnings.join(";")
+                : "quality-evidence-not-recorded"
+              : entry[field],
+          ),
           offset,
           captureKind,
         ]),

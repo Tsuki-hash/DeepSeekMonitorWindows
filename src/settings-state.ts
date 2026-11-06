@@ -9,6 +9,7 @@ import { currencySymbol, fmtMoney } from "./format";
 import type { AppConfig, BalanceData, SavedApiKey, UsageResult } from "./types";
 import { fetchCurrentUsage } from "./usage-api";
 import { errorMessage } from "./error-state";
+import type { LeaveBlocker } from "./leave-guard";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -85,6 +86,14 @@ export type SettingsState = {
   saveRefreshInterval: (seconds: number) => void;
   saveAutoRefreshEnabled: (enabled: boolean) => void;
   saveAutostart: (enabled: boolean) => void;
+  /**
+   * 复评 T12：凭据草稿（API Key / 用量 Token）的离开拦截登记。
+   * 与 AlertSettings 的 blocker 由 SettingsPanel 组合成**一个** blocker，
+   * 避免子组件互相覆盖导致某一类草稿失去保护。
+   */
+  registerCredentialBlocker: (
+    register: (blocker: LeaveBlocker | null) => void,
+  ) => void;
 };
 
 export function useSettingsState(handlers: {
@@ -242,7 +251,9 @@ export function useSettingsState(handlers: {
     }
   }, []);
 
-  const saveApiKey = React.useCallback(() => {
+  // 复评 T12：保存改为返回 `Promise<boolean>` —— 「保存并离开」需要等待
+  // 真实结果，失败时不得导航。
+  const saveApiKey = React.useCallback(async (): Promise<boolean> => {
     const operation = beginApiKeyOperation();
     // 复评 R16：记录**本次提交的草稿值**。保存期间用户可能继续输入
     //（旧实现只禁用按钮、不禁输入），成功回调若无条件 `setApiKey("")`
@@ -250,23 +261,27 @@ export function useSettingsState(handlers: {
     const submitted = apiKey;
     setBusy(true);
     setStatus("正在验证 API Key…");
-    void invoke<SavedApiKey>("save_api_key", { apiKey })
-      .then(({ config: nextConfig, balance }) => {
-        if (!isCurrentApiKeyOperation(operation)) return;
-        setCommittedConfig(nextConfig);
-        // 只有输入仍是本次提交值时才清空；否则保留新草稿并提示未保存。
-        setApiKey((current) => (current === submitted ? "" : current));
-        onBalanceLoaded(balance);
-        const symbol = currencySymbol(balance.currency);
-        const tip = balance.isAvailable ? "" : "（余额不足）";
-        setStatus(`验证通过，当前余额 ${symbol}${balance.totalBalance}${tip}`);
-      })
-      .catch((error) => {
-        if (!isCurrentApiKeyOperation(operation)) return;
-        const message = errorMessage(error);
-        setStatus(message);
-      })
-      .finally(() => setBusy(false));
+    try {
+      const { config: nextConfig, balance } = await invoke<SavedApiKey>(
+        "save_api_key",
+        { apiKey },
+      );
+      if (!isCurrentApiKeyOperation(operation)) return false;
+      setCommittedConfig(nextConfig);
+      // 只有输入仍是本次提交值时才清空；否则保留新草稿并提示未保存。
+      setApiKey((current) => (current === submitted ? "" : current));
+      onBalanceLoaded(balance);
+      const symbol = currencySymbol(balance.currency);
+      const tip = balance.isAvailable ? "" : "（余额不足）";
+      setStatus(`验证通过，当前余额 ${symbol}${balance.totalBalance}${tip}`);
+      return true;
+    } catch (error) {
+      if (!isCurrentApiKeyOperation(operation)) return false;
+      setStatus(errorMessage(error));
+      return false;
+    } finally {
+      setBusy(false);
+    }
   }, [apiKey, onBalanceLoaded]);
 
   const clearApiKey = React.useCallback(() => {
@@ -334,23 +349,28 @@ export function useSettingsState(handlers: {
       .catch((error) => setUsageStatus(errorMessage(error)));
   }, []);
 
-  const saveUsageToken = React.useCallback(() => {
+  // 复评 T12：与 API Key 一样返回布尔结果，供「保存并离开」等待。
+  const saveUsageToken = React.useCallback(async (): Promise<boolean> => {
     // 复评 R16：与 API Key 同一规则 —— 只清空**本次提交**的草稿值。
     const submitted = usageToken;
     setBusy(true);
     setUsageStatus("正在验证候选 Token…");
-    void invoke<AppConfig>("save_usage_token", { usageToken })
-      .then((nextConfig) => {
-        setCommittedConfig(nextConfig);
-        setUsageToken((current) => (current === submitted ? "" : current));
-        setUsageStatus("验证通过并已保存，正在刷新用量…");
-      })
-      .catch((error) => {
-        // 走到这里说明是「保存」这一步失败（刷新阶段的失败已在 refreshUsageAfterToken
-        // 内处理并给出更准确的文案），所以不再笼统地说"保存或验证失败"。
-        setUsageStatus(errorMessage(error));
-      })
-      .finally(() => setBusy(false));
+    try {
+      const nextConfig = await invoke<AppConfig>("save_usage_token", {
+        usageToken,
+      });
+      setCommittedConfig(nextConfig);
+      setUsageToken((current) => (current === submitted ? "" : current));
+      setUsageStatus("验证通过并已保存，正在刷新用量…");
+      return true;
+    } catch (error) {
+      // 走到这里说明是「保存」这一步失败（刷新阶段的失败已在 refreshUsageAfterToken
+      // 内处理并给出更准确的文案），所以不再笼统地说"保存或验证失败"。
+      setUsageStatus(errorMessage(error));
+      return false;
+    } finally {
+      setBusy(false);
+    }
   }, [usageToken]);
 
   const clearUsageToken = React.useCallback(() => {
@@ -371,13 +391,28 @@ export function useSettingsState(handlers: {
       .finally(() => setBusy(false));
   }, [onUsageCleared, usageToken]);
 
+  // 复评 T13：凭据清除类操作（忘记账户 / `usage-token-cleared` 事件）必须按
+  // **草稿代际**清空，而不是无条件 `setUsageToken("")`。
+  //
+  // 旧实现在 forget 开始后、事件到达后都无条件清空 —— 用户在这两步之间
+  // 输入的新 Token 会被直接抹掉。这里记录操作开始时的草稿值：只有草稿
+  // **仍是该值**（说明用户没再输入）时才清空；否则保留新草稿。
+  // 重复事件/响应幂等：清空后草稿已是空串，再次到来不会误清。
+  const forgetDraftRef = React.useRef<string | null>(null);
+  const clearIfUnchanged = (submitted: string | null) => {
+    setUsageToken((current) =>
+      submitted === null || current === submitted ? "" : current,
+    );
+  };
   const forgetUsageSession = React.useCallback(() => {
+    // 记录本次清除所属的草稿版本。
+    forgetDraftRef.current = usageToken;
     setBusy(true);
     setUsageStatus("正在清除应用内的网页登录数据…");
     void invoke<AppConfig>("forget_usage_session")
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
-        setUsageToken("");
+        clearIfUnchanged(forgetDraftRef.current);
         setUsageSyncing(false);
         onUsageCleared();
         setUsageStatus(
@@ -386,12 +421,14 @@ export function useSettingsState(handlers: {
       })
       .catch((error) => setUsageStatus(errorMessage(error)))
       .finally(() => setBusy(false));
-  }, [onUsageCleared]);
+  }, [onUsageCleared, usageToken]);
 
   React.useEffect(() => {
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
       setCommittedConfig(event.payload);
-      setUsageToken("");
+      // 复评 T13：事件只清理**操作开始时**的草稿版本；用户在此之后输入
+      // 的新候选不会被事件擦掉。
+      clearIfUnchanged(forgetDraftRef.current);
       setUsageSyncing(false);
       onUsageCleared();
     });
@@ -399,6 +436,54 @@ export function useSettingsState(handlers: {
       void cleared.then((unlisten) => unlisten()).catch(() => undefined);
     };
   }, [onUsageCleared]);
+
+  // 复评 T12：把凭据草稿登记为离开拦截。设置页聚合「API Key + 用量 Token」
+  // 两类草稿（AlertSettings 的提醒草稿由 SettingsPanel 合并），因此这里只
+  // 报告凭据这一路；调用方负责组合成单个 blocker。
+  //
+  // 草稿只存在内存 state，不写 localStorage/sessionStorage/日志；
+  // 「保存并离开」等待真实保存结果，失败不导航。
+  const apiKeyRef = React.useRef(apiKey);
+  apiKeyRef.current = apiKey;
+  const usageTokenRef = React.useRef(usageToken);
+  usageTokenRef.current = usageToken;
+  // 保存函数每次渲染都是新函数，用 ref 转发避免 blocker 闭包过期。
+  const saveApiKeyRef = React.useRef(saveApiKey);
+  saveApiKeyRef.current = saveApiKey;
+  const saveUsageTokenRef = React.useRef(saveUsageToken);
+  saveUsageTokenRef.current = saveUsageToken;
+  const registerCredentialBlocker = React.useCallback(
+    (register: (blocker: LeaveBlocker | null) => void) => {
+      const hasDraft =
+        apiKeyRef.current.trim().length > 0 ||
+        usageTokenRef.current.trim().length > 0;
+      register(
+        hasDraft
+          ? {
+              dirty: true,
+              subject: "凭据草稿",
+              // 保存并离开：两项都尝试保存；任一失败则保留在页。
+              save: async () => {
+                const results: boolean[] = [];
+                if (apiKeyRef.current.trim()) {
+                  results.push(await saveApiKeyRef.current());
+                }
+                if (usageTokenRef.current.trim()) {
+                  results.push(await saveUsageTokenRef.current());
+                }
+                return results.every(Boolean);
+              },
+              discard: () => {
+                // 放弃：只清内存草稿（不触碰已保存凭据）。
+                setApiKey("");
+                setUsageToken("");
+              },
+            }
+          : null,
+      );
+    },
+    [],
+  );
 
   const saveRefreshInterval = React.useCallback(
     (seconds: number) => {
@@ -532,5 +617,6 @@ export function useSettingsState(handlers: {
     saveRefreshInterval,
     saveAutoRefreshEnabled,
     saveAutostart,
+    registerCredentialBlocker,
   };
 }

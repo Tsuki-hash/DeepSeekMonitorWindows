@@ -99,6 +99,7 @@ function SettingsPanel({
     saveRefreshInterval,
     saveAutoRefreshEnabled,
     saveAutostart,
+    registerCredentialBlocker,
   } = useSettingsState({
     onBalanceLoaded,
     onBalanceCleared,
@@ -110,6 +111,55 @@ function SettingsPanel({
   const { theme, toggleTheme } = useTheme();
   const [retrying, setRetrying] = React.useState(false);
   const [confirmForget, setConfirmForget] = React.useState(false);
+  // 复评 T12：把「凭据草稿」与「提醒草稿」组合成**一个** blocker 再上报，
+  // 避免两个子组件各自 `onRegisterLeaveBlocker` 时后者覆盖前者（其中一类
+  // 草稿因此失去保护）。这里按各自最新注册状态合并：任一脏即拦。
+  const credentialBlocker = React.useRef<LeaveBlocker | null>(null);
+  const alertBlocker = React.useRef<LeaveBlocker | null>(null);
+  const publishBlocker = React.useCallback(() => {
+    const parts = [credentialBlocker.current, alertBlocker.current].filter(
+      Boolean,
+    ) as LeaveBlocker[];
+    if (!parts.length) {
+      onRegisterLeaveBlocker?.(null);
+      return;
+    }
+    onRegisterLeaveBlocker?.({
+      dirty: true,
+      // 两个主体都点名，用户知道会丢什么。
+      subject: parts.map((part) => part.subject).join("、"),
+      save: async () => {
+        // 全部保存成功才允许离开。
+        for (const part of parts) {
+          if (!(await part.save())) return false;
+        }
+        return true;
+      },
+      discard: () => {
+        for (const part of parts) part.discard();
+      },
+    });
+  }, [onRegisterLeaveBlocker]);
+  const registerCredential = React.useCallback(
+    (blocker: LeaveBlocker | null) => {
+      credentialBlocker.current = blocker;
+      publishBlocker();
+    },
+    [publishBlocker],
+  );
+  const registerAlertBlocker = React.useCallback(
+    (blocker: LeaveBlocker | null) => {
+      alertBlocker.current = blocker;
+      publishBlocker();
+    },
+    [publishBlocker],
+  );
+  React.useEffect(() => {
+    // 复评 T12：凭据草稿只在内存里，输入变化时必须**重新注册**才能让
+    // blocker 反映当前是否脏（依赖 apiKey/usageToken）。
+    registerCredentialBlocker(registerCredential);
+    return () => registerCredentialBlocker(() => undefined);
+  }, [registerCredentialBlocker, registerCredential, apiKey, usageToken]);
   const notices = usageNotices(usage ?? null);
   const [healthClock, setHealthClock] = React.useState(Date.now);
   React.useEffect(() => {
@@ -576,7 +626,7 @@ function SettingsPanel({
               {settingErrors.refresh}
             </p>
           )}
-          <AlertSettings onRegisterLeaveBlocker={onRegisterLeaveBlocker} />
+          <AlertSettings onRegisterLeaveBlocker={registerAlertBlocker} />
         </SettingsSection>
 
         <SettingsSection icon={<Info size={15} />} title="外观">

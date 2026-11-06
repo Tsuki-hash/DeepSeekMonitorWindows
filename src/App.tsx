@@ -659,6 +659,11 @@ function App() {
   React.useEffect(() => {
     if (previousView.current === view) return;
     previousView.current = view;
+    // 复评 T18：**单一焦点所有者**。设置页有定向目标（`usageToken` 区块或
+    // 数据提示）时，焦点由 SettingsPanel 的定向 effect 负责 —— 这里的通用
+    // 「聚焦标题」必须跳过，否则后者的 RAF 会把焦点抢回顶部 h1，键盘/读屏
+    // 用户还得重新找 Token 区。普通入口（无定向目标）仍聚焦标题。
+    if (view === "settings" && (settingsTarget || showDataNotices)) return;
     // 让 React 先把新视图渲染出来，再找标题。
     const frame = window.requestAnimationFrame(() => {
       const heading = stageRef.current?.querySelector<HTMLElement>(
@@ -668,7 +673,7 @@ function App() {
       heading?.focus();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [view]);
+  }, [view, settingsTarget, showDataNotices]);
 
   // 复评 T05/T08：与局部出口共用同一提示组件 —— 对话框命名、初始焦点、
   // 焦点归还与提交中禁用都在组件内实现，两个出口行为一致。

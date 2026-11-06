@@ -515,3 +515,86 @@ test("N16：金额累计溢出为未知，且不会把 1e308+1e308 当正常金�
   const ok = safeKnownSum([model(0.1), model(0.2)], "cost");
   assert.ok(ok != null && Math.abs(ok - 0.3) < 1e-9);
 });
+
+// ---------- 第十轮复评 T10：跨记账午夜的未来零占位 ----------
+
+test("T10：晚于请求发起记账日的行不算已返回", () => {
+  const now = Date.parse("2026-11-05T00:00:30Z"); // 北京 08:00:30，新的一天
+  const model = (tokens: number) => ({
+    model: "deepseek-flash",
+    groupKey: "flash",
+    totalTokens: tokens,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: tokens,
+    otherTokens: 0,
+    cost: 0,
+  });
+  // 请求在 11-04 23:59:30 发起（sourceAsOfDate = 2026-11-04），
+  // 响应里含 11-05 的零占位行 —— 跨午夜后它不该变成「今天实测 0」。
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-11-05"),
+    [
+      {
+        month: "2026-11",
+        fetchedAt: now,
+        sourceAsOfDate: "2026-11-04",
+        usage: {
+          schemaVersion: 2,
+          models: [],
+          rawModels: [model(100)],
+          monthCost: 0,
+          days: [
+            { date: "2026-11-04", rawModels: [model(100)] },
+            { date: "2026-11-05", rawModels: [model(0)] },
+          ],
+        } as unknown as UsageResult,
+      },
+    ],
+    [],
+  );
+  assert.equal(
+    snapshot.rows.some((row) => row.date === "2026-11-05"),
+    false,
+    "晚于 sourceAsOfDate 的行必须被拒绝（否则未来零占位变成实测零）",
+  );
+  assert.equal(
+    snapshot.rows.some((row) => row.date === "2026-11-04"),
+    true,
+    "窗口内的真实数据保留",
+  );
+});
+
+test("T10：未记录 sourceAsOfDate 时不过滤（兼容旧夹具）", () => {
+  const now = Date.parse("2026-11-05T00:00:30Z");
+  const model = (tokens: number) => ({
+    model: "deepseek-flash",
+    groupKey: "flash",
+    totalTokens: tokens,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: tokens,
+    otherTokens: 0,
+    cost: 0,
+  });
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-11-05"),
+    [
+      {
+        month: "2026-11",
+        fetchedAt: now,
+        usage: {
+          schemaVersion: 2,
+          models: [],
+          rawModels: [model(100)],
+          monthCost: 0,
+          days: [{ date: "2026-11-05", rawModels: [model(100)] }],
+        } as unknown as UsageResult,
+      },
+    ],
+    [],
+  );
+  assert.equal(snapshot.rows.length, 1, "无 sourceAsOfDate 时不做额外过滤");
+});

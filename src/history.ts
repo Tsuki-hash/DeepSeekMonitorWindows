@@ -4,6 +4,16 @@ export type HistoryWindow = { from: string; to: string; months: string[] };
 export type HistoryMonth = {
   month: string;
   fetchedAt: number;
+  /**
+   * 复评 T10：**请求发起时**的东八区记账日。
+   *
+   * 旧实现只用 5 分钟 TTL 复用本月 payload，跨记账午夜后仍把同一份响应当
+   * 本日数据：接口在月初会返回未来日期的零占位行，跨过午夜后这些「未来」
+   * 日期就变成了「今天」，于是凭空多出一根「今天 0 Tokens」的实测柱。
+   * 用发起时刻的记账日作为窗口上界，晚于它的行一律不算「已返回」。
+   * 旧夹具/调用方可省略（空串表示「未记录」，此时不做该过滤）。
+   */
+  sourceAsOfDate?: string;
   usage: UsageResult;
 };
 export type HistoryRecord = { date: string; model: RawModelUsage };
@@ -77,11 +87,15 @@ export function buildHistory(
   const rows = new Map<string, HistoryRecord>();
   const returned = new Set<string>();
   for (const month of months) {
+    // 复评 T10：晚于**请求发起时**记账日的行不算「已返回」——即使请求
+    // 完成时已经跨过午夜。否则未来零占位会变成新一天的实测零。
+    const asOf = month.sourceAsOfDate;
     for (const day of month.usage.days) {
       if (
         day.date.slice(0, 7) !== month.month ||
         day.date < window.from ||
         day.date > window.to ||
+        (asOf && day.date > asOf) ||
         day.unavailable
       )
         continue;
