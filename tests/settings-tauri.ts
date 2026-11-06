@@ -3,6 +3,9 @@ export const invoke = (command: string, args?: unknown) =>
 export const isTauri = () => true;
 export const getVersion = () => Promise.resolve("1.3.1");
 export const listen = (name: string, callback: (event: unknown) => void) => {
+  if (globalThis.__settingsListen) {
+    return globalThis.__settingsListen(name, callback);
+  }
   const handlers = globalThis.__settingsListeners.get(name) ?? new Set();
   globalThis.__settingsListeners.set(name, handlers);
   handlers.add(callback);

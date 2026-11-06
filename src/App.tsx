@@ -59,23 +59,23 @@ type DetailFocusOrigin = {
   navigationId: number;
   accountEpoch: number;
 };
+type SettingsFocusTarget = "usageToken" | "dataNotices" | null;
 type ViewFocusRequest = {
   navigationId: number;
   view: ViewName;
   activeElement: Element | null;
   origin: DetailFocusOrigin | null;
+  settingsTarget: SettingsFocusTarget;
+  accountEpoch: number;
 };
 
 function App() {
-  // 复评 R16：设置页需要定位到用量 Token 区块时由这里指定。
-  const [settingsTarget, setSettingsTarget] = React.useState<
-    "usageToken" | "dataNotices" | null
-  >(null);
   // 页面与导航代际一起提交，不能让旧 RAF 误认并发渲染中的新页面。
   const [page, setPage] = React.useState<{
     view: ViewName;
     navigationId: number;
-  }>({ view: "dashboard", navigationId: 0 });
+    settingsTarget: SettingsFocusTarget;
+  }>({ view: "dashboard", navigationId: 0, settingsTarget: null });
   const { view } = page;
   const stageRef = React.useRef<HTMLDivElement>(null);
   const committedPage = React.useRef(page);
@@ -85,8 +85,8 @@ function App() {
   const detailFocusOrigin = React.useRef<DetailFocusOrigin | null>(null);
   const accountFocusEpoch = React.useRef(0);
   const [committedAccountFocusEpoch, setAccountFocusEpoch] = React.useState(0);
-  const visibleForFocus = React.useRef(true);
-  const windowVisibilityRevision = React.useRef(0);
+  // 原生订阅和首次快照均未就绪时不能猜测窗口可见。
+  const visibleForFocus = React.useRef(false);
   const cancelFocusFrame = React.useCallback(() => {
     if (focusFrame.current !== null) {
       window.cancelAnimationFrame(focusFrame.current);
@@ -101,23 +101,42 @@ function App() {
     // 失效后又恢复为同一凭据，也不能复活先前账户状态的入口。
     const nextEpoch = ++accountFocusEpoch.current;
     detailFocusOrigin.current = null;
-    if (focusRequest.current) focusRequest.current.origin = null;
+    if (focusRequest.current?.settingsTarget) {
+      // 定向入口属于创建时的账户，不可在新账户提交后重排或回退聚焦。
+      cancelViewFocus();
+    } else if (focusRequest.current) {
+      focusRequest.current.origin = null;
+    }
     // 保留当前导航的标题回退，但必须等账户更新真正提交后再执行。
     cancelFocusFrame();
     setAccountFocusEpoch(nextEpoch);
-  }, [cancelFocusFrame]);
+  }, [cancelFocusFrame, cancelViewFocus]);
   const setView = React.useCallback(
-    (nextView: ViewName, origin: DetailFocusOrigin | null = null) => {
+    (
+      nextView: ViewName,
+      origin: DetailFocusOrigin | null = null,
+      target: SettingsFocusTarget = null,
+    ) => {
       cancelViewFocus();
       const nextId = ++navigationId.current;
-      focusRequest.current = {
-        navigationId: nextId,
-        view: nextView,
-        activeElement: document.activeElement,
-        origin,
-      };
+      const settingsTarget = nextView === "settings" ? target : null;
+      // 未确认可见/已隐藏/已失焦时产生的导航不储存自动焦点请求，
+      // 避免下一次 shown 或初始化读取成功后补执行后台导航。
+      focusRequest.current =
+        visibleForFocus.current &&
+        document.visibilityState === "visible" &&
+        document.hasFocus?.() !== false
+          ? {
+              navigationId: nextId,
+              view: nextView,
+              activeElement: document.activeElement,
+              origin,
+              settingsTarget,
+              accountEpoch: accountFocusEpoch.current,
+            }
+          : null;
       detailFocusOrigin.current = null;
-      setPage({ view: nextView, navigationId: nextId });
+      setPage({ view: nextView, navigationId: nextId, settingsTarget });
       return nextId;
     },
     [cancelViewFocus],
@@ -586,41 +605,89 @@ function App() {
   // 否则面板整天收在托盘里也会按时打接口。该状态由 Rust 侧在显隐时发的事件驱动
   // （见 lib.rs 的 EVENT_MAIN_WINDOW_SHOWN / EVENT_MAIN_WINDOW_HIDDEN），
   // 这样从托盘唤出、托盘左键切换、程序内点关闭三条路径都覆盖得到。
-  const [windowVisible, setWindowVisible] = React.useState(true);
-  // 首帧后按实际窗口可见性校正，避免启动时若已在托盘仍多跑一轮刷新
+  const [windowVisible, setWindowVisible] = React.useState(false);
+  const [visibilityError, setVisibilityError] = React.useState(false);
+  const [visibilityAttempt, retryVisibility] = React.useReducer(
+    (attempt: number) => attempt + 1,
+    0,
+  );
+  // R29：订阅和读取必须属于同一生命周期。先确认两种事件都已注册，
+  // 再捕获 revision 并查询，消除「已读取、尚未监听」的丢事件窗口。
   React.useEffect(() => {
-    const startedAt = windowVisibilityRevision.current;
-    void invoke<boolean>("is_main_window_visible")
-      .then((visible) => {
-        // 首次查询的迟到结果不能覆盖更新的显隐事件。
-        if (startedAt !== windowVisibilityRevision.current) return;
-        visibleForFocus.current = visible;
-        if (!visible) cancelViewFocus();
-        setWindowVisible(visible);
+    let disposed = false;
+    let failed = false;
+    let subscribed = false;
+    let revision = 0;
+    const unlisteners = new Set<() => void>();
+    const active = () => !disposed && !failed;
+    const release = (unlisten: () => void) => {
+      try {
+        unlisten();
+      } catch {
+        // 已撤销的生命周期仍拒绝所有回调，不让一次清理失败阻止另一监听释放。
+      }
+    };
+    const releaseAll = () => {
+      const registered = [...unlisteners];
+      unlisteners.clear();
+      registered.forEach(release);
+    };
+    const applyVisibility = (visible: boolean) => {
+      visibleForFocus.current = visible;
+      if (!visible) cancelViewFocus();
+      setWindowVisible(visible);
+    };
+    const fail = () => {
+      if (!active()) return;
+      failed = true;
+      subscribed = false;
+      releaseAll();
+      applyVisibility(false);
+      setVisibilityError(true);
+    };
+    applyVisibility(false);
+    setVisibilityError(false);
+    const register = async (name: string, visible: boolean) => {
+      const unlisten = await listen(name, () => {
+        if (!active()) return;
+        revision += 1;
+        // 只装好单个监听时，另一方向仍可能漏事件；由双订阅后的查询收敛。
+        if (!subscribed) return;
+        applyVisibility(visible);
+        if (visible) {
+          // 唤出只做静默刷新，不闪掉已有快照。
+          void refreshAll(true);
+        }
+      });
+      if (!active()) release(unlisten);
+      else unlisteners.add(unlisten);
+    };
+    void Promise.all([
+      register("main-window-shown", true),
+      register("main-window-hidden", false),
+    ])
+      .then(async () => {
+        if (!active()) return;
+        subscribed = true;
+        const startedAt = revision;
+        try {
+          const visible = await invoke<boolean>("is_main_window_visible");
+          if (!active() || startedAt !== revision) return;
+          applyVisibility(visible);
+        } catch {
+          // 新原生事件已经给出可信状态时，旧查询失败也不能撤销它。
+          if (active() && startedAt === revision) fail();
+        }
       })
-      .catch(() => undefined);
-  }, [cancelViewFocus]);
-
-  React.useEffect(() => {
-    const shown = listen("main-window-shown", () => {
-      windowVisibilityRevision.current += 1;
-      visibleForFocus.current = true;
-      setWindowVisible(true);
-      // 面板被唤出即拉最新数据，避免托盘唤出后看到的是旧快照。
-      // 走静默刷新：唤出瞬间面板上已有上一轮的数据，不该闪一下「查询中…」。
-      refreshAll(true);
-    });
-    const hidden = listen("main-window-hidden", () => {
-      windowVisibilityRevision.current += 1;
+      .catch(fail);
+    return () => {
+      // StrictMode 重放/卸载即撤销已注册监听，迟到的 listen 自行释放。
+      disposed = true;
+      releaseAll();
       visibleForFocus.current = false;
       cancelViewFocus();
-      setWindowVisible(false);
-    });
-    return () => {
-      void shown.then((unlisten) => unlisten());
-      void hidden.then((unlisten) => unlisten());
     };
-  }, [refreshAll, cancelViewFocus]);
+  }, [refreshAll, cancelViewFocus, visibilityAttempt]);
 
   // 两路各自独立调度（复评 R01）：每个通道有自己的 timer 与截止时间，
   // 一个通道完成不会推迟另一个通道的退避截止时间。
@@ -644,7 +711,9 @@ function App() {
     visible: windowVisible,
     paused: channels.current.balance.paused,
     delaySeconds: balanceDelay,
-    run: () => loadBalance(true),
+    // hidden 事件先同步撤销 ref，不能等 React 提交后才阻止已经到期的 timer。
+    run: () =>
+      visibleForFocus.current ? loadBalance(true) : Promise.resolve(),
     revision: channelRevision.balance,
   });
   useChannelScheduler({
@@ -652,7 +721,7 @@ function App() {
     visible: windowVisible,
     paused: channels.current.usage.paused,
     delaySeconds: usageDelay,
-    run: () => loadUsage(true),
+    run: () => (visibleForFocus.current ? loadUsage(true) : Promise.resolve()),
     revision: channelRevision.usage,
   });
 
@@ -857,7 +926,7 @@ function App() {
   }, [cancelViewFocus]);
 
   // R28：仅详情的明确返回携带入口模型键，重挂载后重新查找原生按钮。
-  // 其他导航仍聚焦首标题；定向设置入口继续由 SettingsPanel 独占焦点。
+  // 普通导航聚焦首标题；定向设置入口也由同一请求拥有展开/滚动/焦点。
   // 每次提交都重新核对，后台数据更新不得留下读取旧 DOM/账户的 RAF。
   React.useLayoutEffect(() => {
     committedPage.current = page;
@@ -865,16 +934,15 @@ function App() {
     if (
       !request ||
       request.navigationId !== page.navigationId ||
-      request.view !== view
+      request.view !== view ||
+      request.settingsTarget !== page.settingsTarget
     ) {
       return;
     }
-    if (view === "settings" && settingsTarget) {
-      cancelViewFocus();
-      return;
-    }
     const frame = window.requestAnimationFrame(() => {
-      if (focusFrame.current === frame) focusFrame.current = null;
+      // 取消后即使宿主仍交付旧 callback，也不能抢占随后重排的同一请求。
+      if (focusFrame.current !== frame) return;
+      focusFrame.current = null;
       if (
         focusRequest.current !== request ||
         navigationId.current !== request.navigationId ||
@@ -884,6 +952,13 @@ function App() {
       }
       // 凭据事件可能早于其 React 提交；等最新提交重新挂帧，不读旧账户 DOM。
       if (accountFocusEpoch.current !== committedAccountFocusEpoch) return;
+      if (
+        request.settingsTarget &&
+        request.accountEpoch !== accountFocusEpoch.current
+      ) {
+        cancelViewFocus();
+        return;
+      }
       if (
         !visibleForFocus.current ||
         document.visibilityState !== "visible" ||
@@ -904,6 +979,31 @@ function App() {
       const stage = stageRef.current;
       if (!stage || stage.isConnected === false) {
         cancelViewFocus();
+        return;
+      }
+      if (view === "settings" && request.settingsTarget) {
+        // 请求消费先于自身产生的 focusin；任何取消都不在 shown/重渲染后复活。
+        focusRequest.current = null;
+        const target = stage.querySelector<HTMLElement>(
+          `[data-settings-focus="${request.settingsTarget}"]`,
+        );
+        if (!target?.isConnected || target.closest("[inert], [hidden]")) return;
+        if (request.settingsTarget === "dataNotices") {
+          const disclosure = stage.querySelector<HTMLDetailsElement>(
+            '[data-settings-disclosure="dataNotices"]',
+          );
+          if (
+            !disclosure?.isConnected ||
+            disclosure.closest("[inert], [hidden]") ||
+            disclosure.getClientRects().length === 0
+          ) {
+            return;
+          }
+          disclosure.open = true;
+        }
+        if (target.getClientRects().length === 0) return;
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        target.focus({ preventScroll: true });
         return;
       }
       const origin = request.origin;
@@ -956,8 +1056,21 @@ function App() {
     <div
       ref={stageRef}
       data-panel-mode={mode}
-      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""}`}
+      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${visibilityError ? "visibility-unavailable" : ""}`}
     >
+      {visibilityError && (
+        <section className="config-read-error visibility-error" role="alert">
+          <strong>无法确认窗口显隐状态</strong>
+          <p>自动刷新和导航自动聚焦已暂停，仍可手动刷新。</p>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => retryVisibility()}
+          >
+            重试窗口状态
+          </button>
+        </section>
+      )}
       {view === "dashboard" && (
         <>
           <DashboardPanel
@@ -972,10 +1085,7 @@ function App() {
                   <div className="disclosure-actions">
                     <button
                       className="secondary"
-                      onClick={() => {
-                        setSettingsTarget(null);
-                        setView("settings");
-                      }}
+                      onClick={() => setView("settings")}
                     >
                       打开设置
                     </button>
@@ -997,10 +1107,11 @@ function App() {
                   })}
                   onChoose={(task) => {
                     setOnboardingDismissed(true);
-                    setSettingsTarget(
+                    setView(
+                      "settings",
+                      null,
                       task === "platform" ? "usageToken" : null,
                     );
-                    setView("settings");
                   }}
                   onDismiss={() => setOnboardingDismissed(true)}
                 />
@@ -1017,14 +1128,8 @@ function App() {
             usageError={usageError}
             onRefresh={() => refreshAll()}
             onClose={hideWindow}
-            onSettings={() => {
-              setSettingsTarget(null);
-              setView("settings");
-            }}
-            onDataStatus={() => {
-              setSettingsTarget("dataNotices");
-              setView("settings");
-            }}
+            onSettings={() => setView("settings")}
+            onDataStatus={() => setView("settings", null, "dataNotices")}
             onDetail={(nextModel, trigger) => {
               // 只记实际进入的原生入口，不记卸载后失效的 DOM 引用。
               const fromDashboard =
@@ -1059,30 +1164,18 @@ function App() {
           usageUpdatedAt={usageUpdatedAt}
           balanceError={balanceError}
           usageError={usageError}
-          targetSection={settingsTarget}
           usage={usage}
           // 第五轮复评 N04：提醒设置草稿注册进同一个 App 级离开拦截；
           // 关闭设置页也走 navigate，脏草稿不再被静默丢弃。
           onRegisterLeaveBlocker={registerLeaveBlocker}
-          onBack={() =>
-            navigate(() => {
-              setSettingsTarget(null);
-              setView("dashboard");
-            })
-          }
+          onBack={() => navigate(() => setView("dashboard"))}
         />
       )}
       {view === "detail" && (
         <ModelDetailPanel
-          onDataStatus={() => {
-            setSettingsTarget("dataNotices");
-            setView("settings");
-          }}
+          onDataStatus={() => setView("settings", null, "dataNotices")}
           updatedAt={usageUpdatedAt}
-          onSettings={() => {
-            setSettingsTarget(null);
-            setView("settings");
-          }}
+          onSettings={() => setView("settings")}
           model={model}
           usage={usage}
           usageState={usageState}
@@ -1105,8 +1198,7 @@ function App() {
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
           onConfigureUsage={() => {
             // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
-            setSettingsTarget("usageToken");
-            setView("settings");
+            setView("settings", null, "usageToken");
           }}
         />
       )}

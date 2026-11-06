@@ -224,8 +224,9 @@ async function fixture(
   inspect: () => Promise<void>,
   initialLoad: (month: string) => Promise<UsageResult> = async (month) =>
     usage(month),
+  initialInstant = "2026-10-31T15:59:00Z",
 ) {
-  now = NativeDate.parse("2026-10-31T15:59:00Z");
+  now = NativeDate.parse(initialInstant);
   calls = [];
   blobs.length = 0;
   load = initialLoad;
@@ -247,6 +248,375 @@ async function fixture(
     assert.equal(intervals.size, 0);
     assert.equal(events.get("visibilitychange")?.size ?? 0, 0);
   }
+}
+
+const remountHistory = async (concurrent: boolean, configured = true) => {
+  await act(async () => {
+    view.unmount();
+    await flush();
+  });
+  await act(async () => {
+    view = Renderer.create(
+      <HistoryPanel
+        onBack={noop}
+        windowVisible
+        usageTokenConfigured={configured}
+      />,
+      { unstable_isConcurrent: concurrent } as any,
+    );
+    await flush();
+  });
+  await act(flush);
+};
+
+const assertCsvStale = async (expected: boolean) => {
+  await click("CSV");
+  const csv = (await blobs[blobs.length - 1].text()).replace(/^\uFEFF/, "");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < csv.length; i++) {
+    const character = csv[i];
+    if (character === '"') {
+      if (quoted && csv[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else quoted = !quoted;
+    } else if (!quoted && (character === "," || character === "\n")) {
+      row.push(field);
+      field = "";
+      if (character === "\n") {
+        rows.push(row);
+        row = [];
+      }
+    } else if (quoted || character !== "\r") field += character;
+  }
+  if (row.length || field) rows.push([...row, field]);
+  const column = rows[0].indexOf("stale");
+  assert.ok(column >= 0);
+  assert.ok(
+    rows.length > 1,
+    "fixture exports returned or explicitly missing dates",
+  );
+  assert.ok(
+    rows.slice(1).every((record) => record[column] === String(expected)),
+  );
+};
+
+// Round 29: cache state is authoritative across selection resets/unmounts.
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+  for (const failure of [
+    {
+      code: "not_configured",
+      message: "not configured",
+      configured: false,
+      action: "去设置页配置用量 Token",
+    },
+    {
+      code: "credentials_invalid",
+      message: "invalid credentials",
+      configured: true,
+      action: "去设置页重新同步 Token",
+    },
+    {
+      code: "rate_limited",
+      message: "rate limited",
+      configured: true,
+      action: "只重试失败月份（1）",
+    },
+    {
+      code: "unavailable",
+      message: "unavailable",
+      configured: true,
+      action: "只重试失败月份（1）",
+    },
+    {
+      code: "invalid_data",
+      message: "平台 Token 数据无效",
+      configured: true,
+      action: "只重试失败月份（1）",
+    },
+    {
+      code: "unknown",
+      message: "ordinary month error",
+      configured: true,
+      action: "只重试失败月份（1）",
+    },
+    {
+      code: "unknown",
+      message: "请重新登录，用量 Token 已失效",
+      configured: true,
+      action: "去设置页重新同步 Token",
+    },
+  ]) {
+    test(`R29 history (${mode}): ${failure.code}/${failure.message} cannot recover by switching ranges or remounting`, async () => {
+      await fixture(concurrent, async () => {
+        const original = await exportJson();
+        if (!failure.configured) {
+          await act(async () => {
+            view.update(
+              <HistoryPanel
+                onBack={noop}
+                windowVisible
+                usageTokenConfigured={false}
+              />,
+            );
+            await flush();
+          });
+        }
+        load = async (month) => {
+          if (month === "2026-10") throw failure;
+          return usage(month);
+        };
+        const before = calls.length;
+        await click("重新查询历史");
+        assert.deepEqual(calls.slice(before), ["2026-10"]);
+        const assertUnrecovered = async () => {
+          const json = await exportJson();
+          assert.deepEqual(json.failedMonths, ["2026-10"]);
+          assert.equal(json.stale, true);
+          assert.deepEqual(json.daily, original.daily);
+          assert.deepEqual(
+            json.sourceMonthlySnapshots,
+            original.sourceMonthlySnapshots,
+          );
+          assert.deepEqual(json.unloadedMonths, []);
+          assert.deepEqual(metrics(), ["30", "¥3.00"]);
+          assert.ok(button(failure.action));
+          assert.ok(button("只重试失败月份（1）"));
+          assert.equal(view.root.findAllByProps({ role: "alert" }).length, 1);
+          await assertCsvStale(true);
+        };
+        await assertUnrecovered();
+        // A now-healthy loader must not be called, or assumed to have run, just
+        // because the component's local error/snapshot state was reset.
+        load = async (month) => usage(month, "recovered");
+        await click("上月");
+        const other = await exportJson();
+        assert.deepEqual(other.failedMonths, []);
+        assert.equal(other.stale, false);
+        assert.ok(
+          other.daily.every((row: any) => row.date.startsWith("2026-09")),
+        );
+        const afterOther = calls.length;
+        await click("本月");
+        assert.equal(calls.length, afterOther);
+        await assertUnrecovered();
+        await remountHistory(concurrent, failure.configured);
+        assert.equal(calls.length, afterOther);
+        await assertUnrecovered();
+        const retryStart = calls.length;
+        await click("只重试失败月份（1）");
+        assert.deepEqual(calls.slice(retryStart), ["2026-10"]);
+        const recovered = await exportJson();
+        assert.deepEqual(recovered.failedMonths, []);
+        assert.equal(recovered.stale, false);
+        assert.ok(
+          recovered.daily.every((row: RawModelUsage) =>
+            row.model.startsWith("recovered-"),
+          ),
+        );
+        await assertCsvStale(false);
+        assert.equal(button("只重试失败月份（1）"), undefined);
+        assert.equal(view.root.findAllByProps({ role: "alert" }).length, 0);
+        const recoveredCalls = calls.length;
+        await remountHistory(concurrent, failure.configured);
+        assert.equal(
+          calls.length,
+          recoveredCalls,
+          "healthy TTL cache works after real recovery",
+        );
+        assert.deepEqual((await exportJson()).daily, recovered.daily);
+      });
+    });
+  }
+
+  test(`R29 history (${mode}): evicted failed payload remains unknown, not a zero or an unexplained success`, async () => {
+    await fixture(concurrent, async () => {
+      await click("全部");
+      const original = await exportJson();
+      assert.equal(original.monthly.length, 12);
+      load = async () => {
+        throw { code: "rate_limited" };
+      };
+      await click("重新查询历史");
+      const retained = await exportJson();
+      assert.deepEqual(
+        retained.daily,
+        original.daily,
+        "the mounted all-history snapshot keeps its own success data",
+      );
+      assert.deepEqual(retained.failedMonths, ["2026-10"]);
+      assert.equal(retained.stale, true);
+      const beforeRemount = calls.length;
+      await remountHistory(concurrent);
+      assert.equal(calls.length, beforeRemount);
+      const evicted = await exportJson();
+      assert.deepEqual(evicted.failedMonths, ["2026-10"]);
+      assert.equal(evicted.stale, true);
+      assert.deepEqual(evicted.daily, []);
+      assert.deepEqual(evicted.monthly, []);
+      assert.deepEqual(evicted.sourceMonthlySnapshots, []);
+      assert.deepEqual(metrics(), ["—", "—"]);
+      assert.ok(trend().every((point) => point.value === null));
+      assert.ok(text(view.toJSON()).includes("旧成功缓存已释放"));
+      assert.ok(button("只重试失败月份（1）"));
+      await assertCsvStale(true);
+      load = async (month) => usage(month);
+      await click("只重试失败月份（1）");
+      assert.equal(calls.length, beforeRemount + 1);
+      assert.deepEqual((await exportJson()).failedMonths, []);
+      assert.deepEqual(metrics(), ["30", "¥3.00"]);
+    });
+  });
+
+  test(`R29 history (${mode}): mixed failed/loaded/unloaded coverage survives range reset and remount`, async () => {
+    await fixture(concurrent, async () => {
+      load = async (month) => {
+        if (month === "2026-10") throw { code: "invalid_data" };
+        return usage(month);
+      };
+      await click("重新查询历史");
+      await click("全部");
+      const all = historyWindow("all", "2026-10-31").months;
+      const snapshot = await exportJson();
+      assert.deepEqual(snapshot.failedMonths, ["2026-10"]);
+      assert.deepEqual(snapshot.unloadedMonths, all.slice(0, -12));
+      assert.equal(snapshot.monthly.length, 12);
+      assert.equal(snapshot.stale, true);
+      assert.ok(button("继续加载更早月份 ›"));
+      await remountHistory(concurrent);
+      await click("全部");
+      const remounted = await exportJson();
+      assert.deepEqual(remounted.failedMonths, ["2026-10"]);
+      assert.deepEqual(remounted.unloadedMonths, all.slice(0, -12));
+      assert.equal(
+        remounted.monthly.length,
+        11,
+        "the evicted failed month has no fabricated payload after remount",
+      );
+      assert.ok(remounted.missingDates.includes("2026-10-31"));
+      const start = calls.length;
+      load = async (month) => usage(month, "recovered");
+      await click("只重试失败月份（1）");
+      assert.deepEqual(calls.slice(start), ["2026-10"]);
+      const recovered = await exportJson();
+      assert.deepEqual(recovered.failedMonths, []);
+      assert.deepEqual(recovered.unloadedMonths, all.slice(0, -12));
+      assert.equal(recovered.monthly.length, 12);
+    });
+  });
+
+  for (const change of ["ttl", "accounting-day"] as const) {
+    test(`R29 history (${mode}): ${change} expiry can clear failure only after an actual loader success`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          load = async () => {
+            throw { code: "invalid_data" };
+          };
+          await click("重新查询历史");
+          const old = await exportJson();
+          assert.deepEqual(old.failedMonths, ["2026-10"]);
+          await tick(
+            change === "ttl" ? "2026-10-30T14:06:00Z" : "2026-10-30T16:01:00Z",
+          );
+          const before = calls.length;
+          await remountHistory(concurrent);
+          assert.deepEqual(calls.slice(before), ["2026-10"]);
+          assert.deepEqual((await exportJson()).failedMonths, ["2026-10"]);
+          assert.equal((await exportJson()).stale, true);
+          const pending = deferredUsage();
+          load = () => pending.promise;
+          await click("只重试失败月份（1）");
+          assert.equal(button("JSON").props.disabled, true);
+          await act(async () => {
+            pending.resolve(usage("2026-10", "new"));
+            await flush();
+          });
+          const recovered = await exportJson();
+          assert.deepEqual(recovered.failedMonths, []);
+          assert.equal(recovered.stale, false);
+        },
+        undefined,
+        "2026-10-30T14:00:00Z",
+      );
+    });
+  }
+
+  for (const late of ["success", "failure"] as const) {
+    test(`R29 history (${mode}): retry remount adopts the active request and ignores old-token late ${late}`, async () => {
+      await fixture(concurrent, async () => {
+        load = async () => {
+          throw { code: "credentials_invalid" };
+        };
+        await click("重新查询历史");
+        const pending = deferredUsage();
+        load = () => pending.promise;
+        await click("只重试失败月份（1）");
+        const before = calls.length;
+        await remountHistory(concurrent);
+        assert.equal(calls.length, before, "remount joins the active retry");
+        assert.equal(button("JSON").props.disabled, true);
+        load = async (month) => usage(month, "B");
+        await act(async () => {
+          historyCache.invalidate();
+          await flush();
+        });
+        const current = await exportJson();
+        assert.deepEqual(current.failedMonths, []);
+        assert.equal(current.stale, false);
+        assert.ok(
+          current.daily.every((row: RawModelUsage) =>
+            row.model.startsWith("B-"),
+          ),
+        );
+        await act(async () => {
+          if (late === "success") pending.resolve(usage("2026-10", "A-late"));
+          else pending.reject({ code: "rate_limited" });
+          await flush();
+        });
+        assert.deepEqual((await exportJson()).daily, current.daily);
+        assert.equal(button("只重试失败月份（1）"), undefined);
+        await remountHistory(concurrent);
+        assert.deepEqual((await exportJson()).daily, current.daily);
+        assert.equal((await exportJson()).stale, false);
+      });
+    });
+  }
+
+  test(`R29 history (${mode}): excluded source dates are visible without entering normal totals`, async () => {
+    await fixture(
+      concurrent,
+      async () => {
+        const json = await exportJson();
+        assert.deepEqual(metrics(), ["30", "¥3.00"]);
+        assert.ok(
+          text(view.toJSON()).includes("2 条来源日期异常，已排除正常合计"),
+        );
+        assert.ok(text(view.toJSON()).includes("2026-10-32"));
+        assert.ok(text(view.toJSON()).includes("2026-09-30"));
+        assert.equal(json.excludedDateRecords.length, 2);
+        assert.ok(json.daily.every((row: any) => row.date === "2026-10-31"));
+      },
+      async (month) => {
+        const original = usage(month);
+        return {
+          ...original,
+          days: [
+            ...original.days,
+            { date: "2026-10-32", rawModels: [raw("invalid-source", 123, 12)] },
+            {
+              date: "2026-09-30",
+              rawModels: [raw("wrong-month-source", 456, 45)],
+            },
+          ] as UsageResult["days"],
+        };
+      },
+    );
+  });
 }
 
 for (const concurrent of [false, true]) {

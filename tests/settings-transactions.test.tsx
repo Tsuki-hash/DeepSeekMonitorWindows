@@ -173,10 +173,41 @@ const nodeMock = (element) => {
       focus.push(name);
       g.document.activeElement = node;
     },
-    querySelector: () => ({
-      setAttribute: noop,
-      focus: () => focus.push("generic-heading"),
-    }),
+    querySelector: (selector = "") => {
+      // R29: App now locates the real settings targets through its stage ref;
+      // the stronger lifecycle/cancellation fixture lives in the directed suite.
+      const target = selector.match(/data-settings-focus="(\w+)"/);
+      const disclosure = selector.includes("data-settings-disclosure");
+      if (target || disclosure) {
+        const attribute = target
+          ? "data-settings-focus"
+          : "data-settings-disclosure";
+        const value = target?.[1] ?? "dataNotices";
+        const matches = () =>
+          renderer?.root.findAllByProps({ [attribute]: value }) ?? [];
+        if (matches().length === 0) return null;
+        const selected = {
+          get isConnected() {
+            return matches().length > 0;
+          },
+          open: false,
+          closest: () => null,
+          getClientRects: () => (matches().length ? [{}] : []),
+          scrollIntoView: noop,
+          focus: () => {
+            focus.push(
+              value === "usageToken" ? "usage-target" : "data-summary",
+            );
+            g.document.activeElement = selected;
+          },
+        };
+        return selected;
+      }
+      return {
+        setAttribute: noop,
+        focus: () => focus.push("generic-heading"),
+      };
+    },
   };
   return node;
 };

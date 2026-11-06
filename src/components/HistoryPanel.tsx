@@ -14,7 +14,7 @@ import { mergeHistoryMonths } from "../history-merge";
 import type { HistoryScope } from "../history-merge";
 import { updateTime, snapshotAge } from "../data-display";
 import { fetchMonthUsage } from "../usage-api";
-import { historyCache } from "../history-cache";
+import { historyCache, HistoryCacheFailure } from "../history-cache";
 import {
   buildHistory,
   historyWindow,
@@ -181,7 +181,7 @@ export function HistoryPanel({
         return;
       }
       // 本次请求之前已成功取得的月份：重试与继续加载都要保留它们。
-      const previousMonths = retained?.months ?? [];
+      const previousMonths = [...(retained?.months ?? [])];
       // 复评 R05：失败月份跨批次持久，只有本次成功才清除。
       const previousFailed = sameSelection
         ? failedRef.current.filter((month) => window.months.includes(month))
@@ -189,6 +189,11 @@ export function HistoryPanel({
       const attempted: string[] = [];
       const successful: HistorySnapshot["months"] = [];
       const failedMonths: string[] = [];
+      const evictedFailedMonths = new Set<string>();
+      const evictedFailureNote = () =>
+        evictedFailedMonths.size
+          ? " 部分月份的旧成功缓存已释放，本次未恢复；请重试获取记录。"
+          : "";
       // 复评 R04：所有写状态的地方都必须先确认「这次请求仍然有效」。
       // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
       const stillOwner = () =>
@@ -201,7 +206,9 @@ export function HistoryPanel({
       const commit = (stopText?: string) => {
         const merged = mergeHistoryMonths({
           scope: requestedScope,
-          previousScope: sameSelection ? requestedScope : null,
+          // previousMonths contains only the scope-checked retained snapshot
+          // and current-epoch cache fallbacks for this request's target months.
+          previousScope: requestedScope,
           windowMonths: window.months,
           planned: targets,
           attempted,
@@ -234,7 +241,7 @@ export function HistoryPanel({
         } else if (merged.failedMonths.length) {
           setRecovery("partial");
           setError(
-            `${merged.failedMonths.length}个月份未取得，未返回日期标为未知。`,
+            `${merged.failedMonths.length}个月份未取得，未返回日期标为未知。${evictedFailureNote()}`,
           );
         } else {
           // A retry may clear the final failure after earlier commits in the
@@ -270,7 +277,30 @@ export function HistoryPanel({
         } catch (failure) {
           // 复评 R04：先复核所有权，迟到的失败结果直接丢弃。
           if (!stillOwner()) return;
-          const classified = classifyHistoryFailure(failure, month);
+          // A warm cache can carry a newer failed refresh alongside its old
+          // successful payload. Restore that payload as retained data, never as
+          // a success for this run: switching ranges/remounting is not recovery.
+          if (
+            failure instanceof HistoryCacheFailure &&
+            failure.epoch === requestedEpoch &&
+            failure.lastSuccess
+          ) {
+            const index = previousMonths.findIndex(
+              (previous) => previous.month === month,
+            );
+            if (index < 0) previousMonths.push(failure.lastSuccess);
+            else previousMonths[index] = failure.lastSuccess;
+          }
+          if (
+            failure instanceof HistoryCacheFailure &&
+            failure.hadSuccess &&
+            !previousMonths.some((previous) => previous.month === month)
+          )
+            evictedFailedMonths.add(month);
+          const classified =
+            failure instanceof HistoryCacheFailure
+              ? failure.classified
+              : classifyHistoryFailure(failure, month);
           const outcome = historyFailureOutcome(
             classified,
             [...failedMonths, month],
@@ -280,7 +310,7 @@ export function HistoryPanel({
           // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
           if (!outcome.continue) {
             setProgress({ done: attempted.length, total: targets.length });
-            setError(outcome.text);
+            setError(outcome.text + evictedFailureNote());
             commit(outcome.recovery);
             requestInProgress.current = false;
             setBusy(false);
@@ -503,7 +533,9 @@ export function HistoryPanel({
       snapshot?.months.flatMap((month) => month.usage.warnings ?? []) ?? [],
     ),
   ];
-  const stale = Boolean(error && snapshot) || windowOutdated;
+  const stale =
+    Boolean(snapshot?.failedMonths.length || (error && snapshot)) ||
+    windowOutdated;
   const fetchedAt = snapshot?.months.length
     ? Math.min(...snapshot.months.map((month) => month.fetchedAt))
     : null;
@@ -668,6 +700,24 @@ export function HistoryPanel({
               ? ` 覆盖不完整：${snapshot.missingDates.length} 日未返回、${snapshot.unloadedMonths.length} 个月未加载、${snapshot.failedMonths.length} 个月查询失败。小计不代表完整区间用量。`
               : " 汇总只包含已返回日记录。"}
           </p>
+        )}
+        {snapshot != null && snapshot.excludedDays.length > 0 && (
+          <details className="history-message warning">
+            <summary>
+              {snapshot.excludedDays.length} 条来源日期异常，已排除正常合计
+            </summary>
+            <p>
+              以下为平台原始日期与查询月份；原始模型记录及警告保留在导出中。
+            </p>
+            <ul>
+              {snapshot.excludedDays.map((day, index) => (
+                <li key={`${day.month}:${day.date}:${index}`}>
+                  查询 {day.month} · 原始日期 {day.date || "（空）"} ·{" "}
+                  {day.message}
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
         {windowOutdated && snapshot && (
           <p className="history-message warning" role="status">

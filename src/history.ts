@@ -18,11 +18,26 @@ export type HistoryMonth = {
   usage: UsageResult;
 };
 export type HistoryRecord = { date: string; model: RawModelUsage };
+/** Source evidence only. These records never enter returned rows or coverage. */
+export type HistoryExcludedDay = {
+  month: string;
+  date: string;
+  reason: "invalid-date" | "outside-query-month";
+  message: string;
+  fetchedAt: number;
+  sourceAsOfDate: string | null;
+  accountingDate: string | null;
+  unavailable: boolean;
+  models: RawModelUsage[];
+  warnings: string[];
+};
 /** Coverage exists even when every attempted month failed and no data returned. */
 export type HistorySnapshot = {
   window: HistoryWindow;
   months: HistoryMonth[];
   rows: HistoryRecord[];
+  /** Invalid or wrong-month source dates, kept apart from normal daily records. */
+  excludedDays: HistoryExcludedDay[];
   missingDates: string[];
   /** 已查询但失败的月份，可与保留的旧成功快照重叠，不能视作恢复。 */
   failedMonths: string[];
@@ -30,11 +45,38 @@ export type HistorySnapshot = {
   unloadedMonths: string[];
 };
 
+/** Exact Gregorian YYYY-MM-DD only; never normalize an invalid source date. */
+export function isHistoryDate(date: string): boolean {
+  if (date.length !== 10) return false;
+  const parts = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.exec(date);
+  if (!parts) return false;
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leap ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  return day <= daysInMonth[month - 1];
+}
+
 export function historyWindow(
   range: HistoryRange,
   today: string,
   selectedMonth = today.slice(0, 7),
 ): HistoryWindow {
+  if (!isHistoryDate(today)) throw new Error("无效历史区间");
   const date = new Date(`${today}T00:00:00Z`);
   let from: string;
   let to = today;
@@ -66,6 +108,8 @@ export function historyWindow(
 }
 
 export function historyDates(from: string, to: string): string[] {
+  if (!isHistoryDate(from) || !isHistoryDate(to))
+    throw new Error("无效历史区间");
   const start = Date.parse(`${from}T00:00:00Z`);
   const end = Date.parse(`${to}T00:00:00Z`);
   if (
@@ -89,13 +133,41 @@ export function buildHistory(
 ): HistorySnapshot {
   const rows = new Map<string, HistoryRecord>();
   const returned = new Set<string>();
+  const excludedDays: HistoryExcludedDay[] = [];
   for (const month of months) {
     // 复评 T10：晚于**请求发起时**记账日的行不算「已返回」——即使请求
     // 完成时已经跨过午夜。否则未来零占位会变成新一天的实测零。
     const asOf = month.sourceAsOfDate;
     for (const day of month.usage.days) {
+      const reason = !isHistoryDate(day.date)
+        ? "invalid-date"
+        : day.date.slice(0, 7) !== month.month
+          ? "outside-query-month"
+          : null;
+      if (reason) {
+        // Capture evidence before window/source-date/unavailable filtering. A
+        // malformed date must not disappear because of a string comparison,
+        // nor be normalized into another real day's returned coverage.
+        excludedDays.push({
+          month: month.month,
+          date: day.date,
+          reason,
+          message:
+            reason === "invalid-date"
+              ? "日期格式或公历日期无效，已排除正常合计"
+              : "日期不属于所查询月份，已排除正常合计",
+          fetchedAt: month.fetchedAt,
+          sourceAsOfDate: asOf ?? null,
+          accountingDate: month.usage.accountingDate ?? null,
+          unavailable:
+            Boolean(day.unavailable) ||
+            Boolean(month.usage.unavailableDates?.includes(day.date)),
+          models: day.rawModels ?? [],
+          warnings: month.usage.warnings ?? [],
+        });
+        continue;
+      }
       if (
-        day.date.slice(0, 7) !== month.month ||
         day.date < window.from ||
         day.date > window.to ||
         (asOf && day.date > asOf) ||
@@ -121,6 +193,7 @@ export function buildHistory(
     window,
     months,
     failedMonths,
+    excludedDays,
     rows: [...rows.values()].sort(
       (a, b) =>
         a.date.localeCompare(b.date) ||
@@ -272,6 +345,7 @@ export function historyExport(
   const cleanModel = (model: RawModelUsage) => ({
     model: model.model,
     groupKey: model.groupKey,
+    dataWarning: model.dataWarning ?? null,
     ...Object.fromEntries(
       fields.map((field) => [
         field,
@@ -328,6 +402,9 @@ export function historyExport(
       modelMappingVersion: month.usage.modelMappingVersion ?? null,
       fetchedAt: new Date(month.fetchedAt).toISOString(),
       warnings: month.usage.warnings ?? [],
+      excludedDateRecordCount: snapshot.excludedDays.filter(
+        (day) => day.month === month.month,
+      ).length,
       models: returnedHistoryModels(snapshot, month.month).map(cleanModel),
     };
   });
@@ -340,7 +417,21 @@ export function historyExport(
     fullMonthTo: monthEndDate(month.month),
     sourceAsOfDate: month.sourceAsOfDate ?? month.usage.accountingDate ?? null,
     fetchedAt: new Date(month.fetchedAt).toISOString(),
+    warnings: month.usage.warnings ?? [],
     models: (month.usage.rawModels ?? []).map(cleanModel),
+  }));
+  const excludedDateRecords = snapshot.excludedDays.map((day) => ({
+    sourceMonth: day.month,
+    date: day.date,
+    status: `excluded-${day.reason}`,
+    includedInTotals: false,
+    reason: day.message,
+    fetchedAt: new Date(day.fetchedAt).toISOString(),
+    sourceAsOfDate: day.sourceAsOfDate,
+    accountingDate: day.accountingDate,
+    unavailable: day.unavailable,
+    warnings: day.warnings,
+    models: day.models.map(cleanModel),
   }));
   const header = [
     "date",
@@ -352,20 +443,35 @@ export function historyExport(
     "fetched_at",
     "source",
     "stale",
+    "source_month",
+    "source_as_of_date",
+    "source_accounting_date",
+    "date_issue",
+    "warnings",
+    "excluded_models",
   ];
-  const records = snapshot.rows.map((row) => [
-    row.date,
-    row.model.model,
-    row.model.groupKey,
-    ...fields.map((field) => row.model[field]),
-    "CNY",
-    "returned",
-    new Date(
-      snapshot.months.find((m) => m.month === row.date.slice(0, 7))!.fetchedAt,
-    ).toISOString(),
-    metadata.source,
-    stale,
-  ]);
+  const records = snapshot.rows.map((row) => {
+    const source = snapshot.months.find(
+      (month) => month.month === row.date.slice(0, 7),
+    )!;
+    return [
+      row.date,
+      row.model.model,
+      row.model.groupKey,
+      ...fields.map((field) => row.model[field]),
+      "CNY",
+      "returned",
+      new Date(source.fetchedAt).toISOString(),
+      metadata.source,
+      stale,
+      source.month,
+      source.sourceAsOfDate ?? null,
+      source.usage.accountingDate ?? null,
+      "",
+      row.model.dataWarning ?? "",
+      "",
+    ];
+  });
   for (const date of snapshot.missingDates)
     records.push([
       date,
@@ -377,6 +483,32 @@ export function historyExport(
       "",
       metadata.source,
       stale,
+      date.slice(0, 7),
+      null,
+      null,
+      "",
+      "",
+      "",
+    ]);
+  for (const day of excludedDateRecords)
+    records.push([
+      day.date,
+      "",
+      null,
+      // Rejected source values live in an explicitly separate evidence column.
+      // They cannot be mistaken for a returned count by ordinary CSV sums.
+      ...fields.map(() => null),
+      "CNY",
+      day.status,
+      day.fetchedAt,
+      metadata.source,
+      stale,
+      day.sourceMonth,
+      day.sourceAsOfDate,
+      day.accountingDate,
+      day.reason,
+      JSON.stringify(day.warnings),
+      JSON.stringify(day.models),
     ]);
   records.sort(
     (a, b) =>
@@ -385,7 +517,13 @@ export function historyExport(
   );
   return {
     json: JSON.stringify(
-      { ...metadata, daily, monthly, sourceMonthlySnapshots },
+      {
+        ...metadata,
+        daily,
+        monthly,
+        sourceMonthlySnapshots,
+        excludedDateRecords,
+      },
       null,
       2,
     ),

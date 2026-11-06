@@ -50,7 +50,11 @@ pub(crate) fn confirm_quit(window: WebviewWindow, app: tauri::AppHandle) -> Resu
 #[tauri::command]
 pub(crate) fn is_main_window_visible(window: WebviewWindow) -> Result<bool, String> {
     require_main(&window)?;
-    Ok(window.is_visible().unwrap_or(true))
+    // 未知不能伪装成可见；前端会暂停自动刷新/聚焦并提供显式重试。
+    // 只返回稳定文案，不把底层错误中的环境或路径信息透传给 WebView。
+    window
+        .is_visible()
+        .map_err(|_| "无法读取窗口显隐状态".to_string())
 }
 
 /// 面板尺寸模式。

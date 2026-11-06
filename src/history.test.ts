@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   historyWindow,
+  historyDates,
+  isHistoryDate,
   buildHistory,
   retainHistoryWindow,
   returnedHistoryModels,
@@ -163,14 +165,16 @@ test("历史刷新失败不覆盖最后成功缓存，过期后重新查询", as
     ),
   );
   let calls = 0;
-  await cache.get(
-    "2026-10",
-    async () => {
-      calls++;
-      return usage();
-    },
-    false,
-    () => 1200,
+  await assert.rejects(() =>
+    cache.get(
+      "2026-10",
+      async () => {
+        calls++;
+        return usage();
+      },
+      false,
+      () => 1200,
+    ),
   );
   assert.equal(calls, 0);
   await cache.get(
@@ -810,4 +814,387 @@ test("R18: failed-only snapshots export failures without inventing data or unque
   assert.deepEqual(advanced.failedMonths, failed);
   assert.ok(advanced.unloadedMonths.includes("2026-11"));
   assert.equal(advanced.missingDates.includes("2026-11-01"), false);
+});
+
+// ---------- Round 29: canonical source dates before returned-day admission ----------
+
+const dateWarning = "平台返回无效日期或查询月份以外的数据，请稍后刷新核对";
+
+// Production retains anomalous dates and complete day fields/raw models. Its
+// Rust payload does not supply accountingDate or unavailableDates, so the main
+// regression must not depend on either optional frontend field rejecting them.
+const productionHistoryDay = (
+  date: string,
+  tokens: number,
+): UsageResult["days"][number] => ({
+  date,
+  rawModels: [usageModel(tokens)],
+  flashTokens: tokens,
+  flashCacheHit: 0,
+  flashCacheMiss: 0,
+  flashResponse: tokens,
+  flashOtherTokens: 0,
+  proTokens: 0,
+  proCacheHit: 0,
+  proCacheMiss: 0,
+  proResponse: 0,
+  proOtherTokens: 0,
+  totalTokens: tokens,
+  totalCost: 0,
+});
+
+const historyCsvRows = (csv: string): string[][] =>
+  csv
+    .trim()
+    .split("\r\n")
+    .map((line) =>
+      Array.from(line.matchAll(/"((?:""|[^"])*)"(?:,|$)/g), (match) =>
+        match[1].replace(/""/g, '"'),
+      ),
+    );
+
+test("R29: dates must be exact Gregorian YYYY-MM-DD, never Date-normalized", () => {
+  for (const date of [
+    "2026-10-01",
+    "2024-02-29",
+    "2000-02-29",
+    "2026-04-30",
+    "2026-12-31",
+  ])
+    assert.equal(isHistoryDate(date), true, date);
+  for (const date of [
+    "2026-10-1",
+    "2026-1-01",
+    "2026-10-03x",
+    "2026-10-03\n",
+    "2026-10-03 ",
+    " 2026-10-03",
+    "2026-10-00",
+    "2026-10-32",
+    "2026-00-01",
+    "2026-13-01",
+    "2026-02-29",
+    "2024-02-30",
+    "2100-02-29",
+    "2026-04-31",
+    "2026-10-03T00:00:00Z",
+    "",
+  ])
+    assert.equal(isHistoryDate(date), false, date);
+  assert.deepEqual(historyDates("2024-02-28", "2024-03-01"), [
+    "2024-02-28",
+    "2024-02-29",
+    "2024-03-01",
+  ]);
+  assert.throws(() => historyDates("2026-02-29", "2026-03-01"));
+  assert.throws(() => historyWindow("month", "2026-04-31"));
+});
+
+for (const anomalousDate of ["2026-10-1", "2026-10-03x"]) {
+  test(`R29: 31 real October days plus ${anomalousDate}=900 stay at 31 days and 310 Tokens`, () => {
+    const validDates = historyDates("2026-10-01", "2026-10-31");
+    const abnormalDay = productionHistoryDay(anomalousDate, 900);
+    abnormalDay.rawModels![0] = Object.assign(
+      { ...usageModel(900), dataWarning: "异常日的原始模型警告" },
+      { token: "EXCLUDED_SECRET" },
+    );
+    const source = {
+      month: "2026-10",
+      fetchedAt: 0,
+      sourceAsOfDate: "2026-11-05",
+      usage: {
+        ...usage(),
+        rawModels: [usageModel(1210)],
+        warnings: [dateWarning],
+        days: [
+          ...validDates.map((date) => productionHistoryDay(date, 10)),
+          abnormalDay,
+        ],
+      },
+    };
+    const before = JSON.stringify(source);
+    const snapshot = buildHistory(
+      historyWindow("previous", "2026-11-05"),
+      [source],
+      [],
+    );
+    assert.equal(snapshot.rows.length, 31);
+    assert.deepEqual(snapshot.missingDates, []);
+    assert.equal(
+      safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+      310,
+    );
+    assert.equal(
+      safeKnownSum(returnedHistoryModels(snapshot, "2026-10"), "totalTokens"),
+      310,
+      "monthly trend and page totals share the admitted day rows",
+    );
+    const dailyTrend = historyDates(
+      snapshot.window.from,
+      snapshot.window.to,
+    ).map((date) =>
+      safeKnownSum(
+        snapshot.rows
+          .filter((row) => row.date === date)
+          .map((row) => row.model),
+        "totalTokens",
+      ),
+    );
+    assert.equal(dailyTrend.length, 31);
+    assert.ok(dailyTrend.every((value) => value === 10));
+    assert.equal(snapshot.excludedDays.length, 1);
+    assert.equal(snapshot.excludedDays[0].date, anomalousDate);
+    assert.equal(snapshot.excludedDays[0].reason, "invalid-date");
+    assert.equal(snapshot.excludedDays[0].models[0].totalTokens, 900);
+    assert.deepEqual(snapshot.excludedDays[0].warnings, [dateWarning]);
+
+    const exported = historyExport(snapshot, 0);
+    assert.equal(exported.json.includes("EXCLUDED_SECRET"), false);
+    assert.equal(exported.csv.includes("EXCLUDED_SECRET"), false);
+    const json = JSON.parse(exported.json);
+    assert.equal(json.daily.length, 31);
+    assert.equal(json.monthly[0].coveredDates, 31);
+    assert.equal(json.monthly[0].excludedDateRecordCount, 1);
+    assert.equal(safeKnownSum(json.daily, "totalTokens"), 310);
+    assert.equal(safeKnownSum(json.monthly[0].models, "totalTokens"), 310);
+    assert.equal(json.sourceMonthlySnapshots[0].models[0].totalTokens, 1210);
+    assert.deepEqual(json.monthly[0].warnings, [dateWarning]);
+    assert.deepEqual(json.sourceMonthlySnapshots[0].warnings, [dateWarning]);
+    const rejected = json.excludedDateRecords[0];
+    assert.equal(rejected.date, anomalousDate, "raw date is not normalized");
+    assert.equal(rejected.status, "excluded-invalid-date");
+    assert.equal(rejected.includedInTotals, false);
+    assert.equal(rejected.sourceMonth, "2026-10");
+    assert.equal(rejected.sourceAsOfDate, "2026-11-05");
+    assert.equal(rejected.accountingDate, null);
+    assert.equal(rejected.models[0].totalTokens, 900);
+    assert.equal(rejected.models[0].dataWarning, "异常日的原始模型警告");
+    assert.deepEqual(rejected.warnings, [dateWarning]);
+
+    const [header, ...csv] = historyCsvRows(exported.csv);
+    const normal = csv.filter((row) => row[11] === "returned");
+    assert.equal(normal.length, 31);
+    assert.equal(
+      normal.reduce((sum, row) => sum + Number(row[3]), 0),
+      310,
+    );
+    assert.equal(
+      csv.reduce((sum, row) => sum + Number(row[3]), 0),
+      310,
+    );
+    const excluded = csv.filter((row) => row[11] === "excluded-invalid-date");
+    assert.equal(excluded.length, 1);
+    assert.equal(excluded[0][0], anomalousDate);
+    assert.ok(excluded[0].slice(3, 10).every((cell) => cell === ""));
+    assert.equal(excluded[0][header.indexOf("source_month")], "2026-10");
+    assert.deepEqual(JSON.parse(excluded[0][header.indexOf("warnings")]), [
+      dateWarning,
+    ]);
+    assert.equal(
+      JSON.parse(excluded[0][header.indexOf("excluded_models")])[0].totalTokens,
+      900,
+    );
+    assert.equal(
+      JSON.stringify(source),
+      before,
+      "source evidence stays unchanged",
+    );
+  });
+}
+
+test("R29: malformed dates cannot fill a missing real date or disappear behind source filters", () => {
+  const source = {
+    month: "2026-10",
+    fetchedAt: 0,
+    sourceAsOfDate: "2026-10-04",
+    usage: {
+      ...usage(),
+      accountingDate: "2026-10-03",
+      unavailableDates: ["2026-10-02", "2026-10-1"],
+      // The frontend must also create its own visible exclusion evidence when
+      // an older response has no backend warnings field.
+      warnings: undefined,
+      days: [
+        productionHistoryDay("2026-10-1", 900),
+        productionHistoryDay("2026-10-03x", 900),
+        productionHistoryDay("2026-10-00", 900),
+        productionHistoryDay("2026-10-32", 900),
+        productionHistoryDay("2026-09-30", 900),
+        productionHistoryDay("2026-11-01", 900),
+        productionHistoryDay("2026-10-02", 10),
+        productionHistoryDay("2026-10-03", 10),
+        productionHistoryDay("2026-10-04", 0),
+        productionHistoryDay("2026-10-05", 0),
+      ],
+    },
+  };
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-10-05"),
+    [source],
+    [],
+  );
+  assert.deepEqual(
+    snapshot.rows.map((row) => row.date),
+    ["2026-10-03"],
+  );
+  assert.deepEqual(snapshot.missingDates, [
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-04",
+    "2026-10-05",
+  ]);
+  assert.equal(snapshot.excludedDays.length, 6);
+  assert.equal(snapshot.excludedDays[0].unavailable, true);
+  assert.ok(snapshot.excludedDays.every((day) => day.message.length > 0));
+  assert.deepEqual(
+    snapshot.excludedDays
+      .filter((day) => day.reason === "outside-query-month")
+      .map((day) => day.date),
+    ["2026-09-30", "2026-11-01"],
+  );
+  const json = JSON.parse(historyExport(snapshot, 0).json);
+  assert.equal(json.monthly[0].coveredDates, 1);
+  assert.equal(json.excludedDateRecords.length, 6);
+  assert.equal(json.daily[0].totalTokens, 10);
+  const retained = retainHistoryWindow(
+    snapshot,
+    historyWindow("month", "2026-10-06"),
+  );
+  assert.deepEqual(retained.excludedDays, snapshot.excludedDays);
+  assert.deepEqual(retained.rows, snapshot.rows);
+  assert.ok(retained.missingDates.includes("2026-10-06"));
+});
+
+test("R29: invalid leap and month-end dates are evidence only, legitimate leap days remain returned", () => {
+  for (const [month, good, bad] of [
+    ["2024-02", "2024-02-29", "2024-02-30"],
+    ["2026-02", "2026-02-28", "2026-02-29"],
+    ["2026-04", "2026-04-30", "2026-04-31"],
+  ]) {
+    const snapshot = buildHistory(
+      historyWindow("custom", "2026-11-05", month),
+      [
+        {
+          month,
+          fetchedAt: 0,
+          sourceAsOfDate: "2026-11-05",
+          usage: {
+            ...usage(),
+            accountingDate: "2026-11-05",
+            days: [
+              productionHistoryDay(good, 10),
+              productionHistoryDay(bad, 900),
+            ],
+          },
+        },
+      ],
+      [],
+    );
+    assert.deepEqual(
+      snapshot.rows.map((row) => row.date),
+      [good],
+    );
+    assert.equal(snapshot.excludedDays[0].date, bad);
+    assert.equal(snapshot.excludedDays[0].reason, "invalid-date");
+    assert.equal(snapshot.missingDates.includes(bad), false);
+    assert.equal(
+      safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+      10,
+    );
+  }
+});
+
+test("R29: a source with only invalid dates remains unknown, not returned zero", () => {
+  const source = {
+    ...usageMonth("2026-10", 900, [["2026-10-1", 900]]),
+    sourceAsOfDate: "2026-11-05",
+  };
+  const snapshot = buildHistory(
+    historyWindow("previous", "2026-11-05"),
+    [source],
+    [],
+  );
+  assert.deepEqual(snapshot.rows, []);
+  assert.equal(snapshot.missingDates.length, 31);
+  assert.equal(
+    safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+    null,
+  );
+  const json = JSON.parse(historyExport(snapshot, 0).json);
+  assert.deepEqual(json.monthly[0].models, []);
+  assert.equal(json.monthly[0].coveredDates, 0);
+  assert.equal(json.excludedDateRecords[0].models[0].totalTokens, 900);
+});
+
+test("R29: valid zero, missing models, unavailable days and legacy source-date compatibility remain distinct", () => {
+  const data = {
+    ...usage(),
+    days: [
+      productionHistoryDay("2026-10-01", 0),
+      { ...productionHistoryDay("2026-10-02", 10), unavailable: true },
+      { ...productionHistoryDay("2026-10-03", 10), rawModels: [] },
+      { ...productionHistoryDay("2026-10-04", 10), rawModels: undefined },
+    ],
+  };
+  for (const sourceAsOfDate of [undefined, "", "2026-10-04"]) {
+    const snapshot = buildHistory(
+      historyWindow("month", "2026-10-04"),
+      [{ month: "2026-10", fetchedAt: 0, sourceAsOfDate, usage: data }],
+      [],
+    );
+    assert.deepEqual(
+      snapshot.rows.map((row) => row.date),
+      ["2026-10-01"],
+    );
+    assert.equal(
+      safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+      0,
+    );
+    assert.deepEqual(snapshot.excludedDays, []);
+    assert.deepEqual(snapshot.missingDates, [
+      "2026-10-02",
+      "2026-10-03",
+      "2026-10-04",
+    ]);
+  }
+  const legacy = buildHistory(
+    historyWindow("month", "2026-10-04"),
+    [
+      {
+        month: "2026-10",
+        fetchedAt: 0,
+        usage: {
+          ...data,
+          schemaVersion: undefined,
+          rawModels: undefined,
+          days: data.days.map((day) => ({ ...day, rawModels: undefined })),
+        },
+      },
+    ],
+    [],
+  );
+  assert.deepEqual(legacy.rows, []);
+  assert.deepEqual(legacy.excludedDays, []);
+  assert.equal(legacy.missingDates.length, 4);
+  assert.equal(
+    safeKnownSum(returnedHistoryModels(legacy), "totalTokens"),
+    null,
+  );
+});
+
+test("R29: excluded CSV dates still receive formula protection and JSON preserves raw source evidence", () => {
+  const date = "=SUM(1,2)";
+  const source = usageMonth("2026-10", 900, [[date, 900]]);
+  const snapshot = buildHistory(
+    historyWindow("previous", "2026-11-05"),
+    [source],
+    [],
+  );
+  const exported = historyExport(snapshot, 0);
+  const csv = historyCsvRows(exported.csv).find(
+    (row) => row[11] === "excluded-invalid-date",
+  );
+  assert.ok(csv);
+  assert.equal(csv[0], `'${date}`);
+  assert.equal(JSON.parse(exported.json).excludedDateRecords[0].date, date);
 });

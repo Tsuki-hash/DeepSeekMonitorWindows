@@ -20,6 +20,8 @@ try {
     "history-trend-interactions.test",
     "month-accessibility.test",
     "return-focus.test",
+    "directed-settings-focus.test",
+    "window-visibility.test",
   ];
   const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({

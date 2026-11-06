@@ -36,7 +36,6 @@ function SettingsPanel({
   balanceErrorCode,
   usageErrorCode,
   usage,
-  targetSection,
   onRetry,
   onBack,
   onRegisterLeaveBlocker,
@@ -50,8 +49,6 @@ function SettingsPanel({
   balanceErrorCode?: string;
   usageErrorCode?: string;
   usage?: UsageResult | null;
-  /** 进入设置后需要滚动并聚焦的区块（复评 R16）。 */
-  targetSection?: "usageToken" | "dataNotices" | null;
   onRetry?: () => Promise<unknown>;
   onBack: () => void;
   /** 第五轮复评 N04：提醒设置草稿经此登记为 App 级离开拦截。 */
@@ -168,24 +165,6 @@ function SettingsPanel({
     const timer = window.setInterval(() => setHealthClock(Date.now()), 60000);
     return () => window.clearInterval(timer);
   }, []);
-  const noticesRef = React.useRef<HTMLDetailsElement>(null);
-  const usageTokenRef = React.useRef<HTMLDivElement>(null);
-  const noticesSummaryRef = React.useRef<HTMLElement>(null);
-  React.useEffect(() => {
-    if (!targetSection) return;
-    const frame = window.requestAnimationFrame(() => {
-      const node =
-        targetSection === "usageToken"
-          ? usageTokenRef.current
-          : noticesSummaryRef.current;
-      if (targetSection === "dataNotices" && noticesRef.current)
-        noticesRef.current.open = true;
-      if (!node) return;
-      node.scrollIntoView({ block: "start", behavior: "smooth" });
-      node.focus({ preventScroll: true });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [targetSection]);
 
   return (
     <section className="settings-panel" data-testid="settings-panel">
@@ -277,7 +256,8 @@ function SettingsPanel({
           ))}
         </SettingsSection>
 
-        <div ref={usageTokenRef} tabIndex={-1}>
+        {/* R29: App's navigation request is the sole focus/scroll owner. */}
+        <div data-settings-focus="usageToken" tabIndex={-1}>
           <SettingsSection
             icon={<BarChart3 size={15} />}
             title="用量同步 Token"
@@ -437,10 +417,9 @@ function SettingsPanel({
         <SettingsSection icon={<Info size={15} />} title="数据状态与口径">
           <details
             className="settings-disclosure"
-            ref={noticesRef}
-            open={targetSection === "dataNotices" || undefined}
+            data-settings-disclosure="dataNotices"
           >
-            <summary ref={noticesSummaryRef}>
+            <summary data-settings-focus="dataNotices">
               {balanceError || usageError || notices.length
                 ? "查看更新状态与数据提示"
                 : "更新时间与统计说明"}

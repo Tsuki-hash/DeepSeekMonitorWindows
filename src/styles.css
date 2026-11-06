@@ -2782,3 +2782,34 @@ button:disabled:hover {
 .leave-guard p {
   margin: 0 0 8px;
 }
+
+/* R29: visibility recovery occupies its own row, never an implicit clipped row
+   or an overlay on refresh/close/navigation. Only failure changes the layout. */
+.stage.visibility-unavailable {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.stage.visibility-unavailable.with-navigation {
+  grid-template-rows: auto minmax(0, 1fr) 48px;
+}
+.stage > .visibility-error {
+  grid-area: 1 / 1;
+  width: min(356px, 100vw);
+  max-height: 35vh;
+  overflow-y: auto;
+}
+.stage.mode-expanded > .visibility-error {
+  width: min(720px, 100vw);
+}
+.stage.visibility-unavailable > .panel,
+.stage.visibility-unavailable > .settings-panel {
+  grid-area: 2 / 1;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+}
+.stage.visibility-unavailable > .primary-navigation {
+  grid-area: 3 / 1;
+}
+.stage.visibility-unavailable > .leave-guard {
+  grid-area: 2 / 1;
+}

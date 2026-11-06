@@ -1274,6 +1274,8 @@ test("component runner bundles every retained regression suite and executes all 
     "history-trend-interactions.test",
     "month-accessibility.test",
     "return-focus.test",
+    "directed-settings-focus.test",
+    "window-visibility.test",
   ]) {
     assert.ok(source.includes(`"${name}"`));
     assert.match(

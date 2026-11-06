@@ -80,7 +80,7 @@ Windows 回归在新建证据根中建立 `run [ab]` 和 `run a`，后者含不�
 # 只验证门禁的拒绝行为，使用合成进程输出，不证明 DPAPI/Win32 已运行。
 node --test scripts/tests/release-gates.test.mjs
 
-# 共八套：settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus。
+# 共十套：settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus、directed-settings-focus、window-visibility。
 # return-focus 只检查合成 ref/事件/RAF 所有权，不能证明真实 DOM 或 Windows 原生焦点。
 # 每个 .tsx 输出为独立 .mjs，再由 node --test 的文件级进程隔离执行。
 npm run test:components
