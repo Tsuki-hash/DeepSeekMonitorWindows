@@ -257,6 +257,14 @@ const classify = (label, result) => {
   return "FAIL";
 };
 
+/**
+ * 复评 T14：Rust 测试用 `eprintln!("NOT RUN: ...")` 表达「能力缺失未执行」，
+ * libtest 仍记 PASS。发行门禁必须**扫描输出里的 NOT RUN 行**并阻断，
+ * 不能只看退出码。
+ */
+const notRunMarkers = (text) =>
+  (String(text).match(/NOT RUN[：:]/g) ?? []).length;
+
 const lines = [];
 lines.push(`# 发版证据记录 v${version}`);
 lines.push("");
@@ -345,6 +353,11 @@ for (const [label, command, commandArgs] of checks) {
   checkResults.push({ label, command, commandArgs, result, verdict });
   if (verdict === "FAIL") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
+  // 复评 T14：测试输出里出现 `NOT RUN:` 行 → 该项记为未完整执行（发版阻断）。
+  const markers = notRunMarkers(`${result.stdout}\n${result.stderr}`);
+  if (markers > 0) {
+    notRun.push(`${label}（${markers} 个场景 NOT RUN）`);
+  }
   // 复评 Q09：集成入口的 stdout 含多条 `test result:` 行（每子用例一条），
   // exec 只取首个会得到 tests=1。集成项改用结构化子用例日志合计。
   // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机；

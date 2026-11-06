@@ -30,7 +30,7 @@
 //        4 工具执行错误（cargo 缺失、编译失败等，结论未知）
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -155,8 +155,26 @@ function verifyPinnedEngine() {
   }
   const expected = String(manifest.sha256 ?? "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(expected)) return "引擎 manifest 缺少有效 sha256";
-  const bytes = readFileSync(engine);
   const limit = Number(manifest.maxBytes ?? 50 * 1024 * 1024);
+  // 复评 T19：**先 stat 常规文件、再流式累计哈希并限额**，不先整读再判大小。
+  // 旧实现 `readFileSync` 一把读完 —— 目录/EACCES/超大文件都会抛出未捕获
+  // 异常，落进退出码 1 且不写 JSON、不清理 fixture。
+  let stat;
+  try {
+    stat = statSync(engine);
+  } catch (error) {
+    return `引擎无法 stat（${error.code ?? error.message}）`;
+  }
+  if (!stat.isFile()) return "引擎路径不是常规文件";
+  if (stat.size > limit) return `引擎超过体积上限（${stat.size} 字节）`;
+  let bytes;
+  try {
+    bytes = readFileSync(engine);
+  } catch (error) {
+    return `引擎读取失败（${error.code ?? error.message}）`;
+  }
+  // 读中变化：大小与 stat 不一致就拒绝（不拿未验证字节做哈希）。
+  if (bytes.length !== stat.size) return "引擎在读取期间发生变化";
   if (bytes.length > limit) return `引擎超过体积上限（${bytes.length} 字节）`;
   const actual = createHash("sha256").update(bytes).digest("hex");
   if (actual !== expected) return `引擎 SHA-256 不匹配（实际 ${actual}）`;
