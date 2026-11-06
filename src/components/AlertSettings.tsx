@@ -40,6 +40,7 @@ export function AlertSettings({
     active: true,
     readSequence: 0,
     writeSequence: 0,
+    discardSequence: 0,
   });
   const live = React.useRef({
     status: null as AlertStatus | null,
@@ -48,6 +49,9 @@ export function AlertSettings({
     budget: "",
     revision: 0,
     committedRevision: 0,
+    // Discard removes local edit intent, not a write already sent to native.
+    // Keep following the committed baseline until the user really edits again.
+    followingCommitted: true,
   });
   const dirtyNow = React.useCallback(() => {
     const value = live.current;
@@ -63,13 +67,16 @@ export function AlertSettings({
   const accept = React.useCallback((value: AlertStatus, reset: boolean) => {
     live.current.status = value;
     setStatus(value);
-    if (reset) {
+    if (reset || live.current.followingCommitted) {
       live.current.draft = value.options;
       live.current.low = String(value.options.lowBalanceCny);
       live.current.budget = String(value.options.monthlyBudgetCny);
       live.current.revision += 1;
       live.current.committedRevision = live.current.revision;
-      setError("");
+      live.current.followingCommitted = true;
+      // A background baseline update is not an acknowledgement of an existing
+      // validation/save/test error. Only an explicit reset may clear that error.
+      if (reset) setError("");
       setDraft(value.options);
       setLow(String(value.options.lowBalanceCny));
       setBudget(String(value.options.monthlyBudgetCny));
@@ -125,6 +132,10 @@ export function AlertSettings({
   ): Promise<boolean> => {
     const { draft, status, low, budget, revision } = submitted;
     if (!control.current.active || !draft || !status) return false;
+    const allowed = interactionGate.capture();
+    const discardSequence = control.current.discardSequence;
+    const ownsIntent = () =>
+      allowed() && discardSequence === control.current.discardSequence;
     setError("");
     setMessage("");
     let options: AlertOptions;
@@ -156,12 +167,14 @@ export function AlertSettings({
         control.current.active &&
         sequence === control.current.writeSequence
       ) {
-        // A later edit, including ABA, is a new draft even if text is equal.
+        // Native may have committed before exit/discard. Always reconcile that
+        // receipt, but a discarded form follows it instead of reviving old text
+        // as a draft. A later real edit, including ABA, still keeps its ownership.
         accept(value, live.current.revision === revision);
         // 保存回执是新的可信状态；放弃草稿仅恢复旧基线，不走此清错路径。
         setReadError("");
-        setMessage("提醒设置已保存");
-        return !dirtyNow();
+        if (ownsIntent()) setMessage("提醒设置已保存");
+        return ownsIntent() && !dirtyNow();
       }
       // 组件已卸载或更新操作已取代当前保存：不算当前设置实例的成功。
       return false;
@@ -170,7 +183,7 @@ export function AlertSettings({
         control.current.active &&
         sequence === control.current.writeSequence
       ) {
-        setError(errorMessage(failure));
+        if (ownsIntent()) setError(errorMessage(failure));
         // 复评 F07：回读**不得**影响写操作的 busy —— 它有自己的读取代际。
         void reload();
       }
@@ -210,6 +223,7 @@ export function AlertSettings({
       prepareSave,
       save: () => prepareSave()(),
       discard: () => {
+        control.current.discardSequence++;
         if (live.current.status) accept(live.current.status, true);
         setMessage("");
       },
@@ -250,6 +264,7 @@ export function AlertSettings({
     if (!interactionGate.allowed()) return;
     if (live.current.draft) {
       live.current.revision += 1;
+      live.current.followingCommitted = false;
       live.current.draft = { ...live.current.draft, ...value };
       setDraft(live.current.draft);
       setMessage("");
@@ -292,6 +307,7 @@ export function AlertSettings({
                   onChange={(event) => {
                     if (!interactionGate.allowed()) return;
                     live.current.revision += 1;
+                    live.current.followingCommitted = false;
                     live.current.low = event.target.value;
                     setLow(event.target.value);
                   }}
@@ -323,6 +339,7 @@ export function AlertSettings({
                   onChange={(event) => {
                     if (!interactionGate.allowed()) return;
                     live.current.revision += 1;
+                    live.current.followingCommitted = false;
                     live.current.budget = event.target.value;
                     setBudget(event.target.value);
                   }}

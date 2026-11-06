@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QuitIntentMailbox } from "./quit-intent.ts";
-import { QuitRequest } from "./quit-request.ts";
+import { QuitRequest, QUIT_RECONCILE_INTERVAL_MS } from "./quit-request.ts";
 import type { QuitRequestState } from "./quit-request.ts";
 
 function deferred<T>() {
@@ -50,6 +50,18 @@ function nativeMailbox() {
 }
 
 function renderer(mailbox: QuitIntentMailbox) {
+  let timerId = 0;
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  const clock = {
+    setTimeout: (callback: () => void, delay: number) => {
+      const id = ++timerId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+  };
   const registrations: {
     wake: () => void;
     result: ReturnType<typeof deferred<() => void>>;
@@ -71,6 +83,7 @@ function renderer(mailbox: QuitIntentMailbox) {
     (state) => states.push(state),
     undefined,
     mailbox,
+    clock,
   );
   return {
     owner,
@@ -83,6 +96,18 @@ function renderer(mailbox: QuitIntentMailbox) {
     commands: () => commands,
     releases: () => releases,
     state: () => states[states.length - 1],
+    timers,
+    tick: () => {
+      assert.equal(
+        timers.size,
+        1,
+        "Exactly one reconciliation timer owns work",
+      );
+      const [id, timer] = [...timers][0];
+      assert.equal(timer.delay, QUIT_RECONCILE_INTERVAL_MS);
+      timers.delete(id);
+      timer.callback();
+    },
   };
 }
 
@@ -309,3 +334,273 @@ test("R32 invalid native intent fails closed without navigation or acknowledgeme
     assert.equal(acknowledged, 0);
   }
 });
+
+test("R33 ready listener reconciles a lost wake without a second click or duplicate draft prompt", async () => {
+  const native = nativeMailbox();
+  const f = renderer(native.mailbox);
+  f.owner.start();
+  assert.equal(f.timers.size, 0, "Do not poll before listener installation");
+  f.accept();
+  await flush();
+  assert.equal(f.state().listener, "ready");
+  native.publish(); // Native persisted the click, but emit delivered no wake.
+  assert.equal(f.intents.length, 0);
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 1);
+  assert.equal(f.commands(), 0, "Polling is not permission to bypass drafts");
+  assert.equal(native.pending(), null);
+  // Stay/Cancel: never execute the approved-navigation action.
+  f.registrations[0].wake();
+  await flush();
+  f.tick();
+  await flush();
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 1);
+  native.publish(); // A genuinely new click also works with no wake.
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 2);
+  f.owner.dispose();
+  assert.equal(f.timers.size, 0);
+});
+
+test("R33 reconciliation joins a slow ack and reads a newer unwoken click without parallel drains", async () => {
+  const native = nativeMailbox();
+  const f = renderer(native.mailbox);
+  f.owner.start();
+  f.accept();
+  await flush();
+  const receipt = deferred<void>();
+  native.receipts.push(receipt.promise);
+  native.publish();
+  f.registrations[0].wake();
+  await flush();
+  assert.equal(f.intents.length, 1);
+  const reads = native.reads();
+  native.publish(); // The second wake is lost while ack 1 is in flight.
+  const deliveredAgain = [...f.timers.values()][0].callback;
+  f.tick();
+  deliveredAgain();
+  assert.equal(f.timers.size, 0, "No new timer until the shared drain settles");
+  assert.equal(
+    native.reads(),
+    reads,
+    "The timer must not overlap the slow ack",
+  );
+  receipt.resolve();
+  await flush();
+  assert.equal(native.reads(), reads + 1);
+  assert.deepEqual(native.acknowledgements, ["1", "2"]);
+  assert.equal(f.intents.length, 2);
+  assert.equal(f.timers.size, 1);
+  f.intents[0]();
+  assert.equal(f.commands(), 0, "New intent supersedes old draft approval");
+  f.owner.dispose();
+});
+
+test("R33 reconciliation read failure exposes recovery and a stale timer cannot affect the retry", async () => {
+  const native = nativeMailbox();
+  const f = renderer(native.mailbox);
+  f.owner.start();
+  f.accept();
+  await flush();
+  const staleTimer = [...f.timers.values()][0].callback;
+  const snapshot = deferred<string | null>();
+  native.snapshots.push(snapshot.promise);
+  native.publish();
+  f.tick();
+  snapshot.reject(new Error("synthetic reconciliation failure"));
+  await flush();
+  assert.equal(f.state().listener, "failed");
+  assert.equal(f.state().recovery, true);
+  assert.equal(f.releases(), 1);
+  assert.equal(f.timers.size, 0);
+  assert.equal(native.pending(), "1");
+  f.owner.retryListener();
+  f.accept(1);
+  await flush();
+  assert.equal(f.intents.length, 1);
+  assert.equal(f.state().listener, "ready");
+  const reads = native.reads();
+  staleTimer();
+  await flush();
+  assert.equal(native.reads(), reads);
+  assert.equal(
+    f.timers.size,
+    1,
+    "Old timer cannot remove the replacement timer",
+  );
+  f.owner.dispose();
+});
+
+test("R33 failed reconciliation ack retries receipt without reviving a cancelled prompt", async () => {
+  const native = nativeMailbox();
+  const f = renderer(native.mailbox);
+  f.owner.start();
+  f.accept();
+  await flush();
+  const receipt = deferred<void>();
+  native.receipts.push(receipt.promise);
+  native.publish();
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 1);
+  receipt.reject(new Error("synthetic ack failure"));
+  await flush();
+  assert.equal(f.state().listener, "failed");
+  assert.equal(f.timers.size, 0);
+  assert.equal(native.pending(), "1");
+  f.owner.retryListener();
+  f.accept(1);
+  await flush();
+  assert.equal(f.intents.length, 1);
+  assert.deepEqual(native.acknowledgements, ["1", "1"]);
+  assert.equal(native.pending(), null);
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 1);
+  native.publish();
+  f.tick();
+  await flush();
+  assert.equal(f.intents.length, 2);
+  f.owner.dispose();
+});
+
+test("R33 unmount revokes an in-flight reconciliation and leaves intent for the next owner", async () => {
+  const native = nativeMailbox();
+  const old = renderer(native.mailbox);
+  old.owner.start();
+  old.accept();
+  await flush();
+  const staleTimer = [...old.timers.values()][0].callback;
+  const snapshot = deferred<string | null>();
+  native.snapshots.push(snapshot.promise);
+  native.publish();
+  old.tick();
+  old.owner.dispose();
+  snapshot.resolve("1");
+  await flush();
+  assert.equal(old.intents.length, 0);
+  assert.equal(native.acknowledgements.length, 0);
+  assert.equal(old.timers.size, 0);
+  const current = renderer(native.mailbox);
+  current.owner.start();
+  current.accept();
+  await flush();
+  const reads = native.reads();
+  staleTimer();
+  await flush();
+  assert.equal(native.reads(), reads);
+  assert.equal(current.intents.length, 1);
+  assert.equal(current.timers.size, 1);
+  current.owner.dispose();
+});
+
+test("R33 confirmed quit cancels reconciliation and retained timer callbacks stay inert", async () => {
+  const native = nativeMailbox();
+  const f = renderer(native.mailbox);
+  f.owner.start();
+  f.accept();
+  await flush();
+  native.publish();
+  f.tick();
+  await flush();
+  const staleTimer = [...f.timers.values()][0].callback;
+  f.intents[0]();
+  await flush();
+  assert.equal(f.state().command, "confirmed");
+  assert.equal(f.timers.size, 0);
+  const reads = native.reads();
+  staleTimer();
+  await flush();
+  assert.equal(native.reads(), reads);
+  assert.equal(f.commands(), 1);
+  f.owner.dispose();
+});
+
+for (const outcome of ["success", "failure"] as const) {
+  test(`R33 confirmed quit revokes an in-flight reconciliation read before late ${outcome}`, async () => {
+    const native = nativeMailbox();
+    const f = renderer(native.mailbox);
+    f.owner.start();
+    f.accept();
+    await flush();
+    native.publish();
+    f.tick();
+    await flush();
+    assert.equal(f.intents.length, 1);
+    const snapshot = deferred<string | null>();
+    native.snapshots.push(snapshot.promise);
+    native.publish();
+    f.tick();
+    await flush();
+    const reads = native.reads();
+    assert.equal(
+      f.timers.size,
+      0,
+      "The reconciliation read is already in flight",
+    );
+    f.intents[0]();
+    await flush();
+    const terminal = f.state();
+    assert.equal(terminal.command, "confirmed");
+    if (outcome === "success") snapshot.resolve("2");
+    else snapshot.reject(new Error("synthetic late read failure"));
+    await flush();
+    assert.equal(
+      f.state(),
+      terminal,
+      "Late read cannot publish recovery or ready",
+    );
+    assert.equal(f.intents.length, 1);
+    assert.equal(f.commands(), 1);
+    assert.deepEqual(native.acknowledgements, ["1"]);
+    assert.equal(
+      native.pending(),
+      "2",
+      "Terminal owner does not consume new intent",
+    );
+    f.registrations[0].wake();
+    f.owner.retryListener();
+    await flush();
+    assert.equal(native.reads(), reads);
+    assert.equal(f.timers.size, 0);
+    f.owner.dispose();
+  });
+
+  test(`R33 confirmed quit ignores late ${outcome} from an already-sent reconciliation ack`, async () => {
+    const native = nativeMailbox();
+    const f = renderer(native.mailbox);
+    f.owner.start();
+    f.accept();
+    await flush();
+    const receipt = deferred<void>();
+    native.receipts.push(receipt.promise);
+    native.publish();
+    f.tick();
+    await flush();
+    assert.deepEqual(native.acknowledgements, ["1"]);
+    f.intents[0]();
+    await flush();
+    const terminal = f.state();
+    const reads = native.reads();
+    assert.equal(terminal.command, "confirmed");
+    if (outcome === "success") receipt.resolve();
+    else receipt.reject(new Error("synthetic late ack failure"));
+    await flush();
+    assert.equal(
+      f.state(),
+      terminal,
+      "An issued ack may settle, but cannot change terminal UI",
+    );
+    assert.equal(f.intents.length, 1);
+    assert.equal(f.commands(), 1);
+    assert.equal(f.timers.size, 0);
+    f.registrations[0].wake();
+    await flush();
+    assert.equal(native.reads(), reads);
+    f.owner.dispose();
+  });
+}

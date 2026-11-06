@@ -8,8 +8,11 @@ import { DashboardPanel } from "../src/components/DashboardPanel";
 import { ModelDetailPanel } from "../src/components/ModelDetailPanel";
 import { HistoryPanel } from "../src/components/HistoryPanel";
 import { HistoryTrend } from "../src/components/HistoryTrend";
-import { setCommittedConfig } from "../src/config-store";
-import { invalidateUsageRequests } from "../src/usage-api";
+import {
+  setCommittedConfig,
+  setConfigSubscriptionReady,
+} from "../src/config-store";
+import { fetchCurrentUsage, invalidateUsageRequests } from "../src/usage-api";
 import { todayStr } from "../src/format";
 import type { AppConfig, UsageResult } from "../src/types";
 
@@ -940,6 +943,168 @@ for (const failure of ["shown", "hidden", "query"] as const) {
     },
   );
 }
+
+// Fix the accounting date only within these scenarios. They exercise the real
+// App subscription -> request invalidation -> usage-api -> mocked IPC binding.
+async function atMonthStart(bodyOfTest: () => Promise<void>) {
+  const NativeDate = Date;
+  const now = NativeDate.parse("2026-11-02T04:00:00Z");
+  g.Date = class extends NativeDate {
+    constructor(value?: any) {
+      super(value === undefined ? now : value);
+    }
+    static now() {
+      return now;
+    }
+  };
+  try {
+    await bodyOfTest();
+  } finally {
+    g.Date = NativeDate;
+  }
+}
+
+for (const transition of ["account", "clear", "ready"] as const) {
+  scenario(
+    `R33 revoked month-start continuation: ${transition}`,
+    (concurrent) =>
+      atMonthStart(async () => {
+        const oldCurrent = deferred<UsageResult>();
+        const newCurrent = deferred<UsageResult>();
+        const reads: Array<{ month: string; account: number }> = [];
+        usageRead = (month) => {
+          reads.push({ month, account: config.usageTokenRevision });
+          if (reads.length === 1) return oldCurrent.promise;
+          if (month === "2026-11") return newCurrent.promise;
+          return Promise.resolve(sampleUsage());
+        };
+        await mount(concurrent);
+        assert.deepEqual(usageCalls, ["2026-11"]);
+        // Reusing this exported callback must join only the current generation.
+        const retainedRead = fetchCurrentUsage;
+        const old = retainedRead();
+        const oldRejected = assert.rejects(() => old, /替代/);
+        const oldAccount = config.usageTokenRevision;
+        await change(() => {
+          if (transition === "ready") {
+            // A transient loss followed by recovery is still a new request owner.
+            setConfigSubscriptionReady(false);
+            setConfigSubscriptionReady(true);
+          } else {
+            config = {
+              ...config,
+              configRevision: ++revision,
+              usageTokenRevision: revision,
+              usageTokenConfigured: transition !== "clear",
+            };
+            setCommittedConfig(config);
+          }
+        });
+        assert.equal(usageCalls.length, transition === "clear" ? 1 : 2);
+        const fresh = transition === "clear" ? null : retainedRead();
+        if (fresh) assert.notEqual(fresh, old);
+        await change(() => oldCurrent.resolve(sampleUsage()));
+        await oldRejected;
+        assert.deepEqual(
+          usageCalls,
+          transition === "clear" ? ["2026-11"] : ["2026-11", "2026-11"],
+          "An old current-month completion must not start any previous-month IPC",
+        );
+        assert.equal(reads[0].account, oldAccount);
+        if (fresh) {
+          assert.equal(
+            retainedRead(),
+            fresh,
+            "Old cleanup must not release fresh work",
+          );
+          await change(() =>
+            newCurrent.resolve({ ...sampleUsage(), monthCost: 22 }),
+          );
+          const result = await fresh;
+          assert.equal(result.monthCost, 22);
+          assert.deepEqual(usageCalls, ["2026-11", "2026-11", "2026-10"]);
+          assert.equal(reads[2].account, config.usageTokenRevision);
+          assert.equal(
+            renderer.root.findByType(DashboardPanel).props.usage.monthCost,
+            22,
+            "Only the fresh account result may reach the dashboard",
+          );
+        } else {
+          assert.equal(
+            renderer.root.findByType(DashboardPanel).props.usage,
+            null,
+          );
+        }
+      }),
+  );
+}
+
+for (const completion of ["resolve", "reject"] as const) {
+  scenario(
+    `R33 revoked previous-month ${completion} remains cancellation`,
+    (concurrent) =>
+      atMonthStart(async () => {
+        const previous = deferred<UsageResult>();
+        usageRead = (month) =>
+          month === "2026-10"
+            ? previous.promise
+            : Promise.resolve(sampleUsage());
+        await mount(concurrent);
+        assert.deepEqual(usageCalls, ["2026-11", "2026-10"]);
+        const old = fetchCurrentUsage();
+        const rejected = assert.rejects(() => old, /替代/);
+        await change(() => {
+          config = {
+            ...config,
+            configRevision: ++revision,
+            usageTokenRevision: revision,
+            usageTokenConfigured: false,
+          };
+          setCommittedConfig(config);
+        });
+        await change(() => {
+          if (completion === "resolve") previous.resolve(sampleUsage());
+          else previous.reject(new Error("Synthetic previous-month failure"));
+        });
+        await rejected;
+        assert.deepEqual(usageCalls, ["2026-11", "2026-10"]);
+        assert.equal(
+          renderer.root.findByType(DashboardPanel).props.usage,
+          null,
+        );
+        assert.equal(
+          renderer.root.findByType(DashboardPanel).props.usageState,
+          "nokey",
+        );
+      }),
+  );
+}
+
+scenario(
+  "R33 owned previous-month failure still returns partial data",
+  (concurrent) =>
+    atMonthStart(async () => {
+      const previous = deferred<UsageResult>();
+      usageRead = (month) =>
+        month === "2026-10" ? previous.promise : Promise.resolve(sampleUsage());
+      await mount(concurrent);
+      const request = fetchCurrentUsage();
+      await change(() =>
+        previous.reject(new Error("Synthetic network failure")),
+      );
+      const result = await request;
+      assert.deepEqual(usageCalls, ["2026-11", "2026-10"]);
+      assert.equal(result.monthCost, 1);
+      assert.deepEqual(result.unavailableDates, [
+        "2026-10-31",
+        "2026-10-30",
+        "2026-10-29",
+        "2026-10-28",
+        "2026-10-27",
+      ]);
+      assert.deepEqual(result.warnings, ["上月数据暂未获取，缺失日期标为未知"]);
+    }),
+);
 
 // Source contracts complement the synthetic IPC rejection scenarios above.
 // They do not execute Rust, create a native window or validate browser layout.

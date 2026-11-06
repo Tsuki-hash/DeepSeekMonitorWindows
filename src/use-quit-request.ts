@@ -28,6 +28,10 @@ export function useQuitRequest(
       setState,
       interactionGate.lock,
       quitMailbox,
+      {
+        setTimeout: (callback, delay) => window.setTimeout(callback, delay),
+        clearTimeout: (timer) => window.clearTimeout(timer),
+      },
     );
     owner.current = request;
     request.start();

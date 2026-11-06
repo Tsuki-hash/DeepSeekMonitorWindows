@@ -8,14 +8,22 @@ export class RequestGate<T> {
     this.pending = null;
   }
 
-  run(fetch: () => Promise<T>): Promise<T> {
+  run(fetch: (assertCurrent: () => void) => Promise<T>): Promise<T> {
     if (this.pending) return this.pending;
     const generation = this.generation;
+    // Multi-step tasks must also check before starting each later side effect.
+    // A checkpoint belongs to this generation, never to the latest run.
+    const assertCurrent = () => {
+      if (generation !== this.generation)
+        throw new Error("请求已被新的凭据操作替代");
+    };
     const request = Promise.resolve()
-      .then(fetch)
+      .then(() => {
+        assertCurrent();
+        return fetch(assertCurrent);
+      })
       .then((value) => {
-        if (generation !== this.generation)
-          throw new Error("请求已被新的凭据操作替代");
+        assertCurrent();
         return value;
       });
     this.pending = request;

@@ -14,6 +14,18 @@ export const initialQuitRequestState: QuitRequestState = {
 };
 
 type Unlisten = () => void;
+export const QUIT_RECONCILE_INTERVAL_MS = 2_000;
+export type QuitRequestClock = {
+  setTimeout: (
+    callback: () => void,
+    delay: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+};
+const systemClock: QuitRequestClock = {
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
 
 /** One mounted owner's tray subscription and guarded quit command. */
 export class QuitRequest {
@@ -30,6 +42,10 @@ export class QuitRequest {
   private readonly lockInteractions: () => () => void;
   private releaseInteractions: (() => void) | null = null;
   private readonly mailbox?: QuitIntentMailbox;
+  private readonly clock: QuitRequestClock;
+  private reconciliation: {
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null = null;
 
   constructor(
     listen: (request: () => void) => Promise<Unlisten>,
@@ -38,6 +54,7 @@ export class QuitRequest {
     onChange: (state: QuitRequestState) => void,
     lockInteractions: () => () => void = () => () => {},
     mailbox?: QuitIntentMailbox,
+    clock: QuitRequestClock = systemClock,
   ) {
     this.listen = listen;
     this.confirm = confirm;
@@ -45,6 +62,7 @@ export class QuitRequest {
     this.onChange = onChange;
     this.lockInteractions = lockInteractions;
     this.mailbox = mailbox;
+    this.clock = clock;
   }
 
   start() {
@@ -83,6 +101,7 @@ export class QuitRequest {
     this.active = false;
     this.registration += 1;
     this.intent += 1;
+    this.cancelReconciliation();
     if (this.unlisten) this.release(this.unlisten);
     this.unlisten = null;
     this.releaseInteractions?.();
@@ -105,15 +124,27 @@ export class QuitRequest {
     }
   }
 
+  private cancelReconciliation() {
+    const scheduled = this.reconciliation;
+    // Revoke identity first: a host may still deliver a cancelled callback.
+    this.reconciliation = null;
+    if (scheduled?.timer != null) this.clock.clearTimeout(scheduled.timer);
+  }
+
   private async register() {
     const registration = ++this.registration;
+    this.cancelReconciliation();
     this.publish({ listener: "registering" });
     const current = () =>
       this.active &&
       registration === this.registration &&
-      this.state.listener !== "failed";
+      this.state.listener !== "failed" &&
+      // Confirmed exit is terminal even for a read/ack already in flight.
+      // Late results cannot consume another intent or publish recovery UI.
+      this.state.command !== "confirmed";
     const fail = () => {
       if (!current()) return;
+      this.cancelReconciliation();
       this.publish({ listener: "failed", recovery: true });
       if (this.unlisten) this.release(this.unlisten);
       this.unlisten = null;
@@ -138,6 +169,28 @@ export class QuitRequest {
       })();
       return read;
     };
+    const scheduleReconciliation = () => {
+      if (
+        !this.mailbox ||
+        !current() ||
+        this.state.listener !== "ready" ||
+        this.state.command === "confirmed" ||
+        this.reconciliation !== null
+      )
+        return;
+      const scheduled: { timer: ReturnType<typeof setTimeout> | null } = {
+        timer: null,
+      };
+      this.reconciliation = scheduled;
+      scheduled.timer = this.clock.setTimeout(() => {
+        if (this.reconciliation !== scheduled || !current()) return;
+        this.reconciliation = null;
+        // Native events are only a latency optimization. Reconcile even when
+        // an emit failed or its wake was lost after the initial handshake.
+        // Reuse the single-flight drain, and rearm only after read + ack settle.
+        void drain().then(scheduleReconciliation).catch(fail);
+      }, QUIT_RECONCILE_INTERVAL_MS);
+    };
     try {
       const off = await this.listen(() => {
         if (!current()) return;
@@ -160,6 +213,7 @@ export class QuitRequest {
       if (this.mailbox) await drain();
       if (!current()) return;
       this.publish({ listener: "ready" });
+      scheduleReconciliation();
     } catch {
       fail();
     }
@@ -181,6 +235,7 @@ export class QuitRequest {
       // A successful IPC is terminal for this owner; repeated native events
       // while Windows is closing must not submit another command.
       this.publish({ command: "confirmed" });
+      this.cancelReconciliation();
     } catch {
       if (!this.active || intent !== this.intent) return;
       this.releaseInteractions?.();

@@ -17,13 +17,22 @@ export const fetchMonthUsage = (month: number, year: number) => {
   return invoke<UsageResult>("fetch_usage", { month, year });
 };
 export const fetchCurrentUsage = () =>
-  usageGate.run(async () => {
+  usageGate.run(async (assertCurrent) => {
+    const assertAvailable = () => {
+      assertCurrent();
+      if (!getConfigSubscriptionReady())
+        throw new Error("账户配置同步尚未就绪，请恢复同步后重试");
+    };
+    assertAvailable();
     const date = todayStr();
     const [year, month, day] = date.split("-").map(Number);
     const current = {
       ...(await fetchMonthUsage(month, year)),
       accountingDate: date,
     };
+    // A credential change while the current month was in flight must not let
+    // this old task start a previous-month request using the new account.
+    assertAvailable();
     const needsPreviousMonth = day <= 6;
     if (!needsPreviousMonth) {
       return current;
@@ -33,15 +42,20 @@ export const fetchCurrentUsage = () =>
         month === 1
           ? { month: 12, year: year - 1 }
           : { month: month - 1, year };
+      assertAvailable();
       const previousUsage = await fetchMonthUsage(
         previous.month,
         previous.year,
       );
+      assertAvailable();
       return {
         ...current,
         days: [...previousUsage.days, ...current.days],
       };
     } catch {
+      // Revoked ownership/readiness is cancellation, not a partial-data result.
+      // Checking again also covers a previous-month rejection after revocation.
+      assertAvailable();
       const now = new Date(`${date}T00:00:00Z`);
       const unavailableDates = Array.from({ length: 7 }, (_, i) =>
         new Date(now.getTime() - i * 86400_000).toISOString().slice(0, 10),

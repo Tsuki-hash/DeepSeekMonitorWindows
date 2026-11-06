@@ -7,6 +7,7 @@ import { DashboardPanel } from "../src/components/DashboardPanel";
 import { LeavePromptDialog } from "../src/components/LeavePromptDialog";
 import { SettingsPanel } from "../src/components/SettingsPanel";
 import { QuitInteractionGate } from "../src/quit-interaction";
+import { QUIT_RECONCILE_INTERVAL_MS } from "../src/quit-request";
 import { useQuitInteractionBoundary } from "../src/quit-interaction-context";
 import { getCommittedConfig, setCommittedConfig } from "../src/config-store";
 import { invalidateUsageRequests } from "../src/usage-api";
@@ -18,11 +19,16 @@ const g = globalThis as any;
 g.IS_REACT_ACT_ENVIRONMENT = true;
 const noop = () => {};
 let id = 0;
+const timeouts = new Map<number, { callback: () => void; delay: number }>();
 const attrs = new Map();
 const storage = new Map();
 g.window = {
-  setTimeout: () => ++id,
-  clearTimeout: noop,
+  setTimeout: (callback: () => void, delay: number) => {
+    const timer = ++id;
+    timeouts.set(timer, { callback, delay });
+    return timer;
+  },
+  clearTimeout: (timer: number) => timeouts.delete(timer),
   setInterval: () => ++id,
   clearInterval: noop,
   requestAnimationFrame: () => ++id,
@@ -112,6 +118,23 @@ const balance = {
   grantedBalance: "0",
   toppedUpBalance: "100",
 };
+const defaultAlerts = () => ({
+  options: {
+    enabled: false,
+    lowBalanceEnabled: true,
+    lowBalanceCny: 10,
+    monthlyBudgetEnabled: false,
+    monthlyBudgetCny: 100,
+    quietHours: true,
+  },
+  balanceState: "disabled",
+  budgetState: "disabled",
+  balanceCheckedAt: null,
+  budgetCheckedAt: null,
+  lastNotificationAt: null,
+  quietNow: false,
+  error: null,
+});
 let config = baseConfig();
 let calls = [];
 let handlers = {};
@@ -144,23 +167,7 @@ g.__settingsIpc = async (command, args) => {
     case "get_desktop_options":
       return { alwaysOnTop: false, shortcutEnabled: false, error: null };
     case "get_alert_status":
-      return {
-        options: {
-          enabled: false,
-          lowBalanceEnabled: true,
-          lowBalanceCny: 10,
-          monthlyBudgetEnabled: false,
-          monthlyBudgetCny: 100,
-          quietHours: true,
-        },
-        balanceState: "disabled",
-        budgetState: "disabled",
-        balanceCheckedAt: null,
-        budgetCheckedAt: null,
-        lastNotificationAt: null,
-        quietNow: false,
-        error: null,
-      };
+      return defaultAlerts();
     default:
       return null;
   }
@@ -236,6 +243,7 @@ function scenario(name, body) {
       calls = [];
       handlers = {};
       registrations.length = 0;
+      timeouts.clear();
       quitAcknowledged = quitIssued;
       attrs.clear();
       storage.clear();
@@ -252,6 +260,43 @@ function scenario(name, body) {
     });
   }
 }
+
+scenario(
+  "R33 ready App handles a lost quit wake once and preserves cancelled drafts",
+  async (concurrent) => {
+    const pollTimers = () =>
+      [...timeouts].filter(
+        ([, job]) => job.delay === QUIT_RECONCILE_INTERVAL_MS,
+      );
+    const reconcile = async () => {
+      assert.equal(pollTimers().length, 1);
+      const [timer, job] = pollTimers()[0];
+      timeouts.delete(timer);
+      await change(job.callback);
+    };
+    await mount(concurrent);
+    await change(() => registrations[0].accept());
+    await editDraft();
+    publishQuit(); // Simulate native publish with a failed/lost emit after ready.
+    assert.equal(prompts(), 0);
+    assert.equal(commands().length, 0);
+    await reconcile();
+    assert.equal(prompts(), 1);
+    assert.equal(commands().length, 0);
+    assert.equal(commands("acknowledge_quit_intent").length, 1);
+    await click("留在此页");
+    await change(() => registrations[0].callback());
+    await reconcile();
+    assert.equal(prompts(), 0);
+    assert.equal(input().props.value, "DRAFT_ONLY");
+    publishQuit(); // A second genuine click also arrives without an event.
+    await reconcile();
+    assert.equal(prompts(), 1);
+    await click("放弃修改并离开");
+    assert.equal(commands().length, 1);
+    assert.equal(pollTimers().length, 0, "Confirmed exit stops polling");
+  },
+);
 
 scenario(
   "R32 quit before App mount is replayed after listener setup and duplicate wakes are inert",
@@ -828,6 +873,250 @@ for (const quitState of ["pending", "failed"] as const) {
     );
   }
 }
+
+for (const quitState of ["pending", "failed"] as const) {
+  for (const savePath of ["direct", "leave-prompt"] as const) {
+    scenario(
+      `R33 late ${savePath} alert receipt stays committed and clean after discard and quit ${quitState}`,
+      async (concurrent) => {
+        const saving = deferred();
+        const quitting = deferred();
+        const retrying = deferred();
+        let persisted = defaultAlerts();
+        handlers.get_alert_status = async () => persisted;
+        handlers.save_alert_options = () => saving.promise;
+        handlers.confirm_quit = () => quitting.promise;
+        await mount(concurrent);
+        await change(() => registrations[0].accept());
+        await change(() =>
+          renderer.root.findByType(DashboardPanel).props.onSettings(),
+        );
+        const enabled = () => renderer.root.findByProps({ label: "启用提醒" });
+        await change(() => enabled().props.onChange(true));
+        if (savePath === "direct") {
+          await click("保存提醒设置");
+        } else {
+          await change(() => registrations[0].request());
+          await click("保存并离开");
+          await click("留在此页");
+        }
+        assert.equal(commands("save_alert_options").length, 1);
+        assert.equal(enabled().props.disabled, true);
+        await change(() => registrations[0].request());
+        await click("放弃修改并离开");
+        assert.equal(commands().length, 1);
+        assert.equal(prompts(), 0);
+        assert.equal(enabled().props.checked, false);
+        if (quitState === "failed") {
+          await change(() =>
+            quitting.reject(new Error("synthetic quit failure")),
+          );
+        }
+
+        await change(() => {
+          persisted = {
+            ...defaultAlerts(),
+            options: commands("save_alert_options")[0].args.options,
+          };
+          saving.resolve(persisted);
+        });
+        assert.equal(enabled().props.checked, true);
+        assert.equal(enabled().props.disabled, false);
+        assert.equal(prompts(), 0);
+        assert.doesNotMatch(text(), /修改尚未保存|提醒设置已保存/);
+        assert.equal(commands("save_alert_options").length, 1);
+        assert.equal(commands().length, 1, "Old save cannot resume an exit");
+        if (quitState === "pending") {
+          await change(() => registrations[0].request());
+          assert.equal(commands().length, 1);
+          await change(() =>
+            quitting.reject(new Error("synthetic quit failure")),
+          );
+        }
+        handlers.confirm_quit = () => retrying.promise;
+        await click("重试退出");
+        assert.equal(
+          prompts(),
+          0,
+          "Discarded text must not become a new draft",
+        );
+        assert.equal(commands().length, 2, "Only a fresh intent retries exit");
+        assert.equal(commands("save_alert_options").length, 1);
+      },
+    );
+  }
+}
+
+scenario(
+  "R33 fresh alert edits after failed exit remain dirty against the late committed baseline",
+  async (concurrent) => {
+    const saving = deferred();
+    const quitting = deferred();
+    let persisted = defaultAlerts();
+    handlers.get_alert_status = async () => persisted;
+    handlers.save_alert_options = () => saving.promise;
+    handlers.confirm_quit = () => quitting.promise;
+    await mount(concurrent);
+    await change(() => registrations[0].accept());
+    await change(() =>
+      renderer.root.findByType(DashboardPanel).props.onSettings(),
+    );
+    const enabled = () => renderer.root.findByProps({ label: "启用提醒" });
+    await change(() => enabled().props.onChange(true));
+    await click("保存提醒设置");
+    await change(() => registrations[0].request());
+    await click("放弃修改并离开");
+    await change(() => quitting.reject(new Error("synthetic quit failure")));
+    assert.equal(enabled().props.disabled, true, "Native save still owns busy");
+    await change(() => {
+      persisted = {
+        ...defaultAlerts(),
+        options: commands("save_alert_options")[0].args.options,
+      };
+      saving.resolve(persisted);
+    });
+    assert.equal(enabled().props.disabled, false);
+    assert.equal(enabled().props.checked, true);
+    await change(() => enabled().props.onChange(false));
+    assert.match(text(), /修改尚未保存/);
+    await click("重试退出");
+    assert.equal(prompts(), 1);
+    assert.equal(commands().length, 1);
+    assert.equal(enabled().props.checked, false);
+    await click("留在此页");
+    handlers.save_alert_options = async ({ options }) => {
+      persisted = { ...persisted, options };
+      return persisted;
+    };
+    await click("保存提醒设置");
+    assert.equal(commands("save_alert_options").length, 2);
+    assert.equal(
+      commands("save_alert_options").at(-1).args.options.enabled,
+      false,
+    );
+    assert.equal(enabled().props.checked, false);
+    assert.doesNotMatch(text(), /修改尚未保存/);
+    assert.equal(commands().length, 1);
+  },
+);
+
+scenario(
+  "R33 abandoned alert save failure reconciles a native commit without reviving feedback or drafts",
+  async (concurrent) => {
+    const saving = deferred();
+    const quitting = deferred();
+    let persisted = defaultAlerts();
+    handlers.get_alert_status = async () => persisted;
+    handlers.save_alert_options = () => saving.promise;
+    handlers.confirm_quit = () => quitting.promise;
+    await mount(concurrent);
+    await change(() => registrations[0].accept());
+    await change(() =>
+      renderer.root.findByType(DashboardPanel).props.onSettings(),
+    );
+    const enabled = () => renderer.root.findByProps({ label: "启用提醒" });
+    await change(() => enabled().props.onChange(true));
+    await click("保存提醒设置");
+    await change(() => registrations[0].request());
+    await click("放弃修改并离开");
+    await change(() => quitting.reject(new Error("synthetic quit failure")));
+    await change(() => {
+      // save_options commits before reading status. A failed response must not
+      // hide that write when the ensuing status read succeeds.
+      persisted = {
+        ...defaultAlerts(),
+        options: commands("save_alert_options")[0].args.options,
+      };
+      saving.reject(new Error("obsolete synthetic status failure"));
+    });
+    assert.equal(enabled().props.checked, true);
+    assert.equal(enabled().props.disabled, false);
+    assert.doesNotMatch(
+      text(),
+      /修改尚未保存|提醒设置已保存|obsolete synthetic status failure/,
+    );
+    assert.equal(commands("save_alert_options").length, 1);
+    assert.equal(commands().length, 1);
+    handlers.confirm_quit = async () => null;
+    await click("重试退出");
+    assert.equal(prompts(), 0);
+    assert.equal(commands().length, 2);
+  },
+);
+
+scenario(
+  "R33 fresh alert edits survive a late reload after an abandoned save fails",
+  async (concurrent) => {
+    const saving = deferred();
+    const quitting = deferred();
+    const rereading = deferred();
+    let persisted = defaultAlerts();
+    handlers.get_alert_status = async () => persisted;
+    handlers.save_alert_options = () => saving.promise;
+    handlers.confirm_quit = () => quitting.promise;
+    await mount(concurrent);
+    await change(() => registrations[0].accept());
+    await change(() =>
+      renderer.root.findByType(DashboardPanel).props.onSettings(),
+    );
+    const enabled = () => renderer.root.findByProps({ label: "启用提醒" });
+    const amount = () =>
+      renderer.root.findByProps({ "aria-label": "余额提醒线" });
+    await change(() => enabled().props.onChange(true));
+    await click("保存提醒设置");
+    await change(() => registrations[0].request());
+    await click("放弃修改并离开");
+    await change(() => quitting.reject(new Error("synthetic quit failure")));
+
+    const readsBeforeFailure = commands("get_alert_status").length;
+    handlers.get_alert_status = () => rereading.promise;
+    await change(() => {
+      persisted = {
+        ...defaultAlerts(),
+        options: commands("save_alert_options")[0].args.options,
+      };
+      saving.reject(new Error("obsolete synthetic status failure"));
+    });
+    assert.equal(commands("get_alert_status").length, readsBeforeFailure + 1);
+    assert.equal(enabled().props.disabled, false, "Failed write releases busy");
+    assert.equal(enabled().props.checked, false, "Reload is still pending");
+    // Unlike editing a disabled in-flight form, these are available controls:
+    // native save has settled, exit failed, and only the status read is pending.
+    await change(() => enabled().props.onChange(true));
+    assert.equal(amount().props.disabled, false);
+    await change(() => amount().props.onChange({ target: { value: "47" } }));
+    await change(() => rereading.resolve(persisted));
+    assert.equal(enabled().props.checked, true);
+    assert.equal(amount().props.value, "47");
+    assert.match(text(), /修改尚未保存/);
+    assert.doesNotMatch(
+      text(),
+      /提醒设置已保存|obsolete synthetic status failure/,
+    );
+    assert.equal(commands("save_alert_options").length, 1);
+    assert.equal(commands().length, 1);
+
+    await click("重试退出");
+    assert.equal(prompts(), 1, "The fresh draft must negotiate exit again");
+    assert.equal(amount().props.value, "47");
+    assert.equal(commands().length, 1);
+    await click("留在此页");
+    handlers.get_alert_status = async () => persisted;
+    handlers.save_alert_options = async ({ options }) => {
+      persisted = { ...persisted, options };
+      return persisted;
+    };
+    await click("保存提醒设置");
+    assert.equal(commands("save_alert_options").length, 2);
+    assert.equal(
+      commands("save_alert_options").at(-1).args.options.lowBalanceCny,
+      47,
+    );
+    assert.equal(amount().props.value, "47");
+    assert.doesNotMatch(text(), /修改尚未保存/);
+    assert.equal(commands().length, 1);
+  },
+);
 
 test("R32 native interaction fence and inert state follow the synchronous lock", async () => {
   class Node extends g.HTMLElement {

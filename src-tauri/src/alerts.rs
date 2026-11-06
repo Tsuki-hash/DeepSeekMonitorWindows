@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
@@ -88,17 +88,36 @@ fn identity(kind: Kind, credential: &str, threshold: f64, month: (u32, u32)) -> 
     }
     format!("{:x}", hash.finalize())
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Receipt {
     attempted_at: u64,
     submitted: bool,
+    // Preserve the real attempt and result. This separate, backwards-compatible
+    // anchor bounds cooldown after a persisted wall-clock timestamp is in future.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cooldown_started_at: Option<u64>,
+}
+impl Receipt {
+    fn cooldown_seconds(&self, kind: Kind) -> u64 {
+        if kind == Kind::Test {
+            60
+        } else if self.submitted {
+            COOLDOWN_SECONDS
+        } else {
+            3600
+        }
+    }
+    fn cooldown_start(&self) -> u64 {
+        self.cooldown_started_at.unwrap_or(self.attempted_at)
+    }
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Ledger {
     receipts: BTreeMap<String, Receipt>,
 }
 impl Ledger {
+    #[cfg(test)]
     fn allows(&self, key: &str, kind: Kind, now: u64) -> bool {
         let Some(receipt) = self.receipts.get(key) else {
             return true;
@@ -106,29 +125,28 @@ impl Ledger {
         if kind == Kind::Budget && receipt.submitted {
             return false;
         }
-        let wait = if kind == Kind::Test {
-            60
-        } else if receipt.submitted {
-            COOLDOWN_SECONDS
-        } else {
-            3600
-        };
-        now >= receipt.attempted_at && now - receipt.attempted_at >= wait
+        now >= receipt.cooldown_start()
+            && now - receipt.cooldown_start() >= receipt.cooldown_seconds(kind)
     }
     fn record(&mut self, key: String, now: u64, submitted: bool) {
         self.receipts
             .retain(|_, r| now < r.attempted_at || now - r.attempted_at < 90 * 86400);
         self.receipts.insert(
-            key,
+            key.clone(),
             Receipt {
                 attempted_at: now,
                 submitted,
+                cooldown_started_at: None,
             },
         );
         while self.receipts.len() > 128 {
             let oldest = self
                 .receipts
                 .iter()
+                // After wall-clock rollback, the just-recorded attempt can
+                // have the smallest timestamp. Never evict its own protection
+                // before sending or before persisting the success receipt.
+                .filter(|(candidate, _)| *candidate != &key)
                 .min_by_key(|(_, r)| r.attempted_at)
                 .map(|(k, _)| k.clone())
                 .unwrap();
@@ -175,27 +193,36 @@ fn persist_ledger(ledger: &Ledger) -> Result<(), String> {
 #[derive(Default)]
 struct Poll {
     identity: String,
-    next: u64,
+    next: Option<Instant>,
+    paused: bool,
     failures: u32,
 }
 impl Poll {
-    fn due(&mut self, key: String, now: u64) -> bool {
+    fn due(&mut self, key: String, now: Instant) -> bool {
         if self.identity != key {
             self.identity = key;
-            self.next = 0;
+            self.next = None;
+            self.paused = false;
             self.failures = 0;
         }
-        now >= self.next
+        !self.paused && self.next.is_none_or(|next| now >= next)
     }
-    fn finish(&mut self, now: u64, code: &str) {
+    fn finish(&mut self, now: Instant, code: &str) {
         if code == "ok" || code == "unsupported" || code == "invalid_data" {
             self.failures = 0;
-            self.next = now + CHECK_SECONDS;
+            self.next = Some(now + Duration::from_secs(CHECK_SECONDS));
         } else if code == "credentials_invalid" {
-            self.next = u64::MAX;
+            // No finite time or clock correction resumes an explicitly refused
+            // credential. Only a changed poll identity revokes this pause.
+            self.paused = true;
+            self.next = None;
         } else {
             self.failures = self.failures.saturating_add(1);
-            self.next = now + (CHECK_SECONDS * (1u64 << self.failures.min(3))).min(1800);
+            self.next = Some(
+                now + Duration::from_secs(
+                    (CHECK_SECONDS * (1u64 << self.failures.min(3))).min(1800),
+                ),
+            );
         }
     }
 }
@@ -204,6 +231,7 @@ pub struct AlertRuntime(Mutex<Runtime>);
 #[derive(Default)]
 struct Runtime {
     ledger: Option<Ledger>,
+    receipt_cooldowns: BTreeMap<String, ReceiptCooldown>,
     balance: Poll,
     budget: Poll,
     balance_state: String,
@@ -212,6 +240,45 @@ struct Runtime {
     budget_checked_at: Option<u64>,
     last_notification_at: Option<u64>,
     errors: RuntimeErrors,
+}
+struct ReceiptCooldown {
+    receipt: Receipt,
+    kind: Kind,
+    until: Instant,
+}
+impl Runtime {
+    fn receipt_clock_notice(&self, now: Instant) -> Option<String> {
+        self.receipt_cooldowns
+            .values()
+            .any(|cooldown| cooldown.receipt.cooldown_started_at.is_some() && now < cooldown.until)
+            .then(|| {
+                concat!(
+                    "提醒去重记录的时间曾超前，已校准并保守等待冷却：",
+                    "余额提醒最多24小时、失败重试1小时、测试通知60秒；",
+                    "本月已保存成功回执的预算提醒仍不重复。",
+                    "重启沿用已保存的校准时间；再次回拨会重新校准。",
+                )
+                .into()
+            })
+    }
+    fn remember_receipt(&mut self, key: &str, kind: Kind, now: Instant) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        self.receipt_cooldowns
+            .retain(|key, _| ledger.receipts.contains_key(key));
+        let Some(receipt) = ledger.receipts.get(key) else {
+            return;
+        };
+        self.receipt_cooldowns.insert(
+            key.into(),
+            ReceiptCooldown {
+                receipt: receipt.clone(),
+                kind,
+                until: now + Duration::from_secs(receipt.cooldown_seconds(kind)),
+            },
+        );
+    }
 }
 #[derive(Default)]
 struct RuntimeErrors {
@@ -317,7 +384,16 @@ pub fn status(app: &tauri::AppHandle) -> Result<AlertStatus, String> {
         error: config
             .alerts
             .enabled
-            .then(|| state.errors.message())
+            .then(|| {
+                let messages: Vec<_> = [
+                    state.errors.message(),
+                    state.receipt_clock_notice(Instant::now()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                (!messages.is_empty()).then(|| messages.join("；"))
+            })
             .flatten(),
         options: config.alerts,
         balance_checked_at: current_balance
@@ -372,36 +448,112 @@ fn submit_with(
     send: impl FnOnce(&str) -> Result<(), String>,
     persist: impl FnMut(&Ledger) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let result = attempt_submission(state, key, kind, now, send, persist);
+    submit_with_clock(state, key, kind, now, Instant::now(), send, persist)
+}
+fn submit_with_clock(
+    state: &mut Runtime,
+    key: String,
+    kind: Kind,
+    now: u64,
+    monotonic: Instant,
+    send: impl FnOnce(&str) -> Result<(), String>,
+    persist: impl FnMut(&Ledger) -> Result<(), String>,
+) -> Result<bool, String> {
+    let result = attempt_submission(state, key, kind, now, monotonic, send, persist);
     state.errors.notification_result(&result);
     result
 }
+
+// Runtime timers never follow wall-clock jumps. On restart, persisted wall time
+// can only reconstruct a bounded remaining wait. A future anchor is rebased and
+// durably saved BEFORE any permission to send; failure remains fail-closed.
+fn receipt_allows(
+    state: &mut Runtime,
+    key: &str,
+    kind: Kind,
+    now: u64,
+    monotonic: Instant,
+    persist: &mut impl FnMut(&Ledger) -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some(mut receipt) = state
+        .ledger
+        .as_ref()
+        .and_then(|ledger| ledger.receipts.get(key))
+        .cloned()
+    else {
+        state.receipt_cooldowns.remove(key);
+        return Ok(true);
+    };
+    // A successful budget receipt is a month/account/threshold fact, not a
+    // cooldown. Clock corrections must never turn it into another permission.
+    if kind == Kind::Budget && receipt.submitted {
+        return Ok(false);
+    }
+    let existing = state
+        .receipt_cooldowns
+        .get(key)
+        .filter(|cached| cached.receipt == receipt && cached.kind == kind)
+        .map(|cached| cached.until);
+    if now < receipt.cooldown_start() {
+        receipt.cooldown_started_at = Some(now);
+        let mut adjusted = state.ledger.as_ref().unwrap().clone();
+        adjusted.receipts.insert(key.into(), receipt.clone());
+        persist(&adjusted)
+            .map_err(|_| "提醒时钟校准记录无法保存，未发送通知；请检查本地配置目录后重试")?;
+        state.ledger = Some(adjusted);
+    }
+    let until = existing.unwrap_or_else(|| {
+        let remaining = receipt
+            .cooldown_seconds(kind)
+            .saturating_sub(now.saturating_sub(receipt.cooldown_start()));
+        monotonic + Duration::from_secs(remaining)
+    });
+    state.receipt_cooldowns.insert(
+        key.into(),
+        ReceiptCooldown {
+            receipt,
+            kind,
+            until,
+        },
+    );
+    Ok(monotonic >= until)
+}
+
 fn attempt_submission(
     state: &mut Runtime,
     key: String,
     kind: Kind,
     now: u64,
+    monotonic: Instant,
     send: impl FnOnce(&str) -> Result<(), String>,
     mut persist: impl FnMut(&Ledger) -> Result<(), String>,
 ) -> Result<bool, String> {
     if state.ledger.is_none() {
         state.ledger = Some(load_ledger()?);
     }
-    let ledger = state.ledger.as_ref().unwrap();
-    if !ledger.allows(&key, kind, now) {
+    if now == 0 {
+        return Err("系统时钟不可用，未发送通知".into());
+    }
+    if !receipt_allows(state, &key, kind, now, monotonic, &mut persist)? {
         return Ok(false);
     }
     // Persist an attempted submission first: a crash cannot cause an immediate duplicate.
-    let mut next = ledger.clone();
+    let mut next = state.ledger.as_ref().unwrap().clone();
     next.record(key.clone(), now, false);
     persist(&next)?;
     state.ledger = Some(next);
+    state.remember_receipt(&key, kind, monotonic);
     let body=match kind {Kind::Balance=>"账户余额已达到提醒线，请打开面板查看最新余额。",Kind::Budget=>"平台本月费用已达到预算提醒线，请打开用量页核对。统计按北京时间自然月，提醒不会阻止消费。",Kind::Test=>"这是一条测试通知，没有查询账户余额或用量。"};
     send(body)?;
     state.last_notification_at = Some(now * 1000);
-    let ledger = state.ledger.as_mut().unwrap();
-    ledger.record(key, now, true);
-    persist(ledger).map_err(|_| "通知已提交系统，但去重回执保存失败；请检查本地配置目录")?;
+    state
+        .ledger
+        .as_mut()
+        .unwrap()
+        .record(key.clone(), now, true);
+    state.remember_receipt(&key, kind, monotonic);
+    persist(state.ledger.as_ref().unwrap())
+        .map_err(|_| "通知已提交系统，但去重回执保存失败；请检查本地配置目录")?;
     Ok(true)
 }
 pub fn test_notification(app: &tauri::AppHandle) -> Result<(), String> {
@@ -517,6 +669,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
     // use the same config -> runtime lock order.
     let snapshot = config::read_snapshot();
     let now = now_seconds();
+    let monotonic = Instant::now();
     let runtime = app.state::<AlertRuntime>();
     let prepared = {
         let mut state = runtime.0.lock().map_err(|_| "提醒状态不可用")?;
@@ -537,12 +690,12 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
             && key.is_some()
             && state
                 .balance
-                .due(poll_identity(Kind::Balance, &config, month), now);
+                .due(poll_identity(Kind::Balance, &config, month), monotonic);
         let budget_due = config.alerts.monthly_budget_enabled
             && token.is_some()
             && state
                 .budget
-                .due(poll_identity(Kind::Budget, &config, month), now);
+                .due(poll_identity(Kind::Budget, &config, month), monotonic);
         if balance_due {
             state.balance_state = "checking".into();
         }
@@ -600,10 +753,11 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
             return Ok(());
         }
         let now = now_seconds();
+        let monotonic = Instant::now();
         let quiet_now = quiet(&current.alerts, chrono::Local::now().hour());
         let mut state = runtime.0.lock().map_err(|_| "提醒状态不可用")?;
         if let Some((code, trigger)) = balance {
-            state.balance.finish(now, &code);
+            state.balance.finish(monotonic, &code);
             state.balance_state = code;
             state.balance_checked_at = Some(now * 1000);
             if trigger && !quiet_now {
@@ -622,7 +776,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
             }
         }
         if let Some((code, trigger)) = budget {
-            state.budget.finish(now, &code);
+            state.budget.finish(monotonic, &code);
             state.budget_state = code;
             state.budget_checked_at = Some(now * 1000);
             if trigger && !quiet_now && crate::usage_watcher::cst_month(SystemTime::now()) == month
@@ -668,6 +822,443 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_instant(seconds: u64) -> Instant {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *START.get_or_init(Instant::now) + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn r33_poll_deadlines_ignore_wall_rollback_and_keep_auth_pause() {
+        let mut state = Runtime::default();
+        let config = config::StoredConfig::with_defaults();
+        assert!(state.balance.due("same-account".into(), test_instant(0)));
+        state.balance.finish(test_instant(0), "ok");
+        // Valid-but-earlier wall time is still suitable for dates/quiet hours;
+        // it cannot move the monotonic five-minute check deadline.
+        assert!(prepare_tick(&mut state.errors, Ok((1, config.clone())), 1_000_000).is_some());
+        assert!(prepare_tick(&mut state.errors, Ok((1, config)), 1_000).is_some());
+        assert!(!state.balance.due("same-account".into(), test_instant(299)));
+        assert!(state.balance.due("same-account".into(), test_instant(300)));
+        state
+            .balance
+            .finish(test_instant(300), "credentials_invalid");
+        for elapsed in [301, 86_400, 366 * 86_400] {
+            assert!(!state
+                .balance
+                .due("same-account".into(), test_instant(elapsed)));
+        }
+        assert!(state.balance.paused);
+        assert!(state.balance.due(
+            "validated-new-identity".into(),
+            test_instant(366 * 86_400 + 1),
+        ));
+        assert!(!state.balance.paused);
+    }
+
+    #[test]
+    fn r33_cross_month_rollback_only_rekeys_the_budget_poll() {
+        let _dir = crate::test_support::TempConfigDir::new("r33-alert-month-clock");
+        let mut config = config::StoredConfig::with_defaults();
+        config.api_key = Some("synthetic-key".into());
+        config.usage_token = Some("synthetic-token".into());
+        let november = (11, 2026);
+        let october = (10, 2026);
+        let balance = poll_identity(Kind::Balance, &config, november);
+        let budget = poll_identity(Kind::Budget, &config, november);
+        let mut state = Runtime::default();
+        assert!(state.balance.due(balance.clone(), test_instant(0)));
+        assert!(state.budget.due(budget.clone(), test_instant(0)));
+        state.balance.finish(test_instant(0), "ok");
+        state.budget.finish(test_instant(0), "ok");
+        assert_eq!(balance, poll_identity(Kind::Balance, &config, october));
+        assert_ne!(budget, poll_identity(Kind::Budget, &config, october));
+        assert!(!state.balance.due(balance.clone(), test_instant(1)));
+        assert!(state.budget.due(
+            poll_identity(Kind::Budget, &config, october),
+            test_instant(1),
+        ));
+        assert!(state.balance.due(balance, test_instant(CHECK_SECONDS)));
+    }
+
+    #[test]
+    fn r33_future_receipts_wait_at_most_one_normal_monotonic_cooldown() {
+        for (kind, submitted, wait) in [
+            (Kind::Balance, true, COOLDOWN_SECONDS),
+            (Kind::Balance, false, 3600),
+            (Kind::Budget, false, 3600),
+            (Kind::Test, true, 60),
+            (Kind::Test, false, 60),
+        ] {
+            let mut ledger = Ledger::default();
+            ledger.record("same-receipt".into(), 1_000_000, submitted);
+            let mut state = Runtime {
+                ledger: Some(ledger),
+                ..Default::default()
+            };
+            let mut persisted = None;
+            assert!(!submit_with_clock(
+                &mut state,
+                "same-receipt".into(),
+                kind,
+                1_000,
+                test_instant(0),
+                |_| panic!("a future receipt must not send immediately"),
+                |ledger| {
+                    persisted = Some(ledger.clone());
+                    Ok(())
+                },
+            )
+            .unwrap());
+            let receipt = &persisted.as_ref().unwrap().receipts["same-receipt"];
+            assert_eq!(receipt.attempted_at, 1_000_000);
+            assert_eq!(receipt.submitted, submitted);
+            assert_eq!(receipt.cooldown_started_at, Some(1_000));
+            assert!(state
+                .receipt_clock_notice(test_instant(0))
+                .unwrap()
+                .contains("24小时"));
+            // Repeated backwards jumps update the restart anchor, not this
+            // process's already-running monotonic deadline.
+            assert!(!submit_with_clock(
+                &mut state,
+                "same-receipt".into(),
+                kind,
+                900,
+                test_instant(wait - 1),
+                |_| panic!("cooldown is not complete"),
+                |_| Ok(()),
+            )
+            .unwrap());
+            assert!(submit_with_clock(
+                &mut state,
+                "same-receipt".into(),
+                kind,
+                800,
+                test_instant(wait),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap());
+            assert!(state.receipt_clock_notice(test_instant(wait)).is_none());
+            assert_eq!(
+                state.ledger.as_ref().unwrap().receipts["same-receipt"].attempted_at,
+                800,
+            );
+        }
+    }
+
+    #[test]
+    fn r33_calibrated_receipts_survive_real_ledger_reload_without_restarting_wait() {
+        let _dir = crate::test_support::TempConfigDir::new("r33-alert-receipt-restart");
+        for (kind, submitted, wait) in [
+            (Kind::Balance, true, COOLDOWN_SECONDS),
+            (Kind::Balance, false, 3600),
+            (Kind::Budget, false, 3600),
+            (Kind::Test, true, 60),
+        ] {
+            let key = identity(kind, "synthetic-account", 10.0, (11, 2026));
+            let mut ledger = Ledger::default();
+            ledger.record(key.clone(), 1_000_000, submitted);
+            let legacy = serde_json::to_string(&ledger).unwrap();
+            assert!(!legacy.contains("cooldownStartedAt"));
+            persist_ledger(&serde_json::from_str(&legacy).unwrap()).unwrap();
+            let mut state = Runtime::default(); // Production lazy-load path.
+            assert!(!submit_with_clock(
+                &mut state,
+                key.clone(),
+                kind,
+                1_000,
+                test_instant(0),
+                |_| panic!("future receipt starts bounded wait"),
+                persist_ledger,
+            )
+            .unwrap());
+            assert!(std::fs::read_to_string(ledger_path().unwrap())
+                .unwrap()
+                .contains("cooldownStartedAt"));
+            let mut restarted = Runtime::default();
+            let half = wait / 2;
+            assert!(!submit_with_clock(
+                &mut restarted,
+                key.clone(),
+                kind,
+                1_000 + half,
+                test_instant(10_000),
+                |_| panic!("remaining half still waits"),
+                |_| panic!("existing calibration does not need rewriting"),
+            )
+            .unwrap());
+            assert!(restarted
+                .receipt_clock_notice(test_instant(10_000))
+                .is_some());
+            assert!(!submit_with_clock(
+                &mut restarted,
+                key.clone(),
+                kind,
+                1_000 + half,
+                test_instant(10_000 + wait - half - 1),
+                |_| panic!("one second remains"),
+                |_| panic!("suppressed check must not write"),
+            )
+            .unwrap());
+            // Even a wall clock that does not advance cannot extend runtime wait.
+            assert!(submit_with_clock(
+                &mut restarted,
+                key,
+                kind,
+                1_000 + half,
+                test_instant(10_000 + wait - half),
+                |_| Ok(()),
+                persist_ledger,
+            )
+            .unwrap());
+            assert!(restarted
+                .receipt_clock_notice(test_instant(10_000 + wait - half))
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn r33_successful_budget_receipts_keep_month_identity_across_rollback_and_restart() {
+        let november = identity(Kind::Budget, "synthetic-account", 100.0, (11, 2026));
+        let october = identity(Kind::Budget, "synthetic-account", 100.0, (10, 2026));
+        let september = identity(Kind::Budget, "synthetic-account", 100.0, (9, 2026));
+        let mut ledger = Ledger::default();
+        ledger.record(october.clone(), 900_000, true);
+        ledger.record(november.clone(), 1_000_000, true);
+        let restored: Ledger =
+            serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+        let mut state = Runtime {
+            ledger: Some(restored),
+            ..Default::default()
+        };
+        for key in [&november, &october] {
+            assert!(!submit_with_clock(
+                &mut state,
+                (*key).clone(),
+                Kind::Budget,
+                1_000,
+                test_instant(366 * 86_400),
+                |_| panic!("the same month is already submitted"),
+                |_| panic!("budget facts must not be rebased or erased"),
+            )
+            .unwrap());
+        }
+        assert!(submit_with_clock(
+            &mut state,
+            september.clone(),
+            Kind::Budget,
+            1_000,
+            test_instant(366 * 86_400 + 1),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap());
+        assert!(!submit_with_clock(
+            &mut state,
+            september,
+            Kind::Budget,
+            900,
+            test_instant(366 * 86_400 + 100_000),
+            |_| panic!("new month also submits only once"),
+            |_| panic!("no duplicate write"),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn r33_full_future_ledger_preserves_current_attempt_and_budget_after_reload() {
+        let _dir = crate::test_support::TempConfigDir::new("r33-alert-full-future-ledger");
+        for system_succeeds in [false, true] {
+            let mut ledger = Ledger::default();
+            for index in 0..128 {
+                ledger.record(
+                    identity(
+                        Kind::Budget,
+                        &format!("old-account-{index}"),
+                        100.0,
+                        (11, 2026),
+                    ),
+                    1_000_000 + index,
+                    true,
+                );
+            }
+            assert_eq!(ledger.receipts.len(), 128);
+            let key = identity(Kind::Budget, "current-account", 100.0, (10, 2026));
+            let mut state = Runtime {
+                ledger: Some(ledger),
+                ..Default::default()
+            };
+            let result = submit_with_clock(
+                &mut state,
+                key.clone(),
+                Kind::Budget,
+                1_000,
+                test_instant(0),
+                |_| {
+                    // Production persists the attempted receipt before calling
+                    // the system, including at capacity and after clock rollback.
+                    let persisted = load_ledger()?;
+                    assert_eq!(persisted.receipts.len(), 128);
+                    assert!(!persisted.receipts[&key].submitted);
+                    if system_succeeds {
+                        Ok(())
+                    } else {
+                        Err("synthetic system failure".into())
+                    }
+                },
+                persist_ledger,
+            );
+            assert_eq!(result.is_ok(), system_succeeds);
+            let persisted = load_ledger().unwrap();
+            assert_eq!(persisted.receipts.len(), 128);
+            assert_eq!(persisted.receipts[&key].submitted, system_succeeds);
+            assert_eq!(persisted.receipts[&key].attempted_at, 1_000);
+            let mut restarted = Runtime::default();
+            assert!(!submit_with_clock(
+                &mut restarted,
+                key.clone(),
+                Kind::Budget,
+                1_001,
+                test_instant(1),
+                |_| panic!("a retained attempt/success must block immediate repeated send"),
+                |_| panic!("ordinary suppression must not rewrite receipts"),
+            )
+            .unwrap());
+            let later = submit_with_clock(
+                &mut restarted,
+                key,
+                Kind::Budget,
+                1_001,
+                test_instant(3600),
+                |_| {
+                    assert!(
+                        !system_succeeds,
+                        "successful budget must never repeat for this key",
+                    );
+                    Ok(())
+                },
+                persist_ledger,
+            )
+            .unwrap();
+            assert_eq!(
+                later, !system_succeeds,
+                "only a failed system attempt retries after its hour",
+            );
+        }
+    }
+
+    #[test]
+    fn r33_rebase_write_failure_blocks_send_and_recovers_without_poisoning_receipt() {
+        let mut ledger = Ledger::default();
+        ledger.record("receipt".into(), 1_000_000, false);
+        let mut state = Runtime {
+            ledger: Some(ledger),
+            ..Default::default()
+        };
+        assert!(submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            1_000,
+            test_instant(0),
+            |_| panic!("failed calibration cannot authorize a send"),
+            |_| Err("synthetic disk failure".into()),
+        )
+        .is_err());
+        assert!(state
+            .errors
+            .notification
+            .as_ref()
+            .unwrap()
+            .contains("校准记录无法保存"));
+        assert_eq!(
+            state.ledger.as_ref().unwrap().receipts["receipt"].cooldown_started_at,
+            None,
+        );
+        assert!(state.receipt_cooldowns.is_empty());
+        assert!(!submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            1_000,
+            test_instant(10),
+            |_| panic!("successful calibration still waits"),
+            |_| Ok(()),
+        )
+        .unwrap());
+        assert!(prepare_tick(
+            &mut state.errors,
+            Ok((1, config::StoredConfig::with_defaults())),
+            1_001,
+        )
+        .is_some());
+        assert!(state.receipt_clock_notice(test_instant(11)).is_some());
+        assert!(
+            state.errors.notification.is_some(),
+            "calibration alone does not prove delivery recovered",
+        );
+        assert!(submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            1_001,
+            test_instant(3610),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap());
+        assert!(state.errors.notification.is_none());
+    }
+
+    #[test]
+    fn r33_new_receipt_cooldown_cannot_be_skipped_by_forward_wall_jump() {
+        let mut state = Runtime {
+            ledger: Some(Ledger::default()),
+            ..Default::default()
+        };
+        assert!(submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            1_000,
+            test_instant(0),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap());
+        assert!(!submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            1_000_000,
+            test_instant(1),
+            |_| panic!("wall time cannot skip runtime cooldown"),
+            |_| panic!("ordinary suppression does not write"),
+        )
+        .unwrap());
+        assert!(!submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            900,
+            test_instant(COOLDOWN_SECONDS - 1),
+            |_| panic!("rollback cannot skip cooldown either"),
+            |_| Ok(()),
+        )
+        .unwrap());
+        assert!(submit_with_clock(
+            &mut state,
+            "receipt".into(),
+            Kind::Balance,
+            800,
+            test_instant(COOLDOWN_SECONDS),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap());
+    }
 
     /// 从完整的单日当月响应进入与生产相同的校验/日期质量/预算链路。
     fn r20_decimal_result(rows: Vec<deepseek_api::ModelUsage>) -> deepseek_api::UsageResult {
@@ -1614,11 +2205,11 @@ mod tests {
         let mut restored = config::StoredConfig::with_defaults();
         restored.alerts.enabled = true;
         restored.api_key = Some("synthetic-key".into());
-        state.balance.due("same-poll".into(), 100);
-        state.balance.finish(100, "ok");
+        state.balance.due("same-poll".into(), test_instant(100));
+        state.balance.finish(test_instant(100), "ok");
         state.errors.configuration = Some("old read failure".into());
         let (_, restored) = prepare_tick(&mut state.errors, Ok((3, restored)), 101).unwrap();
-        assert!(!state.balance.due("same-poll".into(), 101));
+        assert!(!state.balance.due("same-poll".into(), test_instant(101)));
         assert!(quiet(&restored.alerts, 23));
         assert_eq!(
             balance_sample(
@@ -1754,10 +2345,14 @@ mod tests {
         let month = (10, 2026);
         let balance_id = poll_identity(Kind::Balance, &config, month);
         let budget_id = poll_identity(Kind::Budget, &config, month);
-        assert!(state.balance.due(balance_id.clone(), 100));
-        assert!(state.budget.due(budget_id.clone(), 100));
-        state.balance.finish(100, "credentials_invalid");
-        state.budget.finish(100, "credentials_invalid");
+        assert!(state.balance.due(balance_id.clone(), test_instant(100)));
+        assert!(state.budget.due(budget_id.clone(), test_instant(100)));
+        state
+            .balance
+            .finish(test_instant(100), "credentials_invalid");
+        state
+            .budget
+            .finish(test_instant(100), "credentials_invalid");
         let receipt = identity(Kind::Budget, "synthetic-token", 100.0, month);
         let mut ledger = Ledger::default();
         ledger.record(receipt.clone(), 100, true);
@@ -1769,12 +2364,14 @@ mod tests {
             .unwrap()
             .is_none());
         let current = config::read_stored_config().unwrap();
-        assert!(state
-            .balance
-            .due(poll_identity(Kind::Balance, &current, month), 200));
-        assert!(!state
-            .budget
-            .due(poll_identity(Kind::Budget, &current, month), 200));
+        assert!(state.balance.due(
+            poll_identity(Kind::Balance, &current, month),
+            test_instant(200)
+        ));
+        assert!(!state.budget.due(
+            poll_identity(Kind::Budget, &current, month),
+            test_instant(200)
+        ));
         assert_eq!(
             config::credential_validation_revision(UsageToken),
             budget_epoch
@@ -1794,9 +2391,10 @@ mod tests {
         std::fs::remove_dir(dir.join("config.json.tmp")).unwrap();
         let current =
             config::edit_validated_credential(UsageToken, "synthetic-token".into()).unwrap();
-        assert!(state
-            .budget
-            .due(poll_identity(Kind::Budget, &current, month), 200));
+        assert!(state.budget.due(
+            poll_identity(Kind::Budget, &current, month),
+            test_instant(200)
+        ));
         assert!(!state
             .ledger
             .as_ref()
@@ -1890,16 +2488,16 @@ mod tests {
     #[test]
     fn 退避封顶_成功恢复_无效凭据暂停() {
         let mut poll = Poll::default();
-        assert!(poll.due("one".into(), 1));
+        assert!(poll.due("one".into(), test_instant(1)));
         for _ in 0..9 {
-            poll.finish(1, "unavailable");
+            poll.finish(test_instant(1), "unavailable");
         }
-        assert_eq!(poll.next, 1801);
-        poll.finish(1, "ok");
-        assert_eq!(poll.next, 301);
-        poll.finish(1, "credentials_invalid");
-        assert!(!poll.due("one".into(), 1000));
-        assert!(poll.due("new-key".into(), 1000));
+        assert_eq!(poll.next, Some(test_instant(1801)));
+        poll.finish(test_instant(1), "ok");
+        assert_eq!(poll.next, Some(test_instant(301)));
+        poll.finish(test_instant(1), "credentials_invalid");
+        assert!(!poll.due("one".into(), test_instant(1000)));
+        assert!(poll.due("new-key".into(), test_instant(1000)));
     }
     #[test]
     fn 失败不触发通知_金额与币种不猜测() {
