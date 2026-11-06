@@ -4,12 +4,42 @@
 // 影响合计与导出；「继续加载更早」又只在 older 分支保留旧结果。
 // 提前停止时还把**计划**目标当作已请求，未尝试的月份被误标成「平台未返回」。
 //
-// 这里把合并与边界计算收敛成纯函数：按月份索引合并，区分
-// planned（计划请求）/ attempted（真正尝试过）/ successful / failed / unloaded。
+// 复评 R02：合并器无条件保留旧月份，切范围（本月→上月）后旧月份会混进新窗口的
+// 月汇总与 JSON；跨账户时旧账户月份还可能被重新标上新 epoch。
+// 因此这里增加**作用域身份**：只有同一 scope（区间 + 窗口 + 凭据代际）的结果
+// 才允许继承，且输出一律按窗口过滤。
+//
+// 复评 R05：失败月份必须跨批次持久，只有本次成功才能清除该月的旧失败状态。
 
 import type { HistoryMonth } from "./history";
 
+/** 一次历史查询的身份：区间、窗口与凭据代际。 */
+export type HistoryScope = {
+  /** 区间类型（month/previous/30days/custom/all）。 */
+  range: string;
+  /** 窗口起止。 */
+  from: string;
+  /** 窗口止。 */
+  to: string;
+  /** 凭据代际：账号/Token 变化时递增，用于账户隔离。 */
+  epoch: number;
+};
+
+/** 两个作用域是否可继承。 */
+export function sameScope(a: HistoryScope, b: HistoryScope): boolean {
+  return (
+    a.range === b.range &&
+    a.from === b.from &&
+    a.to === b.to &&
+    a.epoch === b.epoch
+  );
+}
+
 export type MergeInput = {
+  /** 本次请求的作用域。 */
+  scope: HistoryScope;
+  /** 旧结果所属作用域；null 表示没有旧结果。 */
+  previousScope: HistoryScope | null;
   /** 窗口内全部月份（升序）。 */
   windowMonths: string[];
   /** 本次计划请求的月份。 */
@@ -20,8 +50,10 @@ export type MergeInput = {
   successful: HistoryMonth[];
   /** 此前已有的成功月份（重试/继续加载时传入）。 */
   previous: HistoryMonth[];
-  /** 失败月份。 */
+  /** 本次失败月份。 */
   failed: string[];
+  /** 此前累计的失败月份（跨批次持久）。 */
+  previousFailed: string[];
 };
 
 export type MergeResult = {
@@ -29,38 +61,67 @@ export type MergeResult = {
   months: HistoryMonth[];
   /** 已覆盖到的最早月份；null 表示尚未覆盖任何月份。 */
   coveredFrom: string | null;
-  /** 窗口内尚未加载的月份：早于已覆盖范围、且本次未尝试的月份。 */
+  /** 窗口内尚未加载的月份：早于已覆盖范围、且从未尝试过的月份。 */
   unloaded: string[];
+  /** 累计失败月份（含前批次）：只有本次成功才从列表移除。 */
+  failedMonths: string[];
 };
 
 export function mergeHistoryMonths(input: MergeInput): MergeResult {
-  const { windowMonths, attempted, successful, previous, failed } = input;
+  const {
+    scope,
+    previousScope,
+    windowMonths,
+    attempted,
+    successful,
+    previous,
+    failed,
+    previousFailed,
+  } = input;
+
+  // 复评 R02：作用域不一致时**不继承**旧月份（切范围/换账户）。
+  const inheritable =
+    previousScope != null && sameScope(scope, previousScope) ? previous : [];
+
+  const windowSet = new Set(windowMonths);
   const byMonth = new Map<string, HistoryMonth>();
-  // 旧结果先入表；本次结果按月份覆盖同名项，避免「重试成功反被旧值盖住」。
-  for (const month of previous) byMonth.set(month.month, month);
-  for (const month of successful) byMonth.set(month.month, month);
+  for (const month of inheritable) {
+    // 防御性过滤：即使作用域一致，窗口外的月份也不能进入结果。
+    if (windowSet.has(month.month)) byMonth.set(month.month, month);
+  }
+  for (const month of successful) {
+    if (windowSet.has(month.month)) byMonth.set(month.month, month);
+  }
   const months = [...byMonth.values()].sort((a, b) =>
     a.month.localeCompare(b.month),
   );
 
   const attemptedSet = new Set(attempted);
-  const failedSet = new Set(failed);
-  // 已覆盖范围：本次成功的最早月份与旧结果的最早月份取更早者。
-  // 只看「成功」的月份——失败月份没有数据，边界不能越过它。
-  const successfulMonths = successful.map((month) => month.month);
-  const previousMonths = previous.map((month) => month.month);
+  // 复评 R05：失败状态跨批次累积，只有本次**成功**才清除对应月份。
+  const succeededThisRun = new Set(successful.map((month) => month.month));
+  const failedSet = new Set(
+    [...previousFailed, ...failed].filter(
+      (month) => !succeededThisRun.has(month) && windowSet.has(month),
+    ),
+  );
+
   const coveredFrom =
-    [...successfulMonths, ...previousMonths].sort()[0] ?? null;
+    [
+      ...successful.map((month) => month.month),
+      ...months.map((month) => month.month),
+    ].sort()[0] ?? null;
 
   const unloaded = windowMonths.filter((month) => {
-    if (attemptedSet.has(month)) return false; // 本次尝试过（成功或失败）都不算未加载
+    if (attemptedSet.has(month)) return false;
     if (failedSet.has(month)) return false;
-    if (coveredFrom == null) return true; // 还没有任何成功数据：全部未加载
-    // 早于已覆盖范围、且从未尝试过的月份才是未加载。
+    if (coveredFrom == null) return true;
     return month < coveredFrom;
   });
 
-  // 无论重试、扩展还是首次加载，旧结果都保留：本次结果只按月份覆盖同名项，
-  // 这样「只重试失败月份」不会抹掉其他成功月份。
-  return { months, coveredFrom, unloaded };
+  return {
+    months,
+    coveredFrom,
+    unloaded,
+    failedMonths: [...failedSet].sort(),
+  };
 }

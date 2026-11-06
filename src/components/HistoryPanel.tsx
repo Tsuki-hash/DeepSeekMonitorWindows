@@ -4,6 +4,7 @@ import { ArrowLeft, Download, RefreshCw } from "lucide-react";
 import { todayStr, fmtTokensShort, fmtMoneyDisplay, mmdd } from "../format";
 import { historyDateLabel } from "../history-date-label";
 import { mergeHistoryMonths } from "../history-merge";
+import type { HistoryScope } from "../history-merge";
 import { updateTime, snapshotAge } from "../data-display";
 import { fetchMonthUsage } from "../usage-api";
 import { historyCache } from "../history-cache";
@@ -88,6 +89,15 @@ export function HistoryPanel({
   const loadedFrom = React.useRef<string | null>(null);
   // 快照也走 ref：继续加载时需要读上一批结果，但不应让 request 依赖它而重置列表。
   const snapshotRef = React.useRef<HistorySnapshot | null>(null);
+  // 复评 R02/R05：上一批的作用域身份与累计失败月份，供合并器判断能否继承。
+  const previousScopeRef = React.useRef<HistoryScope | null>(null);
+  const failedRef = React.useRef<string[]>([]);
+  // 凭据代际：账号/Token 变化时递增，避免跨账户继承旧月份。
+  const scopeEpoch = React.useRef(0);
+  React.useEffect(() => {
+    // historyCache 的 epoch 在凭据变化时递增；镜像到本地代际用于作用域比较。
+    scopeEpoch.current = epoch;
+  }, [epoch]);
   const request = React.useCallback(
     async (
       force = false,
@@ -116,22 +126,32 @@ export function HistoryPanel({
       }
       // 本次请求之前已成功取得的月份：重试与继续加载都要保留它们。
       const previousMonths = snapshotRef.current?.months ?? [];
+      // 复评 R05：失败月份跨批次持久，只有本次成功才清除。
+      const previousFailed = failedRef.current;
       const attempted: string[] = [];
       const successful: HistorySnapshot["months"] = [];
       const failedMonths: string[] = [];
-      // 统一的收尾：按月份合并（区分 attempted/successful/failed/unloaded），
-      // 正常结束与提前停止走同一条边界计算（复评 F02）。
+      // 复评 R04：所有写状态的地方都必须先确认「这次请求仍然有效」。
+      // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
+      const stillOwner = () =>
+        id === sequence.current.value &&
+        requestedEpoch === historyCache.epoch() &&
+        scopeEpoch.current === requestedScope.epoch;
+      // 统一收尾：按月份合并（区分 attempted/successful/failed/unloaded），
+      // 正常结束与提前停止走同一条边界计算（复评 F02/R02/R05）。
       const commit = (stopText?: string) => {
         const merged = mergeHistoryMonths({
+          scope: requestedScope,
+          previousScope: previousScopeRef.current,
           windowMonths: window.months,
           planned: targets,
           attempted,
           successful,
           previous: previousMonths,
           failed: failedMonths,
+          previousFailed,
         });
         if (merged.coveredFrom && range === "all") {
-          // 边界取实际成功的月份：失败的月份不能被当成已覆盖。
           const previousFrom = loadedFrom.current;
           loadedFrom.current =
             previousFrom != null && previousFrom < merged.coveredFrom
@@ -141,16 +161,31 @@ export function HistoryPanel({
         if (successful.length || previousMonths.length) {
           snapshotEpoch.current = requestedEpoch;
           setSnapshot(
-            buildHistory(window, merged.months, failedMonths, merged.unloaded),
+            buildHistory(
+              window,
+              merged.months,
+              merged.failedMonths,
+              merged.unloaded,
+            ),
           );
         }
-        setFailed(failedMonths);
+        setFailed(merged.failedMonths);
+        failedRef.current = merged.failedMonths;
         if (stopText) {
           setRecovery(stopText as never);
-        } else if (failedMonths.length) {
+        } else if (merged.failedMonths.length) {
           setRecovery("partial");
-          setError(`${failedMonths.length}个月份未取得，未返回日期标为未知。`);
+          setError(
+            `${merged.failedMonths.length}个月份未取得，未返回日期标为未知。`,
+          );
         }
+      };
+      // 记录本次作用域：后续合并据此判断能否继承旧结果。
+      const requestedScope: HistoryScope = {
+        range,
+        from: window.from,
+        to: window.to,
+        epoch: scopeEpoch.current,
       };
       setBusy(true);
       setError("");
@@ -158,11 +193,7 @@ export function HistoryPanel({
       setExportStatus("");
       setProgress({ done: 0, total: targets.length });
       for (const month of [...targets].reverse()) {
-        if (
-          id !== sequence.current.value ||
-          requestedEpoch !== historyCache.epoch()
-        )
-          return;
+        if (!stillOwner()) return;
         attempted.push(month);
         const [year, number] = month.split("-").map(Number);
         try {
@@ -174,6 +205,8 @@ export function HistoryPanel({
             ),
           );
         } catch (failure) {
+          // 复评 R04：先复核所有权，迟到的失败结果直接丢弃。
+          if (!stillOwner()) return;
           const classified = classifyHistoryFailure(failure, month);
           const outcome = historyFailureOutcome(
             classified,
@@ -183,26 +216,20 @@ export function HistoryPanel({
           failedMonths.push(month);
           // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
           if (!outcome.continue) {
-            setProgress({
-              done: attempted.length,
-              total: targets.length,
-            });
+            setProgress({ done: attempted.length, total: targets.length });
             setError(outcome.text);
             commit(outcome.recovery);
+            previousScopeRef.current = requestedScope;
             setBusy(false);
             return;
           }
         }
-        if (
-          id !== sequence.current.value ||
-          requestedEpoch !== historyCache.epoch()
-        )
-          return;
+        if (!stillOwner()) return;
         setProgress({ done: attempted.length, total: targets.length });
-        // 每个成功月份都增量合并，用户在等待时就能看到已取得的部分。
         commit();
       }
       commit();
+      previousScopeRef.current = requestedScope;
       setBusy(false);
     },
     [range, date, selectedMonth, usageTokenConfigured],
@@ -211,6 +238,10 @@ export function HistoryPanel({
     setSnapshot(null);
     setSelected("");
     loadedFrom.current = null;
+    // 复评 R02：切范围时必须同步清空快照与继承来源，否则 request 会读到旧月份。
+    snapshotRef.current = null;
+    previousScopeRef.current = null;
+    failedRef.current = [];
     void request();
     const owner = sequence.current;
     return () => {
