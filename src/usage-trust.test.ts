@@ -10,6 +10,7 @@ import {
   emptyUsageDay,
   chartPointFromDay,
   chartTotal,
+  missingUsageDates,
 } from "./format.ts";
 import { buildHistory, historyWindow, historyExport } from "./history.ts";
 import { usageNotices } from "./usage-notices.ts";
@@ -273,4 +274,139 @@ test("R14-06：未来未知占位不能降低当前完整覆盖，旧版无日�
     usageCompleteness(usage({ accountingDate: undefined, days: [] }), false),
     "partial",
   );
+});
+
+test("R25：跨月真实月快照各自合法，近7日超界不可标完整或缺日期", () => {
+  const now = new Date("2026-11-02T02:00:00Z");
+  const countDay = (date: string, tokens: number) => ({
+    ...returnedZero(date),
+    flashTokens: tokens,
+    flashCacheHit: tokens,
+    totalTokens: tokens,
+    rawModels: [{ ...rawZero, totalTokens: tokens, cacheHitTokens: tokens }],
+  });
+  for (const currentCount of [2 ** 52 - 1, 2 ** 52 + 1]) {
+    const safe = currentCount === 2 ** 52 - 1;
+    const previous = usage({
+      accountingDate: "2026-10-31",
+      monthCost: 0,
+      days: [
+        ...[27, 28, 29, 30].map((date) => countDay(`2026-10-${date}`, 0)),
+        countDay("2026-10-31", 2 ** 52),
+      ],
+      rawModels: [
+        { ...rawZero, totalTokens: 2 ** 52, cacheHitTokens: 2 ** 52 },
+      ],
+    });
+    const current = usage({
+      accountingDate: "2026-11-02",
+      monthCost: 0,
+      days: [countDay("2026-11-01", currentCount), countDay("2026-11-02", 0)],
+      rawModels: [
+        { ...rawZero, totalTokens: currentCount, cacheHitTokens: currentCount },
+      ],
+      models: [
+        {
+          key: "flash",
+          name: "V4.1 Flash",
+          totalTokens: currentCount,
+          requestCount: 0,
+          cacheHitTokens: currentCount,
+          cacheMissTokens: 0,
+          responseTokens: 0,
+          otherTokens: 0,
+          cost: 0,
+        },
+      ],
+    });
+    const data = { ...current, days: [...previous.days, ...current.days] };
+    const before = JSON.stringify(data);
+    assert.equal(
+      completenessAt(data, false, now),
+      safe ? "complete" : "partial",
+    );
+    assert.deepEqual(missingUsageDates(data, now), []);
+    assert.deepEqual(usageNotices(data, now), [], "超界不是源日期缺失");
+    const trust = trustAt({
+      usage: data,
+      state: "ok",
+      error: "",
+      updatedAt: now.getTime(),
+      snapshotMonth: "2026-11",
+      currentMonth: "2026-11",
+      lastSuccessText: null,
+      now,
+    });
+    assert.equal(trust.completeness, safe ? "complete" : "partial");
+    assert.equal(trust.stale, false);
+    if (safe) assert.equal(trust.reason, null);
+    else {
+      assert.ok(trust.reason?.includes("超出安全整数"));
+      assert.ok(!trust.reason?.includes("日期未取得"));
+    }
+    const history = buildHistory(
+      { from: "2026-10-27", to: "2026-11-02", months: ["2026-10", "2026-11"] },
+      [
+        { month: "2026-10", fetchedAt: now.getTime(), usage: previous },
+        { month: "2026-11", fetchedAt: now.getTime(), usage: current },
+      ],
+      [],
+    );
+    const exported = JSON.parse(historyExport(history, now.getTime()).json);
+    assert.deepEqual(exported.missingDates, []);
+    assert.equal(exported.daily.length, 7);
+    assert.equal(exported.daily[4].totalTokens, 2 ** 52);
+    assert.equal(exported.daily[5].totalTokens, currentCount);
+    assert.equal(exported.daily[6].totalTokens, 0);
+    assert.deepEqual(
+      exported.monthly.map(
+        (item: { models: { totalTokens: number }[] }) =>
+          item.models[0].totalTokens,
+      ),
+      [2 ** 52, currentCount],
+    );
+    assert.equal(
+      JSON.stringify(data),
+      before,
+      "前端降级不得改写原始数据或JSON来源",
+    );
+  }
+});
+
+test("R25：已返回的别名合计超界有明确原因，不变成缺日期", () => {
+  const data = usage();
+  data.days[9] = {
+    ...returnedZero("2026-11-10"),
+    flashTokens: null,
+    totalTokens: null,
+    flashCacheHit: 2 ** 52,
+    flashCacheMiss: 2 ** 52 + 1,
+    rawModels: [
+      {
+        ...rawZero,
+        model: "deepseek-v4-flash",
+        totalTokens: 2 ** 52,
+        cacheHitTokens: 2 ** 52,
+      },
+      {
+        ...rawZero,
+        model: "deepseek-flash",
+        totalTokens: 2 ** 52 + 1,
+        cacheMissTokens: 2 ** 52 + 1,
+      },
+    ],
+  };
+  assert.equal(usageCompleteness(data, false), "partial");
+  assert.deepEqual(missingUsageDates(data, NOW), []);
+  const trust = usageTrust({
+    usage: data,
+    state: "ok",
+    error: "",
+    updatedAt: 1,
+    snapshotMonth: "2026-11",
+    currentMonth: "2026-11",
+    lastSuccessText: null,
+  });
+  assert.ok(trust.reason?.includes("2026-11-10"));
+  assert.ok(trust.reason?.includes("超出安全整数"));
 });

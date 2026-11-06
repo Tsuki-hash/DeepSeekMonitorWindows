@@ -2206,6 +2206,25 @@ button:disabled:hover {
   border: 0;
   gap: 10px;
 }
+/* Returned-but-unknown counts retain their explanation and known segments.
+   The dashboard already scrolls; grow this card instead of clipping its footer. */
+.chart-inspector[data-count-issue] {
+  height: auto;
+  overflow-wrap: anywhere;
+}
+.chart-card:has(.chart-inspector[data-count-issue]),
+.chart-card:has(.chart-count-warning) {
+  flex: 0 0 auto;
+}
+.chart-card:has(.chart-inspector[data-count-issue]) .bars,
+.chart-card:has(.chart-count-warning) .bars {
+  flex: 0 0 96px;
+}
+.chart-count-warning {
+  flex-shrink: 0;
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
 .chart-inspector-head {
   display: flex;
   justify-content: space-between;

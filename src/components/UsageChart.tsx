@@ -2,10 +2,12 @@ import React from "react";
 import { BarChart3 } from "lucide-react";
 import {
   chartPointFromDay,
-  chartTotal,
+  chartTotalStatus,
+  CHART_TOTAL_UNSAFE_REASON,
   fmtTokensShort,
   recentUsageDays,
 } from "../format";
+import { sumUsageCounts } from "../usage-counts";
 import type { LoadState, UsageResult } from "../types";
 import { updateTime } from "../data-display";
 import { usageNotices } from "../usage-notices";
@@ -39,13 +41,19 @@ function UsageChart({
   // all：合计含未识别模型（差额并入 other），避免按日图静默丢量
   const points = days.map((day) => chartPointFromDay(day, "all"));
   const notices = usageNotices(usage, now);
-  const hasOther = points.some((point) => point.other > 0);
-  const sumHit = points.reduce((sum, point) => sum + point.hit, 0);
-  const sumMiss = points.reduce((sum, point) => sum + point.miss, 0);
-  const sumTotal = chartTotal(points);
+  const hasOther = points.some(
+    (point) =>
+      (point.other ?? 0) > 0 ||
+      (point.unavailableReason != null && point.other == null),
+  );
+  const sumHit = sumUsageCounts(points.map((point) => point.hit)).total;
+  const sumMiss = sumUsageCounts(points.map((point) => point.miss)).total;
+  const sumInput = sumUsageCounts([sumHit, sumMiss]).total;
+  const totalStatus = chartTotalStatus(points);
+  const sumTotal = totalStatus.total;
   const hitRate =
-    sumTotal != null && sumHit + sumMiss > 0
-      ? ((sumHit / (sumHit + sumMiss)) * 100).toFixed(0)
+    sumTotal != null && sumHit != null && sumInput != null && sumInput > 0
+      ? ((sumHit / sumInput) * 100).toFixed(0)
       : "—";
   const placeholder =
     state === "loading"
@@ -101,6 +109,11 @@ function UsageChart({
           )}
         </span>
       </div>
+      {state === "ok" && totalStatus.issue === "unsafe" && (
+        <p className="chart-inspector-note chart-count-warning" role="status">
+          {CHART_TOTAL_UNSAFE_REASON}
+        </p>
+      )}
       {state === "ok" && points.length > 0 ? (
         <StackedBarChart
           points={points}

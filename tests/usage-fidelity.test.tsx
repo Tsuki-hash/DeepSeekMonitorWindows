@@ -15,12 +15,13 @@ import type { UsageDay } from "../src/format";
 const g = globalThis as any;
 const NativeDate = Date;
 const NOW = NativeDate.parse("2026-11-09T16:00:00Z");
+let fixtureNow = NOW;
 g.Date = class extends NativeDate {
   constructor(value?: any) {
-    super(value === undefined ? NOW : value);
+    super(value === undefined ? fixtureNow : value);
   }
   static now() {
-    return NOW;
+    return fixtureNow;
   }
 };
 g.IS_REACT_ACT_ENVIRONMENT = true;
@@ -105,6 +106,10 @@ const usage = (over: Partial<UsageResult> = {}): UsageResult => ({
 });
 const text = (node: any): string =>
   typeof node === "string" ? node : (node?.children?.map(text).join("") ?? "");
+const chartBar = (view: any, date: string) =>
+  view.root
+    .findAllByType("button")
+    .find((node: any) => node.props["aria-label"]?.startsWith(`${date}：`));
 async function render(
   element: React.ReactElement,
   inspect: (view: any) => void | Promise<void>,
@@ -140,7 +145,10 @@ const dashboard = (data: UsageResult, onDetail = noop) => (
     onHistory={noop}
   />
 );
-const detail = (data: UsageResult, key: "flash" | "other" = "flash") => (
+const detail = (
+  data: UsageResult,
+  key: "flash" | "pro" | "other" = "flash",
+) => (
   <ModelDetailPanel
     model={key}
     usage={data}
@@ -339,4 +347,178 @@ test("R14-09: other的非零请求、未知字段和全零样本均保留可点�
       "原始模型名不可丢失",
     );
   }
+});
+
+test("R25: 月初两月各自安全但七日和超界，首页保留单日与0，不显示确定总量或完整", async () => {
+  fixtureNow = NativeDate.parse("2026-11-02T02:00:00Z");
+  try {
+    for (const currentCount of [2 ** 52 - 1, 2 ** 52 + 1]) {
+      const safe = currentCount === 2 ** 52 - 1;
+      const countDay = (date: string, tokens: number) =>
+        day(date, {
+          flashTokens: tokens,
+          flashCacheHit: tokens,
+          totalTokens: tokens,
+          rawModels: [raw({ totalTokens: tokens, cacheHitTokens: tokens })],
+        });
+      const data = usage({
+        accountingDate: "2026-11-02",
+        monthCost: 0,
+        models: [
+          model({ totalTokens: currentCount, cacheHitTokens: currentCount }),
+        ],
+        rawModels: [
+          raw({ totalTokens: currentCount, cacheHitTokens: currentCount }),
+        ],
+        days: [
+          ...[27, 28, 29, 30].map((date) => countDay(`2026-10-${date}`, 0)),
+          countDay("2026-10-31", 2 ** 52),
+          countDay("2026-11-01", currentCount),
+          countDay("2026-11-02", 0),
+        ],
+      });
+      const before = JSON.stringify(data);
+      await render(dashboard(data), async (view) => {
+        const header = text(
+          view.root.findByProps({ className: "chart-total" }),
+        );
+        const trust = text(
+          view.root.findByProps({ className: "source-trust" }),
+        );
+        assert.ok(trust.includes(safe ? "完整" : "部分"));
+        if (safe) assert.notEqual(header, "数据待核对 ›");
+        else {
+          assert.equal(header, "数据待核对 ›");
+          assert.ok(
+            text(view.toJSON()).includes(
+              "近7日 Token 计数或合计超出安全整数范围",
+            ),
+          );
+          assert.ok(view.root.findByProps({ title: "输入缓存命中率未取得" }));
+          assert.doesNotMatch(trust, /完整/);
+        }
+        for (const [date, tokens] of [
+          ["2026-10-31", 2 ** 52],
+          ["2026-11-01", currentCount],
+          ["2026-11-02", 0],
+        ] as const) {
+          const bar = chartBar(view, date);
+          assert.ok(
+            bar.props["aria-label"].includes(
+              `合计 ${tokens.toLocaleString("en-US")} tokens`,
+            ),
+          );
+          assert.doesNotMatch(bar.props["aria-label"], /数据暂未取得/);
+          await act(async () => bar.props.onClick());
+          assert.equal(bar.props["aria-pressed"], true);
+          assert.equal(
+            view.root.findByProps({ className: "chart-inspector" }).props[
+              "aria-live"
+            ],
+            "polite",
+          );
+        }
+      });
+      assert.equal(JSON.stringify(data), before);
+    }
+  } finally {
+    fixtureNow = NOW;
+  }
+});
+
+test("R25: 两个Flash别名的分段和超界，首页/详情显示原因与已知分段，Pro仍有效", async () => {
+  const hit = 2 ** 52;
+  const miss = 2 ** 52 + 1;
+  const data = usage({
+    models: [
+      model({ totalTokens: null, cacheHitTokens: hit, cacheMissTokens: miss }),
+      model({ key: "pro", name: "V4 Pro", totalTokens: 7, responseTokens: 7 }),
+    ],
+  });
+  data.days[9] = day("2026-11-10", {
+    flashTokens: null,
+    flashCacheHit: hit,
+    flashCacheMiss: miss,
+    proTokens: 7,
+    proResponse: 7,
+    totalTokens: null,
+    rawModels: [
+      raw({
+        model: "deepseek-v4-flash",
+        totalTokens: hit,
+        cacheHitTokens: hit,
+      }),
+      raw({
+        model: "deepseek-flash",
+        totalTokens: miss,
+        cacheMissTokens: miss,
+      }),
+      raw({
+        model: "deepseek-pro",
+        groupKey: "pro",
+        totalTokens: 7,
+        responseTokens: 7,
+      }),
+    ],
+  });
+  data.rawModels = data.days[9].rawModels;
+  const before = JSON.stringify(data);
+  for (const element of [dashboard(data), detail(data)]) {
+    await render(element, async (view) => {
+      const bar = chartBar(view, "2026-11-10");
+      assert.match(bar.props["aria-label"], /超出安全整数范围，合计未知/);
+      assert.doesNotMatch(
+        bar.props["aria-label"],
+        /数据暂未取得|合计 9,007,199,254,740,992/,
+      );
+      assert.ok(
+        bar.props["aria-label"].includes(`命中 ${hit.toLocaleString("en-US")}`),
+      );
+      assert.ok(
+        bar.props["aria-label"].includes(
+          `未命中 ${miss.toLocaleString("en-US")}`,
+        ),
+      );
+      await act(async () => bar.props.onClick());
+      const inspector = view.root.findByProps({ className: "chart-inspector" });
+      assert.equal(inspector.props["data-count-issue"], true);
+      assert.ok(text(inspector).includes("合计未知"));
+      assert.ok(text(inspector).includes("已知分段保留"));
+      assert.ok(
+        inspector.findByProps({
+          title: `命中：${hit.toLocaleString("en-US")} Tokens`,
+        }),
+      );
+      assert.ok(
+        inspector.findByProps({
+          title: `未命中：${miss.toLocaleString("en-US")} Tokens`,
+        }),
+      );
+      assert.doesNotMatch(text(inspector), /尚未取得数据，不代表用量为零/);
+      assert.equal(inspector.props["aria-live"], "polite");
+    });
+  }
+  await render(detail(data, "pro"), (view) => {
+    const bar = chartBar(view, "2026-11-10");
+    assert.match(bar.props["aria-label"], /合计 7 tokens/);
+    assert.doesNotMatch(bar.props["aria-label"], /未知|超出安全整数/);
+  });
+  assert.equal(JSON.stringify(data), before, "前端状态不改写原始别名和计数");
+});
+
+test("R25: 已返回但其他分段未知，详情保留其他—而不是省略该字段", async () => {
+  const data = usage();
+  data.days[9] = day("2026-11-10", {
+    totalTokens: null,
+    rawModels: [
+      raw({ model: "future-model", groupKey: null, totalTokens: null }),
+    ],
+  });
+  await render(detail(data, "other"), async (view) => {
+    const bar = chartBar(view, "2026-11-10");
+    assert.match(bar.props["aria-label"], /其他 未知/);
+    await act(async () => bar.props.onClick());
+    const unknown = view.root.findByProps({ title: "其他：未知" });
+    assert.equal(text(unknown), "其他 —");
+  });
 });

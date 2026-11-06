@@ -6,6 +6,8 @@
 //
 // 注意本文件**不得** import 任何浏览器或 Tauri API，否则 Node 侧测不了。
 
+import { sumUsageCounts, type UsageCountSum } from "./usage-counts.ts";
+
 // 日级计数与费用：`null` 表示「未取得」，不是零。图表据此区分空柱与未知柱。
 export type UsageDay = {
   rawModels?: import("./types").RawModelUsage[];
@@ -178,26 +180,26 @@ export type ChartScope = "all" | "flash" | "pro" | "other";
 
 export type ChartPoint = {
   unavailable?: boolean;
+  /** 已返回的计数问题不等于日期缺失。 */
+  unavailableReason?: string;
+  countIssue?: UsageCountSum["issue"];
   date: string;
-  hit: number;
-  miss: number;
-  response: number;
-  other: number;
-  total: number;
+  hit: number | null;
+  miss: number | null;
+  response: number | null;
+  other: number | null;
+  total: number | null;
 };
 
-/** 任一分段未知即整根柱子未知；缺失不能画成零高度的空柱。 */
-const sumKnown = (values: (number | null)[]): number | null =>
-  values.some((value) => value == null)
-    ? null
-    : values.reduce<number>((total, value) => total + (value as number), 0);
+export const CHART_TOTAL_UNSAFE_REASON =
+  "近7日 Token 计数或合计超出安全整数范围，合计未知；已知日期与分段保留";
 
 /**
  * 把单日用量映射成柱状图数据点。
  *
  * `scope === "all"` 时合计优先取 `day.totalTokens`（后端覆盖含未识别模型），
  * 与已知分段之和的差额并入 other，避免新模型名出现时按日图静默丢量。
- * 单模型（flash/pro）没有独立的 total 字段，仍按分段求和。
+ * 单模型（flash/pro）按分段求和，但不能绕过后端槽位总量的未知状态。
  * `scope === "other"` 是未接入模型的兜底档：平台不给分段明细，
  * 按日量 = 当日合计 − flash − pro，柱子只有一段。
  *
@@ -208,26 +210,34 @@ export const chartPointFromDay = (
   day: UsageDay,
   scope: ChartScope = "all",
 ): ChartPoint => {
-  const unknown = {
+  const unknown: ChartPoint = {
     unavailable: true,
     date: day.date,
-    hit: 0,
-    miss: 0,
-    response: 0,
-    other: 0,
-    total: 0,
+    hit: null,
+    miss: null,
+    response: null,
+    other: null,
+    total: null,
   };
   if (!hasReturnedUsageDay(day)) return unknown;
-  // 非空原始行里的未知计数也不能被旧版聚合零掩盖。
-  if (
-    day.rawModels!.some(
-      (model) =>
-        (scope === "all" || scope === "other" || model.groupKey === scope) &&
-        model.totalTokens == null,
-    )
-  )
-    return unknown;
-  const hit = sumKnown(
+  // 非空原始行及后端槽位的未知/超界不能被分段和或旧版聚合零掩盖。
+  // 单槽位仅检查所属模型，不能让异常 Flash 污染合法 Pro（反之亦然）。
+  const rawTotal = sumUsageCounts(
+    day
+      .rawModels!.filter(
+        (model) =>
+          scope === "all" || scope === "other" || model.groupKey === scope,
+      )
+      .map((model) => model.totalTokens),
+  );
+  const slotTotals = (
+    scope === "flash"
+      ? [day.flashTokens]
+      : scope === "pro"
+        ? [day.proTokens]
+        : [day.totalTokens, day.flashTokens, day.proTokens]
+  ).map((value) => sumUsageCounts([value]));
+  const hit = sumUsageCounts(
     scope === "flash"
       ? [day.flashCacheHit]
       : scope === "pro"
@@ -236,7 +246,7 @@ export const chartPointFromDay = (
           ? [day.flashCacheHit, day.proCacheHit]
           : [],
   );
-  const miss = sumKnown(
+  const miss = sumUsageCounts(
     scope === "flash"
       ? [day.flashCacheMiss]
       : scope === "pro"
@@ -245,7 +255,7 @@ export const chartPointFromDay = (
           ? [day.flashCacheMiss, day.proCacheMiss]
           : [],
   );
-  const response = sumKnown(
+  const response = sumUsageCounts(
     scope === "flash"
       ? [day.flashResponse]
       : scope === "pro"
@@ -254,58 +264,90 @@ export const chartPointFromDay = (
           ? [day.flashResponse, day.proResponse]
           : [],
   );
-  if (hit == null || miss == null || response == null) return unknown;
+  const knownSlots = sumUsageCounts([day.flashTokens, day.proTokens]);
   const knownOther =
     scope === "flash"
-      ? (day.flashOtherTokens ?? null)
+      ? sumUsageCounts([day.flashOtherTokens])
       : scope === "pro"
-        ? (day.proOtherTokens ?? null)
+        ? sumUsageCounts([day.proOtherTokens])
         : scope === "all"
-          ? sumKnown([day.flashOtherTokens, day.proOtherTokens])
-          : sumKnown(
-              day.totalTokens == null ||
-                day.flashTokens == null ||
-                day.proTokens == null
-                ? [null]
-                : [
-                    Math.max(
-                      0,
-                      day.totalTokens - day.flashTokens - day.proTokens,
-                    ),
-                  ],
-            );
-  if (knownOther == null) return unknown;
-  const segmented = hit + miss + response + knownOther;
-  if (scope !== "all") {
-    return {
-      unavailable: day.unavailable,
-      date: day.date,
-      hit,
-      miss,
-      response,
-      other: knownOther,
-      total: segmented,
-    };
-  }
-  if (day.totalTokens == null) return unknown;
-  const total = Math.max(day.totalTokens, segmented);
-  const other = knownOther + (total - segmented);
-  return {
-    date: day.date,
+          ? sumUsageCounts([day.flashOtherTokens, day.proOtherTokens])
+          : knownSlots.total == null || slotTotals[0].total == null
+            ? { total: null, issue: knownSlots.issue ?? slotTotals[0].issue }
+            : sumUsageCounts([
+                Math.max(0, slotTotals[0].total - knownSlots.total),
+              ]);
+  const segmented = sumUsageCounts([
+    hit.total,
+    miss.total,
+    response.total,
+    knownOther.total,
+  ]);
+  const checks = [
+    rawTotal,
+    ...slotTotals,
+    ...(scope === "all" || scope === "other" ? [knownSlots] : []),
     hit,
     miss,
     response,
+    knownOther,
+    segmented,
+  ];
+  const issue = checks.some((check) => check.issue === "unsafe")
+    ? "unsafe"
+    : checks.some((check) => check.total == null)
+      ? "unknown"
+      : null;
+  const segments = {
+    hit: hit.total,
+    miss: miss.total,
+    response: response.total,
+    other: knownOther.total,
+  };
+  if (issue || segmented.total == null) {
+    return {
+      ...unknown,
+      ...segments,
+      countIssue: issue,
+      unavailableReason:
+        issue === "unsafe"
+          ? "Token 计数或合计超出安全整数范围，合计未知；已知分段保留"
+          : "部分 Token 计数未取得或无法汇总，合计未知；已知分段保留",
+    };
+  }
+  const total =
+    scope === "all"
+      ? Math.max(slotTotals[0].total!, segmented.total)
+      : segmented.total;
+  // total 与分段和均已安全且非负，差额仍必须走同一累加器。
+  const other = sumUsageCounts([
+    knownOther.total,
+    total - segmented.total,
+  ]).total;
+  return {
+    date: day.date,
+    ...segments,
     other,
     total,
     unavailable: day.unavailable,
   };
 };
 
-/** 近 N 日存在未知柱时，不把已返回记录之和冒充完整总量。 */
+/** 近 N 日逐项安全累加；未知/超界不能被后续真实零重新变成有效合计。 */
+export function chartTotalStatus(points: ChartPoint[]): UsageCountSum {
+  const sum = sumUsageCounts(points.map((point) => point.total));
+  if (
+    sum.issue === "unsafe" ||
+    points.some((point) => point.countIssue === "unsafe")
+  )
+    return { total: null, issue: "unsafe" };
+  if (points.some((point) => point.unavailable))
+    return { total: null, issue: "unknown" };
+  return sum;
+}
+
 export const chartTotal = (points: ChartPoint[]): number | null =>
-  points.some((point) => point.unavailable)
-    ? null
-    : points.reduce((sum, point) => sum + point.total, 0);
+  chartTotalStatus(points).total;
 
 /** 当前月及近7日的源日期覆盖，统一用于状态与图表提示。 */
 export function missingUsageDates(

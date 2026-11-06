@@ -7,6 +7,8 @@
 import {
   accountingDateKey,
   chartPointFromDay,
+  chartTotalStatus,
+  CHART_TOTAL_UNSAFE_REASON,
   missingUsageDates,
   recentUsageDays,
 } from "./format.ts";
@@ -49,6 +51,12 @@ export function usageCompleteness(
     )
   )
     return "partial";
+  // 月初近7日跨两个月；各月/各日安全不代表窗口合计仍在安全整数内。
+  if (
+    chartTotalStatus(days.slice(-7).map((day) => chartPointFromDay(day)))
+      .total == null
+  )
+    return "partial";
   // 本次请求失败：数据是否完整无从判断（旧快照可能已经不完整）。
   if (hasError) return "unknown";
   return "complete";
@@ -68,17 +76,30 @@ export function usageTrust(input: {
 }): UsageTrust {
   const { usage, state, error, snapshotMonth, currentMonth, lastSuccessText } =
     input;
+  const now = input.now ?? new Date();
   // 「有数据但本次失败」：保留旧值，必须标旧。
   const stale = Boolean(usage && (state === "error" || error));
-  const completeness = usageCompleteness(usage, Boolean(error), input.now);
+  const completeness = usageCompleteness(usage, Boolean(error), now);
   const reason = (() => {
     if (!usage) return null;
+    const days = recentUsageDays(
+      usage.days,
+      Math.max(7, Number(accountingDateKey(now).slice(8))),
+      usage.unavailableDates,
+      now,
+      usage.accountingDate,
+    );
+    const points = days.map((day) => chartPointFromDay(day));
+    const unsafeDay = points.find((point) => point.countIssue === "unsafe");
+    if (unsafeDay) return `${unsafeDay.date}：${unsafeDay.unavailableReason}`;
+    if (chartTotalStatus(points.slice(-7)).issue === "unsafe")
+      return CHART_TOTAL_UNSAFE_REASON;
     if (usage.warnings?.length) return usage.warnings[0];
     if (usage.unavailableDates?.length) {
       return `${usage.unavailableDates.length} 个日期未取得，不代表零用量`;
     }
     if (usage.monthCost == null) return "本月费用未取得";
-    const missing = missingUsageDates(usage, input.now);
+    const missing = missingUsageDates(usage, now);
     if (missing.length) return `${missing.length} 个日期未取得，不代表零用量`;
     if (completeness === "partial") return "部分日期的用量或费用未取得";
     return null;

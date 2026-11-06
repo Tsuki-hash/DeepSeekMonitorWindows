@@ -1,4 +1,4 @@
-//! R22/R23/R24：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
+//! R22/R23/R24/R25：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
 //! 只注入单月请求、合成时钟与 deadline 等待，不访问网络、不等待真实 15/30 秒。
 //! 本文件是待本机执行的测试源码，不是测试通过记录。
 
@@ -55,12 +55,23 @@ impl Clock {
 struct Step {
     seconds: u64,
     result: Option<Result<(), VerifyFailure>>,
+    yield_before_result: bool,
 }
 
 fn response(seconds: u64, result: Result<(), VerifyFailure>) -> Step {
     Step {
         seconds,
         result: Some(result),
+        yield_before_result: true,
+    }
+}
+
+// R25：同一 poll 内推进时钟并直接 Ready，不能靠额外 Pending 掩盖逐月边界缺口。
+fn ready_response(seconds: u64, result: Result<(), VerifyFailure>) -> Step {
+    Step {
+        seconds,
+        result: Some(result),
+        yield_before_result: false,
     }
 }
 
@@ -99,6 +110,7 @@ impl Network {
             Step {
                 seconds: 15,
                 result: None,
+                yield_before_result: true,
             },
         );
     }
@@ -131,9 +143,11 @@ impl Network {
                         .clock
                         .elapsed
                         .set(network.clock.elapsed.get() + Duration::from_secs(step.seconds));
-                    // 先推进时间并让生产 deadline 再 poll，然后才交付响应。
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+                    if step.yield_before_result {
+                        // 原有挂起回归保留让出；R25 直接 Ready 分支不会走这里。
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                 }
                 match step.result {
                     Some(result) => Poll::Ready(result),
@@ -192,6 +206,402 @@ async fn round(
         collect_cached_usage_tokens_in(scan, dir, || true)
     });
     verify_collected(scan, state, candidates, network).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_当前月同poll到达或越过deadline_丢弃响应并跨来源公平推进() {
+    for seconds in [30, 31] {
+        for response in [
+            Err(VerifyFailure::Transient),
+            Ok(()),
+            Err(VerifyFailure::Definitive),
+        ] {
+            let dir = TempConfigDir::new("r25-ready-current-deadline");
+            let first = dir.join("0-first");
+            let second = dir.join("1-second");
+            write_cache(&first, &[A, C]);
+            write_cache(&second, &[B]);
+            let mut scan = CacheScanState::default();
+            let mut state = CandidateVerificationState::default();
+            let network = Network::new();
+            network.add(A, 11, ready_response(seconds, response));
+            network.add(B, 11, ready_response(0, Ok(())));
+            let candidates = state.collect_for_round(&mut scan, |scan| {
+                let mut actual = collect_cached_usage_tokens_in(scan, &dir, || true);
+                actual.sort_by(|left, right| left.path.cmp(&right.path));
+                actual
+            });
+            {
+                let mut verifying = Box::pin(verify_collected(
+                    &mut scan, &mut state, candidates, &network,
+                ));
+                poll_fn(|cx| {
+                    // 生产 biased select 已先观察未到期；请求必须在这同一次 poll
+                    // 推进时钟并 Ready，不能通过先 Pending 再 poll timer 获得正确结果。
+                    assert_eq!(verifying.as_mut().poll(cx), Poll::Ready(None));
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            assert_eq!(*network.visited.borrow(), vec![(A.into(), 11, 2026)]);
+            assert_eq!(network.clock.elapsed.get(), Duration::from_secs(seconds));
+            let progress = &state.files[&first];
+            assert_eq!(progress.next_candidate, 1);
+            assert_eq!(progress.untried, 1, "已实际请求的超时候选计入服务");
+            assert_eq!(progress.rejected_count, 0, "过期拒绝也不能置位");
+            assert!(progress.rejected.iter().all(|word| *word == 0));
+            assert!(state.files[&second].service_order() < progress.service_order());
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(
+                collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+                3,
+                "超时、迟到成功或拒绝均不能让任一来源seen"
+            );
+            assert_eq!(
+                round(&mut scan, &mut state, &dir, &network)
+                    .await
+                    .as_deref(),
+                Some(B),
+                "下一轮必须实际请求等待更久的B，不能先试C或重置回A"
+            );
+            assert_eq!(
+                *network.visited.borrow(),
+                vec![(A.into(), 11, 2026), (B.into(), 11, 2026)]
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_上月同poll到达或越过deadline_不接收迟到结果且下轮继续B() {
+    for previous_seconds in [15, 16] {
+        for response in [
+            Ok(()),
+            Err(VerifyFailure::Definitive),
+            Err(VerifyFailure::Transient),
+        ] {
+            let dir = TempConfigDir::new("r25-ready-previous-deadline");
+            let path = dir.join("sessions");
+            write_cache(&path, &[A, B]);
+            let mut scan = CacheScanState::default();
+            let mut state = CandidateVerificationState::default();
+            let network = Network::new();
+            network.add(A, 11, ready_response(15, Err(VerifyFailure::Transient)));
+            network.add(A, 10, ready_response(previous_seconds, response));
+            network.add(B, 11, ready_response(0, Ok(())));
+            assert!(round(&mut scan, &mut state, &dir, &network).await.is_none());
+            assert_eq!(
+                *network.visited.borrow(),
+                vec![(A.into(), 11, 2026), (A.into(), 10, 2026)]
+            );
+            let progress = &state.files[&path];
+            assert_eq!(progress.next_candidate, 1);
+            assert_eq!(progress.untried, 1);
+            assert_eq!(progress.rejected_count, 0);
+            assert!(progress.last_attempt > 0);
+            assert_eq!(
+                collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+                2
+            );
+            assert_eq!(
+                round(&mut scan, &mut state, &dir, &network)
+                    .await
+                    .as_deref(),
+                Some(B)
+            );
+            assert_eq!(network.visited.borrow().len(), 3);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_timer仍Pending而首月准入已到deadline_零请求不推进() {
+    let dir = TempConfigDir::new("r25-expired-before-admission");
+    let path = dir.join("sessions");
+    write_cache(&path, &[A, B]);
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let candidates = state.collect_for_round(&mut scan, |scan| {
+        collect_cached_usage_tokens_in(scan, &dir, || true)
+    });
+    let network = Network::new();
+    let timer_polls = Cell::new(0);
+    let requests = Cell::new(0);
+    assert!(verify_candidates_with(
+        &mut scan,
+        &mut state,
+        candidates,
+        &MONTHS,
+        || true,
+        || network.clock.now(),
+        |deadline| {
+            let clock = &network.clock;
+            let timer_polls = &timer_polls;
+            poll_fn(move |_| {
+                timer_polls.set(timer_polls.get() + 1);
+                // 模拟 timer 刚观察未到期后、单月请求准入前时钟到期。
+                // 此分支刻意保持 Pending，必须由生产探针的准入守卫拦截。
+                clock.elapsed.set(deadline.duration_since(clock.base));
+                Poll::<()>::Pending
+            })
+        },
+        |_, _, _| {
+            requests.set(requests.get() + 1);
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .is_none());
+    assert_eq!(timer_polls.get(), 1);
+    assert_eq!(requests.get(), 0);
+    let progress = &state.files[&path];
+    assert_eq!(progress.next_candidate, 0);
+    assert_eq!(progress.untried, 2);
+    assert_eq!(progress.last_attempt, 0);
+    assert_eq!(progress.rejected_count, 0);
+    assert_eq!(state.pending.len(), 1);
+    assert_eq!(
+        collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+        2
+    );
+    network.add(A, 11, ready_response(0, Ok(())));
+    assert_eq!(
+        round(&mut scan, &mut state, &dir, &network)
+            .await
+            .as_deref(),
+        Some(A)
+    );
+    assert_eq!(*network.visited.borrow(), vec![(A.into(), 11, 2026)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_deadline前正常上月成功与明确拒绝仍按HTTP结果处理() {
+    for (current, previous, expected, expected_count) in [
+        (Ok(()), Ok(()), ProbeOutcome::Passed, 1),
+        (
+            Err(VerifyFailure::Definitive),
+            Ok(()),
+            ProbeOutcome::Rejected,
+            1,
+        ),
+        (
+            Err(VerifyFailure::Transient),
+            Ok(()),
+            ProbeOutcome::Passed,
+            2,
+        ),
+        (
+            Err(VerifyFailure::Transient),
+            Err(VerifyFailure::Definitive),
+            ProbeOutcome::Rejected,
+            2,
+        ),
+        (
+            Err(VerifyFailure::Transient),
+            Err(VerifyFailure::Transient),
+            ProbeOutcome::Unavailable,
+            2,
+        ),
+    ] {
+        let dir = TempConfigDir::new("r25-in-budget-response");
+        let path = dir.join("sessions");
+        write_cache(&path, &[A]);
+        let mut scan = CacheScanState::default();
+        let mut state = CandidateVerificationState::default();
+        let network = Network::new();
+        network.add(A, 11, ready_response(14, current));
+        if expected_count == 2 {
+            network.add(A, 10, ready_response(15, previous));
+        }
+        let result = round(&mut scan, &mut state, &dir, &network).await;
+        let reread = collect_cached_usage_tokens_in(&mut scan, &dir, || true);
+        if expected == ProbeOutcome::Rejected {
+            assert!(result.is_none());
+            assert!(reread.is_empty(), "预算内唯一候选明确拒绝才seen");
+            assert!(!state.files.contains_key(&path));
+        } else if expected == ProbeOutcome::Passed {
+            assert_eq!(result.as_deref(), Some(A));
+            assert_eq!(reread.len(), 1);
+        } else {
+            assert!(result.is_none());
+            assert_eq!(reread.len(), 1, "两月Transient不seen");
+            assert_eq!(state.files[&path].rejected_count, 0);
+        }
+        assert_eq!(network.visited.borrow().len(), expected_count);
+        assert!(network.clock.elapsed.get() < CANDIDATE_BATCH_BUDGET);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_同poll取消与deadline先后均不推进首遍队龄或seen() {
+    for deadline_first in [false, true] {
+        for response in [
+            Ok(()),
+            Err(VerifyFailure::Definitive),
+            Err(VerifyFailure::Transient),
+        ] {
+            let dir = TempConfigDir::new("r25-cancel-deadline-order");
+            let path = dir.join("sessions");
+            write_cache(&path, &[A, B]);
+            let session = SyncSession::default();
+            let generation = session
+                .begin_usage("old".into(), &[], UsageSyncKind::Web, || ())
+                .unwrap()
+                .generation;
+            let mut scan = CacheScanState::default();
+            let mut state = CandidateVerificationState::default();
+            let candidates = state.collect_for_round(&mut scan, |scan| {
+                collect_cached_usage_tokens_in(scan, &dir, || true)
+            });
+            let clock = Clock::new();
+            let visited = RefCell::new(Vec::new());
+            assert!(verify_candidates_with(
+                &mut scan,
+                &mut state,
+                candidates,
+                &MONTHS,
+                || session.is_current(generation),
+                || clock.now(),
+                |deadline| clock.wait_until(deadline),
+                |token, month, year| {
+                    let session = &session;
+                    let clock = &clock;
+                    let visited = &visited;
+                    async move {
+                        visited.borrow_mut().push((token, month, year));
+                        if deadline_first {
+                            clock.elapsed.set(CANDIDATE_BATCH_BUDGET);
+                        }
+                        assert!(session
+                            .cancel_usage("old", Some(generation), || ())
+                            .is_some());
+                        if !deadline_first {
+                            clock.elapsed.set(CANDIDATE_BATCH_BUDGET);
+                        }
+                        response
+                    }
+                },
+            )
+            .await
+            .is_none());
+            assert_eq!(*visited.borrow(), vec![(A.to_string(), 11, 2026)]);
+            let progress = &state.files[&path];
+            assert_eq!(progress.next_candidate, 0);
+            assert_eq!(progress.untried, 2);
+            assert_eq!(progress.last_attempt, 0);
+            assert_eq!(progress.rejected_count, 0);
+            assert!(state.pending.is_empty());
+            assert_eq!(
+                collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+                2
+            );
+            assert!(session
+                .commit::<()>(generation, || panic!("取消优先于deadline及迟到HTTP结果"))
+                .is_err());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_deadline主动drop挂起的任一月请求_取消同时发生仍优先() {
+    for pending_month in [11, 10] {
+        for cancel_at_deadline in [false, true] {
+            let dir = TempConfigDir::new("r25-drop-at-deadline");
+            let path = dir.join("sessions");
+            write_cache(&path, &[A, B]);
+            let session = SyncSession::default();
+            let generation = session
+                .begin_usage("old".into(), &[], UsageSyncKind::Web, || ())
+                .unwrap()
+                .generation;
+            let mut scan = CacheScanState::default();
+            let mut state = CandidateVerificationState::default();
+            let candidates = state.collect_for_round(&mut scan, |scan| {
+                collect_cached_usage_tokens_in(scan, &dir, || true)
+            });
+            let network = Network::new();
+            let visited = RefCell::new(Vec::new());
+            let (release, blocked) = tokio::sync::oneshot::channel();
+            let mut blocked = Some(blocked);
+            {
+                let mut verifying = Box::pin(verify_candidates_with(
+                    &mut scan,
+                    &mut state,
+                    candidates,
+                    &MONTHS,
+                    || session.is_current(generation),
+                    || network.clock.now(),
+                    |deadline| network.clock.wait_until(deadline),
+                    |token, month, year| {
+                        visited.borrow_mut().push((token, month, year));
+                        let blocked = if month == pending_month {
+                            Some(blocked.take().expect("只准启动一次挂起请求"))
+                        } else {
+                            None
+                        };
+                        async move {
+                            if let Some(blocked) = blocked {
+                                blocked.await.unwrap()
+                            } else {
+                                Err(VerifyFailure::Transient)
+                            }
+                        }
+                    },
+                ));
+                poll_fn(|cx| {
+                    assert!(verifying.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                network.clock.elapsed.set(CANDIDATE_BATCH_BUDGET);
+                if cancel_at_deadline {
+                    assert!(session
+                        .cancel_usage("old", Some(generation), || ())
+                        .is_some());
+                }
+                poll_fn(|cx| {
+                    assert_eq!(verifying.as_mut().poll(cx), Poll::Ready(None));
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(release.is_closed(), "deadline必须drop实际挂起future");
+            }
+            let expected = if pending_month == 11 {
+                vec![(A.to_string(), 11, 2026)]
+            } else {
+                vec![(A.to_string(), 11, 2026), (A.to_string(), 10, 2026)]
+            };
+            assert_eq!(*visited.borrow(), expected);
+            let progress = &state.files[&path];
+            assert_eq!(progress.rejected_count, 0);
+            assert_eq!(
+                collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+                2
+            );
+            if cancel_at_deadline {
+                assert_eq!(progress.next_candidate, 0);
+                assert_eq!(progress.untried, 2);
+                assert_eq!(progress.last_attempt, 0);
+                assert!(state.pending.is_empty());
+                assert!(session
+                    .commit::<()>(generation, || panic!("旧代际不能提交"))
+                    .is_err());
+            } else {
+                assert_eq!(progress.next_candidate, 1);
+                assert_eq!(progress.untried, 1);
+                assert!(progress.last_attempt > 0);
+                assert!(session.is_current(generation), "预算耗尽不撤销同步所有者");
+                network.add(B, 11, ready_response(0, Ok(())));
+                assert_eq!(
+                    round(&mut scan, &mut state, &dir, &network)
+                        .await
+                        .as_deref(),
+                    Some(B)
+                );
+                assert_eq!(*network.visited.borrow(), vec![(B.into(), 11, 2026)]);
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

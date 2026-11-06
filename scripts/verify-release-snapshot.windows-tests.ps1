@@ -1,5 +1,5 @@
 #requires -Version 7.0
-# 第 21/22/24 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
+# 第 21/22/24/25 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
 # 用户在 Windows 本机 NTFS 上运行。只读用户提供的真实 PE，所有修改仅在新建
 # 隔离目录的测试副本中进行；绝不启动、安装或签名候选 PE，不构建项目。
 # 这不是既有的 release-version-pure-functions，也不算安装/升级验收。
@@ -29,12 +29,13 @@ $null = New-Item -ItemType Directory -Path $scriptsDirectory
 $decoyScriptsDirectory = Join-Path $decoy 'scripts'
 $null = New-Item -ItemType Directory -Path $decoyScriptsDirectory
 [IO.File]::WriteAllText((Join-Path $decoy 'package.json'), '{"version":"65535.65535.65535"}')
-foreach ($helper in @('release-file-snapshot.cs', 'release-pe-version.cs')) {
+foreach ($helper in @('release-file-snapshot.cs', 'release-pe-version.cs', 'release-snapshot-test-hardlink.cs')) {
     [IO.File]::WriteAllText((Join-Path $decoyScriptsDirectory $helper), '#error WILDCARD_DECOY_MUST_NOT_BE_COMPILED')
 }
 Copy-Item -LiteralPath $packagePath -Destination (Join-Path $evidence 'package.json')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-file-snapshot.cs') -Destination $scriptsDirectory
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-pe-version.cs') -Destination $scriptsDirectory
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-snapshot-test-hardlink.cs') -Destination $scriptsDirectory
 foreach ($scriptFile in @('verify-release.ps1', 'verify-release-pe-bytes.static-tests.ps1', 'verify-release-version.static-tests.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptFile) -Destination $scriptsDirectory
 }
@@ -46,6 +47,7 @@ foreach ($file in @('release-file-snapshot.cs', 'release-pe-version.cs', 'verify
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $unmatchedScriptsDirectory
 }
 Add-Type -LiteralPath (Join-Path $scriptsDirectory 'release-pe-version.cs')
+Add-Type -LiteralPath (Join-Path $scriptsDirectory 'release-snapshot-test-hardlink.cs')
 $script:CaseNumber = 0
 $script:AssertionNumber = 0
 $script:PathProbeNumber = 0
@@ -66,6 +68,32 @@ function Get-BytesHash([byte[]]$Bytes) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant() }
     finally { $sha.Dispose() }
+}
+
+# Establish hard-link identity independently of bytes or the production lock
+# helper. A copied file (even with identical bytes) must fail this precondition.
+function Assert-HardLinkFixture([string]$Alias, [string]$Target, [string]$DecoyTarget, [string]$CaseRoot, [string]$Phase, $ExpectedIdentity = $null) {
+    $aliasIdentity = [DeepSeekMonitor.ReleaseVerification.Tests.LiteralHardLink]::ReadIdentity($Alias)
+    $targetIdentity = [DeepSeekMonitor.ReleaseVerification.Tests.LiteralHardLink]::ReadIdentity($Target)
+    $decoyIdentity = [DeepSeekMonitor.ReleaseVerification.Tests.LiteralHardLink]::ReadIdentity($DecoyTarget)
+    [ordered]@{
+        phase = $Phase
+        aliasPath = $Alias
+        targetPath = $Target
+        decoyPath = $DecoyTarget
+        aliasIdentity = $aliasIdentity
+        targetIdentity = $targetIdentity
+        decoyIdentity = $decoyIdentity
+        initialTargetIdentity = $ExpectedIdentity
+        sameTarget = $aliasIdentity.IsSameFile($targetIdentity)
+        differentDecoy = -not $aliasIdentity.IsSameFile($decoyIdentity)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $CaseRoot "hardlink-identity-$Phase.json") -Encoding utf8
+    Assert-Case ($aliasIdentity.IsSameFile($targetIdentity)) "hardlink $Phase：alias 与字面目标的 volume serial/file index 相同"
+    Assert-Case (-not $aliasIdentity.IsSameFile($decoyIdentity) -and -not $targetIdentity.IsSameFile($decoyIdentity)) "hardlink $Phase：alias/target 均与旁路 decoy 身份不同"
+    if ($null -ne $ExpectedIdentity) {
+        Assert-Case ($targetIdentity.IsSameFile($ExpectedIdentity)) "hardlink $Phase：目标身份仍与启动前相同"
+    }
+    return $targetIdentity
 }
 
 # Check the complete path pattern, not only the last component. An outer []
@@ -166,13 +194,13 @@ function Invoke-MainFlow {
     # different match, rather than merely failing because an ancestor is absent.
     $decoyParent = Join-Path $decoy ('case ' + $script:CaseNumber) 'parent with spaces a'
     $null = New-Item -ItemType Directory -Path $decoyParent
-    [IO.File]::WriteAllText((Join-Path $decoyParent "Monitor $version.exe"), 'WILDCARD_DECOY_NOT_A_PE')
+    $decoyTarget = Join-Path $decoyParent "Monitor $version.exe"
+    [IO.File]::WriteAllText($decoyTarget, 'WILDCARD_DECOY_NOT_A_PE')
     $target = Join-Path $parent "Monitor $version.exe"
     $replacement = Join-Path $caseRoot 'replacement.exe'
     $alias = Join-Path $caseRoot 'hard link.exe'
     [IO.File]::WriteAllBytes($target, $Bytes)
     [IO.File]::WriteAllBytes($replacement, $fixtureB)
-    if ($HardLink) { $null = New-Item -ItemType HardLink -Path $alias -Target $target }
     $caseScript = Join-Path $ScriptDirectory ('verify case ' + $script:CaseNumber + '.ps1')
     $ready = $null
     $resume = $null
@@ -182,7 +210,17 @@ function Invoke-MainFlow {
     $errorTask = $null
     $denied = $false
     $mutationError = $null
+    $hardLinkIdentity = $null
     try {
+        if ($HardLink) {
+            # All three paths are fresh fixture files below evidenceRoot, never
+            # the user-supplied installer. PS 7.4.7 expands New-Item -Target [].
+            # CreateHardLinkW is literal on every supported PowerShell version.
+            $targetPattern = [Management.Automation.WildcardPattern]::new($target, [Management.Automation.WildcardOptions]::IgnoreCase)
+            Assert-Case ($targetPattern.IsMatch($decoyTarget)) "$Label：硬链接目标的完整路径确有旁路匹配"
+            [DeepSeekMonitor.ReleaseVerification.Tests.LiteralHardLink]::Create($alias, $target)
+            $hardLinkIdentity = Assert-HardLinkFixture $alias $target $decoyTarget $caseRoot 'before-process'
+        }
         $caseSource = $source
         if ($Barrier) {
             $id = [guid]::NewGuid().ToString('N')
@@ -231,6 +269,7 @@ finally { `$readyEvent.Dispose(); `$resumeEvent.Dispose() }
         $errorTask = $process.StandardError.ReadToEndAsync()
         if ($Barrier) {
             if (-not $ready.WaitOne(60000)) { throw "真实主流程未到达屏障：$Label" }
+            if ($HardLink) { $null = Assert-HardLinkFixture $alias $target $decoyTarget $caseRoot 'at-barrier' $hardLinkIdentity }
             try {
                 & $Mutation $target $replacement $alias $parent
             }
@@ -264,8 +303,31 @@ finally { `$readyEvent.Dispose(); `$resumeEvent.Dispose() }
             # 同一操作在子进程结束后必须成功，排除 ACL、错误路径等假阳性。
             & $Mutation $target $replacement $alias $parent
             Assert-Case $true "$Label：释放句柄后同一修改可以完成"
+            if ($HardLink) {
+                $null = Assert-HardLinkFixture $alias $target $decoyTarget $caseRoot 'after-release' $hardLinkIdentity
+                Assert-Case ((Get-BytesHash ([IO.File]::ReadAllBytes($target))) -ceq (Get-BytesHash $fixtureB)) "$Label：释放后经 alias 写入的 B 已到达真实目标"
+                Assert-Case ([IO.File]::ReadAllText($decoyTarget) -ceq 'WILDCARD_DECOY_NOT_A_PE') "$Label：旁路 decoy 未被修改"
+            }
         }
         return $result
+    }
+    catch {
+        # Preserve native setup/identity errors as failures, never a skip or a
+        # successful sharing denial. The helper captured LastError before cleanup.
+        $failureRecord = $_
+        $exception = $_.Exception
+        while ($null -ne $exception.InnerException) { $exception = $exception.InnerException }
+        try {
+            [ordered]@{
+                label = $Label
+                status = 'FAIL'
+                barrier = $Barrier
+                nativeErrorCode = $(if ($exception -is [ComponentModel.Win32Exception]) { $exception.NativeErrorCode } else { $null })
+                exception = $exception.ToString()
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $caseRoot 'failure.json') -Encoding utf8
+        }
+        catch { Write-Warning "无法写入 failure.json；原始失败仍保留：$($exception.ToString())" }
+        throw $failureRecord
     }
     finally {
         if ($null -ne $resume) { $null = $resume.Set() }

@@ -932,6 +932,151 @@ test("PowerShell known checkout and evidence paths use literal path binding", ()
   assert.match(windows, /-ScriptDirectory \$unmatchedScriptsDirectory/);
 });
 
+// Text-only wiring guards. These do not execute Win32 or substitute for the
+// separately required Windows double-barrier acceptance on both PS versions.
+test("Windows hard-link fixtures use the literal Unicode API and retain native failures", () => {
+  const windows = readFileSync(
+    join(root, "scripts", "verify-release-snapshot.windows-tests.ps1"),
+    "utf8",
+  );
+  const helperName = "release-snapshot-test-hardlink.cs";
+  const helper = readFileSync(join(root, "scripts", helperName), "utf8");
+  assert.match(
+    windows,
+    /Copy-Item -LiteralPath \(Join-Path \$PSScriptRoot 'release-snapshot-test-hardlink\.cs'\) -Destination \$scriptsDirectory/,
+  );
+  assert.match(
+    windows,
+    /^Add-Type -LiteralPath \(Join-Path \$scriptsDirectory 'release-snapshot-test-hardlink\.cs'\)/m,
+  );
+  assert.match(
+    windows,
+    /foreach \(\$helper in @\([^\n]*'release-snapshot-test-hardlink\.cs'/,
+  );
+  assert.doesNotMatch(
+    windows,
+    /^[\t ]*(?![\t ]*#)[^\r\n]*\bNew-Item\b[^\r\n]*\bHardLink\b/im,
+  );
+  assert.doesNotMatch(windows, /New-Item[^\n]*-LiteralPath\b/);
+  assert.doesNotMatch(windows, /WildcardPattern[^\n]*\bEscape\s*\(/);
+  assert.match(windows, /LiteralHardLink\]::Create\(\$alias, \$target\)/);
+  assert.match(
+    helper,
+    /\[DllImport\("kernel32\.dll", CharSet = CharSet\.Unicode, ExactSpelling = true, SetLastError = true\)\]\s*\[return: MarshalAs\(UnmanagedType\.Bool\)\]\s*private static extern bool CreateHardLinkW\(/,
+  );
+  assert.match(
+    helper,
+    /if \(!CreateHardLinkW\(alias, target, IntPtr\.Zero\)\)\s*\{\s*int error = Marshal\.GetLastWin32Error\(\);\s*throw new Win32Exception\(error,/,
+  );
+  const createBody = helper.slice(
+    helper.indexOf("public static void Create("),
+    helper.indexOf("public static TestFileIdentity ReadIdentity("),
+  );
+  assert.doesNotMatch(
+    createBody,
+    /File\.(?:Copy|Delete)|CreateSymbolicLink|Process\.Start/,
+  );
+  assert.match(windows, /nativeErrorCode = .*\$exception\.NativeErrorCode/);
+  assert.match(windows, /throw \$failureRecord/);
+});
+
+test("Windows hard-link identity probes use file IDs without adding a test lock", () => {
+  const helper = readFileSync(
+    join(root, "scripts", "release-snapshot-test-hardlink.cs"),
+    "utf8",
+  );
+  assert.match(helper, /VolumeSerialNumber == other\.VolumeSerialNumber/);
+  assert.match(helper, /FileIndexHigh == other\.FileIndexHigh/);
+  assert.match(helper, /FileIndexLow == other\.FileIndexLow/);
+  assert.match(helper, /ShareReadWriteDelete = 7;/);
+  assert.match(
+    helper,
+    /CreateFileW\(path, 0, ShareReadWriteDelete, IntPtr\.Zero,\s*OpenExisting, OpenReparsePoint, IntPtr\.Zero\)/,
+  );
+  assert.match(helper, /using \(handle\)/);
+  assert.match(
+    helper,
+    /if \(handle\.IsInvalid\)\s*\{\s*int error = Marshal\.GetLastWin32Error\(\);\s*handle\.Dispose\(\);\s*throw new Win32Exception\(error,/,
+  );
+  assert.match(
+    helper,
+    /if \(!GetFileInformationByHandle\(handle, out information\)\)\s*\{\s*int error = Marshal\.GetLastWin32Error\(\);\s*throw new Win32Exception\(error,/,
+  );
+  assert.doesNotMatch(
+    helper,
+    /SHA256|ComputeHash|GetHashCode|File\.ReadAllBytes/,
+  );
+});
+
+test("Windows hard-link cases prove the correct fixture before either barrier and after release", () => {
+  const windows = readFileSync(
+    join(root, "scripts", "verify-release-snapshot.windows-tests.ps1"),
+    "utf8",
+  );
+  const identity = windows.slice(
+    windows.indexOf("function Assert-HardLinkFixture("),
+    windows.indexOf("# Check the complete path pattern"),
+  );
+  assert.match(identity, /ReadIdentity\(\$Alias\)/);
+  assert.match(identity, /ReadIdentity\(\$Target\)/);
+  assert.match(identity, /ReadIdentity\(\$DecoyTarget\)/);
+  assert.match(
+    identity,
+    /Assert-Case \(\$aliasIdentity\.IsSameFile\(\$targetIdentity\)\)/,
+  );
+  assert.match(identity, /-not \$aliasIdentity\.IsSameFile\(\$decoyIdentity\)/);
+  assert.match(
+    identity,
+    /-not \$targetIdentity\.IsSameFile\(\$decoyIdentity\)/,
+  );
+  assert.match(
+    identity,
+    /Assert-Case \(\$targetIdentity\.IsSameFile\(\$ExpectedIdentity\)\)/,
+  );
+  assert.doesNotMatch(identity, /Get-BytesHash|ComputeHash/);
+  const mainFlow = windows.slice(
+    windows.indexOf("function Invoke-MainFlow"),
+    windows.indexOf("function Assert-Verdict"),
+  );
+  const create = mainFlow.indexOf("LiteralHardLink]::Create($alias, $target)");
+  const before = mainFlow.indexOf("$hardLinkIdentity = Assert-HardLinkFixture");
+  const start = mainFlow.indexOf("[Diagnostics.Process]::Start($start)");
+  const ready = mainFlow.indexOf("$ready.WaitOne(60000)");
+  const atBarrier = mainFlow.indexOf("'at-barrier' $hardLinkIdentity");
+  const mutation = mainFlow.indexOf(
+    "& $Mutation $target $replacement $alias $parent",
+  );
+  const ended = mainFlow.indexOf("$process.WaitForExit(60000)");
+  const repeatedMutation = mainFlow.indexOf(
+    "& $Mutation $target $replacement $alias $parent",
+    mutation + 1,
+  );
+  const afterRelease = mainFlow.indexOf("'after-release' $hardLinkIdentity");
+  assert.ok(create >= 0 && create < before && before < start);
+  assert.ok(start < ready && ready < atBarrier && atBarrier < mutation);
+  assert.ok(
+    mutation < ended &&
+      ended < repeatedMutation &&
+      repeatedMutation < afterRelease,
+  );
+  assert.match(mainFlow, /\$targetPattern\.IsMatch\(\$decoyTarget\)/);
+  assert.match(mainFlow, /\$nativeCode -in @\(32, 33\)/);
+  assert.match(mainFlow, /Assert-Case \$denied/);
+  assert.match(mainFlow, /释放后经 alias 写入的 B 已到达真实目标/);
+  assert.match(
+    mainFlow,
+    /ReadAllText\(\$decoyTarget\) -ceq 'WILDCARD_DECOY_NOT_A_PE'/,
+  );
+  assert.match(
+    windows,
+    /foreach \(\$barrier in @\('AFTER_HASH', 'BEFORE_VERSION'\)\)/,
+  );
+  assert.match(
+    windows,
+    /Label = '经 hardlink 写入'; HardLink = \$true; Action = .*\[IO.File\]::Copy\(\$replacement, \$alias, \$true\)/,
+  );
+});
+
 test("pure version assertions preserve failure propagation and completion protocol", () => {
   const source = readFileSync(
     join(root, "scripts", "verify-release-version.static-tests.ps1"),

@@ -1,15 +1,16 @@
 import React from "react";
 import { fmtInt, fmtTokensShort, mmdd, todayStr } from "../format";
+import type { ChartPoint } from "../format";
 
-export type StackedPoint = {
-  date: string;
-  hit: number;
-  miss: number;
-  response: number;
-  other: number;
-  total: number;
-  unavailable?: boolean;
-};
+export type StackedPoint = ChartPoint;
+
+const segments = (point: StackedPoint, hasOther: boolean) =>
+  [
+    ["hit", "命中", point.hit],
+    ["miss", "未命中", point.miss],
+    ["response", "输出", point.response],
+    ...(hasOther ? [["other", "其他", point.other]] : []),
+  ] as [string, string, number | null][];
 
 // 主面板与详情共用交互：指向预览、点击固定、Escape 收起；明细占独立区域。
 function StackedBarChart({
@@ -57,7 +58,7 @@ function StackedBarChart({
     return () => document.removeEventListener("keydown", onEscape);
   }, [pinnedDate]);
   const MIN_BAR = 3; // 整根柱子的最小可见高度百分比（含空数据占位）
-  const maxVal = Math.max(...points.map((point) => point.total), 1);
+  const maxVal = Math.max(...points.map((point) => point.total ?? 0), 1);
   const isSummary = variant === "summary";
 
   return (
@@ -69,10 +70,18 @@ function StackedBarChart({
         {points.map((point, idx) => {
           // 键盘用户与读屏用户拿到的是同一条信息：日期、合计与各分段明细
           const label = point.unavailable
-            ? `${point.date}：数据暂未取得，不代表用量为零`
-            : `${point.date}：合计 ${fmtInt(point.total)} tokens，` +
-              `命中 ${fmtInt(point.hit)}，未命中 ${fmtInt(point.miss)}，输出 ${fmtInt(point.response)}` +
-              (point.other > 0 ? `，其他 ${fmtInt(point.other)}` : "");
+            ? `${point.date}：${point.unavailableReason ?? "数据暂未取得，不代表用量为零"}` +
+              (point.unavailableReason
+                ? `，${segments(point, hasOther)
+                    .map(
+                      ([, name, value]) =>
+                        `${name} ${value == null ? "未知" : fmtInt(value)}`,
+                    )
+                    .join("，")}`
+                : "")
+            : `${point.date}：合计 ${fmtInt(point.total!)} tokens，` +
+              `命中 ${fmtInt(point.hit!)}，未命中 ${fmtInt(point.miss!)}，输出 ${fmtInt(point.response!)}` +
+              ((point.other ?? 0) > 0 ? `，其他 ${fmtInt(point.other!)}` : "");
           // 最近 7 天窗口的末柱恒为今天；给整排日期一个中文锚点，读图不用数格子
           const isToday =
             idx === points.length - 1 && point.date === todayStr();
@@ -88,16 +97,16 @@ function StackedBarChart({
                 <span className="bar-value">
                   {point.unavailable
                     ? "—"
-                    : point.total > 0
-                      ? fmtTokensShort(point.total)
+                    : (point.total ?? 0) > 0
+                      ? fmtTokensShort(point.total!)
                       : "0"}
                 </span>
               ) : (
                 <span>
                   {point.unavailable
                     ? "—"
-                    : point.total > 0
-                      ? fmtTokensShort(point.total)
+                    : (point.total ?? 0) > 0
+                      ? fmtTokensShort(point.total!)
                       : ""}
                 </span>
               )}
@@ -129,33 +138,33 @@ function StackedBarChart({
                 <span
                   className={`${isSummary ? "cache-bar" : "detail-bar-stacked"}${point.unavailable ? " unavailable" : ""}`}
                   style={{
-                    height: `${point.unavailable ? 18 : point.total > 0 ? Math.max(MIN_BAR, (point.total / maxVal) * 100) : MIN_BAR}%`,
+                    height: `${point.unavailable ? 18 : (point.total ?? 0) > 0 ? Math.max(MIN_BAR, (point.total! / maxVal) * 100) : MIN_BAR}%`,
                   }}
                 >
-                  {point.total > 0 ? (
+                  {!point.unavailable && (point.total ?? 0) > 0 ? (
                     <>
-                      {point.hit > 0 && (
+                      {(point.hit ?? 0) > 0 && (
                         <i
                           className="seg hit"
-                          style={{ flexGrow: point.hit }}
+                          style={{ flexGrow: point.hit! }}
                         />
                       )}
-                      {point.miss > 0 && (
+                      {(point.miss ?? 0) > 0 && (
                         <i
                           className="seg miss"
-                          style={{ flexGrow: point.miss }}
+                          style={{ flexGrow: point.miss! }}
                         />
                       )}
-                      {point.response > 0 && (
+                      {(point.response ?? 0) > 0 && (
                         <i
                           className="seg response"
-                          style={{ flexGrow: point.response }}
+                          style={{ flexGrow: point.response! }}
                         />
                       )}
-                      {point.other > 0 && (
+                      {(point.other ?? 0) > 0 && (
                         <i
                           className="seg other"
-                          style={{ flexGrow: point.other }}
+                          style={{ flexGrow: point.other! }}
                         />
                       )}
                     </>
@@ -173,7 +182,12 @@ function StackedBarChart({
           );
         })}
       </div>
-      <div className="chart-inspector" aria-live="polite" aria-atomic="true">
+      <div
+        className="chart-inspector"
+        data-count-issue={active?.unavailableReason ? true : undefined}
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {active ? (
           <>
             <div className="chart-inspector-head">
@@ -183,30 +197,33 @@ function StackedBarChart({
               </span>
               <strong>
                 {active.unavailable
-                  ? "数据待取得"
-                  : `${fmtTokensShort(active.total)} Tokens`}
+                  ? active.unavailableReason
+                    ? "合计未知"
+                    : "数据待取得"
+                  : `${fmtTokensShort(active.total!)} Tokens`}
               </strong>
             </div>
-            {active.unavailable ? (
+            {active.unavailable && (
               <div className="chart-inspector-note">
-                尚未取得数据，不代表用量为零
+                {active.unavailableReason ?? "尚未取得数据，不代表用量为零"}
               </div>
-            ) : (
+            )}
+            {(!active.unavailable || active.unavailableReason) && (
               <div
                 className={`chart-inspector-values${hasOther ? " four" : ""}`}
               >
-                {(
-                  [
-                    ["hit", "命中", active.hit],
-                    ["miss", "未命中", active.miss],
-                    ["response", "输出", active.response],
-                    ...(hasOther ? [["other", "其他", active.other]] : []),
-                  ] as [string, string, number][]
-                ).map(([key, title, value]) => (
-                  <span key={key} title={`${title}：${fmtInt(value)} Tokens`}>
+                {segments(active, hasOther).map(([key, title, value]) => (
+                  <span
+                    key={key}
+                    title={`${title}：${value == null ? "未知" : `${fmtInt(value)} Tokens`}`}
+                  >
                     <i className={`dot ${key}`} />
                     {title}{" "}
-                    <strong>{fmtTokensShort(value).replace(".0", "")}</strong>
+                    <strong>
+                      {value == null
+                        ? "—"
+                        : fmtTokensShort(value).replace(".0", "")}
+                    </strong>
                   </span>
                 ))}
               </div>

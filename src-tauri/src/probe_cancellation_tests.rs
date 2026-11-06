@@ -1,5 +1,5 @@
-//! R24：手动保存、登录 IPC 共用的生产多月校验与会话取消链。
-//! 仅替换单月 HTTP 请求；不访问网络或创建原生窗口。以下源码尚未运行，
+//! R24/R25：手动保存、登录 IPC 共用的生产多月校验与会话取消链及预算优先级。
+//! 仅替换单月 HTTP 请求与预算时钟；不访问网络或创建原生窗口。以下源码尚未运行，
 //! Windows / WebView2 的实际命令派发与窗口事件仍须维护者验收。
 
 use super::*;
@@ -51,6 +51,128 @@ fn revoke(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn r25_每月准入分别检查deadline_预算耗尽不是取消() {
+    for allowed_checks in [0, 2] {
+        let base = Instant::now();
+        let deadline = base + CANDIDATE_BATCH_BUDGET;
+        let checks = Cell::new(0);
+        let visited = RefCell::new(Vec::new());
+        let result = probe_token_with(
+            &MONTHS,
+            || true,
+            || {
+                let check = checks.replace(checks.get() + 1);
+                if check < allowed_checks {
+                    base
+                } else {
+                    deadline
+                }
+            },
+            Some(deadline),
+            |month, year| {
+                visited.borrow_mut().push((month, year));
+                std::future::ready(Err(VerifyFailure::Transient))
+            },
+        )
+        .await;
+        assert_eq!(result, ProbeOutcome::BudgetExpired);
+        assert_eq!(checks.get(), allowed_checks + 1);
+        let expected_count = if allowed_checks == 0 { 0 } else { 1 };
+        assert_eq!(visited.borrow().as_slice(), &MONTHS[..expected_count]);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_响应后取消与deadline先后_取消优先于预算和HTTP结果() {
+    for deadline_first in [false, true] {
+        for response in [
+            Ok(()),
+            Err(VerifyFailure::Definitive),
+            Err(VerifyFailure::Transient),
+        ] {
+            let base = Instant::now();
+            let deadline = base + CANDIDATE_BATCH_BUDGET;
+            let now = Cell::new(base);
+            let active = Cell::new(true);
+            let visited = RefCell::new(Vec::new());
+            let result = probe_token_with(
+                &MONTHS,
+                || active.get(),
+                || now.get(),
+                Some(deadline),
+                |month, year| {
+                    let now = &now;
+                    let active = &active;
+                    let visited = &visited;
+                    async move {
+                        visited.borrow_mut().push((month, year));
+                        if deadline_first {
+                            now.set(deadline);
+                        }
+                        active.set(false);
+                        if !deadline_first {
+                            now.set(deadline);
+                        }
+                        response
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result, ProbeOutcome::Cancelled);
+            assert_eq!(*visited.borrow(), vec![MONTHS[0]]);
+        }
+    }
+
+    assert_eq!(
+        probe_token_with(
+            &MONTHS,
+            || false,
+            || panic!("准入已取消时连预算检查也不需要"),
+            Some(Instant::now()),
+            |_, _| -> std::future::Ready<Result<(), VerifyFailure>> {
+                panic!("已取消时不得发请求")
+            },
+        )
+        .await,
+        ProbeOutcome::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r25_未设置批deadline不读取缓存时钟_手动IPC保持HTTP探针语义() {
+    for current in [
+        Ok(()),
+        Err(VerifyFailure::Definitive),
+        Err(VerifyFailure::Transient),
+    ] {
+        let visited = RefCell::new(Vec::new());
+        let result = probe_token_with(
+            &MONTHS,
+            || true,
+            || panic!("未设置deadline的共享探针不得读取批时钟"),
+            None,
+            |month, year| {
+                visited.borrow_mut().push((month, year));
+                std::future::ready(if month == 11 { current } else { Ok(()) })
+            },
+        )
+        .await;
+        let expected = if current == Err(VerifyFailure::Definitive) {
+            ProbeOutcome::Rejected
+        } else {
+            ProbeOutcome::Passed
+        };
+        assert_eq!(result, expected);
+        let expected_count = if current == Err(VerifyFailure::Transient) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(visited.borrow().as_slice(), &MONTHS[..expected_count]);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn r24_每月准入前检查取消_不依赖50毫秒唤醒() {
     let checks = Cell::new(0);
     let visited = RefCell::new(Vec::new());
@@ -62,6 +184,8 @@ async fn r24_每月准入前检查取消_不依赖50毫秒唤醒() {
             // 当前月准入与响应后仍有效，到上月准入时恰好撤销。
             call < 2
         },
+        Instant::now,
+        None,
         |month, year| {
             visited.borrow_mut().push((month, year));
             std::future::ready(Err(VerifyFailure::Transient))
@@ -75,6 +199,8 @@ async fn r24_每月准入前检查取消_不依赖50毫秒唤醒() {
     let result = probe_token_with(
         &MONTHS,
         || false,
+        Instant::now,
+        None,
         |_, _| -> std::future::Ready<Result<(), VerifyFailure>> {
             panic!("准入已撤销时不得构造第一个请求")
         },
@@ -95,6 +221,8 @@ async fn r24_单月响应前撤销_成功拒绝暂时失败均返回独立取消
         let result = probe_token_with(
             &MONTHS,
             || active.get(),
+            Instant::now,
+            None,
             |month, year| {
                 visited.borrow_mut().push((month, year));
                 let active = &active;

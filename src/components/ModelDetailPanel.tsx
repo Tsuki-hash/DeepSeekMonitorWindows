@@ -59,7 +59,11 @@ function ModelDetailPanel({
   const notices = usageNotices(usage, now);
   const hasUnknown =
     usageState === "ok" && points.some((point) => point.unavailable);
-  const hasOther = points.some((point) => point.other > 0);
+  const hasOther = points.some(
+    (point) =>
+      (point.other ?? 0) > 0 ||
+      (point.unavailableReason != null && point.other == null),
+  );
   const rangeText =
     points.length > 0
       ? `${mmdd(points[0].date)} - ${mmdd(points[points.length - 1].date)}`

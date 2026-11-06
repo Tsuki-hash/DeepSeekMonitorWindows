@@ -14,6 +14,8 @@ import {
   accountingDateKey,
   chartPointFromDay,
   chartTotal,
+  chartTotalStatus,
+  hasReturnedUsageDay,
   missingUsageDates,
   currencySymbol,
   dateKey,
@@ -339,12 +341,12 @@ test("chartPointFromDay：all 用 totalTokens 吞掉未识别模型差额", () =
   assert.equal(point.other, 140);
   assert.equal(point.total, 500);
   assert.equal(
-    point.hit + point.miss + point.response + point.other,
+    point.hit! + point.miss! + point.response! + point.other!,
     point.total,
   );
 });
 
-test("chartPointFromDay：all 在 totalTokens 缺失时退回分段和", () => {
+test("chartPointFromDay：all 在合法 totalTokens 小于分段和时保留分段", () => {
   const sample: UsageDay = {
     ...returnedDay("2026-09-11"),
     flashCacheHit: 10,
@@ -519,4 +521,129 @@ test("R14-08：Pro未知不能污染完整Flash，all与差额other仍未知", (
   assert.equal(flash.total, 100);
   for (const scope of ["all", "pro", "other"] as const)
     assert.equal(chartPointFromDay(partial, scope).unavailable, true);
+});
+
+const countedDay = (date: string, tokens: number): UsageDay => ({
+  ...returnedDay(date, tokens),
+  flashCacheHit: tokens,
+  rawModels: [
+    { ...returnedDay(date, tokens).rawModels![0], cacheHitTokens: tokens },
+  ],
+});
+
+test("R25：跨月两天都合法，2^52 + (2^52+1) 近7日合计必须未知", () => {
+  const now = new Date("2026-11-01T02:00:00Z");
+  const source = [
+    ...[26, 27, 28, 29, 30].map((date) => countedDay(`2026-10-${date}`, 0)),
+    countedDay("2026-10-31", 2 ** 52),
+    countedDay("2026-11-01", 2 ** 52 + 1),
+  ];
+  const before = JSON.stringify(source);
+  const days = recentUsageDays(source, 7, [], now, "2026-11-01");
+  const points = days.map((day) => chartPointFromDay(day));
+  assert.ok(points.every((point) => !point.unavailable));
+  assert.equal(points[5].total, 2 ** 52);
+  assert.equal(points[6].total, 2 ** 52 + 1);
+  assert.equal(chartTotal(points), null);
+  assert.deepEqual(chartTotalStatus(points), { total: null, issue: "unsafe" });
+  assert.deepEqual(
+    missingUsageDates({ days, models: [], monthCost: 0 }, now),
+    [],
+  );
+  assert.equal(
+    JSON.stringify(source),
+    before,
+    "日期与原始分段不得被合计超界改写",
+  );
+});
+
+test("R25：跨日恰等安全上界可显示，超界后加0与未知不能恢复有效合计", () => {
+  const point = (tokens: number) =>
+    chartPointFromDay(countedDay("2026-11-01", tokens));
+  assert.equal(
+    chartTotal([point(2 ** 52), point(2 ** 52 - 1), point(0)]),
+    Number.MAX_SAFE_INTEGER,
+  );
+  assert.equal(
+    chartTotal([point(2 ** 52), point(2 ** 52 + 1), point(0)]),
+    null,
+  );
+  assert.equal(
+    chartTotal([
+      point(0),
+      chartPointFromDay(emptyUsageDay("2026-10-31")),
+      point(0),
+    ]),
+    null,
+  );
+  for (const invalid of [-1, 0.5, NaN, Infinity, 2 ** 53])
+    assert.equal(chartTotal([{ ...point(0), total: invalid }]), null);
+});
+
+test("R25：单柱各分段与槽位上界都需校验，不能只检查最终日总量", () => {
+  for (const second of [2 ** 52 - 1, 2 ** 52 + 1]) {
+    const safe = second === 2 ** 52 - 1;
+    const sample: UsageDay = {
+      ...countedDay("2026-11-01", 0),
+      flashCacheHit: 2 ** 52,
+      flashCacheMiss: second,
+      flashTokens: safe ? Number.MAX_SAFE_INTEGER : null,
+      totalTokens: safe ? Number.MAX_SAFE_INTEGER : null,
+      rawModels: [
+        {
+          ...returnedDay("2026-11-01").rawModels![0],
+          model: "deepseek-v4-flash",
+          cacheHitTokens: 2 ** 52,
+          totalTokens: 2 ** 52,
+        },
+        {
+          ...returnedDay("2026-11-01").rawModels![0],
+          model: "deepseek-flash",
+          cacheMissTokens: second,
+          totalTokens: second,
+        },
+      ],
+    };
+    const before = JSON.stringify(sample);
+    for (const scope of ["all", "flash"] as const) {
+      const point = chartPointFromDay(sample, scope);
+      assert.equal(point.total, safe ? Number.MAX_SAFE_INTEGER : null);
+      assert.equal(Boolean(point.unavailable), !safe);
+      assert.equal(point.hit, 2 ** 52);
+      assert.equal(point.miss, second);
+      if (!safe) {
+        assert.equal(point.countIssue, "unsafe");
+        assert.ok(point.unavailableReason?.includes("超出安全整数"));
+      }
+    }
+    const sibling = chartPointFromDay(sample, "pro");
+    assert.equal(sibling.total, 0);
+    assert.equal(Boolean(sibling.unavailable), false, "合法兄弟槽位不被污染");
+    assert.equal(hasReturnedUsageDay(sample), true);
+    assert.equal(JSON.stringify(sample), before);
+  }
+});
+
+test("R25：即使可见分段全为零也必须尊重后端槽位 total 未知", () => {
+  const sample = { ...countedDay("2026-11-01", 0), flashTokens: null };
+  const point = chartPointFromDay(sample, "flash");
+  assert.equal(point.total, null);
+  assert.equal(point.unavailable, true);
+  assert.equal(point.hit, 0, "真实已知零分段保留");
+  assert.equal(point.countIssue, "unknown");
+  assert.equal(chartPointFromDay(sample, "pro").total, 0);
+});
+
+test("R25：同一分段跨槽位超界为未知，其他安全分段仍保留", () => {
+  const sample = {
+    ...countedDay("2026-11-01", 0),
+    flashCacheHit: 2 ** 52,
+    proCacheHit: 2 ** 52 + 1,
+    flashCacheMiss: 3,
+  };
+  const point = chartPointFromDay(sample);
+  assert.equal(point.total, null);
+  assert.equal(point.hit, null);
+  assert.equal(point.miss, 3);
+  assert.equal(point.countIssue, "unsafe");
 });

@@ -309,25 +309,32 @@ fn verify_probe_months(now: SystemTime) -> Vec<(u32, u32)> {
 }
 
 /// 探针结果：通过 / 明确拒绝（401/403，与探针月份无关）/ 暂不可用（网络、
-/// 服务端或路由类失败，值得换探针月或稍后重试）/ 会话已撤销。
+/// 服务端或路由类失败，值得换探针月或稍后重试）/ 缓存批预算耗尽 / 会话已撤销。
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeOutcome {
     Passed,
     Rejected,
     Unavailable,
+    BudgetExpired,
     Cancelled,
 }
 
 /// 手动保存、登录 IPC 和缓存候选共用同一个探针循环。
 /// 测试只替换单月请求，顺序、短路与错误优先级仍由生产循环决定。
 /// 外层 while_current 负责主动丢弃挂起请求；这里必须逐月检查，防止同一次
-/// poll 内当前月刚返回 Transient，就越过尚未唤醒的取消计时器发出上月请求。
-async fn probe_token_with<F, Fut>(
+/// poll 内当前月刚返回 Transient，就越过尚未唤醒的取消/deadline 计时器发出上月请求。
+/// 缓存单独传入批 deadline 与时钟；手动/IPC 传 None，保留单月 HTTP 超时。
+/// 每月准入与响应后的优先级均为：取消 > 批预算 > HTTP 结果。等于 deadline
+/// 也算耗尽；过期的成功/明确拒绝不再生效，预算耗尽不能伪装成取消或凭据拒绝。
+async fn probe_token_with<N, F, Fut>(
     probes: &[(u32, u32)],
     is_current: impl Fn() -> bool,
+    now: N,
+    deadline: Option<Instant>,
     mut verify: F,
 ) -> ProbeOutcome
 where
+    N: Fn() -> Instant,
     F: FnMut(u32, u32) -> Fut,
     Fut: std::future::Future<Output = Result<(), VerifyFailure>>,
 {
@@ -335,9 +342,15 @@ where
         if !is_current() {
             return ProbeOutcome::Cancelled;
         }
+        if deadline.is_some_and(|deadline| now() >= deadline) {
+            return ProbeOutcome::BudgetExpired;
+        }
         let result = verify(*month, *year).await;
         if !is_current() {
             return ProbeOutcome::Cancelled;
+        }
+        if deadline.is_some_and(|deadline| now() >= deadline) {
+            return ProbeOutcome::BudgetExpired;
         }
         match result {
             Ok(()) => return ProbeOutcome::Passed,
@@ -444,8 +457,8 @@ where
             async {
                 tokio::select! {
                     biased;
-                    _ = wait_until(deadline) => ProbeOutcome::Unavailable,
-                    result = probe_token_with(probes, &is_current, |month, year| {
+                    _ = wait_until(deadline) => ProbeOutcome::BudgetExpired,
+                    result = probe_token_with(probes, &is_current, &now, Some(deadline), |month, year| {
                         attempted = true;
                         verify(token.clone(), month, year)
                     }) => result,
@@ -458,7 +471,8 @@ where
         if outcome == ProbeOutcome::Cancelled {
             return None;
         }
-        // precheck 与 select 之间也可能耗尽预算；未发出任何月请求就不能出队或计首遍。
+        // 外层 precheck / timer poll 与首月准入之间也可能耗尽预算；
+        // 未发出任何月请求就不能出队或计首遍。已尝试的 BudgetExpired 正常轮转。
         if !attempted {
             break;
         }
@@ -475,7 +489,7 @@ where
                 rejected += 1;
                 progress.reject(cursor);
             }
-            ProbeOutcome::Unavailable => {
+            ProbeOutcome::Unavailable | ProbeOutcome::BudgetExpired => {
                 unavailable += 1;
             }
             ProbeOutcome::Passed | ProbeOutcome::Cancelled => unreachable!(),
@@ -521,7 +535,7 @@ where
     }
     if unavailable > 0 {
         log::warn!(
-            "缓存的 {unavailable} 个候选用量 Token 因网络/服务端原因暂未验证成功，下轮自动重试"
+            "缓存的 {unavailable} 个候选用量 Token 因网络/服务端原因或批预算耗尽暂未验证成功，下轮自动重试"
         );
     }
     if rejected > 0 {
@@ -600,13 +614,18 @@ where
     Fut: std::future::Future<Output = Result<(), VerifyFailure>>,
 {
     let is_current = || session.is_current(generation);
-    let outcome = while_current(probe_token_with(probes, &is_current, verify), &is_current)
-        .await
-        .unwrap_or(ProbeOutcome::Cancelled);
+    let outcome = while_current(
+        probe_token_with(probes, &is_current, Instant::now, None, verify),
+        &is_current,
+    )
+    .await
+    .unwrap_or(ProbeOutcome::Cancelled);
     match outcome {
         ProbeOutcome::Passed => Ok(()),
         ProbeOutcome::Rejected => Err(VerifyFailure::Definitive.message()),
-        ProbeOutcome::Unavailable => Err(VerifyFailure::Transient.message()),
+        ProbeOutcome::Unavailable | ProbeOutcome::BudgetExpired => {
+            Err(VerifyFailure::Transient.message())
+        }
         ProbeOutcome::Cancelled => Err("同步已取消或已被新的操作替代".to_string()),
     }
 }
@@ -875,6 +894,8 @@ mod tests {
         let result = probe_token_with(
             &probes,
             || true,
+            Instant::now,
+            None,
             |month, year| {
                 visited.push((month, year));
                 let body = if (month, year) == probes[0] {
@@ -957,6 +978,8 @@ mod tests {
             let result = probe_token_with(
                 &probes,
                 || true,
+                Instant::now,
+                None,
                 |month, year| {
                     let response = responses[visited.len()];
                     visited.push((month, year));
