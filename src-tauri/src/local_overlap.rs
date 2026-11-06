@@ -66,6 +66,10 @@ pub struct ToolRoot {
 /// 找出「单工具路径已被某个主目录来源的标准布局覆盖」的组合。
 ///
 /// 返回 `(tool_id, home_id)`：调用方把 tool 来源标为 `duplicate` 并说明原因。
+///
+/// **只按标准布局判重**（复评 F03）：主目录来源的引擎只扫描 `standard_layout`
+/// 那一个位置，home 下的其他自定义目录并不在它的覆盖范围内。若把「在 home 下」
+/// 一律当成重复，用户配置的自定义日志目录会被静默跳过、导致漏采。
 pub fn overlapping_tools(homes: &[HomeRoot], tools: &[ToolRoot]) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for tool in tools {
@@ -73,11 +77,9 @@ pub fn overlapping_tools(homes: &[HomeRoot], tools: &[ToolRoot]) -> Vec<(String,
             continue;
         };
         for home in homes {
-            // 两条判据：
-            // 1. 单工具路径正好在该主目录的标准布局内（最常见：默认 home + 同一个库）；
-            // 2. 单工具路径本身就在主目录下（工具目录被整个指过来）。
+            // 唯一判据：单工具路径落在该主目录的**标准布局**内。
             let layout_root = format!("{}\\{}", normalize(&home.path), normalize(layout));
-            if is_within(&layout_root, &tool.path) || is_within(&home.path, &tool.path) {
+            if is_within(&layout_root, &tool.path) {
                 found.push((tool.id.clone(), home.id.clone()));
                 break;
             }
@@ -130,6 +132,31 @@ mod tests {
             path: r"D:\Users\B\.claude\projects".into(),
         }];
         assert!(overlapping_tools(&homes, &tools).is_empty());
+    }
+
+    #[test]
+    fn home_下的非标准自定义目录不能被当成重复_否则漏采() {
+        // 复评 F03 回归：主目录引擎只扫 .claude/projects，不扫 custom/claude-logs。
+        let homes = vec![HomeRoot {
+            id: "home-1".into(),
+            path: r"D:\Users\A".into(),
+        }];
+        let custom = vec![ToolRoot {
+            id: "tool-custom".into(),
+            tool: "claude".into(),
+            path: r"D:\Users\A\custom\claude-logs".into(),
+        }];
+        assert!(
+            overlapping_tools(&homes, &custom).is_empty(),
+            "非标准位置的自定义目录必须照常采集，不能被跳过"
+        );
+        // 而标准布局下的同一目录仍应判为重复。
+        let standard = vec![ToolRoot {
+            id: "tool-standard".into(),
+            tool: "claude".into(),
+            path: r"D:\Users\A\.claude\projects".into(),
+        }];
+        assert_eq!(overlapping_tools(&homes, &standard).len(), 1);
     }
 
     #[test]

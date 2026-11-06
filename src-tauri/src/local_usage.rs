@@ -423,6 +423,12 @@ pub async fn collect_sources(
                 let canonical = crate::local_sources::probe_path(home.clone(), directory).await?;
                 // 解析后的目标要重新核对来源策略（评审条件验收：junction/symlink）。
                 // 配置里写的路径通过了校验，但真正读取的是解析后的路径。
+                // 来源种类决定解析后的允许范围：显式 WSL 入口不能被误拒（复评 F15）。
+                let origin = if matches!(kind, crate::local_sources::HomeKind::Wsl { .. }) {
+                    crate::local_sources::SourceOrigin::Wsl
+                } else {
+                    crate::local_sources::SourceOrigin::Native
+                };
                 let canonical = crate::local_sources::recheck_resolved_target(
                     &home.to_string_lossy(),
                     &canonical,
@@ -431,6 +437,7 @@ pub async fn collect_sources(
                     } else {
                         crate::local_sources::ResolvedExpect::File
                     },
+                    origin,
                 )?;
                 let key = format!(
                     "{}:{}",

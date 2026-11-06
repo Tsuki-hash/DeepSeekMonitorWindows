@@ -392,15 +392,38 @@ pub fn recheck_resolved_target(
     requested: &str,
     resolved: &Path,
     expect: ResolvedExpect,
+    origin: SourceOrigin,
 ) -> Result<PathBuf, String> {
-    let resolved_text = resolved.to_string_lossy().to_string();
-    // 解析后落到 WSL 挂载点：本地入口不允许，必须显式用 WSL 入口配置。
-    if is_wsl_path(&resolved_text) {
-        return Err("路径解析后指向 WSL 目录，请改用 WSL 入口配置".into());
-    }
-    // 解析后仍是 Windows 系统盘根目录或系统目录：不读取。
-    if is_protected_system_path(&resolved_text) {
-        return Err("路径解析后指向 Windows 系统目录，未读取".into());
+    // 统一规范化：扩展 UNC（`\\?\UNC\` 与 `\\?\`）要还原成可比较形式，
+    // 否则扩展写法能绕过下面的 WSL / 系统目录判定（复评 F15）。
+    let resolved_text = normalize_resolved(resolved);
+    let requested_text = normalize_resolved_str(requested);
+    match origin {
+        // 本地入口：解析后落到 WSL 或系统目录一律拒绝。
+        SourceOrigin::Native => {
+            if is_wsl_path(&resolved_text) {
+                return Err("路径解析后指向 WSL 目录，请改用 WSL 入口配置".into());
+            }
+            if is_protected_system_path(&resolved_text) {
+                return Err("路径解析后指向 Windows 系统目录，未读取".into());
+            }
+        }
+        // 显式 WSL 入口：解析结果**必须**仍在 WSL 内（junction 把 WSL 目录指到本地盘
+        // 同样要拦），但不因「目标是 WSL」而误拒。系统目录仍然拒绝。
+        SourceOrigin::Wsl => {
+            if !is_wsl_path(&resolved_text) {
+                // 只有配置本身也是 WSL 入口时才提示「路径不一致」，否则提示目标越界。
+                let hint = if is_wsl_path(&requested_text) {
+                    "WSL 来源解析后不在 WSL 目录，请检查路径"
+                } else {
+                    "路径解析后不在 WSL 目录，请改用本地入口配置"
+                };
+                return Err(hint.into());
+            }
+            if is_protected_system_path(&resolved_text) {
+                return Err("路径解析后指向 Windows 系统目录，未读取".into());
+            }
+        }
     }
     let metadata = std::fs::metadata(resolved).map_err(|_| "解析后的路径无法访问")?;
     let matches_kind = match expect {
@@ -414,8 +437,16 @@ pub fn recheck_resolved_target(
         }
         .into());
     }
-    let _ = requested;
     Ok(resolved.to_path_buf())
+}
+
+/// 来源入口种类：决定解析后允许落在哪类路径上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// 本地盘符入口（默认主目录、额外 home、本地单工具路径）。
+    Native,
+    /// 显式 WSL 入口（`\\wsl$` 或 `\\wsl.localhost`）。
+    Wsl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,9 +455,25 @@ pub enum ResolvedExpect {
     File,
 }
 
+/// 把扩展 UNC / 正斜杠 / 尾斜杠统一成普通反斜杠形式（小写）。
+fn normalize_resolved_str(value: &str) -> String {
+    let stripped = value.replace(r"\\?\UNC\", r"\\");
+    let stripped = match stripped.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => stripped,
+    };
+    let value = stripped.replace('/', "\\");
+    value.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn normalize_resolved(path: &Path) -> String {
+    normalize_resolved_str(&path.to_string_lossy())
+}
+
 fn is_wsl_path(value: &str) -> bool {
+    // value 已由 normalize_resolved_str 规范化（小写、去掉扩展前缀）。
     let lower = value.to_ascii_lowercase();
-    lower.starts_with("\\\\wsl$\\") || lower.starts_with("\\\\wsl.localhost\\")
+    lower.starts_with(r"\\wsl$\") || lower.starts_with(r"\\wsl.localhost\")
 }
 
 fn is_protected_system_path(value: &str) -> bool {
@@ -642,18 +689,87 @@ mod tests {
         assert!(!is_protected_system_path(r"D:\Users\A\.claude\projects"));
     }
     #[test]
+    fn 扩展unc与wsl入口按来源种类区分() {
+        // 复评 F15：扩展 UNC 写法必须与普通 UNC 同等识别，否则可绕过判定。
+        assert!(is_wsl_path(&normalize_resolved_str(
+            r"\\?\UNC\wsl$\Ubuntu\home\user"
+        )));
+        assert!(is_wsl_path(&normalize_resolved_str(
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\user"
+        )));
+        // 普通盘符经扩展前缀规范化后仍不是 WSL。
+        assert!(!is_wsl_path(&normalize_resolved_str(r"\\?\D:\Users\A")));
+
+        // 显式 WSL 入口：解析结果在 WSL 时必须允许，不能误拒。
+        let wsl_target = Path::new(r"\\wsl$\Ubuntu\home\user\.claude\projects");
+        assert!(
+            recheck_resolved_target(
+                r"\\wsl$\Ubuntu\home\user",
+                wsl_target,
+                ResolvedExpect::Directory,
+                SourceOrigin::Wsl
+            )
+            .is_err(),
+            "目标不存在时应报无法访问，而不是来源不匹配"
+        );
+        // 关键断言：来源判定本身不因「目标是 WSL」而拒绝。
+        // 用一个存在的目录模拟 WSL 入口指向本地（应因来源不一致被拒）。
+        let dir = crate::test_support::TempConfigDir::new("wsl-origin");
+        let directory = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            recheck_resolved_target(
+                r"\\wsl$\Ubuntu\home\user",
+                &directory,
+                ResolvedExpect::Directory,
+                SourceOrigin::Wsl
+            )
+            .is_err(),
+            "显式 WSL 入口解析到本地盘应被拒"
+        );
+        // 同一目录用本地来源则允许。
+        assert!(recheck_resolved_target(
+            "dir",
+            &directory,
+            ResolvedExpect::Directory,
+            SourceOrigin::Native
+        )
+        .is_ok());
+    }
+    #[test]
     fn 解析后类型不符时报错且不静默通过() {
         let dir = crate::test_support::TempConfigDir::new("resolved-target");
         let file = dir.join("db.sqlite");
         std::fs::write(&file, b"x").unwrap();
         let canonical = std::fs::canonicalize(&file).unwrap();
-        assert!(recheck_resolved_target("db.sqlite", &canonical, ResolvedExpect::File).is_ok());
-        assert!(
-            recheck_resolved_target("db.sqlite", &canonical, ResolvedExpect::Directory).is_err()
-        );
+        assert!(recheck_resolved_target(
+            "db.sqlite",
+            &canonical,
+            ResolvedExpect::File,
+            SourceOrigin::Native
+        )
+        .is_ok());
+        assert!(recheck_resolved_target(
+            "db.sqlite",
+            &canonical,
+            ResolvedExpect::Directory,
+            SourceOrigin::Native
+        )
+        .is_err());
         // 目录同理
         let directory = std::fs::canonicalize(dir.path()).unwrap();
-        assert!(recheck_resolved_target("dir", &directory, ResolvedExpect::Directory).is_ok());
-        assert!(recheck_resolved_target("dir", &directory, ResolvedExpect::File).is_err());
+        assert!(recheck_resolved_target(
+            "dir",
+            &directory,
+            ResolvedExpect::Directory,
+            SourceOrigin::Native
+        )
+        .is_ok());
+        assert!(recheck_resolved_target(
+            "dir",
+            &directory,
+            ResolvedExpect::File,
+            SourceOrigin::Native
+        )
+        .is_err());
     }
 }
