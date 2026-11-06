@@ -8,6 +8,7 @@ import { BalanceCard } from "./BalanceCard";
 import { UsageRow } from "./UsageRow";
 import { UsageChart } from "./UsageChart";
 import { SourceTrustLine } from "./SourceTrustLine";
+import { usageTrust } from "../usage-trust";
 import { updateTime } from "../data-display";
 
 function DashboardPanel({
@@ -25,6 +26,7 @@ function DashboardPanel({
   onDataStatus,
   onDetail,
   onHistory,
+  onboarding,
 }: {
   balanceUpdatedAt?: number | null;
   usageUpdatedAt?: number | null;
@@ -40,6 +42,8 @@ function DashboardPanel({
   onDataStatus?: () => void;
   onDetail: (model: ModelName) => void;
   onHistory: () => void;
+  /** 首次引导内容：放在面板内部，避免成为 stage 的第三个网格子项（复评 F04）。 */
+  onboarding?: React.ReactNode;
 }) {
   const { theme, toggleTheme } = useTheme();
   // 手动刷新路径会把状态打回 loading；静默刷新保持 ok 不转，避免托盘唤出时图标常转
@@ -64,20 +68,18 @@ function DashboardPanel({
   const currentMonth = todayStr().slice(0, 7);
   const monthLabel =
     snapshotMonth && snapshotMonth !== currentMonth ? "上期消费" : "本月消费";
-  // 来源与可信状态摘要（评审 P2）：四维信息放在数字旁边，而不是只在设置页说明。
-  const usageTrust = {
-    source: "平台用量",
-    period: `${snapshotMonth ?? currentMonth} · 北京时间`,
-    lastSuccess:
+  // 来源与可信状态摘要（复评 F08）：完整性由警告、缺失日期、缺失费用共同推导，
+  // 普通失败保留旧快照时必须标旧，不能继续宣称「完整」。
+  const trust = usageTrust({
+    usage,
+    state: usageState,
+    error: usageError,
+    updatedAt: usageUpdatedAt ?? null,
+    snapshotMonth,
+    currentMonth,
+    lastSuccessText:
       usageUpdatedAt != null ? updateTime(usageUpdatedAt, true) : null,
-    completeness: (usageState !== "ok"
-      ? "unknown"
-      : usage?.unavailableDates?.length
-        ? "partial"
-        : "complete") as "complete" | "partial" | "unknown",
-    accountVerified: false,
-    stale: usageState === "error",
-  };
+  });
 
   return (
     <section className="panel dashboard-panel" data-testid="dashboard-panel">
@@ -116,55 +118,64 @@ function DashboardPanel({
         </div>
       </header>
 
-      <BalanceCard
-        updatedAt={balanceUpdatedAt}
-        onSettings={onSettings}
-        onDataStatus={onDataStatus ?? onSettings}
-        balance={balance}
-        state={balanceState}
-        error={balanceError}
-        todayCost={todayCost}
-        monthCost={monthCost}
-        monthLabel={monthLabel}
-      />
-
-      <SourceTrustLine trust={usageTrust} />
-
-      <div className="usage-stack">
-        <UsageRow
-          modelKey="flash"
-          data={flash}
-          maxTokens={maxTokens}
-          state={usageState}
-          onClick={() => onDetail("flash")}
+      {/* 面板内部的可滚动内容区：引导与数据一起滚动，导航与网格行数保持不变。 */}
+      <div className="dashboard-scroll">
+        {onboarding}
+        <BalanceCard
+          updatedAt={balanceUpdatedAt}
+          onSettings={onSettings}
+          onDataStatus={onDataStatus ?? onSettings}
+          balance={balance}
+          state={balanceState}
+          error={balanceError}
+          todayCost={todayCost}
+          monthCost={monthCost}
+          monthLabel={monthLabel}
         />
-        <UsageRow
-          modelKey="pro"
-          data={pro}
-          maxTokens={maxTokens}
-          state={usageState}
-          onClick={() => onDetail("pro")}
-        />
-        {other && (
+
+        <SourceTrustLine trust={trust} />
+        {trust.reason && (
+          <p className="source-trust-reason" role="status">
+            {trust.reason}
+          </p>
+        )}
+
+        <div className="usage-stack">
           <UsageRow
-            modelKey="other"
-            data={other}
+            modelKey="flash"
+            data={flash}
             maxTokens={maxTokens}
             state={usageState}
-            onClick={() => onDetail("other")}
+            onClick={() => onDetail("flash")}
           />
-        )}
-      </div>
+          <UsageRow
+            modelKey="pro"
+            data={pro}
+            maxTokens={maxTokens}
+            state={usageState}
+            onClick={() => onDetail("pro")}
+          />
+          {other && (
+            <UsageRow
+              modelKey="other"
+              data={other}
+              maxTokens={maxTokens}
+              state={usageState}
+              onClick={() => onDetail("other")}
+            />
+          )}
+        </div>
 
-      <UsageChart
-        onHistory={onHistory}
-        usage={usage}
-        state={usageState}
-        error={usageError}
-        updatedAt={usageUpdatedAt}
-        onSettings={onSettings}
-        onDataStatus={onDataStatus ?? onSettings}
-      />
+        <UsageChart
+          onHistory={onHistory}
+          usage={usage}
+          state={usageState}
+          error={usageError}
+          updatedAt={usageUpdatedAt}
+          onSettings={onSettings}
+          onDataStatus={onDataStatus ?? onSettings}
+        />
+      </div>
     </section>
   );
 }
