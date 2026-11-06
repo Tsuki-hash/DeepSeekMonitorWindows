@@ -231,13 +231,18 @@ export function useSettingsState(handlers: {
 
   const saveApiKey = React.useCallback(() => {
     const operation = beginApiKeyOperation();
+    // 复评 R16：记录**本次提交的草稿值**。保存期间用户可能继续输入
+    //（旧实现只禁用按钮、不禁输入），成功回调若无条件 `setApiKey("")`
+    // 就会把刚输入的新值清掉，用户以为没输入过。
+    const submitted = apiKey;
     setBusy(true);
     setStatus("正在验证 API Key…");
     void invoke<SavedApiKey>("save_api_key", { apiKey })
       .then(({ config: nextConfig, balance }) => {
         if (!isCurrentApiKeyOperation(operation)) return;
         setCommittedConfig(nextConfig);
-        setApiKey("");
+        // 只有输入仍是本次提交值时才清空；否则保留新草稿并提示未保存。
+        setApiKey((current) => (current === submitted ? "" : current));
         onBalanceLoaded(balance);
         const symbol = currencySymbol(balance.currency);
         const tip = balance.isAvailable ? "" : "（余额不足）";
@@ -313,12 +318,14 @@ export function useSettingsState(handlers: {
   }, []);
 
   const saveUsageToken = React.useCallback(() => {
+    // 复评 R16：与 API Key 同一规则 —— 只清空**本次提交**的草稿值。
+    const submitted = usageToken;
     setBusy(true);
     setUsageStatus("正在验证候选 Token…");
     void invoke<AppConfig>("save_usage_token", { usageToken })
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
-        setUsageToken("");
+        setUsageToken((current) => (current === submitted ? "" : current));
         setUsageStatus("验证通过并已保存，正在刷新用量…");
       })
       .catch((error) => {

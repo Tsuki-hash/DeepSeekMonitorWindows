@@ -165,6 +165,37 @@ export function sumModels(models: RawModelUsage[]): RawModelUsage[] {
   return [...sums.values()];
 }
 
+/**
+ * 复评 R17：跨模型合计的安全版本，所有调用方共用。
+ *
+ * Token 计数逐步检查安全整数且非负（溢出返回 null，不产生伪值）；
+ * 金额只要求有限（允许小数，不能被整数规则误伤）。缺失任一字段即整体未知。
+ */
+export function safeKnownSum(
+  models: RawModelUsage[],
+  field: "totalTokens" | "cost",
+): number | null {
+  if (!models.length) return null;
+  if (models.some((model) => model[field] == null)) return null;
+  let sum = 0;
+  for (const model of models) {
+    const value = model[field]!;
+    if (!Number.isFinite(value)) return null;
+    sum += value;
+    if (field !== "cost" && (!Number.isSafeInteger(sum) || sum < 0))
+      return null;
+  }
+  return sum;
+}
+
+/** 复评 R11：严格 UTC 月末（`2024-02` → `2024-02-29`）。 */
+export function monthEndDate(month: string): string {
+  const [year, number] = month.split("-").map(Number);
+  // Date.UTC 的 day=0 是「上个月最后一天」，用于取真实月末。
+  const last = new Date(Date.UTC(year, number, 0));
+  return last.toISOString().slice(0, 10);
+}
+
 export function csvCell(value: unknown): string {
   let text = value == null ? "" : String(value);
   if (/^[\s\uFEFF]*[=+\-@]/u.test(text) || /^[\t\r\n]/u.test(text))
@@ -224,7 +255,9 @@ export function historyExport(
       scope: "window",
       aggregationScope: "selected-window" as const,
       // 复评 F06：窗口内该月的日期覆盖情况显式给出，缺失日期不折算成 0。
-      coveredDates: inWindow.length,
+      // 复评 R11：覆盖天数必须是**唯一日期数** —— 旧实现用行数，
+      // 一天两个模型会被算成 2 天，误导覆盖率。
+      coveredDates: new Set(inWindow.map((row) => row.date)).size,
       missingDates: snapshot.missingDates.filter((date) =>
         date.startsWith(month.month),
       ),
@@ -240,7 +273,8 @@ export function historyExport(
     scope: "full-source-month",
     aggregationScope: "full-source-month" as const,
     fullMonthFrom: `${month.month}-01`,
-    fullMonthTo: `${month.month}-31`,
+    // 复评 R11：真实月末（闰二月 29、平月 28/30），不再固定 -31。
+    fullMonthTo: monthEndDate(month.month),
     fetchedAt: new Date(month.fetchedAt).toISOString(),
     models: (month.usage.rawModels ?? []).map(cleanModel),
   }));

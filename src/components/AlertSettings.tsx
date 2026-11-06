@@ -46,12 +46,23 @@ export function AlertSettings({
   const reload = React.useCallback(
     async (reset = false) => {
       const sequence = ++control.current.readSequence;
+      // 复评 R13：读取发起时捕获**写代际** —— 若期间有保存成功（基线已被
+      // 写响应更新），这次读取就是过期的，不得覆盖基线或把表单重新标脏。
+      const writeAtStart = control.current.writeSequence;
       try {
         const value = await invoke<AlertStatus>("get_alert_status");
-        if (control.current.active && sequence === control.current.readSequence)
+        if (
+          control.current.active &&
+          sequence === control.current.readSequence &&
+          writeAtStart === control.current.writeSequence
+        )
           accept(value, reset);
       } catch (failure) {
-        if (control.current.active && sequence === control.current.readSequence)
+        if (
+          control.current.active &&
+          sequence === control.current.readSequence &&
+          writeAtStart === control.current.writeSequence
+        )
           setError(errorMessage(failure));
       }
     },
@@ -100,6 +111,9 @@ export function AlertSettings({
       return false;
     }
     setBusy(true);
+    // 复评 R13：写开始即作废在途读取（它们反映的是旧基线），
+    // 并递增写代际让任何已发起的读取结果失效。
+    control.current.readSequence++;
     const sequence = ++control.current.writeSequence;
     try {
       const value = await invoke<AlertStatus>("save_alert_options", {
@@ -160,6 +174,8 @@ export function AlertSettings({
     setError("");
     setMessage("");
     // 复评 F07：测试通知也是写操作，用写令牌保护自己的 busy。
+    // 复评 R13：写操作作废在途读取。
+    control.current.readSequence++;
     const sequence = ++control.current.writeSequence;
     try {
       await invoke("test_alert_notification");

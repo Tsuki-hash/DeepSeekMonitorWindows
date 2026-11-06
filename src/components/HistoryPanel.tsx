@@ -14,6 +14,7 @@ import {
   historyDates,
   historyExport,
   sumModels,
+  safeKnownSum,
   isUnusedHistoryModel,
 } from "../history";
 import {
@@ -22,12 +23,10 @@ import {
   failedMonthsOnly,
 } from "../history-failure";
 import type { HistoryRange, HistorySnapshot } from "../history";
-import type { RawModelUsage } from "../types";
 
-const knownSum = (models: RawModelUsage[], field: "totalTokens" | "cost") =>
-  !models.length || models.some((model) => model[field] == null)
-    ? null
-    : models.reduce((sum, model) => sum + model[field]!, 0);
+// 复评 R17：顶部/趋势合计改用共享的安全版本（Token 检查安全整数，
+// 金额只检查有限），不再用裸 reduce 产生不安全整数。
+const knownSum = safeKnownSum;
 const valueText = (value: number | null, metric: "totalTokens" | "cost") =>
   value == null
     ? "—"

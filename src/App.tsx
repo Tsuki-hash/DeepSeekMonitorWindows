@@ -341,6 +341,24 @@ function App() {
         return config;
       })
       .catch(() => {
+        // 复评 R12：**失败路径同样受读取所有权约束**。
+        // 旧实现无条件把间隔设回 60 秒、自动刷新设为 false —— 如果用户在
+        // 这次旧 GET 之后刚刚开启了自动刷新（保存成功、提交代际已推进），
+        // 迟到的读取失败会把新开启的调度直接关掉。
+        // 现在：已有更新提交时用已提交配置收敛，绝不回退调度；只有
+        // **没有**更新提交（确实是首次读取失败）才回落到默认值。
+        if (getCommitRevision() !== startedAt) {
+          const committed = getCommittedConfig();
+          if (committed) {
+            setRefreshIntervalSeconds(committed.refreshIntervalSeconds || 60);
+            setAutoRefreshEnabled(committed.autoRefreshEnabled);
+            setConfigSnapshot({
+              apiKeyConfigured: committed.apiKeyConfigured,
+              usageTokenConfigured: committed.usageTokenConfigured,
+            });
+          }
+          return null;
+        }
         setRefreshIntervalSeconds(60);
         setAutoRefreshEnabled(false);
         return null;
@@ -469,7 +487,14 @@ function App() {
           action,
           subject: leaveBlocker.current?.subject ?? "当前设置",
         });
+        return;
       }
+      // 复评 R14：**干净导航也必须结束旧的离开决策**。
+      // 旧实现只在 blocked 分支维护 runner/pending：提示期间用户把草稿改回
+      // 原值（dirty 变 false）后再点导航，页面已经换了，旧提示却还挂着，
+      // 点它的「保存并离开」还会执行那次早已过期的导航。
+      // 现在无论走哪条分支，都先作废旧决策并清掉提示，再执行新动作。
+      leaveRunner.current?.cancel();
     },
     [leaveBlocker],
   );

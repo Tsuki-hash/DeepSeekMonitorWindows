@@ -5,6 +5,8 @@ import {
   buildHistory,
   historyExport,
   sumModels,
+  safeKnownSum,
+  monthEndDate,
   csvCell,
   isUnusedHistoryModel,
 } from "./history.ts";
@@ -367,4 +369,124 @@ test("F14：后出现条目的质量警告传播到合并结果", () => {
     "later-month-warning",
     "后续条目的 warning 不能被丢弃",
   );
+});
+
+// ---------- 第八轮复评 R11：覆盖天数与真实月末 ----------
+
+test("R11：coveredDates 是唯一日期数，不是行数", () => {
+  const now = Date.parse("2026-11-04T08:00:00Z");
+  const model = (tokens: number) => ({
+    model: "deepseek-flash",
+    groupKey: "flash",
+    totalTokens: tokens,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: tokens,
+    otherTokens: 0,
+    cost: 0,
+  });
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-10-02"),
+    [
+      {
+        month: "2026-10",
+        fetchedAt: now,
+        usage: {
+          schemaVersion: 2,
+          models: [],
+          rawModels: [model(100)],
+          monthCost: 0,
+          // 同一天两个模型 → 行数 2，但唯一日期只有 1。
+          days: [
+            {
+              date: "2026-10-01",
+              rawModels: [model(50), { ...model(50), model: "deepseek-pro" }],
+            },
+          ],
+        } as unknown as UsageResult,
+      },
+    ],
+    [],
+  );
+  const json = JSON.parse(historyExport(snapshot, now).json);
+  assert.equal(json.monthly[0].coveredDates, 1, "一天两个模型只能算 1 天覆盖");
+});
+
+test("R11：整月截止日使用真实月末（闰二月/短月）", () => {
+  assert.equal(monthEndDate("2024-02"), "2024-02-29", "闰年二月 29");
+  assert.equal(monthEndDate("2023-02"), "2023-02-28", "平年二月 28");
+  assert.equal(monthEndDate("2026-04"), "2026-04-30", "四月 30");
+  assert.equal(monthEndDate("2026-06"), "2026-06-30", "六月 30");
+  assert.equal(monthEndDate("2026-09"), "2026-09-30", "九月 30");
+  assert.equal(monthEndDate("2026-11"), "2026-11-30", "十一月 30");
+  assert.equal(monthEndDate("2026-01"), "2026-01-31", "一月 31");
+  assert.equal(monthEndDate("2026-12"), "2026-12-31", "十二月 31");
+});
+
+test("R11：导出里的 fullMonthTo 不再出现 -31 的短月", () => {
+  const now = Date.parse("2026-11-04T08:00:00Z");
+  const snapshot = buildHistory(
+    historyWindow("30days", "2026-11-04"),
+    [
+      {
+        month: "2026-11",
+        fetchedAt: now,
+        usage: {
+          schemaVersion: 2,
+          models: [],
+          rawModels: [],
+          monthCost: 0,
+          days: [],
+        } as unknown as UsageResult,
+      },
+    ],
+    [],
+  );
+  const json = JSON.parse(historyExport(snapshot, now).json);
+  assert.equal(
+    json.sourceMonthlySnapshots[0].fullMonthTo,
+    "2026-11-30",
+    "十一月不能是 2026-11-31",
+  );
+});
+
+// ---------- 第八轮复评 R17：跨模型合计的安全版本 ----------
+
+test("R17：跨模型 Token 合计溢出返回 null，金额保留小数", () => {
+  const model = (tokens: number, cost: number) => ({
+    model: "deepseek-flash",
+    groupKey: "flash",
+    totalTokens: tokens,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: tokens,
+    otherTokens: 0,
+    cost,
+  });
+  // MAX_SAFE_INTEGER + 2 → 溢出，必须 null。
+  assert.equal(
+    safeKnownSum(
+      [model(Number.MAX_SAFE_INTEGER, 0), model(2, 0)],
+      "totalTokens",
+    ),
+    null,
+    "跨模型合计超过安全整数必须为未知",
+  );
+  // 正常范围相加。
+  assert.equal(safeKnownSum([model(100, 0), model(20, 0)], "totalTokens"), 120);
+  // 金额允许小数（不能被整数规则误伤）。
+  const cost = safeKnownSum([model(10, 0.1), model(10, 0.2)], "cost");
+  assert.ok(cost != null && Math.abs(cost - 0.3) < 1e-9, "费用 0.1+0.2=0.3");
+  // 缺失字段即整体未知。
+  assert.equal(
+    safeKnownSum(
+      [{ ...model(10, 0), totalTokens: null }, model(10, 0)],
+      "totalTokens",
+    ),
+    null,
+  );
+  // 空数组未知。
+  assert.equal(safeKnownSum([], "totalTokens"), null);
 });
