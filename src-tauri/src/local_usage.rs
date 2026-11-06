@@ -386,10 +386,18 @@ pub async fn collect_sources(
         None
     };
     let mut rows = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
+    // 复评 T04：记录「哪个来源已占用该物理路径」，提示能说清是谁覆盖了谁。
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let duplicate_source: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // 复评 T13：主目录内发现引擎 settings.json 时的提示（来源健康信息可见）。
+    let engine_settings_notice: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, &'static str>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let mut succeeded = 0;
     let mut zcode_adapter_used = false;
-    for (id, label, home, kind, is_default) in candidates {
+    for (id, label, home, kind, _is_default) in candidates {
         let mut state = "ok";
         let mut message = None;
         let gate = source_gate(&kind, &wsl);
@@ -439,31 +447,47 @@ pub async fn collect_sources(
                     },
                     origin,
                 )?;
-                let key = format!(
-                    "{}:{}",
-                    tool_path.map(|entry| entry.tool.as_str()).unwrap_or("home"),
-                    home_key(&canonical.to_string_lossy())
-                );
-                if seen.contains(&key) {
+                // 复评 T04：判重键只含 canonical 来源身份，**不带** home/tool 类型前缀。
+                // 带前缀时「默认主目录」与「指向同一目录的单工具路径」会拿到不同键，
+                // 同一批日志被当两个来源合并 → 重复计数。
+                let key = home_key(&canonical.to_string_lossy());
+                if let Some(covering) = seen.get(&key) {
+                    // 复评 T04：把「被谁覆盖」带出去，提示不再是含糊的「相同主目录」。
+                    duplicate_source
+                        .lock()
+                        .map_err(|_| "采集状态不可用")?
+                        .insert(id.clone(), covering.clone());
                     return Ok(None);
                 }
                 let snapshot = if let Some(entry) = tool_path {
                     // 复评 R03：传校验通过的解析目标，而不是配置里的原路径。
                     run_tool_source(path, entry, &canonical, &profile.join(&id)).await?
                 } else {
-                    run_engine_profile(
-                        path,
-                        if is_default {
-                            None
-                        } else {
-                            // 主目录来源同样读取解析后的目标。
-                            Some(&canonical)
-                        },
-                        &profile.join(&id),
-                    )
-                    .await?
+                    // 复评 T13：默认来源也必须传 `--home`。不带 `--home` 时引擎会
+                    // 启用环境来源（实测 TOKSCALE_EXTRA_DIRS / 内建默认根都会进入
+                    // 扫描），其边界不受本应用校验约束；传了 `--home` 之后环境
+                    // 扩展来源被禁用（已实测），扫描根就是校验过的主目录本身。
+                    run_engine_profile(path, Some(&canonical), &profile.join(&id)).await?
                 };
-                seen.insert(key);
+                seen.insert(key, label.clone());
+                // 复评 T13：引擎从 `--home` 目录读取 scanner settings.json，
+                // 其 extraScanPaths 可以扩大实际扫描根（已实测）。这里把它
+                // 暴露出来，让用户知道该来源的边界可能超出所选目录。
+                if tool_path.is_none() {
+                    let engine_settings = canonical
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("tokscale")
+                        .join("settings.json");
+                    if engine_settings.is_file() {
+                        if let Ok(mut map) = engine_settings_notice.lock() {
+                            map.insert(
+                                id.clone(),
+                                "该主目录包含采集引擎的 settings.json，引擎可能按其扩展扫描范围",
+                            );
+                        }
+                    }
+                }
                 Ok::<_, String>(Some(scope_snapshot(snapshot, &id, &label)))
             })
             .await;
@@ -471,6 +495,14 @@ pub async fn collect_sources(
                 Ok(Ok(Some(snapshot))) => {
                     zcode_adapter_used |=
                         snapshot.engine_version == crate::zcode_usage::ADAPTER_VERSION;
+                    if let Ok(map) = engine_settings_notice.lock() {
+                        if let Some(notice) = map.get(&id) {
+                            message = Some(match message.take() {
+                                Some(existing) => format!("{existing}；{notice}"),
+                                None => (*notice).to_string(),
+                            });
+                        }
+                    }
                     if rows.len() + snapshot.rows.len() > 50000 {
                         return Err("合并记录过多，请缩小采集目录范围".into());
                     }
@@ -479,7 +511,13 @@ pub async fn collect_sources(
                 }
                 Ok(Ok(None)) => {
                     state = "duplicate";
-                    message = Some("已由相同主目录覆盖，未重复采集".into());
+                    // 复评 T04：说明是哪个来源覆盖了它，用户才能判断该删哪个配置。
+                    let covering = duplicate_source
+                        .lock()
+                        .map(|map| map.get(&id).cloned())
+                        .unwrap_or_else(|_| Some("相同来源".into()))
+                        .unwrap_or_else(|| "相同来源".into());
+                    message = Some(format!("已由来源「{covering}」覆盖，未重复采集"));
                 }
                 Ok(Err(error)) => {
                     state = "unavailable";
@@ -628,9 +666,13 @@ async fn run_engine_profile(
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
         .env("TOKSCALE_CONFIG_DIR", profile)
         .env("DO_NOT_TRACK", "1")
+        // 复评 T13：显式移除引擎的环境扩展来源开关。即使未来引擎在 --home
+        // 模式下重新读取它，也不允许继承自启动环境扩大扫描根。
+        .env_remove("TOKSCALE_EXTRA_DIRS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // 复评 T13：引擎对越界来源只写 stderr 警告；丢弃它会让边界扩展不可见。
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console window on polling.
@@ -640,20 +682,31 @@ async fn run_engine_profile(
     let mut child = command.spawn().map_err(|_| "无法启动本地采集引擎")?;
     let mut data = Vec::new();
     let result = tokio::time::timeout(Duration::from_secs(30), async {
-        child
-            .stdout
-            .take()
-            .ok_or("采集输出不可用")?
-            .take(MAX_OUTPUT + 1)
-            .read_to_end(&mut data)
-            .await
-            .map_err(|_| "无法读取采集结果")?;
+        let stdout = child.stdout.take().ok_or("采集输出不可用")?;
+        let stderr = child.stderr.take().ok_or("采集输出不可用")?;
+        // stdout 沿用原有上限语义：读 MAX_OUTPUT+1 字节，超出即拒绝。
+        let mut bounded_stdout = stdout.take(MAX_OUTPUT + 1);
+        // 复评 T13：stderr 有界读取（16 KiB 前缀），引擎对越界来源只写
+        // stderr 警告；丢弃它会让边界扩展不可见。
+        let mut bounded_stderr = stderr.take(16 * 1024);
+        let mut stderr_data = Vec::new();
+        let (stdout_result, stderr_result) = tokio::join!(
+            bounded_stdout.read_to_end(&mut data),
+            bounded_stderr.read_to_end(&mut stderr_data)
+        );
+        stdout_result.map_err(|_| "无法读取采集结果")?;
+        stderr_result.map_err(|_| "无法读取采集结果")?;
         if data.len() as u64 > MAX_OUTPUT {
             return Err("采集结果超过安全大小限制");
         }
+        let warnings = String::from_utf8_lossy(&stderr_data).to_string();
         let status = child.wait().await.map_err(|_| "采集进程状态不可用")?;
         if !status.success() {
             return Err("本地记录读取失败，请稍后重试");
+        }
+        // 警告在进程结束后统一落日志（不含正文，可能含路径）。
+        for line in warnings.lines().filter(|line| !line.trim().is_empty()) {
+            log::warn!("采集引擎提示：{line}");
         }
         Ok(())
     })

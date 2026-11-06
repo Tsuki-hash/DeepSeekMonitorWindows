@@ -23,16 +23,43 @@ pub fn standard_layout(tool: &str) -> Option<&'static str> {
     }
 }
 
-/// 统一成小写、反斜杠、去尾斜杠，便于比较前缀。
+/// 来源身份归一化（复评 T04）。
+///
+/// 原实现把**整条路径**转小写，有两个后果：
+/// 1. WSL 的 Linux 部分被强制小写 —— `home/Alice` 与 `home/alice` 是两个不同目录
+///    （WSL 大小写敏感），却被当成同一来源，被判 duplicate 跳过 → **漏采**；
+/// 2. `\\wsl$` 与 `\\wsl.localhost` 没有统一 —— 同一物理来源经两个别名配置
+///    会被当成两个来源 → **重复计数**。
+///
+/// 现在的规则：UNC 前缀还原、正斜杠统一、去尾斜杠；
+/// WSL 服务器别名统一为 `wsl.localhost`，发行版名小写（Windows 侧大小写不敏感），
+/// **Linux 尾段保留原样**；非 WSL 路径整体小写（Windows 文件系统大小写不敏感）。
 fn normalize(path: &str) -> String {
+    const WSL_DOLLAR: &str = r"\\wsl$\";
+    const WSL_LOCALHOST: &str = r"\\wsl.localhost\";
     let value = path
-        .replace("\\\\?\\UNC\\", "\\\\")
-        .trim_start_matches("\\\\?\\")
+        .replace(r"\\?\UNC\", r"\\")
+        .trim_start_matches(r"\\?\")
         .replace('/', "\\");
-    let trimmed = value.trim_end_matches('\\').to_lowercase();
-    // 保留 `\\wsl$\...` 与 `\\wsl.localhost\...` 两种写法都可比对：
-    // 这里不做等价改写，交给调用方用 `home_key` 统一。
-    trimmed
+    let trimmed = value.trim_end_matches('\\');
+    let lower = trimmed.to_lowercase();
+    let server_skip = if lower.starts_with(WSL_LOCALHOST) {
+        Some(WSL_LOCALHOST.len())
+    } else if lower.starts_with(WSL_DOLLAR) {
+        Some(WSL_DOLLAR.len())
+    } else {
+        None
+    };
+    if let Some(skip) = server_skip {
+        // 前缀是纯 ASCII，按字节切分与按字符切分等价。
+        let rest = &trimmed[skip..];
+        let (distro, tail) = match rest.find('\\') {
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, ""),
+        };
+        return format!("{WSL_LOCALHOST}{}{tail}", distro.to_lowercase());
+    }
+    lower
 }
 
 /// `candidate` 是否落在 `root` 之内（按路径分量比较，不做子串匹配）。
@@ -132,6 +159,64 @@ mod tests {
             path: r"D:\Users\B\.claude\projects".into(),
         }];
         assert!(overlapping_tools(&homes, &tools).is_empty());
+    }
+
+    #[test]
+    fn wsl别名统一但linux大小写保留() {
+        // 复评 T04：`\\wsl$` 与 `\\wsl.localhost` 是同一服务器的两个别名，
+        // 必须归一化成同一身份，否则同一来源会被当成两个 → 重复计数。
+        assert_eq!(
+            normalize(r"\\wsl$\Ubuntu\home\user\.claude\projects"),
+            normalize(r"\\wsl.localhost\Ubuntu\home\user\.claude\projects")
+        );
+        // WSL 文件系统大小写敏感：home/Alice 与 home/alice 是**两个不同目录**，
+        // 不得因整路径小写而被当成同一来源 → 否则被判 duplicate 跳过、漏采。
+        assert_ne!(
+            normalize(r"\\wsl.localhost\Ubuntu\home\Alice\.claude\projects"),
+            normalize(r"\\wsl.localhost\Ubuntu\home\alice\.claude\projects")
+        );
+        // 发行版名大小写不敏感（Windows 侧）。
+        assert_eq!(
+            normalize(r"\\wsl.localhost\Ubuntu\home\user"),
+            normalize(r"\\wsl.localhost\ubuntu\home\user")
+        );
+        // 非 WSL 路径保持 Windows 大小写不敏感。
+        assert_eq!(
+            normalize(r"D:\Users\A\.claude\projects"),
+            normalize(r"d:\users\a\.claude\projects")
+        );
+        // 扩展 UNC 前缀还原后同样参与别名统一。
+        assert_eq!(
+            normalize(r"\\?\UNC\wsl$\Ubuntu\home\user"),
+            normalize(r"\\wsl.localhost\Ubuntu\home\user")
+        );
+    }
+
+    #[test]
+    fn wsl大小写不同的两个目录不互相覆盖() {
+        // 复评 T04 回归（误去重 → 漏采）：两个真实不同的 WSL 目录
+        // 不能因为整路径小写而被判 duplicate。
+        let homes = vec![HomeRoot {
+            id: "home-1".into(),
+            path: r"\\wsl.localhost\Ubuntu\home\Alice".into(),
+        }];
+        let tools = vec![ToolRoot {
+            id: "tool-alice".into(),
+            tool: "claude".into(),
+            path: r"\\wsl.localhost\Ubuntu\home\Alice\.claude\projects".into(),
+        }];
+        // Alice 的标准布局应被 home 覆盖（正常判重）。
+        assert_eq!(overlapping_tools(&homes, &tools).len(), 1);
+        let other = vec![ToolRoot {
+            id: "tool-lower".into(),
+            tool: "claude".into(),
+            path: r"\\wsl.localhost\Ubuntu\home\alice\.claude\projects".into(),
+        }];
+        // alice（小写）是另一个目录：不得被 Alice 的 home 覆盖。
+        assert!(
+            overlapping_tools(&homes, &other).is_empty(),
+            "不同大小写的 WSL 目录必须照常采集"
+        );
     }
 
     #[test]

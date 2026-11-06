@@ -168,6 +168,11 @@ export function HistoryPanel({
               merged.unloaded,
             ),
           );
+          // 复评 T03：快照、作用域身份与失败集合必须**同一次提交**。
+          // 原实现只在整批结束或分类错误终止时记录 scope，首次批次中途停止
+          // （停止查询/新请求使 sequence 失效）后 scope 仍为 null，
+          // 继续加载时同身份月份被合并器的防线拒绝继承，用户已看到的月份静默消失。
+          previousScopeRef.current = requestedScope;
         }
         setFailed(merged.failedMonths);
         failedRef.current = merged.failedMonths;
@@ -219,7 +224,6 @@ export function HistoryPanel({
             setProgress({ done: attempted.length, total: targets.length });
             setError(outcome.text);
             commit(outcome.recovery);
-            previousScopeRef.current = requestedScope;
             setBusy(false);
             return;
           }
@@ -229,7 +233,6 @@ export function HistoryPanel({
         commit();
       }
       commit();
-      previousScopeRef.current = requestedScope;
       setBusy(false);
     },
     [range, date, selectedMonth, usageTokenConfigured],
