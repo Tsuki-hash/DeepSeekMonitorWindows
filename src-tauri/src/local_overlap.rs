@@ -75,6 +75,28 @@ pub fn is_within(root: &str, candidate: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
+/// 复评 Q05：判断两个 `home_key` 归一化键是否存在包含关系。
+///
+/// `home_key` 对 WSL 输出 `wsl:{distro}:{tail 正斜杠}`，对普通路径输出
+/// 小写反斜杠形式，所以包含检查要按各自分隔符做**分量级**前缀匹配，
+/// 不能用子串（`D:\Users\AB` 不得命中 `D:\Users\A`）。
+pub fn key_within(root_key: &str, candidate_key: &str) -> bool {
+    if root_key.is_empty() || candidate_key.is_empty() {
+        return false;
+    }
+    if root_key == candidate_key {
+        return true;
+    }
+    let separator = if root_key.starts_with("wsl:") {
+        '/'
+    } else {
+        '\\'
+    };
+    candidate_key
+        .strip_prefix(root_key)
+        .is_some_and(|rest| rest.starts_with(separator))
+}
+
 /// 主目录来源的描述：用于判断单工具路径是否已被它覆盖。
 #[derive(Debug, Clone)]
 pub struct HomeRoot {
@@ -272,4 +294,37 @@ mod tests {
         }];
         assert!(overlapping_tools(&homes, &tools).is_empty());
     }
+}
+#[test]
+fn 归一化键的分量级包含检查() {
+    use crate::local_sources::home_key;
+    // 复评 Q05：junction 把工具标准目录映射到别处后，只有 canonical 布局根
+    // 才能证明同源；键比较必须分量级，不能用子串。
+    assert!(key_within(
+        &home_key(r"D:\Users\A"),
+        &home_key(r"D:\Users\A\.claude\projects")
+    ));
+    assert!(key_within(
+        &home_key(r"D:\Users\A"),
+        &home_key(r"D:\Users\A")
+    ));
+    // 同前缀不同目录不得命中。
+    assert!(!key_within(
+        &home_key(r"D:\Users\A"),
+        &home_key(r"D:\Users\AB\.claude\projects")
+    ));
+    // WSL 键用正斜杠 tail，同样分量级。
+    assert!(key_within(
+        &home_key(r"\wsl.localhost\Ubuntu\home\user"),
+        &home_key(r"\wsl.localhost\Ubuntu\home\user\.claude\projects")
+    ));
+    assert!(!key_within(
+        &home_key(r"\wsl.localhost\Ubuntu\home\user"),
+        &home_key(r"\wsl.localhost\Ubuntu\home\userx\.claude\projects")
+    ));
+    // 交叉分隔符不得命中。
+    assert!(!key_within(
+        &home_key(r"D:\Users\A"),
+        &home_key(r"\wsl.localhost\Ubuntu\home\user")
+    ));
 }

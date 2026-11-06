@@ -387,7 +387,20 @@ pub async fn collect_sources(
     };
     let mut rows = Vec::new();
     // 复评 T04：记录「哪个来源已占用该物理路径」，提示能说清是谁覆盖了谁。
+    // 复评 Q05：键按**解析器作用域**划分 —— home 解析器覆盖全部工具，
+    // 单工具路径用自己的解析器；两个不同工具指向同一目录不代表语义相同，
+    // 不得互相去重。
     let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    // 复评 Q05：home 来源成功后登记它的**标准布局覆盖根**（canonical）。
+    // junction 把工具标准目录映射到别处时，原始字符串判重不命中，
+    // canonical 后与 home 根也不相等 —— 只有把 home 展开成每个工具的
+    // 标准布局根，才能证明「这个工具来源已被 home 覆盖」。
+    let layout_roots: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // 复评 Q05：home 根本身也是覆盖根（工具路径指向 home 根时同样重复）。
+    let home_roots_canonical: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let duplicate_source: std::sync::Arc<
         std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -447,10 +460,18 @@ pub async fn collect_sources(
                     },
                     origin,
                 )?;
-                // 复评 T04：判重键只含 canonical 来源身份，**不带** home/tool 类型前缀。
-                // 带前缀时「默认主目录」与「指向同一目录的单工具路径」会拿到不同键，
-                // 同一批日志被当两个来源合并 → 重复计数。
-                let key = home_key(&canonical.to_string_lossy());
+                // 复评 T04/Q05：判重键按解析器作用域划分。
+                // - home 来源：`home:{canonical}`（该解析器覆盖全部工具）；
+                // - 单工具来源：`tool:{tool}:{canonical}`（同工具同路径才互斥，
+                //   两个不同工具指向同一目录不代表语义相同，不得误跳过）。
+                let key = match &tool_path {
+                    Some(entry) => format!(
+                        "tool:{}:{}",
+                        entry.tool,
+                        home_key(&canonical.to_string_lossy())
+                    ),
+                    None => format!("home:{}", home_key(&canonical.to_string_lossy())),
+                };
                 if let Some(covering) = seen.get(&key) {
                     // 复评 T04：把「被谁覆盖」带出去，提示不再是含糊的「相同主目录」。
                     duplicate_source
@@ -458,6 +479,39 @@ pub async fn collect_sources(
                         .map_err(|_| "采集状态不可用")?
                         .insert(id.clone(), covering.clone());
                     return Ok(None);
+                }
+                // 复评 Q05：工具来源被某个 home 的标准布局（canonical）覆盖时判重。
+                // junction 别名使原始字符串不命中、canonical 又与 home 根不等，
+                // 只有用 home 展开后的布局根才能证明同源。
+                if tool_path.is_some() {
+                    let candidate_key = home_key(&canonical.to_string_lossy());
+                    let roots = layout_roots.lock().map_err(|_| "采集状态不可用")?;
+                    let hit = roots
+                        .iter()
+                        .find(|(root, _)| crate::local_overlap::key_within(root, &candidate_key))
+                        .map(|(_, label)| label.clone());
+                    drop(roots);
+                    if let Some(covering) = hit {
+                        duplicate_source
+                            .lock()
+                            .map_err(|_| "采集状态不可用")?
+                            .insert(id.clone(), covering);
+                        return Ok(None);
+                    }
+                    // 工具路径直接指向某个 home 根（或其上层）时同样重复。
+                    let homes = home_roots_canonical.lock().map_err(|_| "采集状态不可用")?;
+                    let hit = homes
+                        .iter()
+                        .find(|(root, _)| crate::local_overlap::key_within(root, &candidate_key))
+                        .map(|(_, label)| label.clone());
+                    drop(homes);
+                    if let Some(covering) = hit {
+                        duplicate_source
+                            .lock()
+                            .map_err(|_| "采集状态不可用")?
+                            .insert(id.clone(), covering);
+                        return Ok(None);
+                    }
                 }
                 let snapshot = if let Some(entry) = tool_path {
                     // 复评 R03：传校验通过的解析目标，而不是配置里的原路径。
@@ -470,6 +524,22 @@ pub async fn collect_sources(
                     run_engine_profile(path, Some(&canonical), &profile.join(&id)).await?
                 };
                 seen.insert(key, label.clone());
+                // 复评 Q05：home 来源成功后登记它的覆盖根，供后续工具来源判重。
+                if tool_path.is_none() {
+                    let home_key_value = home_key(&canonical.to_string_lossy());
+                    if let Ok(mut roots) = home_roots_canonical.lock() {
+                        roots.insert(home_key_value.clone(), label.clone());
+                    }
+                    if let Ok(mut roots) = layout_roots.lock() {
+                        for tool in ["opencode", "claude", "zcode", "hermes", "openclaw", "dsh"] {
+                            let Some(layout) = crate::local_overlap::standard_layout(tool) else {
+                                continue;
+                            };
+                            let layout_path = canonical.join(layout.replace('/', "\\"));
+                            roots.insert(home_key(&layout_path.to_string_lossy()), label.clone());
+                        }
+                    }
+                }
                 // 复评 T13：引擎从 `--home` 目录读取 scanner settings.json，
                 // 其 extraScanPaths 可以扩大实际扫描根（已实测）。这里把它
                 // 暴露出来，让用户知道该来源的边界可能超出所选目录。
@@ -646,6 +716,39 @@ async fn run_tool_source(
     }
     Ok(snapshot)
 }
+/// 复评 Q01：把 stderr **完整排空**到子进程退出，避免管道背压阻塞引擎。
+///
+/// 只保留前 `STDERR_CAPTURE_BYTES` 字节作为日志摘要，超出部分丢弃并在
+/// 返回值里标注截断。旧实现读满 16 KiB 就停止消费：引擎诊断超过这个量时
+/// 会写满管道缓冲并阻塞在 stderr 上，父进程却只等 stdout EOF，
+/// 最终被迫吃完整超时。
+const STDERR_CAPTURE_BYTES: usize = 16 * 1024;
+async fn drain_stderr(stderr: impl tokio::io::AsyncRead + Unpin) -> (String, bool) {
+    use tokio::io::AsyncReadExt;
+    let mut all = Vec::new();
+    // 读整个流（有上限防御：诊断洪流也不允许无限占用内存）。
+    let mut bounded = stderr.take(4 * 1024 * 1024);
+    if bounded.read_to_end(&mut all).await.is_err() {
+        return ("采集引擎诊断读取失败".to_string(), false);
+    }
+    if all.len() >= 4 * 1024 * 1024 {
+        return (
+            "采集引擎诊断超过 4MiB，已丢弃；请检查引擎输出是否异常".to_string(),
+            true,
+        );
+    }
+    let text = String::from_utf8_lossy(&all).to_string();
+    if text.len() <= STDERR_CAPTURE_BYTES {
+        return (text, false);
+    }
+    // 按行边界截断，避免把一行警告切成两半。
+    let mut cut = STDERR_CAPTURE_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (format!("{}\n…（后续诊断已截断）", &text[..cut]), true)
+}
+
 async fn run_engine_profile(
     path: &Path,
     home: Option<&Path>,
@@ -684,29 +787,40 @@ async fn run_engine_profile(
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let stdout = child.stdout.take().ok_or("采集输出不可用")?;
         let stderr = child.stderr.take().ok_or("采集输出不可用")?;
+        // 复评 Q01：两个流都必须**持续排空到子进程退出**。旧实现把 stderr
+        // 截断在 16 KiB —— 引擎诊断一旦超过这个量且继续写满管道缓冲，
+        // 引擎写 stderr 会阻塞，而父进程只等 stdout EOF，join 永远等不到
+        // 另一半完成，最终只能吃 30 秒超时。现在并发排空整个流，
+        // stderr 只保留前 16 KiB 摘要并标注截断。
         // stdout 沿用原有上限语义：读 MAX_OUTPUT+1 字节，超出即拒绝。
         let mut bounded_stdout = stdout.take(MAX_OUTPUT + 1);
-        // 复评 T13：stderr 有界读取（16 KiB 前缀），引擎对越界来源只写
-        // stderr 警告；丢弃它会让边界扩展不可见。
-        let mut bounded_stderr = stderr.take(16 * 1024);
-        let mut stderr_data = Vec::new();
-        let (stdout_result, stderr_result) = tokio::join!(
-            bounded_stdout.read_to_end(&mut data),
-            bounded_stderr.read_to_end(&mut stderr_data)
-        );
+        let mut stdout_data = Vec::new();
+        let stderr_task = tokio::spawn(drain_stderr(stderr));
+        let stdout_result = bounded_stdout.read_to_end(&mut stdout_data).await;
         stdout_result.map_err(|_| "无法读取采集结果")?;
-        stderr_result.map_err(|_| "无法读取采集结果")?;
+        // 复评 Q01 回归防护：读到的数据必须交回外层 `data` 供解析。
+        // 漏掉这一步会让解析拿到空 Vec，报「采集结果格式不兼容」。
+        data = stdout_data;
         if data.len() as u64 > MAX_OUTPUT {
+            // stdout 超限也及时终止子进程，避免继续等它的其他流。
+            let _ = child.kill().await;
+            let _ = stderr_task.await;
             return Err("采集结果超过安全大小限制");
         }
-        let warnings = String::from_utf8_lossy(&stderr_data).to_string();
+        let (warnings, truncated) = match stderr_task.await {
+            Ok(outcome) => outcome,
+            Err(_) => ("采集引擎诊断读取失败".to_string(), false),
+        };
         let status = child.wait().await.map_err(|_| "采集进程状态不可用")?;
         if !status.success() {
             return Err("本地记录读取失败，请稍后重试");
         }
         // 警告在进程结束后统一落日志（不含正文，可能含路径）。
         for line in warnings.lines().filter(|line| !line.trim().is_empty()) {
-            log::warn!("采集引擎提示：{line}");
+            log::warn!(
+                "采集引擎提示{truncated_note}:{line}",
+                truncated_note = if truncated { "（已截断）" } else { "" }
+            );
         }
         Ok(())
     })
