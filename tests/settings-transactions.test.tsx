@@ -4,11 +4,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { App } from "../src/App";
 import { useSettingsState } from "../src/settings-state";
-import { setCommittedConfig } from "../src/config-store";
+import {
+  getCommittedConfig,
+  getValidatedBalance,
+  setCommittedConfig,
+} from "../src/config-store";
 import { DashboardPanel } from "../src/components/DashboardPanel";
 import { HistoryPanel } from "../src/components/HistoryPanel";
 import { ModelDetailPanel } from "../src/components/ModelDetailPanel";
+import { historyCache } from "../src/history-cache";
 import { useLeaveGuard } from "../src/leave-guard";
+import { LocalSourceSettings } from "../src/components/LocalSourceSettings";
+import { LocalBackgroundSettings } from "../src/components/LocalBackgroundSettings";
+import { LocalArchiveCapture } from "../src/components/LocalArchiveCapture";
+import { LocalUsagePanel } from "../src/components/LocalUsagePanel";
 
 // Synthetic values only. No credentials are written to storage, fixtures, or logs.
 // The renderer honors the StrictMode wrapper but does not replay StrictEffects.
@@ -56,7 +65,11 @@ g.HTMLElement = class {};
 g.__settingsListeners = new Map();
 let calls = [];
 let handlers = {};
+let fixtureRevision = 0;
 const baseConfig = (over = {}) => ({
+  configRevision: ++fixtureRevision,
+  apiKeyRevision: fixtureRevision,
+  usageTokenRevision: fixtureRevision,
   apiKeyConfigured: true,
   apiKeyPreview: "sk-…test",
   usageTokenConfigured: true,
@@ -99,15 +112,40 @@ g.__settingsIpc = async (command, args) => {
     case "get_app_config":
       return { ...config };
     case "save_api_key":
-      return { config: baseConfig(), balance };
+      config = baseConfig();
+      return { config, balance };
     case "save_usage_token":
-      return baseConfig();
+      config = baseConfig();
+      return config;
     case "fetch_balance":
       return balance;
     case "fetch_usage":
       return { models: [], rawModels: [], days: [], monthCost: 0 };
     case "get_local_usage":
       return { enabled: false, snapshot: null, busy: false, lastError: null };
+    case "get_local_sources":
+      return { includeDefault: true, homes: [] };
+    case "get_local_background":
+      return {
+        enabled: false,
+        effective: false,
+        state: "disabled",
+        watchedRoots: 0,
+        lastAttempt: null,
+        lastSuccess: null,
+        error: null,
+        watchWarning: null,
+      };
+    case "get_local_retention_enabled":
+      return false;
+    case "get_local_retention_capacity":
+      return {
+        entries: 0,
+        maxEntries: 128,
+        bytes: 0,
+        maxBytes: 8388608,
+        remainingEntries: 128,
+      };
     case "is_main_window_visible":
       return true;
     case "begin_tray_balance_session":
@@ -123,17 +161,9 @@ g.__settingsIpc = async (command, args) => {
       return null;
   }
 };
-const hookHandlers = {
-  onBalanceLoaded: noop,
-  onBalanceCleared: noop,
-  onUsageLoaded: noop,
-  onUsageCleared: noop,
-  onRefreshIntervalChanged: noop,
-  onAutoRefreshChanged: noop,
-};
 let state;
 function Probe() {
-  state = useSettingsState(hookHandlers);
+  state = useSettingsState();
   return null;
 }
 let renderer;
@@ -700,5 +730,722 @@ scenario(
     });
     assert.equal(panel("dashboard"), 1);
     assert.equal(submitted("save_alert_options").length, 1);
+  },
+);
+
+const startKeySave = async () => {
+  await act(async () => {
+    button("验证并保存").props.onClick();
+  });
+  await flush();
+};
+const dashboard = () => renderer.root.findByType(DashboardPanel).props;
+const nextCredentialConfig = (kind, configured) => {
+  const previous = getCommittedConfig() ?? config;
+  const next = { ...previous, configRevision: ++fixtureRevision };
+  next[`${kind}Revision`] = next.configRevision;
+  next[`${kind}Configured`] = configured;
+  if (kind === "apiKey" && !configured) next.apiKeyPreview = null;
+  return next;
+};
+
+scenario(
+  "N05: ordinary Key clear converges after settings unmount, including tray",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.clear_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await click(button("清除 Key"));
+    await click(input("返回主面板"));
+    assert.equal(panel("dashboard"), 1);
+    const cleared = nextCredentialConfig("apiKey", false);
+    config = cleared;
+    await finish(pending, cleared);
+    assert.equal(getCommittedConfig().apiKeyConfigured, false);
+    assert.equal(dashboard().balance, null);
+    assert.equal(dashboard().balanceState, "nokey");
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+    const callsBeforeDuplicate = submitted("fetch_balance").length;
+    await emit("credential-config-changed", cleared);
+    assert.equal(submitted("fetch_balance").length, callsBeforeDuplicate);
+    assert.equal(dashboard().balance, null);
+  },
+);
+
+scenario(
+  "N05: ordinary Token clear after unmount invalidates history and late usage",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.clear_usage_token = () => pending.promise;
+    await mount(<App />, concurrent);
+    const oldFetch = deferred();
+    handlers.fetch_usage = () => oldFetch.promise;
+    await act(async () => {
+      dashboard().onRefresh();
+    });
+    await flush();
+    await click(input("设置"));
+    const epoch = historyCache.epoch();
+    await click(button("清除 Token"));
+    await click(input("返回主面板"));
+    const cleared = nextCredentialConfig("usageToken", false);
+    config = cleared;
+    await finish(pending, cleared);
+    assert.ok(historyCache.epoch() > epoch);
+    assert.equal(dashboard().usage, null);
+    assert.equal(dashboard().usageState, "nokey");
+    await finish(oldFetch, {
+      models: [],
+      rawModels: [],
+      days: [],
+      monthCost: 999,
+    });
+    assert.equal(dashboard().usage, null);
+    assert.equal(dashboard().usageState, "nokey");
+  },
+);
+
+scenario(
+  "N05: saved Key survives discard/unmount without consuming the new page draft",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    await leave("放弃修改并离开");
+    await click(input("设置"));
+    await change("API Key", "DRAFT_C");
+    const saved = nextCredentialConfig("apiKey", true);
+    config = saved;
+    await finish(pending, {
+      config: saved,
+      balance: { ...balance, totalBalance: "222" },
+    });
+    assert.equal(input("API Key").props.value, "DRAFT_C");
+    assert.equal(getValidatedBalance().balance.totalBalance, "222");
+    await leave("放弃修改并离开");
+    assert.equal(dashboard().balance.totalBalance, "222");
+    assert.equal(submitted("save_api_key").length, 1);
+  },
+);
+
+scenario(
+  "N05: old Key completion cannot replace a newer page commit or resurrect after clear",
+  async (concurrent) => {
+    const first = deferred();
+    const second = deferred();
+    handlers.save_api_key = () => first.promise;
+    await openSettings(concurrent);
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    const oldConfig = nextCredentialConfig("apiKey", true);
+    await leave("放弃修改并离开");
+    await click(input("设置"));
+    handlers.save_api_key = () => second.promise;
+    await change("API Key", "DRAFT_C");
+    await startKeySave();
+    const newest = nextCredentialConfig("apiKey", true);
+    config = newest;
+    await finish(second, {
+      config: newest,
+      balance: { ...balance, totalBalance: "333" },
+    });
+    await finish(first, {
+      config: oldConfig,
+      balance: { ...balance, totalBalance: "222" },
+    });
+    assert.equal(getCommittedConfig(), newest);
+    assert.equal(getValidatedBalance().balance.totalBalance, "333");
+    const cleared = nextCredentialConfig("apiKey", false);
+    config = cleared;
+    await emit("credential-config-changed", cleared);
+    await emit("credential-config-changed", oldConfig);
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance, null);
+    assert.equal(dashboard().balanceState, "nokey");
+  },
+);
+
+scenario(
+  "N05: failed save after leaving preserves previous account snapshot",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    const previous = getCommittedConfig();
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    await leave("放弃修改并离开");
+    await act(async () =>
+      pending.reject(new Error("Synthetic validation failure")),
+    );
+    await flush();
+    assert.equal(getCommittedConfig(), previous);
+    assert.equal(dashboard().balance.totalBalance, "100");
+  },
+);
+
+scenario(
+  "N05: captured/cleared/forget responses in reverse order retain newest Token and draft",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.forget_usage_session = () => pending.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.forgetUsageSession());
+    const cleared = nextCredentialConfig("usageToken", false);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("TOKEN_C"));
+    const captured = nextCredentialConfig("usageToken", true);
+    await emit("usage-token-captured", captured);
+    await finish(pending, cleared);
+    await emit("usage-token-cleared", cleared);
+    await emit("usage-token-captured", captured);
+    assert.equal(getCommittedConfig(), captured);
+    assert.equal(state.usageToken, "TOKEN_C");
+    assert.equal(state.config.usageTokenConfigured, true);
+  },
+);
+
+scenario(
+  "N05: old balance fetch after clear cannot restore dashboard or tray",
+  async (concurrent) => {
+    await mount(<App />, concurrent);
+    const oldFetch = deferred();
+    handlers.fetch_balance = () => oldFetch.promise;
+    await act(async () => {
+      dashboard().onRefresh();
+    });
+    await flush();
+    const cleared = nextCredentialConfig("apiKey", false);
+    config = cleared;
+    await emit("credential-config-changed", cleared);
+    await finish(oldFetch, { ...balance, totalBalance: "999" });
+    assert.equal(dashboard().balance, null);
+    assert.equal(dashboard().balanceState, "nokey");
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+  },
+);
+
+scenario(
+  "N05: Token save response after discard leaves global state configured without consuming new draft",
+  async (concurrent) => {
+    config = baseConfig({ usageTokenConfigured: false });
+    const pending = deferred();
+    handlers.save_usage_token = () => pending.promise;
+    await openSettings(concurrent);
+    await manual();
+    await change("用量 Token", "TOKEN_B");
+    await leave();
+    await click(button("放弃修改并离开"));
+    await click(input("设置"));
+    await manual();
+    await change("用量 Token", "TOKEN_C");
+    const saved = nextCredentialConfig("usageToken", true);
+    config = saved;
+    await finish(pending, saved);
+    assert.equal(input("用量 Token").props.value, "TOKEN_C");
+    assert.equal(getCommittedConfig().usageTokenConfigured, true);
+    await leave("放弃修改并离开");
+    assert.equal(dashboard().usageState, "ok");
+    assert.equal(submitted("save_usage_token").length, 1);
+  },
+);
+
+scenario(
+  "N05: failed ordinary clear after unmount retains configured Key and balance",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.clear_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await click(button("清除 Key"));
+    await click(input("返回主面板"));
+    await act(async () => pending.reject(new Error("Synthetic write failure")));
+    await flush();
+    assert.equal(getCommittedConfig().apiKeyConfigured, true);
+    assert.equal(dashboard().balance.totalBalance, "100");
+  },
+);
+
+scenario(
+  "N05: newer 401 after save event cannot be undone by the late verification receipt",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    const saved = nextCredentialConfig("apiKey", true);
+    config = saved;
+    handlers.fetch_balance = () =>
+      Promise.reject({
+        message: "Synthetic revoked credential",
+        code: "credentials_invalid",
+      });
+    await emit("credential-config-changed", saved);
+    await finish(pending, {
+      config: saved,
+      balance: { ...balance, totalBalance: "222" },
+    });
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance, null);
+    assert.equal(getValidatedBalance(), null);
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+  },
+);
+
+scenario(
+  "N05: newer balance fetch wins over the older verification balance for the same Key",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    const saved = nextCredentialConfig("apiKey", true);
+    config = saved;
+    handlers.fetch_balance = () => ({ ...balance, totalBalance: "444" });
+    await emit("credential-config-changed", saved);
+    await finish(pending, {
+      config: saved,
+      balance: { ...balance, totalBalance: "222" },
+    });
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance.totalBalance, "444");
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, "444");
+  },
+);
+
+scenario(
+  "N05: preference failure after unmount never changes committed scheduler settings",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_auto_refresh_enabled = () => pending.promise;
+    await mount(<Probe />, concurrent);
+    const previous = getCommittedConfig();
+    await act(async () => state.saveAutoRefreshEnabled(true));
+    assert.equal(
+      state.autoRefresh,
+      true,
+      "only the mounted control is optimistic",
+    );
+    assert.equal(getCommittedConfig(), previous);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await mount(<Probe />, concurrent);
+    await act(async () =>
+      pending.reject(new Error("Synthetic preference failure")),
+    );
+    await flush();
+    assert.equal(getCommittedConfig().autoRefreshEnabled, false);
+    assert.equal(state.autoRefresh, false);
+  },
+);
+
+scenario(
+  "N05: old preference failure cannot roll back a newer committed preference",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_refresh_interval = () => pending.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.saveRefreshInterval(300));
+    const newer = {
+      ...getCommittedConfig(),
+      configRevision: ++fixtureRevision,
+      refreshIntervalSeconds: 1800,
+    };
+    await act(async () => {
+      setCommittedConfig(newer);
+    });
+    await act(async () =>
+      pending.reject(new Error("Synthetic preference failure")),
+    );
+    await flush();
+    assert.equal(state.refresh, 1800);
+    assert.equal(getCommittedConfig().refreshIntervalSeconds, 1800);
+  },
+);
+
+scenario(
+  "N05: verification receipt cannot cancel the newer in-flight balance rejection",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_api_key = () => pending.promise;
+    await openSettings(concurrent);
+    await change("API Key", "DRAFT_B");
+    await startKeySave();
+    const saved = nextCredentialConfig("apiKey", true);
+    config = saved;
+    const freshFetch = deferred();
+    handlers.fetch_balance = () => freshFetch.promise;
+    await emit("credential-config-changed", saved);
+    await finish(pending, {
+      config: saved,
+      balance: { ...balance, totalBalance: "222" },
+    });
+    await act(async () =>
+      freshFetch.reject({
+        message: "Synthetic revoked credential",
+        code: "credentials_invalid",
+      }),
+    );
+    await flush();
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance, null);
+    assert.equal(getValidatedBalance(), null);
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+  },
+);
+
+scenario(
+  "N05: duplicate captured commit cannot end a newer login attempt",
+  async (concurrent) => {
+    await mount(<Probe />, concurrent);
+    const captured = nextCredentialConfig("usageToken", true);
+    await emit("usage-token-captured", captured);
+    const pending = deferred();
+    handlers.start_usage_sync = () => pending.promise;
+    await act(async () => state.startUsageSync());
+    await emit("usage-token-captured", captured);
+    assert.equal(state.usageSyncing, true);
+    await finish(pending, false);
+    assert.equal(state.usageSyncing, true);
+  },
+);
+
+// N04: native settings work can complete after IPC timeout. Events invalidate
+// reads; they never certify a save, own a draft, or resurrect a stopped scan.
+const localCheckbox = (label) =>
+  renderer.root
+    .findAllByType("label")
+    .find((node) => textOf(node).includes(label))
+    .findByType("input");
+const checked = async (label, value) => {
+  await act(async () =>
+    localCheckbox(label).props.onChange({ target: { checked: value } }),
+  );
+  await flush();
+};
+
+scenario(
+  "N04: source events update baseline without erasing timeout-era draft",
+  async (concurrent) => {
+    let sources = { includeDefault: true, homes: [] };
+    handlers.get_local_sources = () => sources;
+    const pending = deferred();
+    handlers.save_local_sources = () => pending.promise;
+    let save, result;
+    let saved = 0;
+    await mount(
+      <LocalSourceSettings
+        onSaved={() => saved++}
+        onSaveRequested={(fn) => {
+          save = fn;
+        }}
+      />,
+      concurrent,
+    );
+    await change("额外主目录", "D:\\AgentA");
+    await act(async () => {
+      result = save();
+    });
+    await act(async () =>
+      pending.reject(new Error("Synthetic settings timeout")),
+    );
+    await flush();
+    assert.equal(await result, false);
+    await change("额外主目录", "D:\\AgentB");
+    sources = { includeDefault: true, homes: ["D:\\AgentA"] };
+    await emit("local-settings-changed", 1);
+    assert.equal(input("额外主目录").props.value, "D:\\AgentB");
+    assert.equal(button("保存目录").props.disabled, false);
+    assert.equal(saved, 0);
+    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), false);
+  },
+);
+
+scenario(
+  "N04: source save cannot certify B/ABA edits while its response is pending",
+  async (concurrent) => {
+    let sources = { includeDefault: true, homes: [] };
+    handlers.get_local_sources = () => sources;
+    const pending = deferred();
+    handlers.save_local_sources = () => pending.promise;
+    let save, result;
+    let saved = 0;
+    await mount(
+      <LocalSourceSettings
+        onSaved={() => saved++}
+        onSaveRequested={(fn) => {
+          save = fn;
+        }}
+      />,
+      concurrent,
+    );
+    await change("额外主目录", "D:\\AgentA");
+    await act(async () => {
+      result = save();
+    });
+    await change("额外主目录", "D:\\AgentB");
+    await change("额外主目录", "D:\\AgentA");
+    sources = { includeDefault: true, homes: ["D:\\AgentA"] };
+    await emit("local-settings-changed", 1);
+    await finish(pending, sources);
+    assert.equal(await result, false);
+    assert.equal(saved, 0);
+    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), false);
+  },
+);
+
+scenario(
+  "N04: newest source read wins; duplicate or old events do not loop",
+  async (concurrent) => {
+    await mount(<LocalSourceSettings onSaved={noop} />, concurrent);
+    const older = deferred(),
+      newer = deferred();
+    let count = 0;
+    handlers.get_local_sources = () =>
+      ++count === 1 ? older.promise : newer.promise;
+    await emit("local-settings-changed", 2);
+    await emit("local-settings-changed", 3);
+    await finish(newer, { includeDefault: true, homes: ["D:\\Newest"] });
+    await finish(older, { includeDefault: true, homes: ["D:\\Older"] });
+    assert.equal(input("额外主目录").props.value, "D:\\Newest");
+    await emit("local-settings-changed", 3);
+    await emit("local-settings-changed", 2);
+    await emit("local-settings-changed", "invalid");
+    assert.equal(count, 2);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await emit("local-settings-changed", 4);
+    assert.equal(count, 2);
+  },
+);
+
+scenario(
+  "N04: confirmed source save keeps its success state without remount",
+  async (concurrent) => {
+    let sources = { includeDefault: true, homes: [] };
+    handlers.get_local_sources = () => sources;
+    handlers.save_local_sources = ({ options }) => {
+      sources = options;
+      return sources;
+    };
+    let save, result;
+    let saved = 0;
+    await mount(
+      <LocalSourceSettings
+        onSaved={() => saved++}
+        onSaveRequested={(fn) => {
+          save = fn;
+        }}
+      />,
+      concurrent,
+    );
+    await change("额外主目录", "D:\\AgentA");
+    await act(async () => {
+      result = save();
+    });
+    await flush();
+    assert.equal(await result, true);
+    assert.equal(saved, 1);
+    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), true);
+    assert.equal(input("额外主目录").props.value, "D:\\AgentA");
+  },
+);
+
+scenario(
+  "N04: retention late completion converges and refreshes N05 capacity without success toast",
+  async (concurrent) => {
+    let enabled = false;
+    handlers.get_local_retention_enabled = () => enabled;
+    handlers.set_local_retention_enabled = () =>
+      Promise.reject(new Error("Synthetic retention timeout"));
+    await mount(
+      <LocalArchiveCapture
+        collectedAt={null}
+        scope={{ kind: "all" }}
+        disabled
+        onOpen={noop}
+      />,
+      concurrent,
+    );
+    await checked("自动留存已读取会话", true);
+    const reads = submitted("get_local_retention_capacity").length;
+    enabled = true;
+    await emit("local-settings-changed", 1);
+    assert.equal(localCheckbox("自动留存已读取会话").props.checked, true);
+    assert.equal(localCheckbox("自动留存已读取会话").props.disabled, false);
+    assert.ok(submitted("get_local_retention_capacity").length > reads);
+    assert.equal(
+      textOf(renderer.toJSON()).includes("已开启，下次成功采集时自动留存"),
+      false,
+    );
+  },
+);
+
+scenario(
+  "N04: failed background stop converges and offers false-only persistence retry",
+  async (concurrent) => {
+    let enabled = true;
+    handlers.get_local_background = () => ({
+      enabled,
+      effective: enabled,
+      state: "watching",
+      watchedRoots: 1,
+    });
+    handlers.set_local_background = () => {
+      enabled = false;
+      return Promise.reject(new Error("Synthetic stop persistence failure"));
+    };
+    await mount(
+      <LocalBackgroundSettings localEnabled onMode={noop} />,
+      concurrent,
+    );
+    await checked("收起后继续采集", false);
+    assert.equal(localCheckbox("收起后继续采集").props.checked, false);
+    assert.equal(
+      textOf(renderer.toJSON()).includes("后台采集已关闭，已有留存保留"),
+      false,
+    );
+    await click(button("重新保存后台关闭状态"));
+    assert.equal(submitted("set_local_background").at(-1).args.enabled, false);
+  },
+);
+
+scenario(
+  "N04: failed stop rejects an old scan and never requires enabling to retry",
+  async (concurrent) => {
+    let status = {
+      enabled: true,
+      snapshot: null,
+      generation: 1,
+      busy: false,
+      settingsPending: false,
+      lastError: null,
+    };
+    handlers.get_local_usage = () => status;
+    const scan = deferred();
+    handlers.scan_local_usage = () => scan.promise;
+    handlers.set_local_usage_enabled = () => {
+      status = {
+        ...status,
+        enabled: false,
+        generation: 2,
+        lastError: "Synthetic stop persistence failure",
+      };
+      return Promise.reject(new Error(status.lastError));
+    };
+    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
+    await click(button("关闭本地统计"));
+    assert.ok(button("开启本地统计"));
+    await finish(scan, {
+      rows: [],
+      collectedAt: Date.now(),
+      engineVersion: "synthetic",
+      period: "month",
+    });
+    assert.equal(
+      renderer.root.findByType(LocalArchiveCapture).props.collectedAt,
+      null,
+    );
+    await click(button("重新保存关闭状态"));
+    assert.equal(
+      submitted("set_local_usage_enabled").at(-1).args.enabled,
+      false,
+    );
+  },
+);
+
+scenario(
+  "N04: pending enable converges on completion and ignores older generation",
+  async (concurrent) => {
+    let status = {
+      enabled: false,
+      snapshot: null,
+      generation: 1,
+      busy: false,
+      settingsPending: false,
+    };
+    handlers.get_local_usage = () => status;
+    handlers.is_main_window_visible = () => false;
+    handlers.set_local_usage_enabled = () => {
+      status = { ...status, generation: 2, busy: true, settingsPending: true };
+      return Promise.reject(new Error("Synthetic enable timeout"));
+    };
+    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
+    await click(button("开启本地统计"));
+    assert.equal(button("设置处理中…").props.disabled, true);
+    status = { ...status, enabled: true, busy: false, settingsPending: false };
+    await emit("local-settings-changed", 2);
+    assert.ok(button("关闭本地统计"));
+    status = { ...status, enabled: false, generation: 1 };
+    await emit("local-settings-changed", 3);
+    assert.ok(button("关闭本地统计"));
+    assert.equal(button("开启本地统计"), undefined);
+  },
+);
+
+scenario(
+  "N04: pending stop survives remount and retries false without a fresh error",
+  async (concurrent) => {
+    handlers.get_local_usage = () => ({
+      enabled: false,
+      snapshot: null,
+      generation: 3,
+      busy: false,
+      settingsPending: false,
+      stopSavePending: true,
+      lastError: null,
+    });
+    handlers.set_local_usage_enabled = () => ({ enabled: false });
+    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
+    assert.ok(button("重新保存关闭状态"));
+    await click(button("重新保存关闭状态"));
+    assert.equal(
+      submitted("set_local_usage_enabled").at(-1).args.enabled,
+      false,
+    );
+    await act(async () => renderer.unmount());
+    renderer = null;
+    handlers.get_local_background = () => ({
+      enabled: false,
+      effective: false,
+      stopSavePending: true,
+      state: "disabled",
+      watchedRoots: 0,
+    });
+    handlers.set_local_background = () => ({ enabled: false });
+    await mount(
+      <LocalBackgroundSettings localEnabled={false} onMode={noop} />,
+      concurrent,
+    );
+    await click(button("重新保存后台关闭状态"));
+    assert.equal(submitted("set_local_background").at(-1).args.enabled, false);
+  },
+);
+
+scenario(
+  "N04: App completion refresh cannot be overwritten by an older local read",
+  async (concurrent) => {
+    config = baseConfig({
+      apiKeyConfigured: false,
+      usageTokenConfigured: false,
+    });
+    await mount(<App />, concurrent);
+    assert.equal(panel("onboarding"), 1);
+    const older = deferred(),
+      newer = deferred();
+    let count = 0;
+    handlers.get_local_usage = () =>
+      ++count === 1 ? older.promise : newer.promise;
+    await emit("local-settings-changed", 1);
+    await emit("local-settings-changed", 2);
+    await finish(newer, { enabled: true, snapshot: null, generation: 2 });
+    assert.equal(panel("onboarding"), 0);
+    await finish(older, { enabled: false, snapshot: null, generation: 1 });
+    assert.equal(panel("onboarding"), 0);
   },
 );

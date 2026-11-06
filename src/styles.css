@@ -3066,3 +3066,14 @@ button:disabled:hover {
 .leave-guard p {
   margin: 0 0 8px;
 }
+
+/* N06: source identity must stay visible when labels are long or cards narrow. */
+.local-usage-panel .local-identity-label,
+.local-archive-panel .local-identity-label {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+}

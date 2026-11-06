@@ -88,14 +88,53 @@ fn load_enabled() -> Result<bool, String> {
     serde_json::from_slice(&data).map_err(|_| "自动留存设置损坏，请关闭并重置设置".into())
 }
 fn atomic(path: PathBuf, data: &[u8]) -> Result<(), String> {
+    atomic_guarded(path, data, &|| true)
+}
+fn atomic_guarded(path: PathBuf, data: &[u8], current: &impl Fn() -> bool) -> Result<(), String> {
+    if !current() {
+        return Err("采集已失效，未提交留存".into());
+    }
     fs::create_dir_all(path.parent().ok_or("留存目录不可用")?).map_err(|_| "留存目录不可用")?;
     let temp = path.with_extension("tmp");
+    if !current() {
+        return Err("采集已失效，未提交留存".into());
+    }
     fs::write(&temp, data).map_err(|_| "留存无法保存，原记录保留")?;
+    #[cfg(test)]
+    if path
+        .file_name()
+        .is_some_and(|name| name == "local-usage-retention.json")
+    {
+        crate::commands::collection_test_stage("retention-temp-written");
+    }
+    if !current() {
+        let _ = fs::remove_file(&temp);
+        return Err("采集已失效，未提交留存".into());
+    }
+    // This is the commit boundary. An OS rename cannot be interrupted. All
+    // clear/delete/disable acknowledgements wait for this same store lock, so
+    // an already-entered rename finishes before those operations can succeed.
+    #[cfg(test)]
+    if path
+        .file_name()
+        .is_some_and(|name| name == "local-usage-retention.json")
+    {
+        crate::commands::collection_test_stage("retention-commit-entered");
+    }
     fs::rename(&temp, path).map_err(|error| {
         // 复评 T12：提交失败时尽力删除临时副本，避免留下可读的元数据文件。
         let _ = fs::remove_file(&temp);
         format!("留存无法提交，原记录保留（{error}）")
     })
+}
+/// Wait only on a blocking worker, never while holding the collector mutex.
+pub fn commit_barrier() -> Result<(), String> {
+    let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn hold_commit_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    lock().lock().unwrap()
 }
 pub fn enabled() -> Result<bool, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
@@ -191,11 +230,14 @@ fn load() -> Result<Store, String> {
     Ok(store)
 }
 fn write(store: &Store) -> Result<(), String> {
+    write_guarded(store, &|| true)
+}
+fn write_guarded(store: &Store, current: &impl Fn() -> bool) -> Result<(), String> {
     let bytes = serde_json::to_vec(store).map_err(|_| "会话留存无法编码")?;
     if bytes.len() > MAX_BYTES {
         return Err("会话留存超过8MiB，未覆盖；请删除不需要的记录".into());
     }
-    atomic(store_path()?, &bytes)
+    atomic_guarded(store_path()?, &bytes, current)
 }
 /// 容量状态：让界面能显示「还剩几条」而不是只在满额时报错。
 #[derive(Debug, Clone, Serialize)]
@@ -260,15 +302,38 @@ fn entry_size(entry: &ArchiveEntry) -> usize {
 pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String> {
     checkpoint_budget(snapshot, MAX_BYTES)
 }
+pub fn checkpoint_guarded(
+    snapshot: &LocalSnapshot,
+    current: impl Fn() -> bool,
+) -> Result<CheckpointOutcome, String> {
+    checkpoint_budget_guarded(snapshot, MAX_BYTES, &current)
+}
 
 /// `budget` 可注入（测试用小预算验证条目级选择，不必构造 8MiB 级 fixture）。
 fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<CheckpointOutcome, String> {
+    checkpoint_budget_guarded(snapshot, budget, &|| true)
+}
+fn checkpoint_budget_guarded(
+    snapshot: &LocalSnapshot,
+    budget: usize,
+    current: &impl Fn() -> bool,
+) -> Result<CheckpointOutcome, String> {
+    #[cfg(test)]
+    crate::commands::collection_test_stage("retention-lock-wait");
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
+    if !current() {
+        return Err("采集已失效，未提交留存".into());
+    }
     let mut outcome = CheckpointOutcome::default();
     if !load_enabled()? {
         return Ok(outcome);
     }
+    #[cfg(test)]
+    crate::commands::collection_test_stage("retention-read");
     let mut store = load()?;
+    if !current() {
+        return Err("采集已失效，未提交留存".into());
+    }
     // 复评 R09：以当前文件的**实际序列化体积**为预算基线，逐条目增量更新；
     // 最终 write 仍做精确字节检查（原子提交语义不变），这里的估算只负责
     // 把放不下的条目挑出来单独跳过。
@@ -399,7 +464,7 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
         outcome.written += 1;
         changed = true;
     }
-    if changed && write(&store).is_err() {
+    if changed && write_guarded(&store, current).is_err() {
         // 写盘失败：整批未提交，原记录保留，如实报告。
         // 复评 R09/F03：条目级预算选择后这里只剩真实 IO 失败或极端漂移。
         outcome.failed = true;

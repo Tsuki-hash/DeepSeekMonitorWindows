@@ -2,6 +2,8 @@ import React from "react";
 import { applyStoredGlass } from "./components/GlassSettings";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useLocalSettingsRefresh } from "./local-settings-sync";
+import type { LocalUsageStatus } from "./local-usage";
 import type {
   AppConfig,
   BalanceData,
@@ -46,6 +48,10 @@ import {
   applyReadConfig,
   getCommitRevision,
   getCommittedConfig,
+  getValidatedBalance,
+  markBalanceObserved,
+  setCommittedConfig,
+  subscribeCommittedConfig,
 } from "./config-store";
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
@@ -160,6 +166,7 @@ function App() {
   const loadBalance = React.useCallback(
     (silent = false) => {
       const requestId = ++balanceRequestId.current;
+      const credentialRevision = getCommittedConfig()?.apiKeyRevision;
       if (silent) {
         setBalanceState((prev) => (prev === "ok" ? prev : "loading"));
       } else {
@@ -171,6 +178,7 @@ function App() {
           if (requestId !== balanceRequestId.current) {
             return;
           }
+          markBalanceObserved(credentialRevision);
           availableSnapshot.current.balance = true;
           applyChannel(
             "balance",
@@ -190,6 +198,7 @@ function App() {
           if (requestId !== balanceRequestId.current) {
             return;
           }
+          markBalanceObserved(credentialRevision);
           const { message, code } = errorInfo(error);
           setBalanceErrorCode(code);
           const next = onChannelFailure(
@@ -309,59 +318,120 @@ function App() {
     usageTokenConfigured: boolean;
   } | null>(null);
 
-  // 配置状态必须能被重新读取：保存/清除凭据、开启本地统计后，
-  // 首次引导与历史页的恢复文案都依赖它（复评 F12）。
+  // Application ownership is independent of the settings page. Every committed
+  // credential version invalidates the old account's requests, data and tray.
+  const observedCredentials = React.useRef<AppConfig | null>(null);
+  const observedBalance =
+    React.useRef<ReturnType<typeof getValidatedBalance>>(null);
+  React.useEffect(() => {
+    const synchronize = () => {
+      const next = getCommittedConfig();
+      if (!next) return;
+      const previous = observedCredentials.current;
+      const receipt = getValidatedBalance();
+      const keyChanged =
+        !previous || previous.apiKeyRevision !== next.apiKeyRevision;
+      const tokenChanged =
+        !previous || previous.usageTokenRevision !== next.usageTokenRevision;
+      const balanceReceived =
+        receipt !== null && receipt !== observedBalance.current;
+      observedCredentials.current = next;
+      observedBalance.current = receipt;
+      setRefreshIntervalSeconds(next.refreshIntervalSeconds || 60);
+      setAutoRefreshEnabled(next.autoRefreshEnabled);
+      setConfigSnapshot({
+        apiKeyConfigured: next.apiKeyConfigured,
+        usageTokenConfigured: next.usageTokenConfigured,
+      });
+      if (keyChanged || balanceReceived) {
+        if (keyChanged) {
+          balanceRequestId.current += 1;
+          balanceGate.current.invalidate();
+          availableSnapshot.current.balance = false;
+          setBalance(null);
+          setBalanceUpdatedAt(null);
+          setBalanceCredentialValid(false);
+          // Revoke synchronously, not after another render/effect. A late
+          // verification receipt for this same Key must NOT cancel its newer
+          // in-flight fetch; that fetch may subsequently reject the credential.
+          trayPublisher.current?.update({
+            total: null,
+            currency: null,
+            stale: false,
+          });
+        }
+        applyChannel(
+          "balance",
+          onCredentialChanged(
+            channels.current.balance,
+            next.apiKeyConfigured,
+            refreshIntervalRef.current,
+          ),
+        );
+        setBalanceError("");
+        setBalanceErrorCode(undefined);
+        if (
+          receipt &&
+          receipt.revision === next.apiKeyRevision &&
+          next.apiKeyConfigured
+        ) {
+          availableSnapshot.current.balance = true;
+          setBalance(receipt.balance);
+          setBalanceUpdatedAt(Date.now());
+          setBalanceCredentialValid(true);
+          setBalanceState("ok");
+          applyChannel(
+            "balance",
+            onChannelSuccess(
+              channels.current.balance,
+              refreshIntervalRef.current,
+            ),
+          );
+        } else if (next.apiKeyConfigured) {
+          setBalanceState("loading");
+          void loadBalance();
+        } else {
+          setBalanceState("nokey");
+        }
+      }
+      if (tokenChanged) {
+        usageRequestId.current += 1;
+        invalidateUsageRequests();
+        availableSnapshot.current.usage = false;
+        usageSnapshot.current = null;
+        setUsage(null);
+        setUsageUpdatedAt(null);
+        applyChannel(
+          "usage",
+          onCredentialChanged(
+            channels.current.usage,
+            next.usageTokenConfigured,
+            refreshIntervalRef.current,
+          ),
+        );
+        setUsageError(next.usageTokenConfigured ? "" : "未配置用量 Token");
+        setUsageErrorCode(
+          next.usageTokenConfigured ? undefined : "not_configured",
+        );
+        setUsageState(next.usageTokenConfigured ? "loading" : "nokey");
+        if (next.usageTokenConfigured) void loadUsage();
+      }
+    };
+    const unsubscribe = subscribeCommittedConfig(synchronize);
+    synchronize();
+    return unsubscribe;
+  }, [applyChannel, loadBalance, loadUsage]);
+
+  // Reads only feed the committed store. Scheduler and onboarding state have
+  // one owner above; neither a stale GET nor its failure may reset them.
   const reloadConfig = React.useCallback(() => {
-    // 复评 F08：App 的读取同样受提交代际约束 —— 旧 GET 迟到时不得把
-    // autoRefreshEnabled/refreshIntervalSeconds 回退成旧值（那会影响本会话调度）。
     const startedAt = getCommitRevision();
     return invoke<AppConfig>("get_app_config")
       .then((config) => {
-        if (!applyReadConfig(config, startedAt)) {
-          // 已有更新的提交：用已提交配置收敛，不使用这份过期读取。
-          const committed = getCommittedConfig();
-          if (committed) {
-            setRefreshIntervalSeconds(committed.refreshIntervalSeconds || 60);
-            setAutoRefreshEnabled(committed.autoRefreshEnabled);
-            setConfigSnapshot({
-              apiKeyConfigured: committed.apiKeyConfigured,
-              usageTokenConfigured: committed.usageTokenConfigured,
-            });
-            return committed;
-          }
-          return null;
-        }
-        setRefreshIntervalSeconds(config.refreshIntervalSeconds || 60);
-        setAutoRefreshEnabled(config.autoRefreshEnabled);
-        setConfigSnapshot({
-          apiKeyConfigured: config.apiKeyConfigured,
-          usageTokenConfigured: config.usageTokenConfigured,
-        });
-        return config;
+        applyReadConfig(config, startedAt);
+        return getCommittedConfig();
       })
-      .catch(() => {
-        // 复评 R12：**失败路径同样受读取所有权约束**。
-        // 旧实现无条件把间隔设回 60 秒、自动刷新设为 false —— 如果用户在
-        // 这次旧 GET 之后刚刚开启了自动刷新（保存成功、提交代际已推进），
-        // 迟到的读取失败会把新开启的调度直接关掉。
-        // 现在：已有更新提交时用已提交配置收敛，绝不回退调度；只有
-        // **没有**更新提交（确实是首次读取失败）才回落到默认值。
-        if (getCommitRevision() !== startedAt) {
-          const committed = getCommittedConfig();
-          if (committed) {
-            setRefreshIntervalSeconds(committed.refreshIntervalSeconds || 60);
-            setAutoRefreshEnabled(committed.autoRefreshEnabled);
-            setConfigSnapshot({
-              apiKeyConfigured: committed.apiKeyConfigured,
-              usageTokenConfigured: committed.usageTokenConfigured,
-            });
-          }
-          return null;
-        }
-        setRefreshIntervalSeconds(60);
-        setAutoRefreshEnabled(false);
-        return null;
-      });
+      .catch(() => null);
   }, []);
   React.useEffect(() => {
     void reloadConfig();
@@ -372,21 +442,43 @@ function App() {
   // 现在封装成可重读函数，并在进入首页/Agent 页时刷新（开关就在这些页面上）。
   const [localEnabled, setLocalEnabled] = React.useState(false);
   const [localStatusLoaded, setLocalStatusLoaded] = React.useState(false);
-  const reloadLocalStatus = React.useCallback(() => {
-    return invoke<{ enabled: boolean }>("get_local_usage")
+  const localStatusOwner = React.useRef({
+    active: true,
+    sequence: 0,
+    generation: 0,
+  });
+  const reloadLocalStatus = React.useCallback((generation?: number) => {
+    const owner = localStatusOwner.current;
+    owner.generation = Math.max(owner.generation, generation ?? 0);
+    const sequence = ++owner.sequence;
+    return invoke<LocalUsageStatus>("get_local_usage")
       .then((status) => {
+        if (
+          !owner.active ||
+          sequence !== owner.sequence ||
+          (status.generation != null && status.generation < owner.generation)
+        )
+          return null;
+        owner.generation = Math.max(owner.generation, status.generation ?? 0);
         setLocalEnabled(status.enabled === true);
         setLocalStatusLoaded(true);
         return status.enabled === true;
       })
       .catch(() => {
-        setLocalStatusLoaded(true);
+        if (owner.active && sequence === owner.sequence)
+          setLocalStatusLoaded(true);
         return null;
       });
   }, []);
   React.useEffect(() => {
-    void reloadLocalStatus();
-  }, [reloadLocalStatus]);
+    const owner = localStatusOwner.current;
+    owner.active = true;
+    return () => {
+      owner.active = false;
+      owner.sequence++;
+    };
+  }, []);
+  useLocalSettingsRefresh(reloadLocalStatus);
   // 每次回到首页或 Agent 页都重新读取：这两个页面可能刚改过开关。
   React.useEffect(() => {
     if (view === "dashboard" || view === "local") void reloadLocalStatus();
@@ -583,48 +675,15 @@ function App() {
 
   // 无论设置页是否挂载，登录同步成功都使旧凭据响应失效并刷新主数据。
   React.useEffect(() => {
-    const captured = listen("usage-token-captured", () => {
-      usageRequestId.current += 1;
-      invalidateUsageRequests();
-      availableSnapshot.current.usage = false;
-      usageSnapshot.current = null;
-      // 复评 F01：新 Token 已通过验证，必须先解除暂停，否则自动刷新会一直停在暂停态。
-      applyChannel(
-        "usage",
-        onCredentialChanged(
-          channels.current.usage,
-          true,
-          refreshIntervalRef.current,
-        ),
-      );
-      setUsage(null);
-      setUsageUpdatedAt(null);
-      setUsageState("loading");
-      setUsageError("");
-      setUsageErrorCode(undefined);
-      void loadUsage();
-      void reloadConfig();
-    });
-    const cleared = listen("usage-token-cleared", () => {
-      usageRequestId.current += 1;
-      invalidateUsageRequests();
-      availableSnapshot.current.usage = false;
-      usageSnapshot.current = null;
-      applyChannel(
-        "usage",
-        onCredentialChanged(
-          channels.current.usage,
-          false,
-          refreshIntervalRef.current,
-        ),
-      );
-      setUsage(null);
-      setUsageUpdatedAt(null);
-      setUsageState("nokey");
-      setUsageError("未配置用量 Token");
-      setUsageErrorCode("not_configured");
-      void reloadConfig();
-    });
+    const acceptConfig = (event: { payload: AppConfig }) => {
+      setCommittedConfig(event.payload);
+    };
+    const captured = listen<AppConfig>("usage-token-captured", acceptConfig);
+    const cleared = listen<AppConfig>("usage-token-cleared", acceptConfig);
+    const changed = listen<AppConfig>(
+      "credential-config-changed",
+      acceptConfig,
+    );
     const browsingCleared = listen("browsing-data-cleared", () => {
       // 「退出并忘记账户」只应清除网页登录数据，外观偏好必须保留。
       // 主题与透明度都存在 localStorage 里，清理 WebView 数据会一并清掉，
@@ -640,11 +699,12 @@ function App() {
     return () => {
       void captured.then((unlisten) => unlisten()).catch(() => undefined);
       void cleared.then((unlisten) => unlisten()).catch(() => undefined);
+      void changed.then((unlisten) => unlisten()).catch(() => undefined);
       void browsingCleared
         .then((unlisten) => unlisten())
         .catch(() => undefined);
     };
-  }, [applyChannel, loadUsage, reloadConfig]);
+  }, []);
 
   React.useEffect(() => {
     applyStoredGlass();
@@ -752,99 +812,6 @@ function App() {
           usageError={usageError}
           targetSection={settingsTarget}
           usage={usage}
-          onBalanceLoaded={(nextBalance) => {
-            balanceRequestId.current += 1;
-            balanceGate.current.invalidate();
-            availableSnapshot.current.balance = true;
-            // 复评 F01：设置页验证成功等同一次成功请求，必须解除暂停并恢复托盘有效性。
-            applyChannel(
-              "balance",
-              onCredentialChanged(
-                channels.current.balance,
-                true,
-                refreshIntervalRef.current,
-              ),
-            );
-            channels.current.balance = onChannelSuccess(
-              channels.current.balance,
-              refreshIntervalRef.current,
-            );
-            setBalance(nextBalance);
-            setBalanceUpdatedAt(Date.now());
-            setBalanceCredentialValid(true);
-            setBalanceState("ok");
-            setBalanceError("");
-            setBalanceErrorCode(undefined);
-            void reloadConfig();
-          }}
-          onBalanceCleared={() => {
-            balanceRequestId.current += 1;
-            balanceGate.current.invalidate();
-            availableSnapshot.current.balance = false;
-            applyChannel(
-              "balance",
-              onCredentialChanged(
-                channels.current.balance,
-                false,
-                refreshIntervalRef.current,
-              ),
-            );
-            setBalance(null);
-            setBalanceUpdatedAt(null);
-            setBalanceCredentialValid(false);
-            setBalanceState("nokey");
-            setBalanceError("");
-            setBalanceErrorCode(undefined);
-            void reloadConfig();
-          }}
-          onUsageLoaded={(nextUsage) => {
-            const current = currentUsageSnapshot(nextUsage, todayStr());
-            if (!current) {
-              void loadUsage();
-              return;
-            }
-            // 设置页的刷新代表更新的意图：作废 App 侧在途的旧请求，
-            // 避免慢响应返回后把设置页刚拿到的数据覆盖掉
-            usageRequestId.current += 1;
-            availableSnapshot.current.usage = true;
-            usageSnapshot.current = current;
-            // 复评 F01：用量成功路径原先不清 paused，凭据恢复后自动刷新永久暂停。
-            applyChannel(
-              "usage",
-              onChannelSuccess(
-                channels.current.usage,
-                refreshIntervalRef.current,
-              ),
-            );
-            setUsage(current);
-            setUsageUpdatedAt(Date.now());
-            setUsageState("ok");
-            setUsageError("");
-            setUsageErrorCode(undefined);
-            void reloadConfig();
-          }}
-          onUsageCleared={() => {
-            usageRequestId.current += 1;
-            invalidateUsageRequests();
-            availableSnapshot.current.usage = false;
-            usageSnapshot.current = null;
-            applyChannel(
-              "usage",
-              onCredentialChanged(
-                channels.current.usage,
-                false,
-                refreshIntervalRef.current,
-              ),
-            );
-            setUsage(null);
-            setUsageUpdatedAt(null);
-            setUsageState("nokey");
-            setUsageError("未配置用量 Token");
-            setUsageErrorCode("not_configured");
-            void reloadConfig();
-          }}
-          onRefreshIntervalChanged={setRefreshIntervalSeconds}
-          onAutoRefreshChanged={setAutoRefreshEnabled}
           // 第五轮复评 N04：提醒设置草稿注册进同一个 App 级离开拦截；
           // 关闭设置页也走 navigate，脏草稿不再被静默丢弃。
           onRegisterLeaveBlocker={registerLeaveBlocker}

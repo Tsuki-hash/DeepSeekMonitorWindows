@@ -163,7 +163,10 @@ test("R13 same-named clients and unknown historical clients have distinct keys, 
   const rows = clients.map((clientId) => ({ ...row, clientId }));
   const groups = localSessions(rows);
   assert.equal(groups.length, 4);
-  assert.equal(new Set(rows.map(localSessionLabel)).size, 4);
+  assert.equal(
+    new Set(rows.map((current) => localSessionLabel(current))).size,
+    4,
+  );
   for (const current of rows) {
     const saved = {
       ...entry,

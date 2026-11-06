@@ -1,5 +1,19 @@
-import { localClientLabel, localIdentity } from "./local-usage.ts";
-import type { ClientIdentityStatus } from "./local-usage";
+import {
+  localClientLabel,
+  localIdentity,
+  localSessionLabel,
+  localSessionIdentityKey,
+  localSourceLabel,
+  localSourceCatalog,
+  localSourceExportIdentity,
+  localSourcesLabel,
+  localTools,
+} from "./local-usage.ts";
+import type {
+  ClientIdentityStatus,
+  SourceIdentity,
+  SourceIdentityStatus,
+} from "./local-usage";
 import { snapshotQuality } from "./local-quality.ts";
 import type { LocalRow } from "./local-usage";
 import { csvCell } from "./history.ts";
@@ -15,6 +29,10 @@ export type ArchiveRow = Omit<LocalRow, "id" | "projectKey" | "projectPath"> & {
 export type ArchiveSummary = {
   sourceLabel?: string | null;
   sourceId?: string | null;
+  /** Derived from rows on read, never persisted or backfilled into old archives. */
+  sourceCount?: number;
+  sourceHasUnknown?: boolean;
+  sourceIdentityStatus?: SourceIdentityStatus;
   clientId?: string | null;
   identityStatus?: ClientIdentityStatus;
   sessionId?: string | null;
@@ -47,26 +65,55 @@ export function archiveIdentityLabel(
     ? "多个客户端（混合身份）"
     : localClientLabel(identity.clientId);
 }
+export function archiveSourceLabel(
+  entry: ArchiveSummary | ArchiveEntry,
+  sources: readonly SourceIdentity[] = [],
+  fullId = false,
+): string {
+  if ("rows" in entry)
+    return localSourcesLabel(entry.rows, [...sources, ...entry.rows], fullId);
+  if (entry.sourceIdentityStatus === "mixed" || (entry.sourceCount ?? 0) > 1) {
+    return `多个来源${entry.sourceCount ? `（${entry.sourceCount} 个已知${entry.sourceHasUnknown ? "，含未知身份" : ""}）` : "（含未知身份）"}`;
+  }
+  if (entry.sourceId && entry.sourceId !== "legacy-unknown")
+    return localSourceLabel(
+      { sourceId: entry.sourceId, sourceLabel: entry.sourceLabel || undefined },
+      sources,
+      fullId,
+    );
+  // Older summaries with no unique ID cannot establish one source from a label.
+  return entry.sourceIdentityStatus === "unknown"
+    ? "来源身份未知"
+    : "多个来源或身份未知";
+}
 export function archiveSelectionLabel(
   entry: ArchiveSummary | ArchiveEntry,
+  sources: readonly SourceIdentity[] = [],
+  fullId = false,
 ): string {
   if ("rows" in entry) {
-    const labels = [
-      ...new Set(
-        entry.rows.map(
-          (row) =>
-            `${row.sourceLabel || row.sourceId || "来源未知"} · ${localClientLabel(row.clientId)} · ${row.sessionId}`,
-        ),
-      ),
-    ];
+    const identities = new Map<string, ArchiveRow>();
+    for (const row of entry.rows) {
+      const key = localSessionIdentityKey(row);
+      const previous = identities.get(key);
+      if (
+        !previous ||
+        (row.sourceLabel || "").localeCompare(previous.sourceLabel || "") < 0
+      )
+        identities.set(key, row);
+    }
+    const context = localSourceCatalog([...sources, ...entry.rows]);
+    const labels = [...identities]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, row]) => localSessionLabel(row, context, fullId));
     return (
-      labels.slice(0, 5).join("；") +
-      (labels.length > 5
-        ? `；另 ${labels.length - 5} 个会话身份（共 ${labels.length} 个）`
-        : "")
+      (fullId ? labels : labels.slice(0, 5)).join("；") +
+        (!fullId && labels.length > 5
+          ? `；另 ${labels.length - 5} 个会话身份（共 ${labels.length} 个）`
+          : "") || "会话身份未知"
     );
   }
-  return `${entry.sourceLabel || entry.sourceId || "多个来源"} · ${archiveIdentityLabel(entry)} · ${entry.sessionId || "多个会话"}`;
+  return `${archiveSourceLabel(entry, sources, fullId)} · ${entry.tool ? localTools[entry.tool] || entry.tool : "多个工具"} · ${archiveIdentityLabel(entry)} · ${entry.sessionId || "多个会话"}`;
 }
 export const archiveScopeLabel = (scope: string) =>
   scope === "session" ? "会话" : scope === "project" ? "项目" : "全部记录";
@@ -126,6 +173,12 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
       ? entry.accountingUtcOffsetSeconds
       : null;
   const quality = snapshotQuality(entry);
+  // Legacy stores may predate opaque source IDs. Redact only the export projection;
+  // enabling project paths never authorizes arbitrary source IDs as secret text.
+  const exportRows = entry.rows.map((row) => ({
+    ...row,
+    ...localSourceExportIdentity(row),
+  }));
   // Entry data came from the backend archive whitelist. CSV selects fields again.
   return {
     json: JSON.stringify(
@@ -138,7 +191,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
         accountingUtcOffsetSeconds: offset,
         ...Object.fromEntries(metadata.map((field) => [field, entry[field]])),
         ...quality,
-        rows: entry.rows.map((row) =>
+        rows: exportRows.map((row) =>
           Object.fromEntries(
             [...fields, "firstActiveMs", "lastActiveMs"].map((field) => [
               field,
@@ -158,7 +211,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
       "\uFEFF" +
       [
         [...fields, ...metadata, "accountingUtcOffsetSeconds", "captureKind"],
-        ...entry.rows.map((row) => [
+        ...exportRows.map((row) => [
           ...fields.map((field) =>
             field === "tokenAccuracy"
               ? "unclassified"

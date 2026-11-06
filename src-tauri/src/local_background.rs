@@ -43,7 +43,7 @@ pub fn enabled(state: &mut crate::local_usage::LocalState) -> Result<bool, Strin
     state.background_enabled = Some(value);
     Ok(value)
 }
-pub fn save(state: &mut crate::local_usage::LocalState, value: bool) -> Result<(), String> {
+pub fn save_preference(value: bool) -> Result<(), String> {
     let path = preference_path()?;
     std::fs::create_dir_all(path.parent().ok_or("后台采集目录不可用")?)
         .map_err(|_| "后台采集设置无法保存")?;
@@ -58,12 +58,6 @@ pub fn save(state: &mut crate::local_usage::LocalState, value: bool) -> Result<(
     )
     .map_err(|_| "后台采集设置无法保存，原设置保留")?;
     std::fs::rename(temp, path).map_err(|_| "后台采集设置无法提交，原设置保留")?;
-    state.background_enabled = Some(value);
-    state.generation = state.generation.wrapping_add(1);
-    if let Some(cancel) = state.cancel.take() {
-        cancel.notify_one();
-    }
-    changed().notify_one();
     Ok(())
 }
 
@@ -71,6 +65,7 @@ pub fn save(state: &mut crate::local_usage::LocalState, value: bool) -> Result<(
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub enabled: bool,
+    pub stop_save_pending: bool,
     pub effective: bool,
     pub state: String,
     pub watched_roots: usize,
@@ -83,9 +78,11 @@ pub struct Status {
 pub struct Runtime(pub Mutex<Status>);
 pub fn status(app: &tauri::AppHandle) -> Result<Status, String> {
     let collector = app.state::<crate::local_usage::LocalCollector>();
-    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
-    let local = crate::commands::local_enabled(&mut state)?;
-    let background = enabled(&mut state)?;
+    let state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
+    let local = state.enabled.ok_or("本地统计设置尚未读取")?;
+    let background = state.background_enabled.ok_or("后台采集设置尚未读取")?;
+    let stop_save_pending = state.background_stop_save_pending;
+    drop(state);
     let mut value = app
         .state::<Runtime>()
         .0
@@ -93,6 +90,7 @@ pub fn status(app: &tauri::AppHandle) -> Result<Status, String> {
         .map_err(|_| "后台状态不可用")?
         .clone();
     value.enabled = background;
+    value.stop_save_pending = stop_save_pending;
     value.effective = background && local;
     if !value.effective {
         value.state = if background { "paused" } else { "off" }.into();
@@ -389,17 +387,17 @@ pub fn start(app: tauri::AppHandle) {
         let mut owner = None;
         let mut schedule = Schedule::default();
         loop {
-            let settings = (|| {
-                let collector = app.state::<crate::local_usage::LocalCollector>();
-                let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
-                if !crate::commands::local_enabled(&mut state)? || !enabled(&mut state)? {
-                    return Ok(None);
-                }
-                if state.sources.is_none() {
-                    state.sources = Some(crate::local_sources::load()?);
-                }
-                Ok::<_, String>(Some((state.generation, state.sources.clone().unwrap())))
-            })();
+            let settings = crate::commands::background_settings(&app)
+                .await
+                .map(|settings| {
+                    if settings.enabled == Some(true) && settings.background_enabled == Some(true) {
+                        settings
+                            .sources
+                            .map(|sources| (settings.generation, sources))
+                    } else {
+                        None
+                    }
+                });
             match settings {
                 Ok(Some((generation, options))) => {
                     if owner != Some(generation) {
@@ -480,22 +478,20 @@ mod tests {
     use super::*;
     use crate::test_support::TempConfigDir;
     #[test]
-    fn policy_defaults_off_persists_and_failure_preserves_memory() {
+    fn policy_defaults_off_persists_and_failure_preserves_file() {
         let dir = TempConfigDir::new("background-policy");
         let mut state = crate::local_usage::LocalState::default();
         assert!(!enabled(&mut state).unwrap());
-        save(&mut state, true).unwrap();
+        save_preference(true).unwrap();
         assert!(enabled(&mut crate::local_usage::LocalState::default()).unwrap());
-        let generation = state.generation;
         let temp = preference_path().unwrap().with_extension("tmp");
         std::fs::create_dir(&temp).unwrap();
-        assert!(save(&mut state, false).is_err());
-        assert_eq!(state.background_enabled, Some(true));
-        assert_eq!(state.generation, generation);
+        assert!(save_preference(false).is_err());
+        assert!(enabled(&mut crate::local_usage::LocalState::default()).unwrap());
         std::fs::remove_dir(temp).unwrap();
         std::fs::write(preference_path().unwrap(), b"corrupt").unwrap();
         assert!(enabled(&mut crate::local_usage::LocalState::default()).is_err());
-        save(&mut state, false).unwrap();
+        save_preference(false).unwrap();
         assert!(!enabled(&mut crate::local_usage::LocalState::default()).unwrap());
         assert!(dir.path().exists());
     }
@@ -566,28 +562,6 @@ mod tests {
             watch_roots(&[database]).get(&dir.path().canonicalize().unwrap()),
             Some(&false)
         );
-    }
-    #[tokio::test]
-    async fn disabling_policy_invalidates_and_cancels_without_deleting_snapshot() {
-        let _dir = TempConfigDir::new("background-cancel");
-        let cancel = Arc::new(tokio::sync::Notify::new());
-        let mut state = crate::local_usage::LocalState {
-            generation: 7,
-            busy: true,
-            cancel: Some(cancel.clone()),
-            ..Default::default()
-        };
-        state.snapshot = Some(
-            crate::local_usage::normalize_report(&serde_json::json!({"entries":[]}), 1000).unwrap(),
-        );
-        save(&mut state, false).unwrap();
-        assert_eq!(state.generation, 8);
-        assert!(state.cancel.is_none());
-        assert!(state.busy);
-        assert!(state.snapshot.is_some());
-        tokio::time::timeout(Duration::from_millis(100), cancel.notified())
-            .await
-            .unwrap();
     }
     #[test]
     fn synthetic_native_event_and_disabled_watcher_lifecycle() {

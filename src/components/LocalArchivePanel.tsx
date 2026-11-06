@@ -5,11 +5,19 @@ import { errorMessage } from "../error-state";
 import { fmtTokensShort } from "../format";
 import { downloadText } from "../download";
 import { snapshotQualityLabel } from "../local-quality";
-import { localClientLabel, localSum, localTools } from "../local-usage";
+import {
+  localClientLabel,
+  localSessionLabel,
+  localSourceLabel,
+  localSourceCatalog,
+  localSum,
+  localTools,
+} from "../local-usage";
 import {
   archiveScopeLabel,
   archiveIdentityLabel,
   archiveSelectionLabel,
+  archiveSourceLabel,
   archiveExport,
   archiveLocalRows,
 } from "../local-archive";
@@ -151,6 +159,13 @@ export function LocalArchivePanel({
     setMessage(`已发起 ${format.toUpperCase()} 下载`);
   };
   const rows = selected ? archiveLocalRows(selected) : [];
+  const sourceIdentities = localSourceCatalog([
+    ...entries.map((entry) => ({
+      sourceId: entry.sourceId || undefined,
+      sourceLabel: entry.sourceLabel || undefined,
+    })),
+    ...rows,
+  ]);
   return (
     <section className="panel history-panel local-archive-panel">
       <header className="history-header">
@@ -213,7 +228,21 @@ export function LocalArchivePanel({
               {selected.stale ? " · 上次结果" : ""}
               {!selected.complete ? " · 来源不完整" : ""}
             </p>
-            <p className="history-message">{archiveSelectionLabel(selected)}</p>
+            <p className="history-message">
+              {archiveSourceLabel(selected, sourceIdentities)}
+            </p>
+            <p
+              className="history-message"
+              title={archiveSelectionLabel(selected, sourceIdentities, true)}
+            >
+              {archiveSelectionLabel(selected, sourceIdentities)}
+            </p>
+            <details className="history-details">
+              <summary>完整来源与会话标识</summary>
+              <p className="local-session-id">
+                {archiveSelectionLabel(selected, sourceIdentities, true)}
+              </p>
+            </details>
             <div className="history-metrics local-metrics">
               <article className="card">
                 <span>{retained ? "留存会话 Tokens" : "这份快照 Tokens"}</span>
@@ -238,7 +267,11 @@ export function LocalArchivePanel({
                   key={index}
                 >
                   <h2>{localTools[row.tool] || row.tool}</h2>
-                  <p title={row.clientId || "旧版身份未知"}>
+                  <p
+                    className="local-identity-label"
+                    title={localSessionLabel(row, sourceIdentities, true)}
+                  >
+                    {localSourceLabel(row, sourceIdentities)} ·{" "}
                     {localClientLabel(row.clientId)}
                   </p>
                   <p className="local-model-name" title={row.model}>
@@ -259,8 +292,9 @@ export function LocalArchivePanel({
                   </div>
                   <details>
                     <summary>会话与来源</summary>
-                    <p className="local-session-id">{row.sessionId}</p>
-                    <p>{row.sourceLabel || "本机"}</p>
+                    <p className="local-session-id">
+                      {localSessionLabel(row, sourceIdentities, true)}
+                    </p>
                     {row.projectPath && (
                       <p className="local-path">{row.projectPath}</p>
                     )}
@@ -315,11 +349,18 @@ export function LocalArchivePanel({
                 <button
                   className="card local-group"
                   key={entry.id}
+                  aria-label={`${entry.periodKey} · ${archiveScopeLabel(entry.scope)} · ${archiveSelectionLabel(entry, sourceIdentities, true)} · ${time(entry.savedAt)} · ${entry.rowCount} 条汇总`}
                   disabled={busy}
                   onClick={() => void open(entry.id)}
                 >
                   <span className="local-group-copy">
-                    <strong title={archiveSelectionLabel(entry)}>
+                    <strong
+                      title={archiveSelectionLabel(
+                        entry,
+                        sourceIdentities,
+                        true,
+                      )}
+                    >
                       {entry.periodKey} ·{" "}
                       {retained && entry.tool
                         ? localTools[entry.tool] || entry.tool
@@ -329,8 +370,8 @@ export function LocalArchivePanel({
                         ? ` · ${entry.projectLabel}`
                         : ""}
                     </strong>
-                    <small>
-                      {entry.sourceLabel || entry.sourceId || "多个来源"} ·{" "}
+                    <small className="local-identity-label">
+                      {archiveSourceLabel(entry, sourceIdentities)} ·{" "}
                       {entry.sessionId || "多个会话"} · {time(entry.savedAt)} ·{" "}
                       {entry.rowCount}条{entry.stale ? " · 上次结果" : ""}
                       {!entry.complete ? " · 不完整" : ""}
@@ -377,10 +418,19 @@ export function LocalArchivePanel({
                   <>
                     <br />
                     {selected.periodKey} · {archiveScopeLabel(selected.scope)} ·{" "}
-                    {archiveSelectionLabel(selected)}
+                    {archiveSelectionLabel(selected, sourceIdentities)}
                   </>
                 )}
               </p>
+              {confirm === "one" && selected && (
+                <details>
+                  <summary>核对拟删除记录的完整标识</summary>
+                  <p className="local-session-id">
+                    {archiveSelectionLabel(selected, sourceIdentities, true)}
+                  </p>
+                  <p className="local-session-id">归档编号：{selected.id}</p>
+                </details>
+              )}
               <div className="disclosure-actions">
                 <button
                   className="secondary"

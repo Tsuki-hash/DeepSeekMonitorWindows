@@ -90,8 +90,17 @@ pub fn edit_config(
 ) -> Result<StoredConfig, String> {
     let _guard = lock_config_io();
     let mut config = read_stored_config_unlocked()?;
+    let old_key = config.api_key.clone();
+    let old_token = config.usage_token.clone();
     f(&mut config)?;
     write_stored_config_unlocked(&config)?;
+    if config.api_key != old_key {
+        API_KEY_COMMIT_REVISION.store(revision(), Ordering::SeqCst);
+    }
+    if config.usage_token != old_token {
+        USAGE_TOKEN_COMMIT_REVISION.store(revision(), Ordering::SeqCst);
+    }
+    stamp_snapshot(&mut config);
     Ok(config)
 }
 
@@ -113,6 +122,15 @@ pub const DEFAULT_REFRESH_INTERVAL_SECONDS: u64 = 60;
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
+// Non-secret, process-local commit versions. They are captured under the IO lock
+// together with the data, never sampled later while serializing an old response.
+static API_KEY_COMMIT_REVISION: AtomicU64 = AtomicU64::new(0);
+static USAGE_TOKEN_COMMIT_REVISION: AtomicU64 = AtomicU64::new(0);
+fn stamp_snapshot(config: &mut StoredConfig) {
+    config.config_revision = revision();
+    config.api_key_revision = API_KEY_COMMIT_REVISION.load(Ordering::SeqCst);
+    config.usage_token_revision = USAGE_TOKEN_COMMIT_REVISION.load(Ordering::SeqCst);
+}
 static API_KEY_VALIDATION_REVISION: AtomicU64 = AtomicU64::new(0);
 static USAGE_TOKEN_VALIDATION_REVISION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
@@ -143,6 +161,12 @@ pub fn edit_validated_credential(
     }
     write_stored_config_unlocked(&config)?;
     credential_counter(kind).fetch_add(1, Ordering::SeqCst);
+    let committed_revision = match kind {
+        ValidatedCredential::ApiKey => &API_KEY_COMMIT_REVISION,
+        ValidatedCredential::UsageToken => &USAGE_TOKEN_COMMIT_REVISION,
+    };
+    committed_revision.store(revision(), Ordering::SeqCst);
+    stamp_snapshot(&mut config);
     changed().notify_one();
     Ok(config)
 }
@@ -178,6 +202,12 @@ pub fn default_refresh_interval_seconds() -> u64 {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct StoredConfig {
+    #[serde(skip)]
+    pub config_revision: u64,
+    #[serde(skip)]
+    pub api_key_revision: u64,
+    #[serde(skip)]
+    pub usage_token_revision: u64,
     #[serde(skip)]
     pub config_warnings: Vec<String>,
     // 放在首位，便于人工查看 config.json 时一眼看到格式版本
@@ -218,6 +248,9 @@ impl StoredConfig {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    pub config_revision: u64,
+    pub api_key_revision: u64,
+    pub usage_token_revision: u64,
     pub config_warnings: Vec<String>,
     pub api_key_configured: bool,
     pub api_key_preview: Option<String>,
@@ -257,7 +290,9 @@ pub fn read_stored_config() -> Result<StoredConfig, String> {
 fn read_stored_config_unlocked() -> Result<StoredConfig, String> {
     let path = config_path()?;
     if !path.exists() {
-        return Ok(StoredConfig::with_defaults());
+        let mut config = StoredConfig::with_defaults();
+        stamp_snapshot(&mut config);
+        return Ok(config);
     }
 
     let raw = fs::read(&path).map_err(|_| "无法读取配置文件，原文件未改动".to_string())?;
@@ -282,6 +317,7 @@ fn read_stored_config_unlocked() -> Result<StoredConfig, String> {
         }
     }
 
+    stamp_snapshot(&mut config);
     Ok(config)
 }
 
@@ -434,6 +470,9 @@ pub fn to_app_config(config: StoredConfig) -> Result<AppConfig, String> {
         .unwrap_or(false);
 
     Ok(AppConfig {
+        config_revision: config.config_revision,
+        api_key_revision: config.api_key_revision,
+        usage_token_revision: config.usage_token_revision,
         config_warnings: config.config_warnings,
         api_key_configured: api_key_preview.is_some(),
         api_key_preview,
@@ -816,6 +855,63 @@ mod tests {
         .unwrap();
         assert_eq!(stored.refresh_interval_seconds, 300);
         assert_eq!(read_stored_config().unwrap().refresh_interval_seconds, 300);
+    }
+
+    #[test]
+    fn n05_snapshot_versions_are_frozen_and_not_persisted() {
+        let dir = TempConfigDir::new("n05_snapshot_versions");
+        let first = edit_config(|config| {
+            config.refresh_interval_seconds = 300;
+            Ok(())
+        })
+        .unwrap();
+        let old_revision = first.config_revision;
+        let second = edit_config(|config| {
+            config.auto_refresh_enabled = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(second.config_revision > old_revision);
+        assert_eq!(second.api_key_revision, first.api_key_revision);
+        assert_eq!(second.usage_token_revision, first.usage_token_revision);
+        // Conversion occurs after another commit, but must retain the old stamp.
+        assert_eq!(to_app_config(first).unwrap().config_revision, old_revision);
+        let read = read_stored_config().unwrap();
+        assert_eq!(read.config_revision, second.config_revision);
+        let disk = fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(!disk.contains("config_revision"));
+        assert!(!disk.contains("api_key_revision"));
+        assert!(!disk.contains("usage_token_revision"));
+        let before_failure = revision();
+        assert!(edit_config(|_| Err("synthetic failure".into())).is_err());
+        assert_eq!(revision(), before_failure);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n05_key_and_token_versions_change_only_after_their_successful_commits() {
+        let _dir = TempConfigDir::new("n05_credential_versions");
+        let key =
+            edit_validated_credential(ValidatedCredential::ApiKey, "SYNTHETIC_KEY".into()).unwrap();
+        let token =
+            edit_validated_credential(ValidatedCredential::UsageToken, "SYNTHETIC_TOKEN".into())
+                .unwrap();
+        assert_eq!(token.api_key_revision, key.api_key_revision);
+        assert!(token.usage_token_revision > key.usage_token_revision);
+        let same_key =
+            edit_validated_credential(ValidatedCredential::ApiKey, "SYNTHETIC_KEY".into()).unwrap();
+        assert!(same_key.api_key_revision > key.api_key_revision);
+        assert_eq!(same_key.usage_token_revision, token.usage_token_revision);
+        let cleared = edit_config(|stored| {
+            stored.api_key = None;
+            Ok(())
+        })
+        .unwrap();
+        assert!(cleared.api_key_revision > same_key.api_key_revision);
+        assert_eq!(cleared.usage_token_revision, token.usage_token_revision);
+        let public = to_app_config(cleared).unwrap();
+        assert!(!public.api_key_configured);
+        assert!(public.usage_token_configured);
     }
 
     #[test]

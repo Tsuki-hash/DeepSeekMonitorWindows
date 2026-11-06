@@ -42,10 +42,12 @@ pub async fn collect(path: PathBuf) -> Result<LocalSnapshot, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "系统时钟异常")?
         .as_millis() as u64;
+    let collection = crate::commands::collection_worker_lease();
     let task = tokio::task::spawn_blocking(move || {
         // Keep the single reader slot until the actual worker exits, even if
         // timeout/cancellation drops the caller while an OS read is blocked.
         let _permit = permit;
+        let _collection = collection;
         read(
             &path,
             now,

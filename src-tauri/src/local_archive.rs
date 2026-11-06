@@ -101,6 +101,10 @@ impl Default for Store {
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveSummary {
     pub source_id: Option<String>,
+    /// Read-time projection only: do not expand or rewrite historical stores.
+    pub source_count: usize,
+    pub source_has_unknown: bool,
+    pub source_identity_status: String,
     pub client_id: Option<String>,
     pub identity_status: String,
     pub quality_evidence_recorded: bool,
@@ -232,6 +236,18 @@ pub(crate) fn normalize_quality(entry: &mut ArchiveEntry) {
     (entry.quality_evidence_recorded, entry.quality_warnings) =
         quality_evidence(entry.quality_evidence_recorded, &entry.quality_warnings);
 }
+fn known_source_id(id: &str) -> bool {
+    id == "native"
+        || id
+            .strip_prefix("home-")
+            .or_else(|| id.strip_prefix("tool-"))
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+}
 pub(crate) fn summary(entry: ArchiveEntry) -> ArchiveSummary {
     let unique = |values: Vec<&str>| -> Option<String> {
         let values: BTreeSet<_> = values.into_iter().collect();
@@ -257,23 +273,49 @@ pub(crate) fn summary(entry: ArchiveEntry) -> ArchiveSummary {
     } else {
         "unknown"
     };
-    let (quality_evidence_recorded, quality_warnings) =
-        quality_evidence(entry.quality_evidence_recorded, &entry.quality_warnings);
-    ArchiveSummary {
-        source_id: unique(
-            entry
-                .rows
-                .iter()
-                .map(|row| row.source_id.as_str())
-                .collect(),
-        ),
-        source_label: unique(
+    let known_sources: BTreeSet<_> = entry
+        .rows
+        .iter()
+        .map(|row| row.source_id.as_str())
+        .filter(|id| known_source_id(id))
+        .collect();
+    let source_has_unknown = entry
+        .rows
+        .iter()
+        .any(|row| !known_source_id(&row.source_id));
+    let source_identity_status =
+        if known_sources.len() > 1 || (!known_sources.is_empty() && source_has_unknown) {
+            "mixed"
+        } else if known_sources.len() == 1 {
+            "known"
+        } else {
+            "unknown"
+        };
+    let source_count = known_sources.len();
+    let source_id =
+        (source_identity_status == "known").then(|| (*known_sources.first().unwrap()).to_owned());
+    // Equal display labels do not mean equal identities. A mixed-source archive
+    // must not advertise the one shared label as if it were one source.
+    let source_label = if source_identity_status == "known" {
+        unique(
             entry
                 .rows
                 .iter()
                 .map(|row| row.source_label.as_str())
                 .collect(),
-        ),
+        )
+        .filter(|label| !label.is_empty())
+    } else {
+        None
+    };
+    let (quality_evidence_recorded, quality_warnings) =
+        quality_evidence(entry.quality_evidence_recorded, &entry.quality_warnings);
+    ArchiveSummary {
+        source_id,
+        source_count,
+        source_has_unknown,
+        source_identity_status: source_identity_status.into(),
+        source_label,
         session_id: unique(
             entry
                 .rows
@@ -1035,6 +1077,53 @@ mod tests {
         assert_eq!(known.client_id.as_deref(), Some("claude"));
         assert_eq!(known.source_id.as_deref(), Some(row.source_id.as_str()));
         assert_eq!(known.session_id.as_deref(), Some(row.session_id.as_str()));
+    }
+
+    #[test]
+    fn n06_summary_counts_source_ids_not_equal_labels_without_rewriting_rows() {
+        let _dir = TempConfigDir::new("archive-source-identity-summary");
+        let mut snap = snapshot(1000);
+        let mut first = snap.rows[0].clone();
+        first.source_id = format!("home-{}", "a".repeat(64));
+        first.source_label = "WSL · Ubuntu".into();
+        let mut second = first.clone();
+        second.source_id = format!("home-{}", "b".repeat(64));
+        snap.rows = vec![first.clone(), second.clone()];
+        let captured = capture(&snap, &ArchiveScope::All, false, false, 2000).unwrap();
+        let original_rows = captured.rows.clone();
+        let mixed = summary(captured.clone());
+        assert_eq!(mixed.source_count, 2);
+        assert_eq!(mixed.source_identity_status, "mixed");
+        assert!(!mixed.source_has_unknown);
+        assert!(mixed.source_id.is_none());
+        assert!(mixed.source_label.is_none());
+        assert_eq!(read(&captured.id).unwrap().rows, original_rows);
+        let mut reordered = captured.clone();
+        reordered.rows.reverse();
+        assert_eq!(summary(reordered).source_count, 2);
+        let mut single = captured.clone();
+        single.rows.truncate(1);
+        let known = summary(single.clone());
+        assert_eq!(known.source_count, 1);
+        assert_eq!(known.source_identity_status, "known");
+        assert_eq!(known.source_id.as_deref(), Some(first.source_id.as_str()));
+        assert_eq!(known.source_label.as_deref(), Some("WSL · Ubuntu"));
+        // Missing legacy IDs and raw-path IDs cannot become a public source ID.
+        single.rows[0].source_id = "D:\\Private\\SECRET".into();
+        let unknown = summary(single.clone());
+        assert_eq!(unknown.source_identity_status, "unknown");
+        assert_eq!(unknown.source_count, 0);
+        assert!(unknown.source_has_unknown);
+        assert!(unknown.source_id.is_none());
+        assert!(unknown.source_label.is_none());
+        single.rows[0].source_id.clear();
+        assert_eq!(summary(single.clone()).source_identity_status, "unknown");
+        single.rows.push(original_rows[0].clone());
+        let partial = summary(single);
+        assert_eq!(partial.source_identity_status, "mixed");
+        assert_eq!(partial.source_count, 1);
+        assert!(partial.source_has_unknown);
+        assert!(partial.source_id.is_none());
     }
 
     #[test]

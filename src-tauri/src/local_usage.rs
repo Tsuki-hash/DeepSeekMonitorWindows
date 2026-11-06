@@ -420,11 +420,9 @@ pub async fn collect_sources(
         candidates.push((id, label, entry.path.clone().into(), kind, false));
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    // 复评 R02：删除「采集前先算 overlaps、循环无条件跳过」的先验判重 ——
-    // covering home 本轮失败/被拒时，用户单独配置的单工具来源必须照常采集
-    // （它是可用的退路）。判重只承认**本轮成功读取的实际入口**：home 成功
-    // 后才登记其标准布局覆盖根（见下方 layout_roots），后续工具来源据此判重。
-    // 候选顺序保证 home 先于单工具路径处理，登记一定发生在判定之前。
+    // Same-invocation aliases are skipped only after that invocation succeeds.
+    // A home's declared roots never suppress a separately configured tool:
+    // exit 0 cannot establish per-root adoption or successful parser reads.
     let wsl = if candidates
         .iter()
         .any(|(_, _, _, kind, _)| matches!(kind, HomeKind::Wsl { .. }))
@@ -437,8 +435,9 @@ pub async fn collect_sources(
     // 读取并记住，避免逐来源重复 spawn wsl.exe。
     let mut wsl_memo = wsl.clone();
     let mut rows = Vec::new();
-    // Only completed sources contribute immutable, previously validated roots.
-    let mut successful_roots: Vec<(crate::local_overlap::ScanRoot, String)> = Vec::new();
+    // Completed invocations retain their declarations only to flag overlap.
+    // The pinned executable does not return per-root adoption/read receipts.
+    let mut completed_plans: Vec<(crate::local_overlap::ScanRoot, String)> = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     let mut succeeded = 0;
     let mut zcode_adapter_used = false;
@@ -483,6 +482,9 @@ pub async fn collect_sources(
                     crate::local_sources::resolve_layout_root(&requested, origin, expect)
                 })
                 .await??;
+                if tool_path.is_some_and(|entry| entry.tool == "opencode") {
+                    require_opencode_database_name(&canonical)?;
+                }
                 let key = match tool_path {
                     Some(entry) => format!(
                         "tool:{}:{}",
@@ -501,6 +503,7 @@ pub async fn collect_sources(
                     let mut tool_plan = vec![RegisteredRoot {
                         tool: entry.tool.clone(),
                         client: entry.tool.clone(),
+                        engine_path: canonical.clone(),
                         path: canonical.clone(),
                         expect,
                         origin,
@@ -551,12 +554,11 @@ pub async fn collect_sources(
                     plan.extend(extra);
                 }
                 check_plan_size(plan.len())?;
+                let dependency_plan = plan.clone();
+                run_bounded_io(move || audit_claude_dependencies(&dependency_plan)).await??;
                 let scan_plan: Vec<_> = plan.iter().map(RegisteredRoot::scan_root).collect();
-                let coverage = crate::local_overlap::compare_plans(&scan_plan, &successful_roots);
-                if let Some(owner) = coverage.covered_by {
-                    duplicate_owner = Some(owner);
-                    return Ok(None);
-                }
+                let coverage = crate::local_overlap::compare_plans(&scan_plan, &completed_plans);
+                debug_assert!(coverage.covered_by.is_none());
                 // The fixed executable cannot exclude individual home roots. Do
                 // not discard unique data or pretend this is a deduplicated total.
                 overlap = coverage.partial;
@@ -566,7 +568,7 @@ pub async fn collect_sources(
                     run_engine_profile(path, Some(&canonical), &profile.join(&id)).await?
                 };
                 seen.insert(key, label.clone());
-                successful_roots.extend(scan_plan.into_iter().map(|root| (root, label.clone())));
+                completed_plans.extend(scan_plan.into_iter().map(|root| (root, label.clone())));
                 Ok::<_, String>(Some(scope_snapshot(snapshot, &id, &label)))
             })
             .await;
@@ -594,7 +596,9 @@ pub async fn collect_sources(
                     state = "duplicate";
                     // 复评 T04：说明是哪个来源覆盖了它，用户才能判断该删哪个配置。
                     let covering = duplicate_owner.unwrap_or_else(|| "相同来源".into());
-                    message = Some(format!("已由来源「{covering}」覆盖，未重复采集"));
+                    message = Some(format!(
+                        "与来源「{covering}」的已完成采集入口相同，未重复执行"
+                    ));
                 }
                 Ok(Err(error)) => {
                     state = "unavailable";
@@ -775,9 +779,11 @@ where
         cancelled,
         deadline: std::time::Instant::now() + Duration::from_secs(60),
     };
+    let collection = crate::commands::collection_worker_lease();
     tokio::task::spawn_blocking(move || {
         // The permit lives in the worker even when its waiter is cancelled.
         let _permit = permit;
+        let _collection = collection;
         IO_CONTROL.with(|slot| *slot.borrow_mut() = Some(control));
         struct ClearControl;
         impl Drop for ClearControl {
@@ -955,6 +961,7 @@ fn validated_standard_roots_with_budget(
             roots.push(RegisteredRoot {
                 tool: tool.to_string(),
                 client: tool.to_string(),
+                engine_path: path,
                 path: resolved,
                 expect,
                 origin,
@@ -1047,6 +1054,7 @@ fn audit_optional_database(
     Ok(Some(RegisteredRoot {
         tool: tool.into(),
         client: tool.into(),
+        engine_path: path.to_path_buf(),
         optional: false,
         path: resolved,
         expect: crate::local_sources::ResolvedExpect::File,
@@ -1066,6 +1074,21 @@ fn is_opencode_database_name(name: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         })
+}
+
+/// The fixed scanner filters the supplied basename before canonicalizing.
+/// Explicit tool sources supply the canonical path, so validate that exact
+/// name rather than the spelling of a symlink chosen in the settings UI.
+fn require_opencode_database_name(path: &Path) -> Result<(), String> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_opencode_database_name)
+    {
+        Ok(())
+    } else {
+        Err("OpenCode规范目标文件名不受固定引擎支持；须为opencode.db或opencode-渠道.db，未将命名跳过当成空用量".into())
+    }
 }
 
 /// The fixed engine's specialized discovery is shallow. Check only its exact
@@ -1148,6 +1171,7 @@ fn audit_special_databases(
                         tool: tool.into(),
                         client: tool.into(),
                         optional: false,
+                        engine_path: legacy,
                         path: canonical,
                         expect: crate::local_sources::ResolvedExpect::Directory,
                         origin,
@@ -1275,9 +1299,7 @@ fn read_engine_config_roots(
     };
     let mut roots: Vec<RegisteredRoot> = Vec::new();
     if let Some(text) = settings {
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| "采集引擎 settings.json 无法解析".to_string())?;
-        for (tool, raw, directory) in engine_config_roots(&value)? {
+        for (tool, raw, directory) in engine_config_roots_from_text(&text)? {
             // 复评 R06：只登记实际启用且受支持的扩展根。
             if !READ_CLIENTS.contains(&tool.as_str()) {
                 continue;
@@ -1288,6 +1310,7 @@ fn read_engine_config_roots(
             roots.push(RegisteredRoot {
                 client: tool.clone(),
                 tool,
+                engine_path: std::path::PathBuf::from(&raw),
                 path: std::path::PathBuf::from(&raw),
                 expect: if directory {
                     crate::local_sources::ResolvedExpect::Directory
@@ -1397,12 +1420,16 @@ fn read_settings_text(
     }
 }
 
-/// 复评 F01：一个会被引擎实际读取、并已通过来源策略校验的根。
+/// A declared root which passed preflight. This is not evidence that the
+/// executable adopted it or that its parser successfully read it.
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredRoot {
     pub tool: String,
     pub client: String,
     pub optional: bool,
+    /// Exact spelling passed by the scanner, retained because Claude derives
+    /// parent/variant paths from ancestry before canonicalization.
+    pub engine_path: std::path::PathBuf,
     pub path: std::path::PathBuf,
     pub expect: crate::local_sources::ResolvedExpect,
     /// 复评 N02：根**自身**的 origin。旧实现登记时用外层 home 的 origin
@@ -1498,6 +1525,7 @@ fn read_cc_mirror_roots(
                 crate::local_sources::home_key(&entry.path().to_string_lossy())
             ),
             optional: true,
+            engine_path: projects.clone(),
             path: projects.clone(),
             expect: crate::local_sources::ResolvedExpect::Directory,
             origin: crate::local_sources::origin_for_path(&projects.to_string_lossy()),
@@ -1506,51 +1534,402 @@ fn read_cc_mirror_roots(
     Ok(roots)
 }
 
-/// 复评 R03：从引擎 settings.json 提取**全部**实际来源声明。
-///
-/// 返回 `(tool, path, 是否目录)`：
-/// - `scanner.extraScanPaths`：按工具分桶的目录根列表；
-/// - `scanner.opencodeDbPaths`：OpenCode 的数据库文件列表（上游会
-///   `is_file`/`canonicalize` 后并入解析列表，应用的 --client 固定包含
-///   opencode，因此该字段可达）。
-///
-/// 字段存在但形态非法（不是数组、含非字符串项）时返回错误 —— 宁可拒绝
-/// 采集，也不能留下未经校验的来源。
-fn engine_config_roots(value: &serde_json::Value) -> Result<Vec<(String, String, bool)>, String> {
+/// Typed acceptance contract from the pinned d5e8ad9b Settings and nested
+/// structs. Do not deserialize to Value first: that discards duplicate keys.
+/// All known non-scanner fields still participate in validation because any
+/// typed failure makes the executable replace the *whole* Settings by defaults.
+/// Unknown fields and the upstream lossy fields intentionally remain accepted.
+/// Upstream normalize only clamps UI/autosubmit timings; it does not alter roots.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(dead_code)] // These fields validate the complete upstream contract.
+struct PinnedEngineSettings {
+    color_palette: String,
+    auto_refresh_enabled: bool,
+    auto_refresh_ms: u64,
+    include_unused_models: bool,
+    native_timeout_ms: u64,
+    scanner: PinnedScannerSettings,
+    #[serde(deserialize_with = "pinned_lossy_string_array")]
+    default_clients: Vec<String>,
+    light: PinnedLightSettings,
+    usage: PinnedUsageSettings,
+    minutely_tab_enabled: bool,
+    autosubmit: PinnedAutosubmitSettings,
+    model_aliases: Value,
+    tui_light_mode: bool,
+    tui_language: Value,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PinnedScannerSettings {
+    opencode_db_paths: Vec<String>,
+    extra_scan_paths: BTreeMap<String, Vec<String>>,
+    bucket_timezone: Option<String>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PinnedLightSettings {
+    write_cache: bool,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PinnedUsageSettings {
+    // Upstream drops non-string members, but rejects a non-array field.
+    disabled_providers: Vec<Value>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PinnedAutosubmitSettings {
+    enabled: bool,
+    interval_minutes: u64,
+    #[serde(deserialize_with = "pinned_lossy_string_array")]
+    clients: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    today: bool,
+    yesterday: bool,
+    week: bool,
+    month: bool,
+    scheduler: Option<String>,
+    managed_executable: Option<String>,
+    managed_executable_version: Option<String>,
+    last_run_at_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+// Preserve the fixed implementation, including error consumption, rather than
+// replacing a lossy Vec deserializer by a more permissive generic Value.
+fn pinned_lossy_string_array<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<Vec<Value>> = Option::deserialize(deserializer).ok().flatten();
+    Ok(value
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect())
+}
+
+fn engine_config_roots_from_text(text: &str) -> Result<Vec<(String, String, bool)>, String> {
+    let settings: PinnedEngineSettings = serde_json::from_str(text).map_err(|_| {
+        "引擎 settings.json 的类型或重复字段与固定版本不兼容，已拒绝该主目录；单工具来源仍可独立采集".to_string()
+    })?;
     let mut roots = Vec::new();
-    let scanner = value.get("scanner");
-    if let Some(extra) = scanner.and_then(|scanner| scanner.get("extraScanPaths")) {
-        let Some(map) = extra.as_object() else {
-            return Err("引擎 settings.json 的 extraScanPaths 无法解析，拒绝采集".into());
-        };
-        for (tool, list) in map {
-            let Some(list) = list.as_array() else {
-                return Err(format!(
-                    "引擎 settings.json 的 extraScanPaths[{tool}] 无法解析，拒绝采集"
-                ));
-            };
-            for entry in list {
-                let Some(raw) = entry.as_str() else {
-                    return Err(format!(
-                        "引擎 settings.json 的 extraScanPaths[{tool}] 含非字符串项，拒绝采集"
-                    ));
-                };
-                roots.push((tool.clone(), raw.to_string(), true));
+    for (tool, paths) in settings.scanner.extra_scan_paths {
+        // Match ClientId::from_str and extra_scan_paths_for: exact lowercase
+        // client IDs; an empty path is ignored, not a successful read root.
+        if !READ_CLIENTS.contains(&tool.as_str()) {
+            continue;
+        }
+        roots.extend(
+            paths
+                .into_iter()
+                .filter(|path| !path.is_empty())
+                .map(|path| (tool.clone(), path, true)),
+        );
+    }
+    for path in settings.scanner.opencode_db_paths {
+        // The engine receives the original configured spelling here, unlike
+        // run_tool_source, which passes a canonical path. Invalid names cannot
+        // be registered as evidence for a database the engine silently skips.
+        let name = path.rsplit(['\\', '/']).next().unwrap_or("");
+        if !is_opencode_database_name(name) {
+            return Err(
+                "引擎 settings.json 的OpenCode数据库文件名不受固定版本支持，已拒绝该主目录".into(),
+            );
+        }
+        roots.push(("opencode".into(), path, false));
+    }
+    Ok(roots)
+}
+
+#[cfg(test)]
+fn engine_config_roots(value: &Value) -> Result<Vec<(String, String, bool)>, String> {
+    engine_config_roots_from_text(&value.to_string())
+}
+
+const CLAUDE_AUDIT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const CLAUDE_AUDIT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const CLAUDE_AUDIT_METADATA_BYTES: u64 = 256 * 1024;
+
+#[derive(Default)]
+struct ClaudeDependencyBudget {
+    entries: usize,
+    bytes: u64,
+    metadata: std::collections::BTreeSet<std::path::PathBuf>,
+}
+
+impl ClaudeDependencyBudget {
+    fn entry(&mut self) -> Result<(), String> {
+        io_checkpoint()?;
+        self.entries += 1;
+        if self.entries > REPARSE_AUDIT_MAX_ENTRIES {
+            return Err("Claude依赖条目累计超过安全上限，未启动该来源采集".into());
+        }
+        Ok(())
+    }
+}
+
+/// Pure lexical gate, before any candidate exists/metadata/open operation.
+/// Appending `.jsonl` does not make drive/UNC/ADS or reserved device names safe.
+fn safe_claude_parent_id(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 200
+        || value == "."
+        || value == ".."
+        || value.ends_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    let stem = value.split('.').next().unwrap_or("").to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(*prefix)
+                .is_some_and(|tail| tail.len() == 1 && matches!(tail.as_bytes()[0], b'1'..=b'9'))
+        })
+}
+
+/// Same candidate order as d5e8ad9b parent_session_paths, without filesystem IO.
+fn claude_parent_candidates(
+    path: &Path,
+    session_id: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    if !safe_claude_parent_id(session_id) {
+        return Err("Claude记录含不安全的父会话标识，未访问派生路径并拒绝该来源".into());
+    }
+    let filename = format!("{session_id}.jsonl");
+    let mut candidates = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents") {
+            if let Some(project) = ancestor.parent().and_then(Path::parent) {
+                candidates.push(project.join(&filename));
+            }
+            break;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let candidate = parent.join(filename);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+/// The default mirror layout may be outside home, including when an extra root
+/// starts below `projects`. Match the engine's ancestry rule, not a root label.
+fn claude_variant_dependency(path: &Path) -> Option<std::path::PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) != Some("config")
+            || !path.starts_with(ancestor.join("projects"))
+        {
+            continue;
+        }
+        let variant = ancestor.parent()?;
+        if variant
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".cc-mirror")
+        {
+            return Some(variant.join("variant.json"));
+        }
+    }
+    None
+}
+
+fn read_claude_dependency(
+    path: &Path,
+    origin: crate::local_sources::SourceOrigin,
+    limit: u64,
+    optional: bool,
+    budget: &mut ClaudeDependencyBudget,
+) -> Result<Option<Vec<u8>>, String> {
+    budget.entry()?;
+    // Full ancestry/link policy precedes metadata and bounded content reads.
+    crate::local_sources::check_link_chain(path, origin)?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Err("Claude依赖不是普通文件，已拒绝该来源".into()),
+        Err(error)
+            if optional
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+        {
+            return Ok(None)
+        }
+        Err(_) => return Err("Claude依赖无法完整检查，已拒绝该来源".into()),
+    };
+    let remaining = CLAUDE_AUDIT_TOTAL_BYTES.saturating_sub(budget.bytes);
+    if metadata.len() > limit || metadata.len() > remaining {
+        return Err("Claude依赖超过单文件或累计读取预算，未启动该来源采集".into());
+    }
+    let bytes =
+        read_bounded(path, limit.min(remaining)).map_err(|_| "Claude依赖读取失败，已拒绝该来源")?;
+    budget.bytes = budget.bytes.saturating_add(bytes.len() as u64);
+    if bytes.len() as u64 > limit || budget.bytes > CLAUDE_AUDIT_TOTAL_BYTES {
+        return Err("Claude依赖在读取时超过预算，已拒绝该来源".into());
+    }
+    Ok(Some(bytes))
+}
+
+fn audit_claude_metadata(
+    path: &Path,
+    origin: crate::local_sources::SourceOrigin,
+    budget: &mut ClaudeDependencyBudget,
+) -> Result<(), String> {
+    if budget.metadata.insert(path.to_path_buf()) {
+        // Invalid/missing metadata affects attribution, not the read boundary.
+        // It still must be checked and bounded even when a usable meta sidecar
+        // would prevent the hot parser's parent fallback: the cache probes it.
+        read_claude_dependency(path, origin, CLAUDE_AUDIT_METADATA_BYTES, true, budget)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ClaudeDependencyEntry {
+    #[serde(rename = "isSidechain", default)]
+    is_sidechain: Value,
+    #[serde(rename = "sessionId", default)]
+    session_id: Value,
+}
+
+/// Transitional preflight for both parser and source-cache dependencies.
+/// This is NOT an IO sandbox: the fixed executable later reopens the originals.
+/// TOCTOU, cached parent paths and historical cache-key probes still require
+/// an engine-side fix; the old cache is preserved for compacted history.
+fn audit_claude_dependencies(plan: &[RegisteredRoot]) -> Result<(), String> {
+    let mut budget = ClaudeDependencyBudget::default();
+    for root in plan.iter().filter(|root| root.tool == "claude") {
+        let mut root_aliases =
+            crate::local_sources::checked_root_aliases(&root.engine_path, root.origin)?;
+        let resolved =
+            std::fs::canonicalize(&root.engine_path).map_err(|_| "Claude日志根身份无法复核")?;
+        if crate::local_sources::home_key(&resolved.to_string_lossy())
+            != crate::local_sources::home_key(&root.path.to_string_lossy())
+        {
+            return Err("Claude日志根在检查期间发生变化，请重试".into());
+        }
+        root_aliases.push(root.path.clone());
+        let approved_roots: Vec<&Path> = root_aliases
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect();
+        let mut directories = vec![root.engine_path.clone()];
+        while let Some(directory) = directories.pop() {
+            budget.entry()?;
+            crate::local_sources::check_link_chain(&directory, root.origin)?;
+            let entries = std::fs::read_dir(&directory)
+                .map_err(|_| "Claude目录无法完整检查，已拒绝该来源")?;
+            for entry in entries {
+                budget.entry()?;
+                let path = entry.map_err(|_| "Claude目录项无法检查")?.path();
+                let meta =
+                    std::fs::symlink_metadata(&path).map_err(|_| "Claude目录项状态无法检查")?;
+                if crate::local_sources::is_reparse_entry(&meta) {
+                    // WalkDir never descends into directory links, but may
+                    // probe them. The ordinary audit has already validated it.
+                    if !is_dir_link(&meta) {
+                        return Err("Claude目录内含文件链接，已拒绝该来源".into());
+                    }
+                    crate::local_sources::check_link_chain(&path, root.origin)?;
+                    continue;
+                }
+                if meta.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if !meta.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                let bytes = read_claude_dependency(
+                    &path,
+                    root.origin,
+                    CLAUDE_AUDIT_FILE_BYTES,
+                    false,
+                    &mut budget,
+                )?
+                .ok_or("Claude日志在检查时消失")?;
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| "Claude日志不是完整UTF-8，已拒绝该来源")?;
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    audit_claude_metadata(
+                        &path.with_file_name(format!("{stem}.meta.json")),
+                        root.origin,
+                        &mut budget,
+                    )?;
+                }
+                if let Some(variant) = claude_variant_dependency(&path) {
+                    // This grants the exact inferred variant file only, never
+                    // its containing tree. It covers explicit/extra roots too.
+                    audit_claude_metadata(&variant, root.origin, &mut budget)?;
+                }
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    io_checkpoint()?;
+                    // Be conservative about parser differences and duplicate
+                    // fields. Incomplete active writes must be retried, not
+                    // labeled as fully checked based on a partial prefix.
+                    let entry: ClaudeDependencyEntry = serde_json::from_str(line)
+                        .map_err(|_| "Claude日志含未完整或歧义JSON行，请等待写入完成后重试")?;
+                    if entry.is_sidechain != Value::Bool(true) || entry.session_id.is_null() {
+                        continue;
+                    }
+                    let session = entry
+                        .session_id
+                        .as_str()
+                        .ok_or("Claude父会话标识类型不兼容，已拒绝该来源")?;
+                    // Audit every sidechain line, including late lines seen by
+                    // parent_session_paths_for_cache after a normal first row.
+                    for parent in claude_parent_candidates(&path, session)? {
+                        if !parent.starts_with(&root.engine_path) {
+                            return Err("Claude父会话候选超出已批准日志根，未访问该候选".into());
+                        }
+                        crate::local_sources::check_link_chain_within(
+                            &parent,
+                            root.origin,
+                            &approved_roots,
+                        )?;
+                        if let Ok(canonical) = std::fs::canonicalize(&parent) {
+                            if !crate::local_overlap::key_within(
+                                &crate::local_sources::home_key(&root.path.to_string_lossy()),
+                                &crate::local_sources::home_key(&canonical.to_string_lossy()),
+                            ) {
+                                return Err(
+                                    "Claude父会话候选的规范目标超出日志根，已拒绝该来源".into()
+                                );
+                            }
+                        }
+                        // Parser reads the parent in full and cache fingerprints
+                        // all candidates, including a lower-priority candidate.
+                        if budget.metadata.insert(parent.clone()) {
+                            read_claude_dependency(
+                                &parent,
+                                root.origin,
+                                CLAUDE_AUDIT_FILE_BYTES,
+                                true,
+                                &mut budget,
+                            )?;
+                        }
+                    }
+                }
             }
         }
     }
-    if let Some(db_paths) = scanner.and_then(|scanner| scanner.get("opencodeDbPaths")) {
-        let Some(list) = db_paths.as_array() else {
-            return Err("引擎 settings.json 的 opencodeDbPaths 无法解析，拒绝采集".into());
-        };
-        for entry in list {
-            let Some(raw) = entry.as_str() else {
-                return Err("引擎 settings.json 的 opencodeDbPaths 含非字符串项，拒绝采集".into());
-            };
-            roots.push(("opencode".to_string(), raw.to_string(), false));
-        }
-    }
-    Ok(roots)
+    Ok(())
 }
 
 /// 校验一个引擎配置声明的根（复评 R03/R06）。
@@ -1623,6 +2002,9 @@ async fn run_tool_source(
     let target = resolved.to_string_lossy().to_string();
     if entry.tool == "zcode" {
         return crate::zcode_usage::collect(resolved.to_path_buf()).await;
+    }
+    if entry.tool == "opencode" {
+        require_opencode_database_name(resolved)?;
     }
     // --home loads scanner settings from this app-owned empty home. Never write
     // settings into the user's tool root or copy a live SQLite/WAL database.
@@ -1716,6 +2098,9 @@ async fn run_engine_profile(
             "--no-spinner",
         ])
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+        // Preserve cached history needed by compacted Claude transcripts.
+        // The fixed engine can still probe historical cached dependency paths;
+        // host preflight alone does not close that cache-side boundary.
         .env("TOKSCALE_CONFIG_DIR", profile)
         .env("DO_NOT_TRACK", "1")
         // 复评 T13：显式移除引擎的环境扩展来源开关。即使未来引擎在 --home
@@ -1731,7 +2116,8 @@ async fn run_engine_profile(
     if let Some(home) = home {
         command.arg("--home").arg(home);
     }
-    let mut child = command.spawn().map_err(|_| "无法启动本地采集引擎")?;
+    let mut child =
+        crate::commands::CollectionChild::new(command.spawn().map_err(|_| "无法启动本地采集引擎")?);
     let mut data = Vec::new();
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let stdout = child.stdout.take().ok_or("采集输出不可用")?;
@@ -1793,14 +2179,21 @@ async fn run_engine_profile(
 
 #[derive(Default)]
 pub struct LocalCollector {
-    pub inner: Mutex<LocalState>,
+    pub inner: Arc<Mutex<LocalState>>,
 }
 #[derive(Default)]
 pub struct LocalState {
     pub enabled: Option<bool>,
     pub background_enabled: Option<bool>,
+    /// Runtime stop is effective even if its persistence has not succeeded yet.
+    pub stop_save_pending: bool,
+    pub background_stop_save_pending: bool,
+    /// Exit is monotonic for this process; a late enable worker cannot reopen it.
+    pub shutting_down: bool,
     pub generation: u64,
     pub busy: bool,
+    /// A settings/retention mutation owns this until its blocking work really exits.
+    pub settings_busy: bool,
     pub snapshot: Option<LocalSnapshot>,
     pub cancel: Option<Arc<tokio::sync::Notify>>,
     pub sources: Option<crate::local_sources::SourceOptions>,
@@ -2341,7 +2734,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(
             r#"{"scanner":{
                 "extraScanPaths":{"claude":["D:\\Logs\\Claude"],"dsh":["D:\\Logs\\Dsh"]},
-                "opencodeDbPaths":["D:\\Db\\opencode.db","D:\\Db\\other.db"]
+                "opencodeDbPaths":["D:\\Db\\opencode.db","D:\\Db\\opencode-stable.db"]
             }}"#,
         )
         .unwrap();
@@ -2376,6 +2769,298 @@ mod tests {
         // 没有 scanner 字段：没有扩展来源。
         let empty: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
         assert!(engine_config_roots(&empty).unwrap().is_empty());
+    }
+
+    // Round-12 regressions are written for the user's local test run. These
+    // source-level cases are not evidence that the fixed EXE was exercised.
+    #[test]
+    fn r12_settings完整typed合同拒绝假覆盖但保留lossy字段() {
+        for invalid in [
+            r#"{"autoRefreshMs":"oops","scanner":{"extraScanPaths":{"claude":["D:\\Shared"]}}}"#,
+            r#"{"colorPalette":0}"#,
+            r#"{"autoRefreshEnabled":1}"#,
+            r#"{"includeUnusedModels":null}"#,
+            r#"{"nativeTimeoutMs":-1}"#,
+            r#"{"scanner":{"bucketTimezone":3}}"#,
+            r#"{"light":{"writeCache":"yes"}}"#,
+            r#"{"usage":{"disabledProviders":null}}"#,
+            r#"{"autosubmit":{"since":5}}"#,
+            r#"{"autosubmit":{"lastRunAtMs":1.5}}"#,
+            r#"{"minutelyTabEnabled":[]}"#,
+            r#"{"tuiLightMode":{}}"#,
+            r#"{"scanner":{},"scanner":{"extraScanPaths":{"claude":["D:\\Shared"]}}}"#,
+            r#"{"autoRefreshMs":30000,"autoRefreshMs":60000}"#,
+            r#"{"scanner":{"opencodeDbPaths":[],"opencodeDbPaths":[]}}"#,
+            r#"{"light":{"writeCache":false,"writeCache":true}}"#,
+            r#"{"scanner":{"opencodeDbPaths":["D:\\Db\\actual.sqlite"]}}"#,
+        ] {
+            assert!(engine_config_roots_from_text(invalid).is_err(), "{invalid}");
+        }
+        let valid = r#"{
+            "defaultClients":["claude",1,null],
+            "autosubmit":{"clients":[false,"opencode"],"intervalMinutes":0},
+            "usage":{"disabledProviders":["x",0,null]},
+            "modelAliases":42,"tuiLanguage":{"unknown":true},
+            "unknownFutureField":{"arbitrary":[1,2]},
+            "autoRefreshMs":0,"nativeTimeoutMs":18446744073709551615,
+            "scanner":{"extraScanPaths":{"claude":["", "D:\\Shared"],"Claude":["D:\\Ignored"]}}
+        }"#;
+        let roots = engine_config_roots_from_text(valid).unwrap();
+        assert_eq!(roots, vec![("claude".into(), r"D:\Shared".into(), true)]);
+    }
+
+    #[test]
+    fn r12_opencode检查实际执行basename而非入口链接名称() {
+        for valid in ["opencode.db", "opencode-stable.db", "opencode-test_1.2.db"] {
+            assert!(require_opencode_database_name(Path::new(valid)).is_ok());
+        }
+        for invalid in [
+            "actual.db",
+            "actual.sqlite",
+            "opencode-.db",
+            "OPENCODE.db",
+            "opencode.db-wal",
+        ] {
+            assert!(require_opencode_database_name(Path::new(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn r12_claude父标识在任何派生访问前拒绝不安全文本() {
+        for unsafe_id in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            r"..\outside",
+            r"D:\Outside\sentinel",
+            r"\outside",
+            r"\\server\share\sentinel",
+            r"\\wsl.localhost\Other\sentinel",
+            r"\\?\GLOBALROOT\Device\x",
+            "a:b",
+            "CON",
+            "con.txt",
+            "LPT1",
+            "COM9.log",
+            "id.",
+            "id ",
+        ] {
+            assert!(
+                claude_parent_candidates(Path::new("unused/agent-a.jsonl"), unsafe_id).is_err(),
+                "{unsafe_id}"
+            );
+        }
+        for safe in ["11111111-2222-3333-4444-555555555555", "parent_1", "name.2"] {
+            assert!(safe_claude_parent_id(safe));
+        }
+        let nested = Path::new("projects/p/s/subagents/workflows/w/agent-a.jsonl");
+        assert_eq!(
+            claude_parent_candidates(nested, "s").unwrap(),
+            vec![
+                Path::new("projects/p/s.jsonl").to_path_buf(),
+                Path::new("projects/p/s/subagents/workflows/w/s.jsonl").to_path_buf(),
+            ]
+        );
+    }
+
+    fn claude_test_root(engine_path: &Path) -> RegisteredRoot {
+        RegisteredRoot {
+            tool: "claude".into(),
+            client: "claude".into(),
+            optional: false,
+            engine_path: engine_path.to_path_buf(),
+            path: std::fs::canonicalize(engine_path).unwrap(),
+            expect: crate::local_sources::ResolvedExpect::Directory,
+            origin: crate::local_sources::SourceOrigin::Native,
+        }
+    }
+
+    #[test]
+    fn r12_claude迟到sidechain与有效meta仍必须检查cache父候选() {
+        let root = round11_fixture("claude-late-parent");
+        std::fs::write(root.join("agent-a.meta.json"), br#"{"agentType":"valid"}"#).unwrap();
+        std::fs::write(root.join("agent-a.jsonl"), concat!(
+            "{\"type\":\"user\"}\n",
+            "{\"type\":\"user\",\"isSidechain\":true,\"sessionId\":\"../outside\",\"agentId\":\"a\"}\n"
+        )).unwrap();
+        assert!(audit_claude_dependencies(&[claude_test_root(&root)])
+            .unwrap_err()
+            .contains("不安全"));
+        std::fs::write(
+            root.join("agent-a.jsonl"),
+            br#"{"type":"user","isSidechain":true,"sessionId":"safe-parent"}"#,
+        )
+        .unwrap();
+        assert!(audit_claude_dependencies(&[claude_test_root(&root)]).is_ok());
+        std::fs::write(
+            root.join("agent-a.jsonl"),
+            br#"{"sessionId":"safe","sessionId":"../bad","isSidechain":true}"#,
+        )
+        .unwrap();
+        assert!(audit_claude_dependencies(&[claude_test_root(&root)]).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn r12_claude正常nested和deep保持且窄根不得隐式批准树外父日志() {
+        let base = round11_fixture("claude-nested");
+        let projects = base.join("projects");
+        let subagents = projects.join("p/s/subagents");
+        std::fs::create_dir_all(subagents.join("workflows/w")).unwrap();
+        std::fs::write(projects.join("p/s.jsonl"), b"{}").unwrap();
+        for file in [
+            subagents.join("agent-a.jsonl"),
+            subagents.join("workflows/w/agent-b.jsonl"),
+        ] {
+            std::fs::write(
+                file,
+                br#"{"type":"user","isSidechain":true,"sessionId":"s"}"#,
+            )
+            .unwrap();
+        }
+        assert!(audit_claude_dependencies(&[claude_test_root(&projects)]).is_ok());
+        assert!(audit_claude_dependencies(&[claude_test_root(&subagents)])
+            .unwrap_err()
+            .contains("超出"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn r12_claude树外variant与meta有界且缺失坏json不扩大依赖树() {
+        let base = round11_fixture("claude-external-variant");
+        let variant = base.join(".cc-mirror/v");
+        let projects = variant.join("config/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("normal.jsonl"), b"{}").unwrap();
+        let plan = vec![claude_test_root(&projects)];
+        assert!(audit_claude_dependencies(&plan).is_ok());
+        std::fs::write(variant.join("variant.json"), b"{invalid").unwrap();
+        assert!(audit_claude_dependencies(&plan).is_ok());
+        std::fs::File::create(variant.join("variant.json"))
+            .unwrap()
+            .set_len(CLAUDE_AUDIT_METADATA_BYTES + 1)
+            .unwrap();
+        assert!(audit_claude_dependencies(&plan)
+            .unwrap_err()
+            .contains("预算"));
+        std::fs::write(variant.join("variant.json"), b"{}").unwrap();
+        std::fs::File::create(projects.join("normal.meta.json"))
+            .unwrap()
+            .set_len(CLAUDE_AUDIT_METADATA_BYTES + 1)
+            .unwrap();
+        assert!(audit_claude_dependencies(&plan)
+            .unwrap_err()
+            .contains("预算"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn r12_claude超预算和不完整日志明确拒源不当成功空() {
+        let root = round11_fixture("claude-budget");
+        let log = root.join("normal.jsonl");
+        std::fs::write(&log, b"{\"type\":").unwrap();
+        assert!(audit_claude_dependencies(&[claude_test_root(&root)]).is_err());
+        std::fs::write(&log, b"{}").unwrap();
+        let mut budget = ClaudeDependencyBudget {
+            bytes: CLAUDE_AUDIT_TOTAL_BYTES - 1,
+            ..Default::default()
+        };
+        assert!(read_claude_dependency(
+            &log,
+            crate::local_sources::SourceOrigin::Native,
+            CLAUDE_AUDIT_FILE_BYTES,
+            false,
+            &mut budget
+        )
+        .is_err());
+        std::fs::File::create(&log)
+            .unwrap()
+            .set_len(CLAUDE_AUDIT_FILE_BYTES + 1)
+            .unwrap();
+        assert!(audit_claude_dependencies(&[claude_test_root(&root)]).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r12_claude原始junction拼写仍检查树外variant() {
+        let base = round11_fixture("claude-variant-junction");
+        let variant = base.join(".cc-mirror/v");
+        let actual = base.join("actual");
+        let selected = variant.join("config/projects");
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::write(actual.join("normal.jsonl"), b"{}").unwrap();
+        std::fs::File::create(variant.join("variant.json"))
+            .unwrap()
+            .set_len(CLAUDE_AUDIT_METADATA_BYTES + 1)
+            .unwrap();
+        round11_junction(&selected, &actual);
+        assert!(audit_claude_dependencies(&[claude_test_root(&selected)])
+            .unwrap_err()
+            .contains("预算"));
+        std::fs::remove_dir(&selected).unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r12_claude双junction根只批准完整根映射不扩大到祖先() {
+        let base = round11_fixture("claude-two-junctions");
+        let actual = base.join("actual/projects");
+        let middle = base.join("middle");
+        let selected = base.join("selected");
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::write(
+            actual.join("agent-a.jsonl"),
+            br#"{"type":"user","isSidechain":true,"sessionId":"parent"}"#,
+        )
+        .unwrap();
+        std::fs::write(actual.join("parent.jsonl"), b"{}").unwrap();
+        round11_junction(&middle, &actual);
+        round11_junction(&selected, &middle);
+        assert!(audit_claude_dependencies(&[claude_test_root(&selected)]).is_ok());
+        let aliases = crate::local_sources::checked_root_aliases(
+            &selected,
+            crate::local_sources::SourceOrigin::Native,
+        )
+        .unwrap();
+        let refs: Vec<&Path> = aliases.iter().map(|path| path.as_path()).collect();
+        assert!(crate::local_sources::check_link_chain_within(
+            &base.join("outside.jsonl"),
+            crate::local_sources::SourceOrigin::Native,
+            &refs,
+        )
+        .is_err());
+        std::fs::remove_dir(&selected).unwrap();
+        std::fs::remove_dir(&middle).unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r12_opencode文件链接最终名不符必须拒绝而非空成功() {
+        let base = round11_fixture("opencode-canonical-name");
+        let selected = base.join("opencode.db");
+        for filename in ["actual.db", "actual.sqlite", "opencode-stable.db"] {
+            let actual = base.join(filename);
+            std::fs::write(&actual, b"fixture").unwrap();
+            std::os::windows::fs::symlink_file(&actual, &selected)
+                .unwrap_or_else(|error| panic!("NOT RUN: 无法创建OpenCode文件链接（{error}）"));
+            let canonical = crate::local_sources::resolve_layout_root(
+                &selected,
+                crate::local_sources::SourceOrigin::Native,
+                crate::local_sources::ResolvedExpect::File,
+            )
+            .unwrap();
+            assert_eq!(
+                require_opencode_database_name(&canonical).is_ok(),
+                filename == "opencode-stable.db"
+            );
+            std::fs::remove_file(&selected).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     // ---------- 第六轮复评 R02/R04：home 预审只覆盖真实扫描根 ----------

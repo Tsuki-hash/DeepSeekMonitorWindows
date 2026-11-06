@@ -4,6 +4,10 @@ export type ViewName =
   "dashboard" | "settings" | "detail" | "history" | "local";
 export type ModelName = "flash" | "pro" | "other";
 export type AppConfig = {
+  /** Non-secret process-local backend commit versions, captured with this snapshot. */
+  configRevision: number;
+  apiKeyRevision: number;
+  usageTokenRevision: number;
   configWarnings?: string[];
   apiKeyConfigured: boolean;
   apiKeyPreview: string | null;

@@ -122,21 +122,54 @@ test("多来源导出标记不完整，来源状态不带主目录或错误信�
       complete: false,
       sources: [
         {
-          id: "home-hash",
+          id: `home-${"a".repeat(64)}`,
           label: "目录1",
           state: "unavailable",
           message: "SECRET D:\\Private",
         },
       ],
     },
-    [{ ...row, sourceId: "home-hash", sourceLabel: "目录1" }],
+    [{ ...row, sourceId: `home-${"a".repeat(64)}`, sourceLabel: "目录1" }],
     "all",
   );
   const data = JSON.parse(result.json);
   assert.equal(data.schemaVersion, 2);
   assert.equal(data.complete, false);
-  assert.equal(data.records[0].sourceId, "home-hash");
+  assert.equal(data.records[0].sourceId, `home-${"a".repeat(64)}`);
   assert.equal(data.records[0].projectPath, undefined);
   assert.equal(result.json.includes("SECRET"), false);
   assert.ok(result.csv.includes('"complete"'));
+});
+
+test("N06 实时两种导出不从旧来源ID与来源状态泄露路径或秘密，内部ID不变", () => {
+  for (const sourceId of [
+    "D:\\Private\\SECRET",
+    "\\\\wsl$\\Ubuntu\\home\\SECRET",
+    "sk-secret-SECRET",
+    undefined,
+  ]) {
+    const sourceRow = { ...row, sourceId, sourceLabel: "D:\\Private\\SECRET" };
+    const sourceSnapshot = {
+      ...snapshot,
+      rows: [sourceRow],
+      sources: [
+        {
+          id: sourceId || "",
+          label: "D:\\Private\\SECRET",
+          state: "ok",
+          message: null,
+        },
+      ],
+    };
+    const data = localExport(sourceSnapshot, [sourceRow], "all", false);
+    for (const text of [data.json, data.csv]) {
+      assert.equal(text.includes("SECRET"), false);
+      assert.equal(text.includes("Private"), false);
+    }
+    const parsed = JSON.parse(data.json);
+    assert.equal(parsed.records[0].sourceId, "legacy-unknown");
+    assert.equal(parsed.sources[0].id, "legacy-unknown");
+    assert.equal(parsed.records[0].sourceLabel, "旧版来源身份未知");
+    assert.equal(sourceRow.sourceId, sourceId);
+  }
 });

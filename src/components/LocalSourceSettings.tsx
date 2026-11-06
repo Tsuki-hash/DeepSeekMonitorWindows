@@ -2,8 +2,18 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Toggle } from "./ui";
 import { errorMessage } from "../error-state";
+import { useLocalSettingsRefresh } from "../local-settings-sync";
 import { sourceOptions, wslStateLabel, toolPathLabels } from "../local-sources";
 import type { SourceOptions, WslStatus, ToolPath } from "../local-sources";
+
+function sameSources(left: SourceOptions, right: SourceOptions) {
+  return (
+    left.includeDefault === right.includeDefault &&
+    JSON.stringify(left.homes) === JSON.stringify(right.homes) &&
+    JSON.stringify(left.toolPaths || []) ===
+      JSON.stringify(right.toolPaths || [])
+  );
+}
 
 export function LocalSourceSettings({
   onSaved,
@@ -24,65 +34,109 @@ export function LocalSourceSettings({
   const [includeDefault, setIncludeDefault] = React.useState(true);
   const [homes, setHomes] = React.useState("");
   const [toolPaths, setToolPaths] = React.useState<ToolPath[]>([]);
-  const [busy, setBusy] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [wslBusy, setWslBusy] = React.useState(false);
+  const busy = saving || wslBusy;
   const [error, setError] = React.useState("");
   const [message, setMessage] = React.useState("");
   const [wsl, setWsl] = React.useState<WslStatus | null>(null);
-  // 复评 F10：目录读取/保存 与 WSL 查询使用**独立**的请求所有权。
-  // 旧实现共用 owner.sequence：初次 get_local_sources 还在途时点「读取 WSL」，
-  // WSL 递增同一序号 → 随后成功的目录配置被当旧结果丢弃，options 永远为
-  // null（编辑/添加/保存全禁用），且没有错误时连重试入口都不出现。
-  const owner = React.useRef({ active: true, sequence: 0 });
-  const wslOwner = React.useRef({ active: true, sequence: 0 });
-  // 目录读取的显式加载态：失败时总有可达的重试入口，不被无关查询抹除。
+  // Reads, saves, WSL queries and draft edits are independent owners. Events
+  // update the saved baseline but must never adopt it over an edited draft.
+  const owner = React.useRef({
+    active: true,
+    sequence: 0,
+    saving: false,
+    failure: "",
+  });
+  const readOwner = React.useRef({ sequence: 0 });
+  const wslOwner = React.useRef({ active: true, sequence: 0, inFlight: false });
+  const draft = React.useRef({ revision: 0, dirty: false });
+  const dirty = Boolean(
+    options &&
+    (includeDefault !== options.includeDefault ||
+      homes !== options.homes.join("\n") ||
+      JSON.stringify(toolPaths) !== JSON.stringify(options.toolPaths || [])),
+  );
+  draft.current.dirty = dirty;
+  const edited = () => {
+    draft.current.revision++;
+    draft.current.dirty = true;
+    setMessage("");
+  };
   const [loadingOptions, setLoadingOptions] = React.useState(true);
   const accept = React.useCallback((value: SourceOptions) => {
     setOptions(value);
     setIncludeDefault(value.includeDefault);
     setHomes(value.homes.join("\n"));
     setToolPaths(value.toolPaths || []);
+    draft.current.dirty = false;
   }, []);
-  const reload = React.useCallback(async () => {
-    const sequence = ++owner.current.sequence;
-    setLoadingOptions(true);
-    try {
-      const value = await invoke<SourceOptions>("get_local_sources");
-      if (owner.current.active && sequence === owner.current.sequence) {
-        accept(value);
-        setError("");
+  const reload = React.useCallback(
+    async (saved?: { revision: number; value: SourceOptions }) => {
+      const sequence = ++readOwner.current.sequence;
+      const revision = draft.current.revision;
+      const adoptCleanDraft = !draft.current.dirty && !owner.current.saving;
+      setLoadingOptions(true);
+      try {
+        const value = await invoke<SourceOptions>("get_local_sources");
+        if (!owner.current.active || sequence !== readOwner.current.sequence)
+          return null;
+        const confirmedSave =
+          saved != null &&
+          saved.revision === draft.current.revision &&
+          sameSources(saved.value, value);
+        if (
+          confirmedSave ||
+          (adoptCleanDraft &&
+            !draft.current.dirty &&
+            revision === draft.current.revision &&
+            !owner.current.saving)
+        ) {
+          accept(value);
+        } else {
+          setOptions(value);
+        }
+        setError(
+          owner.current.failure
+            ? `上次保存提示：${owner.current.failure}；已重新读取已保存设置，当前输入保留`
+            : "",
+        );
         setLoadingOptions(false);
+        return { sequence, confirmedSave };
+      } catch (failure) {
+        if (owner.current.active && sequence === readOwner.current.sequence) {
+          setError(owner.current.failure || errorMessage(failure));
+          setLoadingOptions(false);
+        }
+        return null;
       }
-    } catch (failure) {
-      if (owner.current.active && sequence === owner.current.sequence) {
-        setError(errorMessage(failure));
-        setLoadingOptions(false);
-      }
-    }
-  }, [accept]);
+    },
+    [accept],
+  );
   React.useEffect(() => {
     const current = owner.current;
     const wslState = wslOwner.current;
+    const reads = readOwner.current;
     current.active = true;
     wslState.active = true;
-    void reload();
     return () => {
       current.active = false;
       current.sequence++;
+      reads.sequence++;
       wslState.active = false;
       wslState.sequence++;
     };
-  }, [reload]);
-  const dirty =
-    options &&
-    (includeDefault !== options.includeDefault ||
-      homes !== options.homes.join("\n") ||
-      JSON.stringify(toolPaths) !== JSON.stringify(options.toolPaths || []));
+  }, []);
+  useLocalSettingsRefresh(() => reload());
   // 把脏状态同步给父级：页面切换前需要据此决定是否拦截。
   React.useEffect(() => {
     onDirtyChanged?.(Boolean(dirty));
   }, [dirty, onDirtyChanged]);
   React.useEffect(() => () => onDirtyChanged?.(false), [onDirtyChanged]);
   const save = async (reset = false): Promise<boolean> => {
+    const current = owner.current;
+    if (!current.active || current.saving || wslOwner.current.inFlight)
+      return false;
     setError("");
     setMessage("");
     let next: SourceOptions;
@@ -94,30 +148,44 @@ export function LocalSourceSettings({
       setError(errorMessage(failure));
       return false;
     }
-    setBusy(true);
-    const sequence = ++owner.current.sequence;
+    current.saving = true;
+    current.failure = "";
+    readOwner.current.sequence++;
+    setSaving(true);
+    const sequence = ++current.sequence;
+    const revision = draft.current.revision;
     try {
       const value = await invoke<SourceOptions>("save_local_sources", {
         options: next,
       });
-      if (owner.current.active && sequence === owner.current.sequence) {
-        accept(value);
+      if (!current.active || sequence !== current.sequence) return false;
+      const result = await reload({ revision, value });
+      if (
+        current.active &&
+        sequence === current.sequence &&
+        result?.sequence === readOwner.current.sequence &&
+        result.confirmedSave &&
+        revision === draft.current.revision
+      ) {
         setMessage("目录已保存，旧采集已作废");
         onSaved();
         return true;
       }
-      // 组件已卸载或被更新的操作替代：不算成功。
       return false;
     } catch (failure) {
-      if (owner.current.active && sequence === owner.current.sequence)
-        setError(errorMessage(failure));
+      if (current.active && sequence === current.sequence) {
+        current.failure = errorMessage(failure);
+        setError(current.failure);
+        // A timeout is not a rollback. Re-read now, then again when the native
+        // worker actually completes. Neither path overwrites a newer draft.
+        await reload();
+      }
       return false;
     } finally {
-      // 复评 Q04：只有**当前**序号的保存可以解除 busy ——
-      // 旧保存迟到结束时可能已有新保存（序号更新）在途，
-      // 新保存自己的 finally 负责解除。
-      if (owner.current.active && sequence === owner.current.sequence)
-        setBusy(false);
+      if (current.active && sequence === current.sequence) {
+        current.saving = false;
+        setSaving(false);
+      }
     }
   };
 
@@ -129,7 +197,14 @@ export function LocalSourceSettings({
     onSaveRequested?.(() => saveRef.current());
   }, [onSaveRequested]);
   const listWsl = async () => {
-    setBusy(true);
+    if (
+      !wslOwner.current.active ||
+      wslOwner.current.inFlight ||
+      owner.current.saving
+    )
+      return;
+    wslOwner.current.inFlight = true;
+    setWslBusy(true);
     // 复评 F10：WSL 查询只用**自己的**代际，绝不递增目录读取的序号 ——
     // 否则一次 WSL 查询就会作废在途的目录初读。
     const sequence = ++wslOwner.current.sequence;
@@ -144,8 +219,10 @@ export function LocalSourceSettings({
       if (wslOwner.current.active && sequence === wslOwner.current.sequence)
         setError(errorMessage(failure));
     } finally {
-      if (wslOwner.current.active && sequence === wslOwner.current.sequence)
-        setBusy(false);
+      if (wslOwner.current.active && sequence === wslOwner.current.sequence) {
+        wslOwner.current.inFlight = false;
+        setWslBusy(false);
+      }
     }
   };
   return (
@@ -157,7 +234,7 @@ export function LocalSourceSettings({
         disabled={busy || !options}
         onChange={(value) => {
           setIncludeDefault(value);
-          setMessage("");
+          edited();
         }}
       />
       <label className="local-source-label">
@@ -170,7 +247,7 @@ export function LocalSourceSettings({
           value={homes}
           onChange={(event) => {
             setHomes(event.target.value);
-            setMessage("");
+            edited();
           }}
           placeholder={
             "D:\\AgentData\\User\n\\\\wsl.localhost\\Ubuntu\\home\\user"
@@ -202,7 +279,7 @@ export function LocalSourceSettings({
                       i === index ? { ...row, tool: event.target.value } : row,
                     ),
                   );
-                  setMessage("");
+                  edited();
                 }}
               >
                 {Object.entries(toolPathLabels).map(([tool, label]) => (
@@ -239,7 +316,7 @@ export function LocalSourceSettings({
                       i === index ? { ...row, path: event.target.value } : row,
                     ),
                   );
-                  setMessage("");
+                  edited();
                 }}
               />
             </label>
@@ -248,7 +325,7 @@ export function LocalSourceSettings({
               disabled={busy || !options}
               onClick={() => {
                 setToolPaths((rows) => rows.filter((_, i) => i !== index));
-                setMessage("");
+                edited();
               }}
             >
               移除路径{index + 1}
@@ -269,7 +346,7 @@ export function LocalSourceSettings({
                 path: "",
               },
             ]);
-            setMessage("");
+            edited();
           }}
         >
           添加工具路径

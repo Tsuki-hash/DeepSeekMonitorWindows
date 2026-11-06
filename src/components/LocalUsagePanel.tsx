@@ -4,6 +4,7 @@ import { ArrowLeft, Folder, Layers, RefreshCw } from "lucide-react";
 import { fmtTokensShort } from "../format";
 import { updateTime } from "../data-display";
 import { errorMessage } from "../error-state";
+import { useLocalSettingsRefresh } from "../local-settings-sync";
 import { snapshotQualityLabel } from "../local-quality";
 import { localExport } from "../local-export";
 import { downloadText } from "../download";
@@ -19,6 +20,9 @@ import type { LeaveBlocker } from "../leave-guard";
 import {
   localTools,
   localSessionLabel,
+  localSourceLabel,
+  localSourceCatalog,
+  localSourcesLabel,
   localProjects,
   localSessions,
   localAverageRate,
@@ -53,6 +57,9 @@ export function LocalUsagePanel({
   const [snapshot, setSnapshot] = React.useState<LocalSnapshot | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [changing, setChanging] = React.useState(false);
+  const [settingsPending, setSettingsPending] = React.useState(false);
+  const [stopSavePending, setStopSavePending] = React.useState(false);
+  const settingsBusy = changing || settingsPending;
   const [error, setError] = React.useState("");
   const [tab, setTab] = React.useState<"projects" | "sessions">("projects");
   const [project, setProject] = React.useState<string | null>(null);
@@ -77,7 +84,19 @@ export function LocalUsagePanel({
   const [archiveView, setArchiveView] = React.useState<
     "manual" | "retention" | null
   >(null);
-  const control = React.useRef({ sequence: 0, inFlight: false });
+  const control = React.useRef({
+    active: true,
+    sequence: 0,
+    operation: 0,
+    inFlight: false,
+    scan: 0,
+    enabled: false,
+    changing: false,
+    settingsPending: false,
+    reconciling: false,
+    generation: 0,
+  });
+  const statusOwner = React.useRef({ sequence: 0 });
   // 目录设置的保存动作由子组件登记，供全局「保存并离开」调用。
   const saveSourceRef = React.useRef<(() => Promise<boolean>) | null>(null);
   const tracker = React.useRef(new LocalRateTracker());
@@ -89,72 +108,131 @@ export function LocalUsagePanel({
     if (background.current !== enabled) {
       background.current = enabled;
       tracker.current.reset();
-      setBusy(false);
     }
   }, []);
-  const scan = React.useCallback(async (visibleOnly = false) => {
-    if (control.current.inFlight) return;
-    control.current.inFlight = true;
-    const sequence = control.current.sequence;
-    let collecting = false;
-    try {
-      if (visibleOnly && !(await invoke<boolean>("is_main_window_visible")))
-        return;
-      if (visibleOnly && background.current) {
-        const status = await invoke<LocalUsageStatus>("get_local_usage");
-        if (sequence !== control.current.sequence) return;
-        if (status.snapshot) tracker.current.observe(status.snapshot.rows);
-        setSnapshot(status.snapshot);
-        setError(status.lastError || "");
-        collecting = status.busy === true;
-        setClock(Date.now());
-        return;
-      }
-      setBusy(true);
-      const next = await invoke<LocalSnapshot>("scan_local_usage");
-      if (sequence !== control.current.sequence) return;
-      tracker.current.observe(next.rows);
-      setSnapshot(next);
-      setError("");
-      setClock(Date.now());
-    } catch (failure) {
-      if (sequence !== control.current.sequence) return;
+  const acceptStatus = React.useCallback((status: LocalUsageStatus) => {
+    const current = control.current;
+    if (
+      !current.active ||
+      (status.generation != null && status.generation < current.generation)
+    )
+      return false;
+    current.generation = Math.max(current.generation, status.generation ?? 0);
+    if (current.enabled !== status.enabled || status.snapshot == null) {
       tracker.current.reset();
-      setError(errorMessage(failure));
-    } finally {
-      control.current.inFlight = false;
-      if (sequence === control.current.sequence) setBusy(collecting);
+      setProject(null);
+      setSession(null);
+      setExportStatus("");
     }
+    current.enabled = status.enabled;
+    current.settingsPending = status.settingsPending === true;
+    setEnabled(status.enabled);
+    setSettingsPending(current.settingsPending);
+    setStopSavePending(status.stopSavePending === true);
+    setSnapshot(status.enabled ? status.snapshot : null);
+    setBusy(status.busy === true);
+    setError(status.lastError || "");
+    setReady(true);
+    setClock(Date.now());
+    // An event may arrive while a source draft is being edited. Preserve that
+    // workspace and draft; disabling only changes the authoritative switch.
+    return true;
   }, []);
-  React.useEffect(() => {
-    const owner = control.current;
-    const sequence = owner.sequence;
-    void invoke<LocalUsageStatus>("get_local_usage")
-      .then((status) => {
-        if (sequence !== owner.sequence) return;
-        setEnabled(status.enabled);
-        setSnapshot(status.snapshot);
-        setError(status.lastError || "");
-        setReady(true);
-      })
-      .catch((failure) => {
-        if (sequence === owner.sequence) {
+  const refreshStatus = React.useCallback(
+    async (generation?: number) => {
+      const current = control.current;
+      current.generation = Math.max(current.generation, generation ?? 0);
+      current.sequence++;
+      current.reconciling = true;
+      tracker.current.reset();
+      const sequence = ++statusOwner.current.sequence;
+      try {
+        const status = await invoke<LocalUsageStatus>("get_local_usage");
+        if (!current.active || sequence !== statusOwner.current.sequence)
+          return;
+        return acceptStatus(status) ? status : null;
+      } catch (failure) {
+        if (current.active && sequence === statusOwner.current.sequence) {
           setReady(true);
           setError(errorMessage(failure));
         }
-      });
+      } finally {
+        if (current.active && sequence === statusOwner.current.sequence)
+          current.reconciling = false;
+      }
+    },
+    [acceptStatus],
+  );
+  const scan = React.useCallback(
+    async (visibleOnly = false) => {
+      const current = control.current;
+      if (
+        !current.active ||
+        current.inFlight ||
+        !current.enabled ||
+        current.changing ||
+        current.settingsPending ||
+        current.reconciling
+      )
+        return;
+      current.inFlight = true;
+      const scanId = ++current.scan;
+      const sequence = current.sequence;
+      const owns = () =>
+        current.active &&
+        sequence === current.sequence &&
+        scanId === current.scan;
+      let collecting = false;
+      try {
+        if (visibleOnly && !(await invoke<boolean>("is_main_window_visible")))
+          return;
+        if (!owns()) return;
+        if (visibleOnly && background.current) {
+          const status = await invoke<LocalUsageStatus>("get_local_usage");
+          if (!owns() || !acceptStatus(status)) return;
+          if (status.snapshot && status.enabled)
+            tracker.current.observe(status.snapshot.rows);
+          collecting = status.busy === true;
+          return;
+        }
+        setBusy(true);
+        const next = await invoke<LocalSnapshot>("scan_local_usage");
+        if (!owns()) return;
+        tracker.current.observe(next.rows);
+        setSnapshot(next);
+        setError("");
+        setClock(Date.now());
+      } catch (failure) {
+        if (!owns()) return;
+        tracker.current.reset();
+        setError(errorMessage(failure));
+      } finally {
+        if (scanId === current.scan) current.inFlight = false;
+        if (owns()) setBusy(collecting);
+      }
+    },
+    [acceptStatus],
+  );
+  React.useEffect(() => {
+    const current = control.current;
+    const reads = statusOwner.current;
+    current.active = true;
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => {
-      owner.sequence++;
+      current.active = false;
+      current.sequence++;
+      current.operation++;
+      reads.sequence++;
       window.clearInterval(timer);
     };
   }, []);
+  useLocalSettingsRefresh(refreshStatus);
   React.useEffect(() => {
-    if (!ready || !enabled || archiveView) return;
+    if (!ready || !enabled || archiveView || settingsBusy) return;
     void scan(true);
     const timer = window.setInterval(() => void scan(true), 3000);
     return () => window.clearInterval(timer);
-  }, [ready, enabled, scan, sourceRevision, archiveView]);
+  }, [ready, enabled, scan, sourceRevision, archiveView, settingsBusy]);
   React.useEffect(() => {
     if (snapshot?.periodKey && snapshot.periodKey !== localPeriodKey(clock)) {
       tracker.current.reset();
@@ -164,32 +242,51 @@ export function LocalUsagePanel({
       setExportStatus("");
     }
   }, [clock, snapshot]);
-  const toggle = async () => {
+  const toggle = async (enabled = !control.current.enabled) => {
+    const current = control.current;
+    if (!current.active || current.changing || current.settingsPending) return;
+    const operation = ++current.operation;
+    const owns = () => current.active && current.operation === operation;
+    current.changing = true;
+    current.sequence++;
+    statusOwner.current.sequence++;
     setChanging(true);
+    tracker.current.reset();
     try {
-      const status = await invoke<LocalUsageStatus>("set_local_usage_enabled", {
-        enabled: !enabled,
-      });
-      control.current.sequence++;
-      tracker.current.reset();
-      setSnapshot(null);
-      setBusy(false);
-      setEnabled(status.enabled);
-      setError("");
-      setProject(null);
-      setSession(null);
-      setExportStatus("");
-      if (!status.enabled) setWorkspace("stats");
+      await invoke<LocalUsageStatus>("set_local_usage_enabled", { enabled });
+      if (owns()) await refreshStatus();
     } catch (failure) {
-      setError(errorMessage(failure));
+      if (owns()) {
+        // Failure/timeout does not prove the setting was rolled back. The
+        // native completion event performs another read if work is still live.
+        const status = await refreshStatus();
+        // A newer completion may have already reconciled this timeout. Do not
+        // replace that final state with an older "still waiting" error.
+        if (owns() && status?.settingsPending && !status.lastError)
+          setError(errorMessage(failure));
+      }
     } finally {
-      setChanging(false);
+      if (owns()) {
+        current.changing = false;
+        setChanging(false);
+      }
     }
   };
   // 聚合与排序只在快照或选择变化时重算（评审 P2 性能）。
   // 原先每秒时钟 tick 都会触发 `localProjects`/`localSessions` 重新分组并排序，
   // 数据量大时是纯浪费；时钟只应影响「最近速度」那一小块读数。
   const rows = React.useMemo(() => snapshot?.rows ?? [], [snapshot]);
+  const sourceIdentities = React.useMemo(
+    () =>
+      localSourceCatalog([
+        ...rows,
+        ...(snapshot?.sources ?? []).map((source) => ({
+          sourceId: source.id,
+          sourceLabel: source.label,
+        })),
+      ]),
+    [rows, snapshot],
+  );
   const projects = React.useMemo(() => localProjects(rows), [rows]);
   const scoped = React.useMemo(
     () =>
@@ -225,7 +322,7 @@ export function LocalUsagePanel({
     setIncludePaths(false);
   }, [project, session]);
   const exportData = (format: "csv" | "json") => {
-    if (!snapshot || !enabled || busy || changing) return;
+    if (!snapshot || !enabled || busy || settingsBusy) return;
     const data = localExport(
       snapshot,
       displayed,
@@ -326,7 +423,7 @@ export function LocalUsagePanel({
         <button
           className="history-icon-button"
           aria-label="刷新本地用量"
-          disabled={!enabled || busy || changing}
+          disabled={!enabled || busy || settingsBusy}
           onClick={() => void scan()}
         >
           <RefreshCw size={18} className={busy ? "refresh-spin" : undefined} />
@@ -423,11 +520,25 @@ export function LocalUsagePanel({
               </p>
               <button
                 className="primary"
-                disabled={!ready || changing}
+                disabled={!ready || settingsBusy}
                 onClick={() => void toggle()}
               >
-                {changing ? "开启中…" : "开启本地统计"}
+                {settingsBusy ? "设置处理中…" : "开启本地统计"}
               </button>
+              {(error || stopSavePending) && (
+                <button
+                  className="secondary"
+                  disabled={settingsBusy}
+                  onClick={() => void toggle(false)}
+                >
+                  重新保存关闭状态
+                </button>
+              )}
+              {stopSavePending && (
+                <p role="status">
+                  本次已停止，关闭设置尚未保存，重启前请重试。
+                </p>
+              )}
             </article>
           )}
           {enabled && (
@@ -478,10 +589,24 @@ export function LocalUsagePanel({
                 <>
                   <p
                     className="local-session-id"
-                    title={localSessionLabel(selected.rows[0])}
+                    title={localSessionLabel(
+                      selected.rows[0],
+                      sourceIdentities,
+                      true,
+                    )}
                   >
-                    {localSessionLabel(selected.rows[0])}
+                    {localSessionLabel(selected.rows[0], sourceIdentities)}
                   </p>
+                  <details className="history-details">
+                    <summary>完整来源与会话标识</summary>
+                    <p className="local-session-id">
+                      {localSessionLabel(
+                        selected.rows[0],
+                        sourceIdentities,
+                        true,
+                      )}
+                    </p>
+                  </details>
                   <p className="local-path" title={selected.path || undefined}>
                     {selected.path || "未归属项目"}
                   </p>
@@ -528,6 +653,11 @@ export function LocalUsagePanel({
                       <button
                         className="card local-group"
                         key={group.key}
+                        aria-label={
+                          project != null || tab === "sessions"
+                            ? `${localSessionLabel(group.rows[0], sourceIdentities, true)} · ${tokens(localSum(group.rows, "totalTokens"))} Tokens`
+                            : `${group.label} · ${localSourcesLabel(group.rows, sourceIdentities, true)} · ${tokens(localSum(group.rows, "totalTokens"))} Tokens`
+                        }
                         onClick={() => {
                           setLimit(30);
                           if (project != null || tab === "sessions")
@@ -544,20 +674,31 @@ export function LocalUsagePanel({
                         </span>
                         <span className="local-group-copy">
                           <strong
+                            className={
+                              project != null || tab === "sessions"
+                                ? "local-identity-label"
+                                : undefined
+                            }
                             title={
                               project != null || tab === "sessions"
-                                ? localSessionLabel(group.rows[0])
-                                : group.path || group.label
+                                ? localSessionLabel(
+                                    group.rows[0],
+                                    sourceIdentities,
+                                    true,
+                                  )
+                                : `${group.path || group.label} · ${localSourcesLabel(group.rows, sourceIdentities, true)}`
                             }
                           >
                             {project != null || tab === "sessions"
-                              ? localSessionLabel(group.rows[0])
+                              ? localSessionLabel(
+                                  group.rows[0],
+                                  sourceIdentities,
+                                )
                               : group.label}
                           </strong>
-                          <small>
-                            {group.rows[0].sourceId &&
-                            group.rows[0].sourceId !== "native"
-                              ? `${group.rows[0].sourceLabel} · `
+                          <small className="local-identity-label">
+                            {project == null && tab === "projects"
+                              ? `${localSourcesLabel(group.rows, sourceIdentities)} · `
                               : ""}
                             {project != null || tab === "sessions"
                               ? `${group.rows.length} 个模型 · ${group.path ? group.path.replace(/\\/g, "/").split("/").pop() : "未归属"}`
@@ -589,14 +730,7 @@ export function LocalUsagePanel({
               saveSourceRef.current = save;
             }}
             onSaved={() => {
-              control.current.sequence++;
-              tracker.current.reset();
-              setSnapshot(null);
-              setBusy(false);
-              setError("");
-              setProject(null);
-              setSession(null);
-              setExportStatus("");
+              void refreshStatus();
               setSourceRevision((value) => value + 1);
             }}
           />
@@ -605,15 +739,16 @@ export function LocalUsagePanel({
           <div className="local-scope-card">
             <span>当前范围</span>
             <strong
+              className="local-identity-label"
               title={
-                (selected ? localSessionLabel(selected.rows[0]) : null) ||
-                projects.find((group) => group.key === project)?.label ||
-                "全部本地记录"
+                selected
+                  ? localSessionLabel(selected.rows[0], sourceIdentities, true)
+                  : `${projects.find((group) => group.key === project)?.label || "全部本地记录"} · ${localSourcesLabel(displayed, sourceIdentities, true)}`
               }
             >
-              {(selected ? localSessionLabel(selected.rows[0]) : null) ||
-                projects.find((group) => group.key === project)?.label ||
-                "全部本地记录"}
+              {selected
+                ? localSessionLabel(selected.rows[0], sourceIdentities)
+                : `${projects.find((group) => group.key === project)?.label || "全部本地记录"} · ${localSourcesLabel(displayed, sourceIdentities)}`}
             </strong>
             <small>
               {scope === "session"
@@ -623,13 +758,33 @@ export function LocalUsagePanel({
                   : "本月"}{" "}
               · {displayed.length} 条模型记录
             </small>
+            {displayed.length > 0 && (
+              <details>
+                <summary>核对完整来源标识</summary>
+                <p className="local-session-id">
+                  {localSourcesLabel(displayed, sourceIdentities, true)}
+                </p>
+              </details>
+            )}
           </div>
           {snapshot?.sources && snapshot.sources.length > 0 && (
             <details className="history-details local-source-health">
               <summary>{error ? "上次来源状态" : "来源状态"}</summary>
               {snapshot.sources.map((source) => (
                 <p key={source.id}>
-                  <strong>{source.label}</strong> ·{" "}
+                  <strong
+                    title={localSourceLabel(
+                      { sourceId: source.id, sourceLabel: source.label },
+                      sourceIdentities,
+                      true,
+                    )}
+                  >
+                    {localSourceLabel(
+                      { sourceId: source.id, sourceLabel: source.label },
+                      sourceIdentities,
+                    )}
+                  </strong>{" "}
+                  ·{" "}
                   {source.state === "ok"
                     ? "已读取"
                     : source.state === "duplicate"
@@ -673,14 +828,14 @@ export function LocalUsagePanel({
               <div className="disclosure-actions">
                 <button
                   className="secondary"
-                  disabled={!snapshot || busy || changing}
+                  disabled={!snapshot || busy || settingsBusy}
                   onClick={() => exportData("csv")}
                 >
                   CSV
                 </button>
                 <button
                   className="secondary"
-                  disabled={!snapshot || busy || changing}
+                  disabled={!snapshot || busy || settingsBusy}
                   onClick={() => exportData("json")}
                 >
                   JSON
@@ -703,7 +858,7 @@ export function LocalUsagePanel({
                   ? { kind: "project", key: project }
                   : { kind: "all" }
             }
-            disabled={!enabled || busy || changing}
+            disabled={!enabled || busy || settingsBusy}
             onOpen={(mode) => {
               // 复评 R06：归档入口同样会卸载采集设置组件，必须走草稿守卫。
               guarded(() => {
@@ -770,10 +925,10 @@ export function LocalUsagePanel({
           {enabled && (
             <button
               className="secondary local-stop"
-              disabled={changing}
+              disabled={settingsBusy}
               onClick={() => void toggle()}
             >
-              {changing ? "关闭中…" : "关闭本地统计"}
+              {settingsBusy ? "设置处理中…" : "关闭本地统计"}
             </button>
           )}
         </div>

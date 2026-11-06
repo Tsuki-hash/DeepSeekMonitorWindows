@@ -260,87 +260,106 @@ pub async fn running_wsl() -> Result<WslStatus, String> {
         enums::{HKEY_CURRENT_USER, KEY_READ},
         RegKey,
     };
-    let registered = {
-        let registry = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss",
-            KEY_READ,
-        ) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(WslStatus {
-                    state: "not-installed".into(),
-                    distros: vec![],
-                })
+    static WSL: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let permit = Arc::new(
+        WSL.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "WSL列表读取尚未结束，请稍后重试")?,
+    );
+    let registry_permit = permit.clone();
+    let collection = crate::commands::collection_worker_lease();
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        let _permit = permit;
+        let registered = tokio::task::spawn_blocking(move || {
+            let _permit = registry_permit;
+            let _collection = collection;
+            let registry = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss",
+                KEY_READ,
+            ) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok::<_, String>(None),
+                Err(_) => return Err("WSL安装信息无法读取".into()),
+                Ok(key) => key,
+            };
+            let mut names = Vec::new();
+            for key in registry.enum_keys().take(33) {
+                let key = key.map_err(|_| "WSL注册信息无法读取")?;
+                let distro = registry
+                    .open_subkey_with_flags(key, KEY_READ)
+                    .map_err(|_| "WSL注册信息无法读取")?;
+                let name: String = distro
+                    .get_value("DistributionName")
+                    .map_err(|_| "WSL注册信息无法读取")?;
+                names.push(name);
             }
-            Err(_) => return Err("WSL安装信息无法读取".into()),
-            Ok(key) => key,
-        };
-        let mut names = Vec::new();
-        for key in registry.enum_keys().take(33) {
-            let key = key.map_err(|_| "WSL注册信息无法读取")?;
-            let distro = registry
-                .open_subkey_with_flags(key, KEY_READ)
-                .map_err(|_| "WSL注册信息无法读取")?;
-            let name: String = distro
-                .get_value("DistributionName")
-                .map_err(|_| "WSL注册信息无法读取")?;
-            names.push(name);
-        }
-        if names.is_empty() {
+            if names.is_empty() {
+                return Ok(None);
+            }
+            if names.len() > 32 {
+                return Err("WSL发行版过多".into());
+            }
+            Ok(Some(names))
+        })
+        .await
+        .map_err(|_| "WSL注册信息读取任务失败".to_string())??;
+        let Some(registered) = registered else {
             return Ok(WslStatus {
                 state: "not-installed".into(),
                 distros: vec![],
             });
+        };
+        let executable = PathBuf::from(std::env::var_os("SystemRoot").ok_or("系统目录不可用")?)
+            .join("System32/wsl.exe");
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args(["--list", "--quiet", "--running"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .creation_flags(0x08000000);
+        let mut child =
+            crate::commands::CollectionChild::new(command.spawn().map_err(|_| "WSL列表无法读取")?)
+                .with_permit(_permit.clone());
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            child
+                .stdout
+                .take()
+                .ok_or("WSL输出不可用")?
+                .take(65537)
+                .read_to_end(&mut data)
+                .await
+                .map_err(|_| "WSL列表无法读取")?;
+            if data.len() > 65536 || !child.wait().await.map_err(|_| "WSL状态不可用")?.success()
+            {
+                return Err("WSL列表无法读取");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "WSL列表读取超时")??;
+        let distros = decode_distros(&data)?;
+        if distros.iter().any(|name| {
+            !registered
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+        }) {
+            return Err("WSL列表包含未注册的发行版，未访问目录".into());
         }
-        if names.len() > 32 {
-            return Err("WSL发行版过多".into());
-        }
-        names
-    };
-    let executable = PathBuf::from(std::env::var_os("SystemRoot").ok_or("系统目录不可用")?)
-        .join("System32/wsl.exe");
-    let mut command = tokio::process::Command::new(executable);
-    command
-        .args(["--list", "--quiet", "--running"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .creation_flags(0x08000000);
-    let mut child = command.spawn().map_err(|_| "WSL列表无法读取")?;
-    let mut data = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        child
-            .stdout
-            .take()
-            .ok_or("WSL输出不可用")?
-            .take(65537)
-            .read_to_end(&mut data)
-            .await
-            .map_err(|_| "WSL列表无法读取")?;
-        if data.len() > 65536 || !child.wait().await.map_err(|_| "WSL状态不可用")?.success() {
-            return Err("WSL列表无法读取");
-        }
-        Ok(())
+        Ok(WslStatus {
+            state: if distros.is_empty() {
+                "not-running"
+            } else {
+                "ok"
+            }
+            .into(),
+            distros,
+        })
     })
     .await
-    .map_err(|_| "WSL列表读取超时")??;
-    let distros = decode_distros(&data)?;
-    if distros.iter().any(|name| {
-        !registered
-            .iter()
-            .any(|known| known.eq_ignore_ascii_case(name))
-    }) {
-        return Err("WSL列表包含未注册的发行版，未访问目录".into());
-    }
-    Ok(WslStatus {
-        state: if distros.is_empty() {
-            "not-running"
-        } else {
-            "ok"
-        }
-        .into(),
-        distros,
-    })
+    .map_err(|_| "WSL列表读取超时，系统调用可能仍在结束中".to_string())?
 }
 #[cfg(not(windows))]
 pub async fn running_wsl() -> Result<WslStatus, String> {
@@ -372,10 +391,12 @@ pub async fn probe_path(
         .clone()
         .try_acquire_owned()
         .map_err(|_| "目录检查尚未结束，请稍后重试")?;
+    let collection = crate::commands::collection_worker_lease();
     tokio::time::timeout(
         Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _collection = collection;
             check_link_chain(&home, origin)?;
             let metadata = std::fs::metadata(&home).map_err(|_| "路径不存在或无法访问")?;
             if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
@@ -430,11 +451,48 @@ const MAX_LINK_HOPS: usize = 8;
 /// 重新从根扫描（处理 A→B→越界 的多跳）。整条链没有任何 reparse 组件才算
 /// 通过 —— 此后调用方的 `metadata` / `canonicalize` 访问的是已验证的路径。
 pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String> {
+    checked_link_chain_paths(path, origin, &[]).map(|_| ())
+}
+
+/// Optional exact-root confinement for content-derived dependencies. A link's
+/// redirected *full path* must remain in an approved root before the next
+/// metadata probe; checking canonicalize's result alone would be too late.
+pub fn check_link_chain_within(
+    path: &Path,
+    origin: SourceOrigin,
+    approved_roots: &[&Path],
+) -> Result<(), String> {
+    checked_link_chain_paths(path, origin, approved_roots).map(|_| ())
+}
+
+/// Preserve the root's approved intermediate spellings for later dependency
+/// checks. The original selected root already authorizes resolving this chain;
+/// this does not authorize following a content-derived path outside it.
+pub fn checked_root_aliases(path: &Path, origin: SourceOrigin) -> Result<Vec<PathBuf>, String> {
+    checked_link_chain_paths(path, origin, &[])
+}
+
+fn checked_link_chain_paths(
+    path: &Path,
+    origin: SourceOrigin,
+    approved_roots: &[&Path],
+) -> Result<Vec<PathBuf>, String> {
     let mut current = normalize_dot_segments(path);
     let approved_distro = wsl_distribution(&path.to_string_lossy());
     let mut hops = 0usize;
+    let mut checked_paths = Vec::new();
     loop {
         crate::local_usage::io_checkpoint()?;
+        if !approved_roots.is_empty()
+            && !approved_roots.iter().any(|root| {
+                crate::local_overlap::key_within(
+                    &home_key(&normalize_dot_segments(root).to_string_lossy()),
+                    &home_key(&current.to_string_lossy()),
+                )
+            })
+        {
+            return Err("派生路径或链接目标超出已批准日志根，未访问该目标".into());
+        }
         match origin {
             SourceOrigin::Native => {
                 // 文本预检（含嫁接后的路径）：WSL/网络共享/系统目录形态
@@ -450,8 +508,9 @@ pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String>
                 )?;
             }
         }
+        checked_paths.push(current.clone());
         let Some((link_component, remaining)) = first_reparse_component(&current)? else {
-            return Ok(());
+            return Ok(checked_paths);
         };
         hops += 1;
         if hops > MAX_LINK_HOPS {

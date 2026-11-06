@@ -7,9 +7,9 @@
 //! 刻意**不**按 sessionId 合并不同来源：不同用户的同名会话必须保持隔离，
 //! 无法证明是同一数据库时只提示、不合并。
 //!
-//! 复评 R02：覆盖判定只承认**本轮成功读取的实际入口**。静态的「先算 overlaps、
-//! 循环最先跳过」已删除 —— covering home 本轮失败/被拒时，用户单独配置的
-//! 单工具来源必须照常采集（它是可用的退路，不能被预先扼杀）。
+//! 第十二轮：固定引擎不返回逐根执行回执，预审声明即使在 exit 0 后仍不能
+//! 证明对应根成功读取。跨来源交集只产生质量提示，不抑制显式退路；完全相同
+//! 的采集入口别名由调用方独立去重。部分重叠尚未精确去重。
 
 /// 布局根的种类：目录根按后代包含判重；**精确文件**根只与自身相等判重。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,7 @@ pub fn cc_mirror_resolve_root(
     Ok(resolved)
 }
 
-/// A validated physical read entry, not the containing home. Client scopes
+/// A validated physical declaration, not a per-root read receipt. Client scopes
 /// remain distinct where mirror metadata can change the interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRoot {
@@ -201,28 +201,14 @@ pub struct PlanOverlap {
     pub partial: bool,
 }
 
-/// Only identical, successful roots prove coverage. Directory ancestry is
-/// evidence of possible overlap, not proof that a specialized SQLite parser
-/// reads every descendant. Never suppress an entire home on one parser's hit.
-pub fn compare_plans(candidate: &[ScanRoot], successful: &[(ScanRoot, String)]) -> PlanOverlap {
-    let owners: Vec<_> = candidate
-        .iter()
-        .filter_map(|entry| {
-            successful
-                .iter()
-                .find(|(root, _)| root == entry)
-                .map(|(_, owner)| owner.clone())
-        })
-        .collect();
-    if !candidate.is_empty() && owners.len() == candidate.len() {
-        let labels: std::collections::BTreeSet<_> = owners.into_iter().collect();
-        return PlanOverlap {
-            covered_by: Some(labels.into_iter().collect::<Vec<_>>().join("、")),
-            partial: false,
-        };
-    }
+/// A completed executable invocation does not acknowledge which individual
+/// roots were adopted or read. These are preflight declarations, not read
+/// receipts: even exact equality must preserve the explicit fallback source.
+/// Only the separate identical-invocation key can suppress an alias today.
+/// Root-level deduplication requires an engine protocol reporting each root.
+pub fn compare_plans(candidate: &[ScanRoot], completed: &[(ScanRoot, String)]) -> PlanOverlap {
     let partial = candidate.iter().any(|entry| {
-        successful.iter().any(|(root, _)| {
+        completed.iter().any(|(root, _)| {
             // OpenClaw's Codex lookup and rollout lane can read the same file.
             // Cross-parser identity never proves coverage, but this known pair
             // must retain a possible-overlap warning across separate engine runs.
@@ -579,13 +565,12 @@ mod round11_tests {
     }
 
     #[test]
-    fn r01_同工具同种根完全成功覆盖才整源跳过() {
+    fn r12_预审根相同也不能当成逐根读取回执() {
         let root = scan("opencode", r"d:\logs\opencode.db", LayoutKind::File);
         let successful = vec![(root.clone(), "H1".into())];
-        assert_eq!(
-            compare_plans(std::slice::from_ref(&root), &successful).covered_by,
-            Some("H1".into())
-        );
+        let result = compare_plans(std::slice::from_ref(&root), &successful);
+        assert!(result.covered_by.is_none(), "exit 0 不得抑制显式退路");
+        assert!(result.partial, "无法切根时仍需保留重复合计风险");
         assert_eq!(
             compare_plans(
                 &[scan("zcode", &root.identity, LayoutKind::File)],

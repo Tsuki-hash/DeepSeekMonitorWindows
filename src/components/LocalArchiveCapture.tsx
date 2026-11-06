@@ -2,6 +2,7 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errorMessage } from "../error-state";
 import { archiveScopeLabel } from "../local-archive";
+import { useLocalSettingsRefresh } from "../local-settings-sync";
 import type { ArchiveScope, ArchiveEntry } from "../local-archive";
 export function LocalArchiveCapture({
   collectedAt,
@@ -24,7 +25,13 @@ export function LocalArchiveCapture({
     [error, setError] = React.useState(""),
     [message, setMessage] = React.useState("");
   const owner = React.useRef({ active: true, sequence: 0 });
-  const retentionOwner = React.useRef({ active: true, sequence: 0 });
+  const retentionOwner = React.useRef({
+    active: true,
+    sequence: 0,
+    operation: 0,
+    saving: false,
+    failure: "",
+  });
   const [retention, setRetention] = React.useState(false),
     [retentionReady, setRetentionReady] = React.useState(false),
     [retentionBusy, setRetentionBusy] = React.useState(false),
@@ -87,61 +94,79 @@ export function LocalArchiveCapture({
   React.useEffect(() => {
     if (retentionOpen) refreshCapacity();
   }, [refreshCapacity, retentionOpen]);
+  const readRetention = React.useCallback(async () => {
+    const state = retentionOwner.current;
+    const sequence = ++state.sequence;
+    try {
+      const enabled = await invoke<boolean>("get_local_retention_enabled");
+      if (!state.active || sequence !== state.sequence) return null;
+      setRetention(enabled);
+      setRetentionReady(true);
+      setRetentionError(
+        state.failure
+          ? `上次请求提示：${state.failure}；当前设置已重新读取，请以当前开关为准`
+          : "",
+      );
+      return { enabled, sequence };
+    } catch (failure) {
+      if (state.active && sequence === state.sequence)
+        setRetentionError(state.failure || errorMessage(failure));
+      return null;
+    }
+  }, []);
   React.useEffect(() => {
     const state = retentionOwner.current;
     state.active = true;
-    const seq = ++state.sequence;
-    void invoke<boolean>("get_local_retention_enabled")
-      .then((value) => {
-        if (state.active && seq === state.sequence) {
-          setRetention(value);
-          setRetentionReady(true);
-        }
-      })
-      .catch((failure) => {
-        if (state.active && seq === state.sequence)
-          setRetentionError(errorMessage(failure));
-      });
     return () => {
       state.active = false;
       state.sequence++;
+      state.operation++;
     };
   }, []);
+  useLocalSettingsRefresh(() => {
+    setRetentionMessage("");
+    refreshCapacity();
+    return readRetention();
+  });
   const changeRetention = async (value: boolean) => {
-    const seq = ++retentionOwner.current.sequence;
+    const state = retentionOwner.current;
+    if (!state.active || state.saving) return;
+    state.saving = true;
+    state.failure = "";
+    state.sequence++;
+    const operation = ++state.operation;
     setRetentionBusy(true);
     setRetentionError("");
     setRetentionMessage("");
     try {
-      const enabled = await invoke<boolean>("set_local_retention_enabled", {
-        enabled: value,
-      });
+      await invoke<boolean>("set_local_retention_enabled", { enabled: value });
+      if (!state.active || operation !== state.operation) return;
+      const result = await readRetention();
       if (
-        retentionOwner.current.active &&
-        seq === retentionOwner.current.sequence
+        state.active &&
+        operation === state.operation &&
+        result?.sequence === state.sequence &&
+        result.enabled === value
       ) {
-        setRetention(enabled);
-        setRetentionReady(true);
         setRetentionMessage(
-          enabled
+          value
             ? "已开启，下次成功采集时自动留存"
             : "自动留存已关闭，已有记录保留",
         );
-        // 第五轮复评 N05：留存开关变更后重读容量，避免旧余量。
+        // Keep the N05 capacity refresh after a confirmed change.
         refreshCapacity();
       }
     } catch (failure) {
-      if (
-        retentionOwner.current.active &&
-        seq === retentionOwner.current.sequence
-      )
-        setRetentionError(errorMessage(failure));
+      if (state.active && operation === state.operation) {
+        state.failure = errorMessage(failure);
+        setRetentionError(state.failure);
+        await readRetention();
+      }
     } finally {
-      if (
-        retentionOwner.current.active &&
-        seq === retentionOwner.current.sequence
-      )
+      if (state.active && operation === state.operation) {
+        state.saving = false;
         setRetentionBusy(false);
+      }
     }
   };
   React.useEffect(() => {
@@ -270,18 +295,20 @@ export function LocalArchiveCapture({
             {retentionError}
           </p>
         )}
-        {!retentionReady && retentionError && (
+        {(!retentionReady || !retention) && retentionError && (
           <button
             className="secondary"
             disabled={retentionBusy}
             onClick={() => void changeRetention(false)}
           >
-            关闭并重置自动留存设置
+            {retentionReady
+              ? "重新保存自动留存关闭状态"
+              : "关闭并重置自动留存设置"}
           </button>
         )}
         {retention && retentionWarning && (
           <p role="alert" className="data-error">
-            留存未更新，当前统计仍可用：{retentionWarning}
+            留存提示，当前统计仍可用：{retentionWarning}
           </p>
         )}
       </details>

@@ -1,5 +1,6 @@
 import { csvCell } from "./history.ts";
 import type { LocalRow, LocalSnapshot } from "./local-usage";
+import { localSourceExportIdentity } from "./local-usage.ts";
 import { localEvidence, snapshotQuality } from "./local-quality.ts";
 const fields = [
   "input",
@@ -27,8 +28,7 @@ export function localExport(
     const key = row.projectKey || "unassigned";
     if (!projects.has(key)) projects.set(key, `project-${projects.size + 1}`);
     return {
-      sourceId: row.sourceId || "native",
-      sourceLabel: row.sourceLabel || "本机",
+      ...localSourceExportIdentity(row),
       tool: row.tool,
       // 复评 N01：导出保留 client 身份，避免镜像与原生会话在导出中不可区分。
       clientId: row.clientId || "legacy-unknown",
@@ -75,11 +75,17 @@ export function localExport(
     stale,
     complete: snapshot.complete !== false,
     ...snapshotQuality(snapshot),
-    sources: (snapshot.sources || []).map((source) => ({
-      id: source.id,
-      label: source.label,
-      state: source.state,
-    })),
+    sources: (snapshot.sources || []).map((source) => {
+      const identity = localSourceExportIdentity({
+        sourceId: source.id,
+        sourceLabel: source.label,
+      });
+      return {
+        id: identity.sourceId,
+        label: identity.sourceLabel,
+        state: source.state,
+      };
+    }),
     includesPaths: includePaths,
     measurement: "source-dependent; may include token estimates",
     billing: "not matched to platform account; not billing evidence",

@@ -5,9 +5,8 @@ import React from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { currencySymbol, fmtMoney } from "./format";
-import type { AppConfig, BalanceData, SavedApiKey, UsageResult } from "./types";
-import { fetchCurrentUsage } from "./usage-api";
+import { currencySymbol } from "./format";
+import type { AppConfig, SavedApiKey } from "./types";
 import { errorMessage } from "./error-state";
 import type { LeaveBlocker } from "./leave-guard";
 import { CredentialDraft } from "./credential-draft";
@@ -15,61 +14,44 @@ import type { CredentialSnapshot } from "./credential-draft";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
+  beginUsageTokenOperation,
+  isCurrentUsageTokenOperation,
 } from "./api-key-operation";
 import {
   applyReadConfig,
   getCommitRevision,
   getCommittedConfig,
+  isCurrentCredential,
   setCommittedConfig,
   subscribeCommittedConfig,
 } from "./config-store";
 
-function useCredentialDraft() {
+function useCredentialDraft(
+  lifecycle: React.MutableRefObject<{ active: boolean; generation: number }>,
+) {
   const draft = React.useRef(new CredentialDraft());
   const [value, setValue] = React.useState("");
-  const edit = React.useCallback((next: string) => {
-    draft.current.edit(next);
-    setValue(next);
-  }, []);
+  const edit = React.useCallback(
+    (next: string) => {
+      if (!lifecycle.current.active) return;
+      draft.current.edit(next);
+      setValue(next);
+    },
+    [lifecycle],
+  );
   const clear = React.useCallback(() => {
+    if (!lifecycle.current.active) return;
     draft.current.clear();
     setValue("");
-  }, []);
-  const commit = React.useCallback((revision: number) => {
-    if (draft.current.commit(revision)) setValue("");
-  }, []);
-  return { draft, value, edit, clear, commit };
-}
-
-function useSettingsActions(handlers: {
-  onUsageLoaded: (usage: UsageResult) => void;
-  setUsageStatus: (status: string) => void;
-  setShowManualPaste: (show: boolean) => void;
-}) {
-  const { onUsageLoaded, setUsageStatus, setShowManualPaste } = handlers;
-  return React.useCallback(
-    (prefix: string) => {
-      setUsageStatus(`${prefix}，正在刷新用量数据…`);
-      return fetchCurrentUsage()
-        .then((usage) => {
-          onUsageLoaded(usage);
-          // 费用缺失时明确说「未取得」，不能显示成 ¥0.00。
-          setUsageStatus(
-            `${prefix}，本月消费 ${
-              usage.monthCost != null ? fmtMoney(usage.monthCost) : "未取得"
-            }`,
-          );
-          return usage;
-        })
-        .catch((error) => {
-          const message = errorMessage(error);
-          setUsageStatus(`${prefix}，但用量刷新失败：${message}`);
-          setShowManualPaste(true);
-          return null;
-        });
+  }, [lifecycle]);
+  const commit = React.useCallback(
+    (revision: number) => {
+      if (lifecycle.current.active && draft.current.commit(revision))
+        setValue("");
     },
-    [onUsageLoaded, setUsageStatus, setShowManualPaste],
+    [lifecycle],
   );
+  return { draft, value, edit, clear, commit };
 }
 
 export type SettingsState = {
@@ -115,38 +97,22 @@ export type SettingsState = {
   ) => void;
 };
 
-export function useSettingsState(handlers: {
-  onBalanceLoaded: (balance: BalanceData) => void;
-  onBalanceCleared: () => void;
-  onUsageLoaded: (usage: UsageResult) => void;
-  onUsageCleared: () => void;
-  onRefreshIntervalChanged: (seconds: number) => void;
-  onAutoRefreshChanged: (enabled: boolean) => void;
-}): SettingsState {
-  const {
-    onBalanceLoaded,
-    onBalanceCleared,
-    onUsageLoaded,
-    onUsageCleared,
-    onRefreshIntervalChanged,
-    onAutoRefreshChanged,
-  } = handlers;
-
+export function useSettingsState(): SettingsState {
+  const lifecycle = React.useRef({ active: true, generation: 0 });
   const {
     draft: keyDraft,
     value: apiKey,
     edit: setApiKey,
     clear: discardApiKey,
     commit: commitApiKey,
-  } = useCredentialDraft();
+  } = useCredentialDraft(lifecycle);
   const {
     draft: tokenDraft,
     value: usageToken,
     edit: setUsageToken,
     clear: discardUsageToken,
     commit: commitUsageToken,
-  } = useCredentialDraft();
-  const lifecycle = React.useRef({ active: true, generation: 0 });
+  } = useCredentialDraft(lifecycle);
   React.useLayoutEffect(() => {
     const owner = lifecycle.current;
     const key = keyDraft.current;
@@ -161,6 +127,11 @@ export function useSettingsState(handlers: {
       token.clear();
     };
   }, [keyDraft, tokenDraft]);
+  const capturePage = React.useCallback(() => {
+    const owner = lifecycle.current;
+    const generation = owner.generation;
+    return () => owner.active && owner.generation === generation;
+  }, []);
   const [config, setConfig] = React.useState<AppConfig | null>(
     getCommittedConfig,
   );
@@ -188,6 +159,9 @@ export function useSettingsState(handlers: {
   const [usageStatus, setUsageStatus] = React.useState("");
   const [usageSyncing, setUsageSyncing] = React.useState(false);
   const syncRequestId = React.useRef(0);
+  const syncCredentialRevision = React.useRef(
+    getCommittedConfig()?.usageTokenRevision ?? -1,
+  );
   const [showManualPaste, setShowManualPaste] = React.useState(false);
   // 空串表示「版本未知」。刻意不写死一个兜底版本号：那个数字会随着发版过期，
   // 显示出来反而是错的信息，不如显示「—」。
@@ -199,7 +173,9 @@ export function useSettingsState(handlers: {
     // 复评 F09：订阅时必须把**全部**由配置派生的控件状态一起收敛 ——
     // 旧实现只 setConfig，自动刷新/间隔/自启这些局部 state 仍停留在旧值，
     // 于是后端已开启自动刷新、设置页开关却显示关闭（再点一次还会重复开启）。
+    const current = capturePage();
     const syncFromCommitted = (next: AppConfig) => {
+      if (!current()) return;
       setConfig(next);
       setRefresh(next.refreshIntervalSeconds || 60);
       setAutoRefresh(next.autoRefreshEnabled);
@@ -234,6 +210,7 @@ export function useSettingsState(handlers: {
         syncFromCommitted(nextConfig);
       })
       .catch((error) => {
+        if (!current()) return;
         // 只有"根本没有 Tauri IPC"才是浏览器预览，属预期情况；真机上失败一律是真实错误，
         // 必须原样透出——否则配置文件损坏会被伪装成"浏览器预览模式"，用户完全无从定位。
         if (!isTauri()) {
@@ -243,38 +220,48 @@ export function useSettingsState(handlers: {
         setStatus(errorMessage(error));
       });
     return unsubscribe;
-  }, []);
+  }, [capturePage]);
 
   React.useEffect(() => {
+    const current = capturePage();
     void getVersion()
-      .then(setAppVersion)
-      .catch(() => setAppVersion(""));
-  }, []);
-
-  // 保存 Token 之后刷新用量。这里刻意不向外抛出（见 useSettingsActions）。
-  const refreshUsageAfterToken = useSettingsActions({
-    onUsageLoaded,
-    setUsageStatus,
-    setShowManualPaste,
-  });
+      .then((version) => {
+        if (current()) setAppVersion(version);
+      })
+      .catch(() => {
+        if (current()) setAppVersion("");
+      });
+  }, [capturePage]);
 
   React.useEffect(() => {
+    const current = capturePage();
     const unlistenPromise = listen<AppConfig>(
       "usage-token-captured",
       (event) => {
-        syncRequestId.current += 1;
+        // Persisted state belongs to the application, even if this page just left.
         setCommittedConfig(event.payload);
+        if (
+          !current() ||
+          !isCurrentCredential(event.payload, "usageToken") ||
+          event.payload.usageTokenRevision <= syncCredentialRevision.current
+        )
+          return;
+        syncCredentialRevision.current = event.payload.usageTokenRevision;
+        syncRequestId.current += 1;
         setUsageSyncing(false);
-        void refreshUsageAfterToken("已通过网页登录自动同步用量 Token");
       },
     );
     return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
+      void unlistenPromise
+        .then((unlisten) => unlisten())
+        .catch(() => undefined);
     };
-  }, [refreshUsageAfterToken]);
+  }, [capturePage]);
 
   React.useEffect(() => {
+    const current = capturePage();
     const unlistenPromise = listen("usage-sync-ended", () => {
+      if (!current()) return;
       syncRequestId.current += 1;
       setUsageSyncing(false);
       setUsageStatus(
@@ -283,19 +270,24 @@ export function useSettingsState(handlers: {
       setShowManualPaste(true);
     });
     return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
+      void unlistenPromise
+        .then((unlisten) => unlisten())
+        .catch(() => undefined);
     };
-  }, []);
+  }, [capturePage]);
 
   const pasteApiKey = React.useCallback(async () => {
+    const current = capturePage();
+    if (!current()) return;
     try {
       const text = await navigator.clipboard.readText();
+      if (!current()) return;
       setApiKey(text.trim());
       setStatus("已从剪贴板读取");
     } catch {
-      setStatus("剪贴板读取失败");
+      if (current()) setStatus("剪贴板读取失败");
     }
-  }, [setApiKey]);
+  }, [setApiKey, capturePage]);
 
   const keySaves = React.useRef(new Map<number, Promise<boolean>>());
   const saveKeySnapshot = React.useCallback(
@@ -318,10 +310,10 @@ export function useSettingsState(handlers: {
             "save_api_key",
             { apiKey: submitted.value },
           );
-          if (!current()) return false;
-          setCommittedConfig(nextConfig);
+          setCommittedConfig(nextConfig, balance);
+          if (!current() || !isCurrentCredential(nextConfig, "apiKey"))
+            return false;
           commitApiKey(submitted.revision);
-          onBalanceLoaded(balance);
           const symbol = currencySymbol(balance.currency);
           const tip = balance.isAvailable ? "" : "（余额不足）";
           setStatus(
@@ -338,7 +330,7 @@ export function useSettingsState(handlers: {
       keySaves.current.set(submitted.revision, saving);
       return saving;
     },
-    [commitApiKey, onBalanceLoaded],
+    [commitApiKey],
   );
   const saveApiKey = React.useCallback(
     () => saveKeySnapshot(keyDraft.current.snapshot()),
@@ -346,6 +338,7 @@ export function useSettingsState(handlers: {
   );
 
   const clearApiKey = React.useCallback(() => {
+    if (!lifecycle.current.active) return;
     const operation = beginApiKeyOperation();
     const revision = keyDraft.current.revision;
     const generation = lifecycle.current.generation;
@@ -356,11 +349,10 @@ export function useSettingsState(handlers: {
     setBusy(true);
     void invoke<AppConfig>("clear_api_key")
       .then((nextConfig) => {
-        if (!current()) return;
         setCommittedConfig(nextConfig);
+        if (!current() || !isCurrentCredential(nextConfig, "apiKey")) return;
         commitApiKey(revision);
         setStatus("已清除 API Key");
-        onBalanceCleared();
       })
       .catch((error) => {
         if (current()) setStatus(errorMessage(error));
@@ -368,25 +360,32 @@ export function useSettingsState(handlers: {
       .finally(() => {
         if (current()) setBusy(false);
       });
-  }, [onBalanceCleared, keyDraft, commitApiKey]);
+  }, [keyDraft, commitApiKey]);
 
   const pasteUsageToken = React.useCallback(async () => {
+    const current = capturePage();
+    if (!current()) return;
     try {
       const text = await navigator.clipboard.readText();
+      if (!current()) return;
       setUsageToken(text.trim());
       setUsageStatus("已从剪贴板读取");
     } catch {
-      setUsageStatus("剪贴板读取失败");
+      if (current()) setUsageStatus("剪贴板读取失败");
     }
-  }, [setUsageToken]);
+  }, [setUsageToken, capturePage]);
 
   const startUsageSync = React.useCallback(() => {
+    const current = capturePage();
+    if (!current()) return;
+    syncCredentialRevision.current =
+      getCommittedConfig()?.usageTokenRevision ?? -1;
     const requestId = ++syncRequestId.current;
     setUsageSyncing(true);
     setUsageStatus("正在打开登录窗口…");
     void invoke<boolean>("start_usage_sync")
       .then((synced) => {
-        if (requestId !== syncRequestId.current) return;
+        if (!current() || requestId !== syncRequestId.current) return;
         if (!synced) {
           setUsageStatus(
             "等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。",
@@ -397,23 +396,26 @@ export function useSettingsState(handlers: {
         // synced=true 时由 usage-token-captured 事件刷新数据并更新状态
       })
       .catch((error) => {
-        if (requestId !== syncRequestId.current) return;
+        if (!current() || requestId !== syncRequestId.current) return;
         setUsageSyncing(false);
         setUsageStatus(errorMessage(error));
       });
-  }, []);
+  }, [capturePage]);
 
   const cancelUsageSync = React.useCallback(() => {
+    const current = capturePage();
+    if (!current()) return;
     syncRequestId.current += 1;
     void invoke("cancel_usage_sync")
       .then(() => {
+        if (!current()) return;
         setUsageSyncing(false);
         setUsageStatus("已取消同步，原 Token 未更改");
       })
-      .catch((error) => setUsageStatus(errorMessage(error)));
-  }, []);
-
-  const tokenOperation = React.useRef(0);
+      .catch((error) => {
+        if (current()) setUsageStatus(errorMessage(error));
+      });
+  }, [capturePage]);
   const tokenSaves = React.useRef(new Map<number, Promise<boolean>>());
   const saveTokenSnapshot = React.useCallback(
     (submitted: CredentialSnapshot): Promise<boolean> => {
@@ -422,11 +424,11 @@ export function useSettingsState(handlers: {
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
       const generation = lifecycle.current.generation;
-      const operation = ++tokenOperation.current;
+      const operation = beginUsageTokenOperation();
       const current = () =>
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
-        tokenOperation.current === operation;
+        isCurrentUsageTokenOperation(operation);
       const saving = (async () => {
         setBusy(true);
         setUsageStatus("正在验证候选 Token…");
@@ -434,10 +436,11 @@ export function useSettingsState(handlers: {
           const nextConfig = await invoke<AppConfig>("save_usage_token", {
             usageToken: submitted.value,
           });
-          if (!current()) return false;
           setCommittedConfig(nextConfig);
+          if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
+            return false;
           commitUsageToken(submitted.revision);
-          setUsageStatus("验证通过并已保存，正在刷新用量…");
+          setUsageStatus("验证通过并已保存");
           return true;
         } catch (error) {
           if (current()) setUsageStatus(errorMessage(error));
@@ -457,22 +460,23 @@ export function useSettingsState(handlers: {
   );
 
   const clearUsageToken = React.useCallback(() => {
+    if (!lifecycle.current.active) return;
     const revision = tokenDraft.current.revision;
     const generation = lifecycle.current.generation;
-    const operation = ++tokenOperation.current;
+    const operation = beginUsageTokenOperation();
     const current = () =>
       lifecycle.current.active &&
       lifecycle.current.generation === generation &&
-      tokenOperation.current === operation;
+      isCurrentUsageTokenOperation(operation);
     setBusy(true);
     void invoke<AppConfig>("clear_usage_token")
       .then((nextConfig) => {
-        if (!current()) return;
         setCommittedConfig(nextConfig);
+        if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
+          return;
         commitUsageToken(revision);
         setUsageStatus("已清除用量 Token");
         setUsageSyncing(false);
-        onUsageCleared();
       })
       .catch((error) => {
         if (current()) setUsageStatus(errorMessage(error));
@@ -480,36 +484,40 @@ export function useSettingsState(handlers: {
       .finally(() => {
         if (current()) setBusy(false);
       });
-  }, [onUsageCleared, tokenDraft, commitUsageToken]);
+  }, [tokenDraft, commitUsageToken]);
 
-  // Events have no operation ID in the existing IPC contract. They update saved
-  // state only; only this operation's response may consume its draft revision.
+  // Versioned events update saved state only. Only this operation's response
+  // may consume its draft revision; backend versions are not draft ownership.
   // This also makes old/duplicate events harmless after unmount or a new forget.
   const forgetOwner = React.useRef<{
     operation: number;
     consumed: boolean;
   } | null>(null);
   const forgetUsageSession = React.useCallback(() => {
-    if (forgetOwner.current) return;
+    if (!lifecycle.current.active || forgetOwner.current) return;
     const revision = tokenDraft.current.revision;
     const generation = lifecycle.current.generation;
-    const owner = { operation: ++tokenOperation.current, consumed: false };
+    const owner = { operation: beginUsageTokenOperation(), consumed: false };
     forgetOwner.current = owner;
     const current = () =>
       lifecycle.current.active &&
       lifecycle.current.generation === generation &&
       forgetOwner.current === owner &&
-      tokenOperation.current === owner.operation;
+      isCurrentUsageTokenOperation(owner.operation);
     setBusy(true);
     setUsageStatus("正在清除应用内的网页登录数据…");
     void invoke<AppConfig>("forget_usage_session")
       .then((nextConfig) => {
-        if (!current() || owner.consumed) return;
-        owner.consumed = true;
         setCommittedConfig(nextConfig);
+        if (
+          !current() ||
+          owner.consumed ||
+          !isCurrentCredential(nextConfig, "usageToken")
+        )
+          return;
+        owner.consumed = true;
         commitUsageToken(revision);
         setUsageSyncing(false);
-        onUsageCleared();
         setUsageStatus(
           "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
         );
@@ -526,24 +534,28 @@ export function useSettingsState(handlers: {
       return (
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
-        tokenOperation.current === owner.operation
+        isCurrentUsageTokenOperation(owner.operation)
       );
     }
-  }, [onUsageCleared, tokenDraft, commitUsageToken]);
+  }, [tokenDraft, commitUsageToken]);
 
   React.useEffect(() => {
-    let active = true;
+    const current = capturePage();
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
-      if (!active) return;
       setCommittedConfig(event.payload);
-      setUsageSyncing(false);
-      onUsageCleared();
+      if (
+        current() &&
+        isCurrentCredential(event.payload, "usageToken") &&
+        event.payload.usageTokenRevision > syncCredentialRevision.current
+      ) {
+        syncCredentialRevision.current = event.payload.usageTokenRevision;
+        setUsageSyncing(false);
+      }
     });
     return () => {
-      active = false;
       void cleared.then((unlisten) => unlisten()).catch(() => undefined);
     };
-  }, [onUsageCleared]);
+  }, [capturePage]);
 
   // The owner registers once. Getters and actions read synchronous memory, never
   // render-time strings or effect-delayed state. Capture both credentials before
@@ -588,6 +600,7 @@ export function useSettingsState(handlers: {
         prepareSave,
         save: () => prepareSave()(),
         discard: () => {
+          if (!lifecycle.current.active) return;
           discardApiKey();
           discardUsageToken();
         },
@@ -598,26 +611,29 @@ export function useSettingsState(handlers: {
 
   const saveRefreshInterval = React.useCallback(
     (seconds: number) => {
-      if (preferenceBusy.current) return;
+      const current = capturePage();
+      if (!current() || preferenceBusy.current) return;
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, refresh: "" }));
       const previous = refresh;
       setRefresh(seconds);
-      onRefreshIntervalChanged(seconds);
       void invoke<AppConfig>("save_refresh_interval", {
         refreshIntervalSeconds: seconds,
       })
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
-          setRefresh(nextConfig.refreshIntervalSeconds || 60);
-          onRefreshIntervalChanged(nextConfig.refreshIntervalSeconds || 60);
+          if (!current()) return;
+          const committed = getCommittedConfig()!;
+          setRefresh(committed.refreshIntervalSeconds || 60);
         })
         .catch((error) => {
+          if (!current()) return;
           // 复评 N12：只有可信旧值才回滚（配置未知时控件已禁用）。
           if (previous !== null) {
-            setRefresh(previous);
-            onRefreshIntervalChanged(previous);
+            setRefresh(
+              getCommittedConfig()?.refreshIntervalSeconds ?? previous,
+            );
           }
           setSettingErrors((previous) => ({
             ...previous,
@@ -626,35 +642,38 @@ export function useSettingsState(handlers: {
         })
         .finally(() => {
           preferenceBusy.current = false;
-          setBusy(false);
+          if (current()) setBusy(false);
         });
     },
-    [onRefreshIntervalChanged, refresh],
+    [refresh, capturePage],
   );
 
   const saveAutoRefreshEnabled = React.useCallback(
     (enabled: boolean) => {
-      if (preferenceBusy.current) return;
+      const current = capturePage();
+      if (!current() || preferenceBusy.current) return;
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, autoRefresh: "" }));
       const previous = autoRefresh;
       setAutoRefresh(enabled);
-      onAutoRefreshChanged(enabled);
       void invoke<AppConfig>("save_auto_refresh_enabled", {
         autoRefreshEnabled: enabled,
       })
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
-          setAutoRefresh(nextConfig.autoRefreshEnabled);
-          onAutoRefreshChanged(nextConfig.autoRefreshEnabled);
+          if (!current()) return;
+          const committed = getCommittedConfig()!;
+          setAutoRefresh(committed.autoRefreshEnabled);
         })
         .catch((error) => {
+          if (!current()) return;
           // 复评 N12：配置未知时控件已禁用、不会走到这里；回滚只在有
           // 可信旧值时进行，不用 null 覆盖真实值。
           if (previous !== null) {
-            setAutoRefresh(previous);
-            onAutoRefreshChanged(previous);
+            setAutoRefresh(
+              getCommittedConfig()?.autoRefreshEnabled ?? previous,
+            );
           }
           setSettingErrors((previous) => ({
             ...previous,
@@ -663,15 +682,16 @@ export function useSettingsState(handlers: {
         })
         .finally(() => {
           preferenceBusy.current = false;
-          setBusy(false);
+          if (current()) setBusy(false);
         });
     },
-    [autoRefresh, onAutoRefreshChanged],
+    [autoRefresh, capturePage],
   );
 
   const saveAutostart = React.useCallback(
     (enabled: boolean) => {
-      if (preferenceBusy.current) return;
+      const current = capturePage();
+      if (!current() || preferenceBusy.current) return;
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, autostart: "" }));
@@ -680,11 +700,13 @@ export function useSettingsState(handlers: {
       void invoke<AppConfig>("save_autostart", { autostart: enabled })
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
-          setAutostart(nextConfig.autostart);
+          if (current()) setAutostart(getCommittedConfig()!.autostart);
         })
         .catch((error) => {
+          if (!current()) return;
           // 复评 N12：只有可信旧值才回滚。
-          if (previous !== null) setAutostart(previous);
+          if (previous !== null)
+            setAutostart(getCommittedConfig()?.autostart ?? previous);
           setSettingErrors((previous) => ({
             ...previous,
             autostart: errorMessage(error),
@@ -692,10 +714,10 @@ export function useSettingsState(handlers: {
         })
         .finally(() => {
           preferenceBusy.current = false;
-          setBusy(false);
+          if (current()) setBusy(false);
         });
     },
-    [autostart],
+    [autostart, capturePage],
   );
 
   return {

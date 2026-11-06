@@ -1,4 +1,4 @@
-import type { AppConfig } from "./types";
+import type { AppConfig, BalanceData } from "./types";
 
 // 复评 F08：已提交配置需要一个**单调提交代际**。
 //
@@ -11,6 +11,16 @@ import type { AppConfig } from "./types";
 // 这样无论多少个组件、多少个读取/写入交错，旧读取都不能回滚新提交。
 let current: AppConfig | null = null;
 let commitRevision = 0;
+let validatedBalance: { revision: number; balance: BalanceData } | null = null;
+export const getValidatedBalance = () => validatedBalance;
+// A verification receipt predates the command event. Once a newer fetch has
+// settled for that Key, its outcome owns the account state (including 401).
+let observedBalanceRevision: number | null = null;
+export const markBalanceObserved = (revision: number | undefined) => {
+  if (revision === undefined || current?.apiKeyRevision !== revision) return;
+  observedBalanceRevision = revision;
+  validatedBalance = null;
+};
 const listeners = new Set<() => void>();
 
 export const getCommittedConfig = () => current;
@@ -25,23 +35,60 @@ export const subscribeCommittedConfig = (listener: () => void) => {
   };
 };
 
-/** 提交新配置（写入类操作），递增提交代际并通知所有已挂载实例。 */
-export const setCommittedConfig = (config: AppConfig | null) => {
-  current = config;
-  commitRevision += 1;
+/** Accept only a newer whole backend snapshot. Equal events/responses are idempotent. */
+export const setCommittedConfig = (
+  config: AppConfig | null,
+  balance?: BalanceData,
+): boolean => {
+  const newer =
+    !config || !current || config.configRevision > current.configRevision;
+  // A later preference/Token commit may have arrived first. Its whole snapshot
+  // wins, but a validated balance is still useful if its Key version is current.
+  const acceptBalance = Boolean(
+    config &&
+    balance &&
+    config.apiKeyConfigured &&
+    config.apiKeyRevision !== observedBalanceRevision &&
+    (newer || current?.apiKeyRevision === config.apiKeyRevision),
+  );
+  if (!newer && !acceptBalance) return false;
+  if (newer) {
+    current = config;
+    if (!config) observedBalanceRevision = null;
+    commitRevision += 1;
+    if (!config || validatedBalance?.revision !== config.apiKeyRevision)
+      validatedBalance = null;
+  }
+  if (acceptBalance && config && balance)
+    validatedBalance = { revision: config.apiKeyRevision, balance };
   for (const listener of listeners) listener();
+  return true;
 };
 
-/**
- * 用**读取**结果更新 store：仅当自 `startedAt` 以来没有新的提交时才接受。
- * 返回是否被接受 —— 调用方据此决定要不要回填自己的局部状态。
- */
+/** Reads cannot roll back a newer backend commit or a write accepted since start. */
 export const applyReadConfig = (
   config: AppConfig | null,
   startedAt: number,
 ): boolean => {
   if (startedAt !== commitRevision) return false;
+  if (config && current && config.configRevision < current.configRevision)
+    return false;
+  if (config && current && config.configRevision === current.configRevision)
+    return true;
   current = config;
+  if (!config || validatedBalance?.revision !== config.apiKeyRevision)
+    validatedBalance = null;
   for (const listener of listeners) listener();
   return true;
+};
+
+/** A result may be older overall but still belong to the current credential. */
+export const isCurrentCredential = (
+  config: AppConfig,
+  credential: "apiKey" | "usageToken",
+): boolean => {
+  if (!current) return false;
+  return credential === "apiKey"
+    ? current.apiKeyRevision === config.apiKeyRevision
+    : current.usageTokenRevision === config.usageTokenRevision;
 };

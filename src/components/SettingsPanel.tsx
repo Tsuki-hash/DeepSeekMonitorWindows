@@ -13,7 +13,7 @@ import {
 import { refreshOptions } from "../usage-api";
 import { useTheme } from "../theme";
 import { useSettingsState } from "../settings-state";
-import type { BalanceData, UsageResult, LoadState } from "../types";
+import type { UsageResult, LoadState } from "../types";
 import { updateTime, snapshotAge, snapshotHealth } from "../data-display";
 import { usageNotices } from "../usage-notices";
 import { SupportSettings } from "./SupportSettings";
@@ -38,12 +38,6 @@ function SettingsPanel({
   onRetry,
   onBack,
   onRegisterLeaveBlocker,
-  onBalanceLoaded,
-  onBalanceCleared,
-  onUsageLoaded,
-  onUsageCleared,
-  onRefreshIntervalChanged,
-  onAutoRefreshChanged,
 }: {
   balanceUpdatedAt?: number | null;
   usageUpdatedAt?: number | null;
@@ -62,12 +56,6 @@ function SettingsPanel({
   onRegisterLeaveBlocker?: (
     blocker: LeaveBlocker | null,
   ) => void | (() => void);
-  onBalanceLoaded: (balance: BalanceData) => void;
-  onBalanceCleared: () => void;
-  onUsageLoaded: (usage: UsageResult) => void;
-  onUsageCleared: () => void;
-  onRefreshIntervalChanged: (seconds: number) => void;
-  onAutoRefreshChanged: (enabled: boolean) => void;
 }) {
   const {
     config,
@@ -100,14 +88,7 @@ function SettingsPanel({
     saveAutoRefreshEnabled,
     saveAutostart,
     registerCredentialBlocker,
-  } = useSettingsState({
-    onBalanceLoaded,
-    onBalanceCleared,
-    onUsageLoaded,
-    onUsageCleared,
-    onRefreshIntervalChanged,
-    onAutoRefreshChanged,
-  });
+  } = useSettingsState();
   const { theme, toggleTheme } = useTheme();
   const [retrying, setRetrying] = React.useState(false);
   const [confirmForget, setConfirmForget] = React.useState(false);

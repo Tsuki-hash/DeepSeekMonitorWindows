@@ -32,6 +32,135 @@ export type LocalRow = {
   lastActiveMs: number | null;
 };
 export type ClientIdentityStatus = "known" | "mixed" | "unknown";
+export type SourceIdentity = Pick<LocalRow, "sourceId" | "sourceLabel">;
+export type SourceIdentityStatus = "known" | "mixed" | "unknown";
+/** Only generated opaque IDs may become visible text, titles or accessible names. */
+export function isKnownSourceId(id?: string | null): id is string {
+  return (
+    id === "native" || Boolean(id && /^(home-|tool-)[a-f0-9]{64}$/.test(id))
+  );
+}
+export function localSourceCatalog(
+  sources: readonly SourceIdentity[],
+): SourceIdentity[] {
+  const unique = new Map<string, SourceIdentity>();
+  // Label is metadata, not identity. Never collapse distinct IDs with equal labels.
+  for (const source of sources) {
+    const key = source.sourceId || "legacy-unknown";
+    const previous = unique.get(key);
+    if (
+      !previous ||
+      (source.sourceLabel || "").localeCompare(previous.sourceLabel || "") < 0
+    )
+      unique.set(key, source);
+  }
+  return [...unique]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, source]) => source);
+}
+
+/** Export projection only; stored IDs and backend selection keys are never rewritten.
+ * Unknown IDs may be a path or a secret, so even enabling project paths does not
+ * turn them into an authorized source-ID field.
+ */
+export function localSourceExportIdentity(source: SourceIdentity) {
+  if (!isKnownSourceId(source.sourceId))
+    return { sourceId: "legacy-unknown", sourceLabel: "旧版来源身份未知" };
+  const sourceLabel =
+    source.sourceLabel &&
+    ![...source.sourceLabel].some(
+      (character) =>
+        character === "/" ||
+        character === "\\" ||
+        character.charCodeAt(0) < 32 ||
+        character.charCodeAt(0) === 127,
+    )
+      ? source.sourceLabel
+      : source.sourceId === "native"
+        ? "本机"
+        : "来源";
+  return { sourceId: source.sourceId, sourceLabel };
+}
+
+/** Display only the backend's opaque source ID, never derive a label from a home path.
+ * Expand colliding digest prefixes using the whole view, independent of row order.
+ * The full ID remains available in titles, accessible names and source details.
+ */
+export function localSourceLabel(
+  source: SourceIdentity,
+  sources: readonly SourceIdentity[] = [],
+  fullId = false,
+): string {
+  const id = source.sourceId;
+  // Old or damaged IDs can contain a raw path or a secret: do not echo them,
+  // even in full-ID details. Do not trust their accompanying label either.
+  if (!isKnownSourceId(id)) return "来源〔旧版来源身份未知〕";
+  const label = localSourceExportIdentity(source).sourceLabel;
+  let tag = id;
+  const digest = /^(home-|tool-)([a-f0-9]{64})$/.exec(tag);
+  if (digest && !fullId) {
+    let length = digest[1].length + 12;
+    while (
+      length < tag.length &&
+      sources.some(
+        (other) =>
+          isKnownSourceId(other.sourceId) &&
+          other.sourceId !== id &&
+          other.sourceId.startsWith(tag.slice(0, length)),
+      )
+    )
+      length++;
+    tag = tag.slice(0, length);
+  }
+  return `${label}〔${tag}〕`;
+}
+export function localSourceIdentity(sources: readonly SourceIdentity[]) {
+  const known = new Set(
+    sources.flatMap((source) =>
+      isKnownSourceId(source.sourceId) ? [source.sourceId] : [],
+    ),
+  );
+  const sourceHasUnknown = sources.some(
+    (source) => !isKnownSourceId(source.sourceId),
+  );
+  return {
+    sourceCount: known.size,
+    sourceHasUnknown,
+    sourceIdentityStatus: (known.size > 1 ||
+    (known.size > 0 && sourceHasUnknown)
+      ? "mixed"
+      : known.size === 1
+        ? "known"
+        : "unknown") as SourceIdentityStatus,
+  };
+}
+export function localSourcesLabel(
+  rows: readonly SourceIdentity[],
+  sources: readonly SourceIdentity[] = rows,
+  fullId = false,
+): string {
+  const identity = localSourceIdentity(rows);
+  const context = localSourceCatalog(sources);
+  const labels = localSourceCatalog(rows).map((source) =>
+    localSourceLabel(source, context, fullId),
+  );
+  const prefix =
+    identity.sourceIdentityStatus === "mixed"
+      ? `多个来源（${identity.sourceCount} 个已知${identity.sourceHasUnknown ? "，含未知身份" : ""}）：`
+      : "";
+  return prefix + (labels.join("；") || "来源身份未知");
+}
+/** Structured identity for display deduplication; keep backend selection keys unchanged. */
+export function localSessionIdentityKey(
+  row: Pick<LocalRow, "sourceId" | "tool" | "clientId" | "sessionId">,
+): string {
+  return JSON.stringify([
+    row.sourceId || "legacy-unknown",
+    row.tool,
+    row.clientId || "legacy-unknown",
+    row.sessionId,
+  ]);
+}
 export function localClientLabel(clientId?: string | null): string {
   if (!clientId || clientId === "legacy-unknown") return "旧版身份未知";
   if (clientId === "claude") return "原生 Claude · claude";
@@ -56,8 +185,10 @@ export function localSessionLabel(
     LocalRow,
     "sourceId" | "sourceLabel" | "tool" | "clientId" | "sessionId"
   >,
+  sources: readonly SourceIdentity[] = [],
+  fullId = false,
 ): string {
-  return `${row.sourceLabel || row.sourceId || "本机"} · ${localTools[row.tool] || row.tool} · ${localClientLabel(row.clientId)} · ${row.sessionId}`;
+  return `${localSourceLabel(row, sources, fullId)} · ${localTools[row.tool] || row.tool} · ${localClientLabel(row.clientId)} · ${row.sessionId}`;
 }
 export type LocalSnapshot = {
   retentionWarning?: string | null;
@@ -83,6 +214,9 @@ export type LocalUsageStatus = {
   snapshot: LocalSnapshot | null;
   busy?: boolean;
   lastError?: string | null;
+  generation?: number;
+  settingsPending?: boolean;
+  stopSavePending?: boolean;
 };
 export type LocalGroup = {
   key: string;

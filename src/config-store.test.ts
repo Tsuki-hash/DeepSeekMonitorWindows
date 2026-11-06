@@ -14,12 +14,19 @@ import {
   applyReadConfig,
   getCommitRevision,
   getCommittedConfig,
+  getValidatedBalance,
+  isCurrentCredential,
+  markBalanceObserved,
   setCommittedConfig,
   subscribeCommittedConfig,
 } from "./config-store.ts";
 import type { AppConfig } from "./types";
 
+let fixtureRevision = 0;
 const config = (over: Partial<AppConfig> = {}): AppConfig => ({
+  configRevision: ++fixtureRevision,
+  apiKeyRevision: fixtureRevision,
+  usageTokenRevision: fixtureRevision,
   apiKeyConfigured: false,
   apiKeyPreview: null,
   usageTokenConfigured: false,
@@ -115,5 +122,82 @@ test("F08：两个写入交错_提交后发起的读取仍然有效", () => {
     true,
   );
   assert.equal(getCommittedConfig()?.usageTokenConfigured, true);
+  setCommittedConfig(null);
+});
+
+test("N05: backend versions reject reversed full snapshots and duplicate events", () => {
+  setCommittedConfig(null);
+  const old = config({ apiKeyConfigured: true, usageTokenConfigured: true });
+  const latest = config({
+    apiKeyConfigured: false,
+    usageTokenConfigured: false,
+  });
+  let notifications = 0;
+  const stop = subscribeCommittedConfig(() => {
+    notifications += 1;
+  });
+  assert.equal(setCommittedConfig(latest), true);
+  const revision = getCommitRevision();
+  assert.equal(setCommittedConfig(old), false);
+  assert.equal(setCommittedConfig(latest), false);
+  assert.equal(applyReadConfig(old, revision), false);
+  assert.equal(getCommittedConfig(), latest);
+  assert.equal(notifications, 1);
+  assert.equal(getCommitRevision(), revision);
+  stop();
+  setCommittedConfig(null);
+});
+
+test("N05: older Key response may publish its matching balance without undoing newer Token/preferences", () => {
+  setCommittedConfig(null);
+  const savedKey = config({
+    apiKeyConfigured: true,
+    usageTokenConfigured: true,
+  });
+  const newerToken = config({
+    apiKeyConfigured: true,
+    apiKeyRevision: savedKey.apiKeyRevision,
+    usageTokenConfigured: false,
+    refreshIntervalSeconds: 300,
+  });
+  setCommittedConfig(newerToken);
+  const balance = {
+    isAvailable: true,
+    currency: "CNY",
+    totalBalance: "27",
+    grantedBalance: "0",
+    toppedUpBalance: "27",
+  };
+  setCommittedConfig(savedKey, balance);
+  assert.equal(getCommittedConfig(), newerToken);
+  assert.equal(getValidatedBalance()?.balance, balance);
+  assert.equal(isCurrentCredential(savedKey, "apiKey"), true);
+  assert.equal(isCurrentCredential(savedKey, "usageToken"), false);
+  const cleared = config({ apiKeyConfigured: false });
+  setCommittedConfig(cleared);
+  assert.equal(getValidatedBalance(), null);
+  assert.equal(setCommittedConfig(savedKey, balance), false);
+  assert.equal(getValidatedBalance(), null);
+  setCommittedConfig(null);
+});
+
+test("N05: a later balance observation supersedes the older verification receipt for the same Key", () => {
+  setCommittedConfig(null);
+  const saved = config({ apiKeyConfigured: true });
+  setCommittedConfig(saved);
+  markBalanceObserved(saved.apiKeyRevision);
+  const balance = {
+    isAvailable: true,
+    currency: "CNY",
+    totalBalance: "27",
+    grantedBalance: "0",
+    toppedUpBalance: "27",
+  };
+  assert.equal(setCommittedConfig(saved, balance), false);
+  assert.equal(getValidatedBalance(), null);
+  // A new verified credential commit can recover; an unrelated read cannot.
+  const newer = config({ apiKeyConfigured: true });
+  setCommittedConfig(newer, balance);
+  assert.equal(getValidatedBalance()?.revision, newer.apiKeyRevision);
   setCommittedConfig(null);
 });

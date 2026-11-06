@@ -5,6 +5,11 @@ import {
   localAverageRate,
   localProjects,
   localSessions,
+  localSessionLabel,
+  localSessionIdentityKey,
+  localSourceIdentity,
+  localSourceLabel,
+  localSourcesLabel,
   localSum,
 } from "./local-usage.ts";
 import type { LocalRow } from "./local-usage.ts";
@@ -127,4 +132,79 @@ test("计数回退、来源消失及重置清速度；新发现行不当成新�
   assert.equal(tracker.reading(4), null);
   tracker.reset();
   assert.equal(tracker.reading(5), null);
+});
+
+test("N06 同发行版来源短标识可辨、碰撞扩展、排序与全路径选项无关", () => {
+  const first = {
+    ...row(),
+    sourceId: `home-${"a".repeat(12)}b${"0".repeat(51)}`,
+    sourceLabel: "WSL · Ubuntu",
+    clientId: "claude",
+    tool: "claude",
+    projectPath: null,
+    projectKey: null,
+  };
+  const second = {
+    ...first,
+    sourceId: `home-${"a".repeat(12)}c${"0".repeat(51)}`,
+  };
+  const sources = [first, second];
+  const firstLabel = localSessionLabel(first, sources);
+  const secondLabel = localSessionLabel(second, sources);
+  assert.notEqual(firstLabel, secondLabel);
+  assert.ok(firstLabel.includes(`home-${"a".repeat(12)}b`));
+  assert.equal(firstLabel, localSessionLabel(first, [...sources].reverse()));
+  assert.equal(secondLabel, localSessionLabel(second, [...sources].reverse()));
+  assert.ok(localSessionLabel(first, sources, true).includes(first.sourceId));
+  assert.ok(localSourceLabel(second, sources, true).includes(second.sourceId));
+  assert.equal(localSessions(sources).length, 2);
+  assert.notEqual(
+    localSessionIdentityKey(first),
+    localSessionIdentityKey(second),
+  );
+  const mixed = localSourcesLabel(sources);
+  assert.ok(mixed.includes("多个来源") && mixed.includes("2 个已知"));
+  assert.equal(mixed, localSourcesLabel([...sources].reverse()));
+  assert.equal(mixed.includes("/home/"), false);
+});
+
+test("N06 旧来源未知不伪装成本机，身份计数不依赖标签去重", () => {
+  const unknown = { sourceLabel: "WSL · Ubuntu" };
+  const known = { sourceId: "native", sourceLabel: "本机" };
+  assert.ok(localSourceLabel(unknown).includes("来源身份未知"));
+  assert.equal(localSourceIdentity([unknown]).sourceIdentityStatus, "unknown");
+  assert.equal(localSourceIdentity([known]).sourceIdentityStatus, "known");
+  assert.deepEqual(localSourceIdentity([known, unknown]), {
+    sourceCount: 1,
+    sourceHasUnknown: true,
+    sourceIdentityStatus: "mixed",
+  });
+  assert.ok(localSourcesLabel([known, unknown]).includes("含未知身份"));
+  assert.equal(localSourceIdentity([]).sourceIdentityStatus, "unknown");
+  assert.notEqual(
+    localSessionIdentityKey({
+      ...row(),
+      tool: "claude",
+      clientId: "cc-mirror:x",
+    }),
+    localSessionIdentityKey({ ...row(), tool: "claude-mirror", clientId: "x" }),
+  );
+});
+
+test("N06 旧任意ID不进入短标识、完整标识、标题与辅助技术标签", () => {
+  for (const sourceId of [
+    "D:\\Private\\SECRET",
+    "\\\\wsl$\\Ubuntu\\home\\SECRET",
+    "sk-secret-SECRET",
+    "home-short-legacy",
+  ]) {
+    const source = { ...row(), sourceId, sourceLabel: "D:\\Private\\SECRET" };
+    for (const fullId of [false, true]) {
+      const text = localSessionLabel(source, [source], fullId);
+      assert.ok(text.includes("来源身份未知"));
+      assert.equal(text.includes("SECRET"), false);
+      assert.equal(text.includes(sourceId), false);
+    }
+    assert.equal(localSourceIdentity([source]).sourceIdentityStatus, "unknown");
+  }
 });
