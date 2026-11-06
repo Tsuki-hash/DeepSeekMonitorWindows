@@ -10,6 +10,8 @@ import type { AppConfig, BalanceData, SavedApiKey, UsageResult } from "./types";
 import { fetchCurrentUsage } from "./usage-api";
 import { errorMessage } from "./error-state";
 import type { LeaveBlocker } from "./leave-guard";
+import { CredentialDraft } from "./credential-draft";
+import type { CredentialSnapshot } from "./credential-draft";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -21,6 +23,23 @@ import {
   setCommittedConfig,
   subscribeCommittedConfig,
 } from "./config-store";
+
+function useCredentialDraft() {
+  const draft = React.useRef(new CredentialDraft());
+  const [value, setValue] = React.useState("");
+  const edit = React.useCallback((next: string) => {
+    draft.current.edit(next);
+    setValue(next);
+  }, []);
+  const clear = React.useCallback(() => {
+    draft.current.clear();
+    setValue("");
+  }, []);
+  const commit = React.useCallback((revision: number) => {
+    if (draft.current.commit(revision)) setValue("");
+  }, []);
+  return { draft, value, edit, clear, commit };
+}
 
 function useSettingsActions(handlers: {
   onUsageLoaded: (usage: UsageResult) => void;
@@ -74,10 +93,10 @@ export type SettingsState = {
   usageSyncing: boolean;
   showManualPaste: boolean;
   setShowManualPaste: React.Dispatch<React.SetStateAction<boolean>>;
-  saveApiKey: () => void;
+  saveApiKey: () => Promise<boolean>;
   clearApiKey: () => void;
   pasteApiKey: () => void;
-  saveUsageToken: () => void;
+  saveUsageToken: () => Promise<boolean>;
   clearUsageToken: () => void;
   forgetUsageSession: () => void;
   pasteUsageToken: () => void;
@@ -113,7 +132,35 @@ export function useSettingsState(handlers: {
     onAutoRefreshChanged,
   } = handlers;
 
-  const [apiKey, setApiKey] = React.useState("");
+  const {
+    draft: keyDraft,
+    value: apiKey,
+    edit: setApiKey,
+    clear: discardApiKey,
+    commit: commitApiKey,
+  } = useCredentialDraft();
+  const {
+    draft: tokenDraft,
+    value: usageToken,
+    edit: setUsageToken,
+    clear: discardUsageToken,
+    commit: commitUsageToken,
+  } = useCredentialDraft();
+  const lifecycle = React.useRef({ active: true, generation: 0 });
+  React.useLayoutEffect(() => {
+    const owner = lifecycle.current;
+    const key = keyDraft.current;
+    const token = tokenDraft.current;
+    owner.active = true;
+    owner.generation += 1;
+    return () => {
+      owner.active = false;
+      owner.generation += 1;
+      // Clear memory synchronously, before child cleanup or stale callbacks.
+      key.clear();
+      token.clear();
+    };
+  }, [keyDraft, tokenDraft]);
   const [config, setConfig] = React.useState<AppConfig | null>(
     getCommittedConfig,
   );
@@ -138,7 +185,6 @@ export function useSettingsState(handlers: {
   const [autostart, setAutostart] = React.useState<boolean | null>(
     initial ? initial.autostart : null,
   );
-  const [usageToken, setUsageToken] = React.useState("");
   const [usageStatus, setUsageStatus] = React.useState("");
   const [usageSyncing, setUsageSyncing] = React.useState(false);
   const syncRequestId = React.useRef(0);
@@ -249,62 +295,80 @@ export function useSettingsState(handlers: {
     } catch {
       setStatus("剪贴板读取失败");
     }
-  }, []);
+  }, [setApiKey]);
 
-  // 复评 T12：保存改为返回 `Promise<boolean>` —— 「保存并离开」需要等待
-  // 真实结果，失败时不得导航。
-  const saveApiKey = React.useCallback(async (): Promise<boolean> => {
-    const operation = beginApiKeyOperation();
-    // 复评 R16：记录**本次提交的草稿值**。保存期间用户可能继续输入
-    //（旧实现只禁用按钮、不禁输入），成功回调若无条件 `setApiKey("")`
-    // 就会把刚输入的新值清掉，用户以为没输入过。
-    const submitted = apiKey;
-    setBusy(true);
-    setStatus("正在验证 API Key…");
-    try {
-      const { config: nextConfig, balance } = await invoke<SavedApiKey>(
-        "save_api_key",
-        { apiKey },
-      );
-      if (!isCurrentApiKeyOperation(operation)) return false;
-      setCommittedConfig(nextConfig);
-      // 只有输入仍是本次提交值时才清空；否则保留新草稿并提示未保存。
-      setApiKey((current) => (current === submitted ? "" : current));
-      onBalanceLoaded(balance);
-      const symbol = currencySymbol(balance.currency);
-      const tip = balance.isAvailable ? "" : "（余额不足）";
-      setStatus(`验证通过，当前余额 ${symbol}${balance.totalBalance}${tip}`);
-      return true;
-    } catch (error) {
-      if (!isCurrentApiKeyOperation(operation)) return false;
-      setStatus(errorMessage(error));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }, [apiKey, onBalanceLoaded]);
+  const keySaves = React.useRef(new Map<number, Promise<boolean>>());
+  const saveKeySnapshot = React.useCallback(
+    (submitted: CredentialSnapshot): Promise<boolean> => {
+      const pending = keySaves.current.get(submitted.revision);
+      if (pending) return pending;
+      if (!lifecycle.current.active || !submitted.value.trim())
+        return Promise.resolve(false);
+      const generation = lifecycle.current.generation;
+      const operation = beginApiKeyOperation();
+      const current = () =>
+        lifecycle.current.active &&
+        lifecycle.current.generation === generation &&
+        isCurrentApiKeyOperation(operation);
+      const saving = (async () => {
+        setBusy(true);
+        setStatus("正在验证 API Key…");
+        try {
+          const { config: nextConfig, balance } = await invoke<SavedApiKey>(
+            "save_api_key",
+            { apiKey: submitted.value },
+          );
+          if (!current()) return false;
+          setCommittedConfig(nextConfig);
+          commitApiKey(submitted.revision);
+          onBalanceLoaded(balance);
+          const symbol = currencySymbol(balance.currency);
+          const tip = balance.isAvailable ? "" : "（余额不足）";
+          setStatus(
+            `验证通过，当前余额 ${symbol}${balance.totalBalance}${tip}`,
+          );
+          return true;
+        } catch (error) {
+          if (current()) setStatus(errorMessage(error));
+          return false;
+        } finally {
+          if (current()) setBusy(false);
+        }
+      })().finally(() => keySaves.current.delete(submitted.revision));
+      keySaves.current.set(submitted.revision, saving);
+      return saving;
+    },
+    [commitApiKey, onBalanceLoaded],
+  );
+  const saveApiKey = React.useCallback(
+    () => saveKeySnapshot(keyDraft.current.snapshot()),
+    [saveKeySnapshot, keyDraft],
+  );
 
   const clearApiKey = React.useCallback(() => {
     const operation = beginApiKeyOperation();
-    // 复评 N11：记录清除开始时的草稿值 —— 清除成功返回时若无条件 `setApiKey("")`
-    // 会把用户在清除期间新输入的值抹掉（实跑已复现）。只在草稿未变时清空，
-    // 否则保留新输入并提示尚未保存。
-    const draftAtStart = apiKey;
+    const revision = keyDraft.current.revision;
+    const generation = lifecycle.current.generation;
+    const current = () =>
+      lifecycle.current.active &&
+      lifecycle.current.generation === generation &&
+      isCurrentApiKeyOperation(operation);
     setBusy(true);
     void invoke<AppConfig>("clear_api_key")
       .then((nextConfig) => {
-        if (!isCurrentApiKeyOperation(operation)) return;
+        if (!current()) return;
         setCommittedConfig(nextConfig);
-        setApiKey((current) => (current === draftAtStart ? "" : current));
+        commitApiKey(revision);
         setStatus("已清除 API Key");
         onBalanceCleared();
       })
       .catch((error) => {
-        if (!isCurrentApiKeyOperation(operation)) return;
-        setStatus(errorMessage(error));
+        if (current()) setStatus(errorMessage(error));
       })
-      .finally(() => setBusy(false));
-  }, [onBalanceCleared, apiKey]);
+      .finally(() => {
+        if (current()) setBusy(false);
+      });
+  }, [onBalanceCleared, keyDraft, commitApiKey]);
 
   const pasteUsageToken = React.useCallback(async () => {
     try {
@@ -314,7 +378,7 @@ export function useSettingsState(handlers: {
     } catch {
       setUsageStatus("剪贴板读取失败");
     }
-  }, []);
+  }, [setUsageToken]);
 
   const startUsageSync = React.useCallback(() => {
     const requestId = ++syncRequestId.current;
@@ -349,140 +413,187 @@ export function useSettingsState(handlers: {
       .catch((error) => setUsageStatus(errorMessage(error)));
   }, []);
 
-  // 复评 T12：与 API Key 一样返回布尔结果，供「保存并离开」等待。
-  const saveUsageToken = React.useCallback(async (): Promise<boolean> => {
-    // 复评 R16：与 API Key 同一规则 —— 只清空**本次提交**的草稿值。
-    const submitted = usageToken;
-    setBusy(true);
-    setUsageStatus("正在验证候选 Token…");
-    try {
-      const nextConfig = await invoke<AppConfig>("save_usage_token", {
-        usageToken,
-      });
-      setCommittedConfig(nextConfig);
-      setUsageToken((current) => (current === submitted ? "" : current));
-      setUsageStatus("验证通过并已保存，正在刷新用量…");
-      return true;
-    } catch (error) {
-      // 走到这里说明是「保存」这一步失败（刷新阶段的失败已在 refreshUsageAfterToken
-      // 内处理并给出更准确的文案），所以不再笼统地说"保存或验证失败"。
-      setUsageStatus(errorMessage(error));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }, [usageToken]);
+  const tokenOperation = React.useRef(0);
+  const tokenSaves = React.useRef(new Map<number, Promise<boolean>>());
+  const saveTokenSnapshot = React.useCallback(
+    (submitted: CredentialSnapshot): Promise<boolean> => {
+      const pending = tokenSaves.current.get(submitted.revision);
+      if (pending) return pending;
+      if (!lifecycle.current.active || !submitted.value.trim())
+        return Promise.resolve(false);
+      const generation = lifecycle.current.generation;
+      const operation = ++tokenOperation.current;
+      const current = () =>
+        lifecycle.current.active &&
+        lifecycle.current.generation === generation &&
+        tokenOperation.current === operation;
+      const saving = (async () => {
+        setBusy(true);
+        setUsageStatus("正在验证候选 Token…");
+        try {
+          const nextConfig = await invoke<AppConfig>("save_usage_token", {
+            usageToken: submitted.value,
+          });
+          if (!current()) return false;
+          setCommittedConfig(nextConfig);
+          commitUsageToken(submitted.revision);
+          setUsageStatus("验证通过并已保存，正在刷新用量…");
+          return true;
+        } catch (error) {
+          if (current()) setUsageStatus(errorMessage(error));
+          return false;
+        } finally {
+          if (current()) setBusy(false);
+        }
+      })().finally(() => tokenSaves.current.delete(submitted.revision));
+      tokenSaves.current.set(submitted.revision, saving);
+      return saving;
+    },
+    [commitUsageToken],
+  );
+  const saveUsageToken = React.useCallback(
+    () => saveTokenSnapshot(tokenDraft.current.snapshot()),
+    [saveTokenSnapshot, tokenDraft],
+  );
 
   const clearUsageToken = React.useCallback(() => {
-    // 复评 N11：与 clearApiKey 同一规则（保留清除期间的新输入）。
-    const draftAtStart = usageToken;
+    const revision = tokenDraft.current.revision;
+    const generation = lifecycle.current.generation;
+    const operation = ++tokenOperation.current;
+    const current = () =>
+      lifecycle.current.active &&
+      lifecycle.current.generation === generation &&
+      tokenOperation.current === operation;
     setBusy(true);
     void invoke<AppConfig>("clear_usage_token")
       .then((nextConfig) => {
+        if (!current()) return;
         setCommittedConfig(nextConfig);
-        setUsageToken((current) => (current === draftAtStart ? "" : current));
+        commitUsageToken(revision);
         setUsageStatus("已清除用量 Token");
         setUsageSyncing(false);
         onUsageCleared();
       })
       .catch((error) => {
-        setUsageStatus(errorMessage(error));
+        if (current()) setUsageStatus(errorMessage(error));
       })
-      .finally(() => setBusy(false));
-  }, [onUsageCleared, usageToken]);
+      .finally(() => {
+        if (current()) setBusy(false);
+      });
+  }, [onUsageCleared, tokenDraft, commitUsageToken]);
 
-  // 复评 T13：凭据清除类操作（忘记账户 / `usage-token-cleared` 事件）必须按
-  // **草稿代际**清空，而不是无条件 `setUsageToken("")`。
-  //
-  // 旧实现在 forget 开始后、事件到达后都无条件清空 —— 用户在这两步之间
-  // 输入的新 Token 会被直接抹掉。这里记录操作开始时的草稿值：只有草稿
-  // **仍是该值**（说明用户没再输入）时才清空；否则保留新草稿。
-  // 重复事件/响应幂等：清空后草稿已是空串，再次到来不会误清。
-  const forgetDraftRef = React.useRef<string | null>(null);
-  const clearIfUnchanged = (submitted: string | null) => {
-    setUsageToken((current) =>
-      submitted === null || current === submitted ? "" : current,
-    );
-  };
+  // Events have no operation ID in the existing IPC contract. They update saved
+  // state only; only this operation's response may consume its draft revision.
+  // This also makes old/duplicate events harmless after unmount or a new forget.
+  const forgetOwner = React.useRef<{
+    operation: number;
+    consumed: boolean;
+  } | null>(null);
   const forgetUsageSession = React.useCallback(() => {
-    // 记录本次清除所属的草稿版本。
-    forgetDraftRef.current = usageToken;
+    if (forgetOwner.current) return;
+    const revision = tokenDraft.current.revision;
+    const generation = lifecycle.current.generation;
+    const owner = { operation: ++tokenOperation.current, consumed: false };
+    forgetOwner.current = owner;
+    const current = () =>
+      lifecycle.current.active &&
+      lifecycle.current.generation === generation &&
+      forgetOwner.current === owner &&
+      tokenOperation.current === owner.operation;
     setBusy(true);
     setUsageStatus("正在清除应用内的网页登录数据…");
     void invoke<AppConfig>("forget_usage_session")
       .then((nextConfig) => {
+        if (!current() || owner.consumed) return;
+        owner.consumed = true;
         setCommittedConfig(nextConfig);
-        clearIfUnchanged(forgetDraftRef.current);
+        commitUsageToken(revision);
         setUsageSyncing(false);
         onUsageCleared();
         setUsageStatus(
           "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
         );
       })
-      .catch((error) => setUsageStatus(errorMessage(error)))
-      .finally(() => setBusy(false));
-  }, [onUsageCleared, usageToken]);
+      .catch((error) => {
+        if (current()) setUsageStatus(errorMessage(error));
+      })
+      .finally(() => {
+        if (forgetOwner.current !== owner) return;
+        forgetOwner.current = null;
+        if (currentAfterForget()) setBusy(false);
+      });
+    function currentAfterForget() {
+      return (
+        lifecycle.current.active &&
+        lifecycle.current.generation === generation &&
+        tokenOperation.current === owner.operation
+      );
+    }
+  }, [onUsageCleared, tokenDraft, commitUsageToken]);
 
   React.useEffect(() => {
+    let active = true;
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
+      if (!active) return;
       setCommittedConfig(event.payload);
-      // 复评 T13：事件只清理**操作开始时**的草稿版本；用户在此之后输入
-      // 的新候选不会被事件擦掉。
-      clearIfUnchanged(forgetDraftRef.current);
       setUsageSyncing(false);
       onUsageCleared();
     });
     return () => {
+      active = false;
       void cleared.then((unlisten) => unlisten()).catch(() => undefined);
     };
   }, [onUsageCleared]);
 
-  // 复评 T12：把凭据草稿登记为离开拦截。设置页聚合「API Key + 用量 Token」
-  // 两类草稿（AlertSettings 的提醒草稿由 SettingsPanel 合并），因此这里只
-  // 报告凭据这一路；调用方负责组合成单个 blocker。
-  //
-  // 草稿只存在内存 state，不写 localStorage/sessionStorage/日志；
-  // 「保存并离开」等待真实保存结果，失败不导航。
-  const apiKeyRef = React.useRef(apiKey);
-  apiKeyRef.current = apiKey;
-  const usageTokenRef = React.useRef(usageToken);
-  usageTokenRef.current = usageToken;
-  // 保存函数每次渲染都是新函数，用 ref 转发避免 blocker 闭包过期。
-  const saveApiKeyRef = React.useRef(saveApiKey);
-  saveApiKeyRef.current = saveApiKey;
-  const saveUsageTokenRef = React.useRef(saveUsageToken);
-  saveUsageTokenRef.current = saveUsageToken;
+  // The owner registers once. Getters and actions read synchronous memory, never
+  // render-time strings or effect-delayed state. Capture both credentials before
+  // awaiting either, so a newly typed candidate is never submitted implicitly.
+  const saveKeyRef = React.useRef(saveKeySnapshot);
+  saveKeyRef.current = saveKeySnapshot;
+  const saveTokenRef = React.useRef(saveTokenSnapshot);
+  saveTokenRef.current = saveTokenSnapshot;
   const registerCredentialBlocker = React.useCallback(
     (register: (blocker: LeaveBlocker | null) => void) => {
-      const hasDraft =
-        apiKeyRef.current.trim().length > 0 ||
-        usageTokenRef.current.trim().length > 0;
-      register(
-        hasDraft
-          ? {
-              dirty: true,
-              subject: "凭据草稿",
-              // 保存并离开：两项都尝试保存；任一失败则保留在页。
-              save: async () => {
-                const results: boolean[] = [];
-                if (apiKeyRef.current.trim()) {
-                  results.push(await saveApiKeyRef.current());
-                }
-                if (usageTokenRef.current.trim()) {
-                  results.push(await saveUsageTokenRef.current());
-                }
-                return results.every(Boolean);
-              },
-              discard: () => {
-                // 放弃：只清内存草稿（不触碰已保存凭据）。
-                setApiKey("");
-                setUsageToken("");
-              },
-            }
-          : null,
-      );
+      const dirty = () =>
+        lifecycle.current.active &&
+        (keyDraft.current.dirty || tokenDraft.current.dirty);
+      const prepareSave = () => {
+        const key = keyDraft.current.snapshot();
+        const token = tokenDraft.current.snapshot();
+        const generation = lifecycle.current.generation;
+        return async () => {
+          if (
+            !lifecycle.current.active ||
+            lifecycle.current.generation !== generation
+          )
+            return false;
+          const results: boolean[] = [];
+          if (key.value.trim()) results.push(await saveKeyRef.current(key));
+          if (
+            !lifecycle.current.active ||
+            lifecycle.current.generation !== generation
+          )
+            return false;
+          if (token.value.trim())
+            results.push(await saveTokenRef.current(token));
+          return results.every(Boolean) && !dirty();
+        };
+      };
+      register({
+        get dirty() {
+          return dirty();
+        },
+        subject: "凭据草稿",
+        canLeave: () => !dirty(),
+        prepareSave,
+        save: () => prepareSave()(),
+        discard: () => {
+          discardApiKey();
+          discardUsageToken();
+        },
+      });
     },
-    [],
+    [keyDraft, discardApiKey, tokenDraft, discardUsageToken],
   );
 
   const saveRefreshInterval = React.useCallback(

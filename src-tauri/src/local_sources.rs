@@ -1,13 +1,15 @@
 //! Explicit home roots only. WSL listing never runs install/start/Linux commands.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::process::Stdio;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, OnceLock},
     time::Duration,
 };
+#[cfg(windows)]
 use tokio::io::AsyncReadExt;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -428,9 +430,11 @@ const MAX_LINK_HOPS: usize = 8;
 /// 重新从根扫描（处理 A→B→越界 的多跳）。整条链没有任何 reparse 组件才算
 /// 通过 —— 此后调用方的 `metadata` / `canonicalize` 访问的是已验证的路径。
 pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String> {
-    let mut current = path.to_path_buf();
+    let mut current = normalize_dot_segments(path);
+    let approved_distro = wsl_distribution(&path.to_string_lossy());
     let mut hops = 0usize;
     loop {
+        crate::local_usage::io_checkpoint()?;
         match origin {
             SourceOrigin::Native => {
                 // 文本预检（含嫁接后的路径）：WSL/网络共享/系统目录形态
@@ -439,7 +443,12 @@ pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String>
                     return Err("路径指向 WSL、网络共享或系统目录，未访问".into());
                 }
             }
-            SourceOrigin::Wsl => {}
+            SourceOrigin::Wsl => {
+                require_same_wsl_distribution(
+                    approved_distro.as_deref(),
+                    &current.to_string_lossy(),
+                )?;
+            }
         }
         let Some((link_component, remaining)) = first_reparse_component(&current)? else {
             return Ok(());
@@ -514,11 +523,19 @@ fn first_reparse_component(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, St
     let mut chain: Vec<&Path> = path.ancestors().collect();
     chain.reverse(); // 浅 → 深
     for prefix in chain {
+        crate::local_usage::io_checkpoint()?;
         let meta = match std::fs::symlink_metadata(prefix) {
             Ok(meta) => meta,
             // 组件不存在（监听场景允许末端尚未创建）：更深的组件也不可能
             // 存在，已检查的前缀就是全部可解析范围。
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None)
+            }
             Err(error) => {
                 return Err(format!("路径组件无法检查：{}（{error}）", prefix.display()));
             }
@@ -565,8 +582,8 @@ pub fn reject_link_target(target: &str, origin: SourceOrigin) -> Result<(), Stri
         }
         SourceOrigin::Wsl => {
             let normalized = normalize_resolved_str(target);
-            if is_network_path(&normalized) {
-                return Err("链接目标指向网络共享，未访问该目标".into());
+            if !is_wsl_path(&normalized) || is_protected_system_path(&normalized) {
+                return Err("WSL 链接目标离开已批准的 WSL 范围，未访问该目标".into());
             }
         }
     }
@@ -585,6 +602,7 @@ pub fn resolve_layout_root(
     expect: ResolvedExpect,
 ) -> Result<PathBuf, String> {
     check_link_chain(path, origin)?;
+    crate::local_usage::io_checkpoint()?;
     let canonical = std::fs::canonicalize(path).map_err(|_| "布局根无法解析")?;
     recheck_resolved_target(&path.to_string_lossy(), &canonical, expect, origin).map(|_| canonical)
 }
@@ -633,11 +651,16 @@ pub fn recheck_resolved_target(
                 };
                 return Err(hint.into());
             }
+            require_same_wsl_distribution(
+                wsl_distribution(&requested_text).as_deref(),
+                &resolved_text,
+            )?;
             if is_protected_system_path(&resolved_text) {
                 return Err("路径解析后指向 Windows 系统目录，未读取".into());
             }
         }
     }
+    crate::local_usage::io_checkpoint()?;
     let metadata = std::fs::metadata(resolved).map_err(|_| "解析后的路径无法访问")?;
     let matches_kind = match expect {
         ResolvedExpect::Directory => metadata.is_dir(),
@@ -681,6 +704,24 @@ fn normalize_resolved_str(value: &str) -> String {
 
 fn normalize_resolved(path: &Path) -> String {
     normalize_resolved_str(&path.to_string_lossy())
+}
+
+fn wsl_distribution(value: &str) -> Option<String> {
+    let normalized = normalize_resolved_str(value);
+    let rest = normalized
+        .strip_prefix(r"\\wsl$\")
+        .or_else(|| normalized.strip_prefix(r"\\wsl.localhost\"))?;
+    let distro = rest.split('\\').next()?;
+    (!distro.is_empty()).then(|| distro.to_string())
+}
+
+fn require_same_wsl_distribution(approved: Option<&str>, target: &str) -> Result<(), String> {
+    let actual = wsl_distribution(target);
+    if approved.is_some() && approved == actual.as_deref() {
+        Ok(())
+    } else {
+        Err("链接目标不在已确认运行的 WSL 发行版内，未访问该目标".into())
+    }
 }
 
 fn is_wsl_path(value: &str) -> bool {
@@ -1082,9 +1123,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let junction = base.join("alias");
         if !make_junction(&junction, Path::new(r"C:\Windows\System32")) {
-            eprintln!("NOT RUN：当前环境无法创建 junction");
             let _ = std::fs::remove_dir_all(&base);
-            return;
+            panic!("NOT RUN：当前环境无法创建 junction");
         }
         // 旧实现会先 symlink_metadata(叶子)：叶子经 junction 落到 System32，
         // 通常不存在 → 报「路径不存在」，但目标已被访问过。
@@ -1115,9 +1155,8 @@ mod tests {
         std::fs::create_dir_all(base.join("real/sub")).unwrap();
         let junction = base.join("alias");
         if !make_junction(&junction, &base.join("real")) {
-            eprintln!("NOT RUN：当前环境无法创建 junction");
             let _ = std::fs::remove_dir_all(&base);
-            return;
+            panic!("NOT RUN：当前环境无法创建 junction");
         }
         // 经 junction 的路径：允许目标 → 放行；更深的末端不存在也放行
         // （监听场景允许祖先目录尚未创建）。
@@ -1139,19 +1178,25 @@ mod tests {
         std::fs::create_dir_all(base.join("a")).unwrap();
         let link_b = base.join("a/b");
         if !make_junction(&link_b, &base.join("a")) {
-            eprintln!("NOT RUN：当前环境无法创建 junction");
             let _ = std::fs::remove_dir_all(&base);
-            return;
+            panic!("NOT RUN：当前环境无法创建 junction");
         }
         // 自我指向的 junction 链：必须终止（要么拒绝，要么放行），不能挂死。
-        let outcome = check_link_chain(&link_b.join("b/b/b"), SourceOrigin::Native);
-        assert!(outcome.is_ok() || outcome.is_err(), "链接环必须有限步终止");
+        assert!(check_link_chain(&link_b.join("b/b/b/b/b/b/b"), SourceOrigin::Native).is_ok());
+        let error =
+            check_link_chain(&link_b.join("b/b/b/b/b/b/b/b"), SourceOrigin::Native).unwrap_err();
+        assert!(
+            error.contains("超过 8 跳"),
+            "九跳必须在固定上限终止：{error}"
+        );
         std::fs::remove_dir(&link_b).ok();
         let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---------- 第七轮复评 F02-D：相对链接的 `..` 必须先折叠 ----------
 
+    // Path components use the host OS syntax. This assertion requires Windows.
+    #[cfg(windows)]
     #[test]
     fn f02_相对目标折叠dot段后再判策略() {
         // 评审示例：`C:\Users\A\alias` 的相对目标 `..\..\Windows\System32`
@@ -1189,5 +1234,23 @@ mod tests {
         let unc = normalize_dot_segments(Path::new(r"\\wsl.localhost\Ubuntu\..\Debian\home"));
         assert!(is_disallowed_local_target_text(&unc.to_string_lossy()));
         assert!(!is_disallowed_local_target_text(&folded.to_string_lossy()));
+    }
+
+    #[test]
+    fn r04_wsl链必须留在已批准发行版内() {
+        assert!(require_same_wsl_distribution(Some("ubuntu"), r"\\wsl$\Ubuntu\home\User").is_ok());
+        assert!(require_same_wsl_distribution(
+            Some("ubuntu"),
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\User"
+        )
+        .is_ok());
+        for target in [
+            r"\\wsl.localhost\Debian\home\User",
+            r"\\server\share",
+            r"C:\Users\Alice",
+        ] {
+            assert!(require_same_wsl_distribution(Some("ubuntu"), target).is_err());
+        }
+        assert!(require_same_wsl_distribution(None, r"\\wsl$\Ubuntu\home\User").is_err());
     }
 }

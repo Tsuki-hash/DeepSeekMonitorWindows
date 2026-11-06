@@ -11,7 +11,9 @@ export function AlertSettings({
   onRegisterLeaveBlocker,
 }: {
   /** 第五轮复评 N04：把未保存草稿登记为 App 级离开拦截，退出前协商。 */
-  onRegisterLeaveBlocker?: (blocker: LeaveBlocker | null) => void;
+  onRegisterLeaveBlocker?: (
+    blocker: LeaveBlocker | null,
+  ) => void | (() => void);
 } = {}) {
   const [status, setStatus] = React.useState<AlertStatus | null>(null);
   const [draft, setDraft] = React.useState<AlertOptions | null>(null);
@@ -34,9 +36,34 @@ export function AlertSettings({
     readSequence: 0,
     writeSequence: 0,
   });
+  const live = React.useRef({
+    status: null as AlertStatus | null,
+    draft: null as AlertOptions | null,
+    low: "",
+    budget: "",
+    revision: 0,
+    committedRevision: 0,
+  });
+  const dirtyNow = React.useCallback(() => {
+    const value = live.current;
+    return Boolean(
+      value.draft &&
+      value.status &&
+      (value.revision !== value.committedRevision ||
+        JSON.stringify(value.draft) !== JSON.stringify(value.status.options) ||
+        value.low !== String(value.status.options.lowBalanceCny) ||
+        value.budget !== String(value.status.options.monthlyBudgetCny)),
+    );
+  }, []);
   const accept = React.useCallback((value: AlertStatus, reset: boolean) => {
+    live.current.status = value;
     setStatus(value);
     if (reset) {
+      live.current.draft = value.options;
+      live.current.low = String(value.options.lowBalanceCny);
+      live.current.budget = String(value.options.monthlyBudgetCny);
+      live.current.revision += 1;
+      live.current.committedRevision = live.current.revision;
       setError("");
       setDraft(value.options);
       setLow(String(value.options.lowBalanceCny));
@@ -84,14 +111,13 @@ export function AlertSettings({
     const timer = window.setInterval(() => void reload(), 10000);
     return () => window.clearInterval(timer);
   }, [open, busy, ready, reload]);
-  const dirty =
-    draft &&
-    status &&
-    (JSON.stringify(draft) !== JSON.stringify(status.options) ||
-      low !== String(status.options.lowBalanceCny) ||
-      budget !== String(status.options.monthlyBudgetCny));
-  const save = async (): Promise<boolean> => {
-    if (!draft || !status) return false;
+  const dirty = dirtyNow();
+  const pendingSaves = React.useRef(new Map<number, Promise<boolean>>());
+  const saveSnapshot = async (
+    submitted: typeof live.current,
+  ): Promise<boolean> => {
+    const { draft, status, low, budget, revision } = submitted;
+    if (!control.current.active || !draft || !status) return false;
     setError("");
     setMessage("");
     let options: AlertOptions;
@@ -123,9 +149,10 @@ export function AlertSettings({
         control.current.active &&
         sequence === control.current.writeSequence
       ) {
-        accept(value, true);
+        // A later edit, including ABA, is a new draft even if text is equal.
+        accept(value, live.current.revision === revision);
         setMessage("提醒设置已保存");
-        return true;
+        return !dirtyNow();
       }
       // 组件已卸载或更新操作已取代当前保存：不算当前设置实例的成功。
       return false;
@@ -146,28 +173,40 @@ export function AlertSettings({
         setBusy(false);
     }
   };
-  // 第五轮复评 N04：未保存的提醒草稿注册为 App 级离开拦截 ——
-  // 关闭设置页/切页前经过三选一协商：保存并离开、放弃（恢复后端值）、取消。
-  // save 每次渲染都是新函数，用 ref 转发避免反复登记。
+  const save = (submitted = { ...live.current }): Promise<boolean> => {
+    const pending = pendingSaves.current.get(submitted.revision);
+    if (pending) return pending;
+    const saving = saveSnapshot(submitted).finally(() => {
+      pendingSaves.current.delete(submitted.revision);
+    });
+    pendingSaves.current.set(submitted.revision, saving);
+    return saving;
+  };
   const saveRef = React.useRef(save);
   saveRef.current = save;
-  React.useEffect(() => {
-    onRegisterLeaveBlocker?.(
-      dirty
-        ? {
-            dirty: true,
-            subject: "提醒设置",
-            save: async () => (await saveRef.current()) === true,
-            discard: () => {
-              // 放弃：草稿恢复为后端已保存值。
-              if (status) accept(status, true);
-              setMessage("");
-            },
-          }
-        : null,
-    );
-    return () => onRegisterLeaveBlocker?.(null);
-  }, [dirty, onRegisterLeaveBlocker, status, accept]);
+  React.useLayoutEffect(() => {
+    const prepareSave = () => {
+      const submitted = { ...live.current };
+      return () => saveRef.current(submitted);
+    };
+    const dispose = onRegisterLeaveBlocker?.({
+      get dirty() {
+        return dirtyNow();
+      },
+      subject: "提醒设置",
+      canLeave: () => !dirtyNow(),
+      prepareSave,
+      save: () => prepareSave()(),
+      discard: () => {
+        if (live.current.status) accept(live.current.status, true);
+        setMessage("");
+      },
+    });
+    return () => {
+      if (typeof dispose === "function") dispose();
+      else onRegisterLeaveBlocker?.(null);
+    };
+  }, [onRegisterLeaveBlocker, dirtyNow, accept]);
 
   const test = async () => {
     setBusy(true);
@@ -195,8 +234,10 @@ export function AlertSettings({
     }
   };
   const change = (value: Partial<AlertOptions>) => {
-    if (draft) {
-      setDraft({ ...draft, ...value });
+    if (live.current.draft) {
+      live.current.revision += 1;
+      live.current.draft = { ...live.current.draft, ...value };
+      setDraft(live.current.draft);
       setMessage("");
     }
   };
@@ -234,7 +275,11 @@ export function AlertSettings({
                   step="0.01"
                   value={low}
                   disabled={busy || !draft.lowBalanceEnabled}
-                  onChange={(event) => setLow(event.target.value)}
+                  onChange={(event) => {
+                    live.current.revision += 1;
+                    live.current.low = event.target.value;
+                    setLow(event.target.value);
+                  }}
                 />
               </span>
             </label>
@@ -260,7 +305,11 @@ export function AlertSettings({
                   step="0.01"
                   value={budget}
                   disabled={busy || !draft.monthlyBudgetEnabled}
-                  onChange={(event) => setBudget(event.target.value)}
+                  onChange={(event) => {
+                    live.current.revision += 1;
+                    live.current.budget = event.target.value;
+                    setBudget(event.target.value);
+                  }}
                 />
               </span>
             </label>

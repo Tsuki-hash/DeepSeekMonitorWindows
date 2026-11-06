@@ -34,7 +34,6 @@ function SettingsPanel({
   balanceErrorCode,
   usageErrorCode,
   usage,
-  showDataNotices = false,
   targetSection,
   onRetry,
   onBack,
@@ -55,13 +54,14 @@ function SettingsPanel({
   balanceErrorCode?: string;
   usageErrorCode?: string;
   usage?: UsageResult | null;
-  showDataNotices?: boolean;
   /** 进入设置后需要滚动并聚焦的区块（复评 R16）。 */
-  targetSection?: "usageToken" | null;
+  targetSection?: "usageToken" | "dataNotices" | null;
   onRetry?: () => Promise<unknown>;
   onBack: () => void;
   /** 第五轮复评 N04：提醒设置草稿经此登记为 App 级离开拦截。 */
-  onRegisterLeaveBlocker?: (blocker: LeaveBlocker | null) => void;
+  onRegisterLeaveBlocker?: (
+    blocker: LeaveBlocker | null,
+  ) => void | (() => void);
   onBalanceLoaded: (balance: BalanceData) => void;
   onBalanceCleared: () => void;
   onUsageLoaded: (usage: UsageResult) => void;
@@ -111,55 +111,69 @@ function SettingsPanel({
   const { theme, toggleTheme } = useTheme();
   const [retrying, setRetrying] = React.useState(false);
   const [confirmForget, setConfirmForget] = React.useState(false);
-  // 复评 T12：把「凭据草稿」与「提醒草稿」组合成**一个** blocker 再上报，
-  // 避免两个子组件各自 `onRegisterLeaveBlocker` 时后者覆盖前者（其中一类
-  // 草稿因此失去保护）。这里按各自最新注册状态合并：任一脏即拦。
+  // One page owner, one registration, and synchronous live participants. A child
+  // cleanup cannot republish an old page, nor dispose a newer registration.
+  const owner = React.useRef({ active: true });
   const credentialBlocker = React.useRef<LeaveBlocker | null>(null);
   const alertBlocker = React.useRef<LeaveBlocker | null>(null);
-  const publishBlocker = React.useCallback(() => {
-    const parts = [credentialBlocker.current, alertBlocker.current].filter(
-      Boolean,
-    ) as LeaveBlocker[];
-    if (!parts.length) {
-      onRegisterLeaveBlocker?.(null);
-      return;
-    }
-    onRegisterLeaveBlocker?.({
-      dirty: true,
-      // 两个主体都点名，用户知道会丢什么。
-      subject: parts.map((part) => part.subject).join("、"),
-      save: async () => {
-        // 全部保存成功才允许离开。
-        for (const part of parts) {
-          if (!(await part.save())) return false;
-        }
-        return true;
-      },
-      discard: () => {
-        for (const part of parts) part.discard();
-      },
-    });
-  }, [onRegisterLeaveBlocker]);
-  const registerCredential = React.useCallback(
-    (blocker: LeaveBlocker | null) => {
-      credentialBlocker.current = blocker;
-      publishBlocker();
-    },
-    [publishBlocker],
-  );
   const registerAlertBlocker = React.useCallback(
     (blocker: LeaveBlocker | null) => {
       alertBlocker.current = blocker;
-      publishBlocker();
+      return () => {
+        if (alertBlocker.current === blocker) alertBlocker.current = null;
+      };
     },
-    [publishBlocker],
+    [],
   );
-  React.useEffect(() => {
-    // 复评 T12：凭据草稿只在内存里，输入变化时必须**重新注册**才能让
-    // blocker 反映当前是否脏（依赖 apiKey/usageToken）。
-    registerCredentialBlocker(registerCredential);
-    return () => registerCredentialBlocker(() => undefined);
-  }, [registerCredentialBlocker, registerCredential, apiKey, usageToken]);
+  React.useLayoutEffect(() => {
+    const currentOwner = owner.current;
+    currentOwner.active = true;
+    registerCredentialBlocker((blocker) => {
+      credentialBlocker.current = blocker;
+    });
+    const parts = () =>
+      [credentialBlocker.current, alertBlocker.current].filter(
+        (part): part is LeaveBlocker => part !== null,
+      );
+    const dirty = () =>
+      owner.current.active && parts().some((part) => part.dirty);
+    const blocker: LeaveBlocker = {
+      get dirty() {
+        return dirty();
+      },
+      get subject() {
+        return parts()
+          .filter((part) => part.dirty)
+          .map((part) => part.subject)
+          .join("、");
+      },
+      canLeave: () => !dirty(),
+      save: async () => {
+        if (!owner.current.active) return false;
+        // Freeze the intended submissions for the entire page before the first
+        // await. New credentials or alert edits stay unsubmitted and block exit.
+        const submissions = parts()
+          .filter((part) => part.dirty)
+          .map((part) => part.prepareSave?.() ?? part.save);
+        for (const submit of submissions) {
+          if (!owner.current.active || !(await submit())) return false;
+        }
+        return owner.current.active && !dirty();
+      },
+      discard: () => {
+        if (!owner.current.active) return;
+        for (const part of parts()) part.discard();
+      },
+    };
+    const dispose = onRegisterLeaveBlocker?.(blocker);
+    return () => {
+      currentOwner.active = false;
+      credentialBlocker.current = null;
+      alertBlocker.current = null;
+      if (typeof dispose === "function") dispose();
+      else onRegisterLeaveBlocker?.(null);
+    };
+  }, [registerCredentialBlocker, onRegisterLeaveBlocker]);
   const notices = usageNotices(usage ?? null);
   const [healthClock, setHealthClock] = React.useState(Date.now);
   React.useEffect(() => {
@@ -167,25 +181,23 @@ function SettingsPanel({
     return () => window.clearInterval(timer);
   }, []);
   const noticesRef = React.useRef<HTMLDetailsElement>(null);
-  // 复评 R16：历史页的恢复按钮必须真正定位到用量 Token 区块，
-  // 只切到设置页顶部（API Key 区）会让用户还要自己找。
-  const usageTokenRef = React.useRef<HTMLElement>(null);
+  const usageTokenRef = React.useRef<HTMLDivElement>(null);
+  const noticesSummaryRef = React.useRef<HTMLElement>(null);
   React.useEffect(() => {
-    if (targetSection !== "usageToken") return;
-    // 等渲染完成再滚动，否则 ref 可能还没挂载。
+    if (!targetSection) return;
     const frame = window.requestAnimationFrame(() => {
-      const node = usageTokenRef.current;
+      const node =
+        targetSection === "usageToken"
+          ? usageTokenRef.current
+          : noticesSummaryRef.current;
+      if (targetSection === "dataNotices" && noticesRef.current)
+        noticesRef.current.open = true;
       if (!node) return;
       node.scrollIntoView({ block: "start", behavior: "smooth" });
-      // 把焦点移到区块标题，键盘与读屏用户能确认「到了」。
-      node.setAttribute("tabindex", "-1");
       node.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [targetSection]);
-  React.useEffect(() => {
-    if (showDataNotices) noticesRef.current?.scrollIntoView({ block: "start" });
-  }, [showDataNotices]);
 
   return (
     <section className="settings-panel" data-testid="settings-panel">
@@ -277,7 +289,7 @@ function SettingsPanel({
           ))}
         </SettingsSection>
 
-        <div ref={usageTokenRef as React.RefObject<HTMLDivElement>}>
+        <div ref={usageTokenRef} tabIndex={-1}>
           <SettingsSection
             icon={<BarChart3 size={15} />}
             title="用量同步 Token"
@@ -335,7 +347,9 @@ function SettingsPanel({
               <summary>账户隐私</summary>
               <p className="muted">
                 “清除 Token”保留网页登录会话；“退出并忘记账户”同时清除本应用的
-                Token 与网页登录数据。API Key 和其他设置保留。
+                Token 与网页登录数据。API Key 和其他设置保留。 历史版本生成的
+                config.json.corrupt-* 备份和手动副本可能含旧凭据， 不会随清除
+                Key、清除 Token 或忘记账户自动删除。
               </p>
               {confirmForget ? (
                 <>
@@ -436,9 +450,9 @@ function SettingsPanel({
           <details
             className="settings-disclosure"
             ref={noticesRef}
-            open={showDataNotices || undefined}
+            open={targetSection === "dataNotices" || undefined}
           >
-            <summary>
+            <summary ref={noticesSummaryRef}>
               {balanceError || usageError || notices.length
                 ? "查看更新状态与数据提示"
                 : "更新时间与统计说明"}

@@ -475,9 +475,9 @@ pub(crate) async fn collect_local_usage(
         // 留存是可选功能：失败不阻断统计。逐条策略下「部分写入」也要如实告诉用户，
         // 而不是只在整批失败时才提示。
         snapshot.retention_warning = match crate::local_retention::checkpoint(snapshot) {
-            Ok(outcome) if outcome.failed => {
-                Some("留存写入失败，已保存的旧记录未改动；当前统计仍可用".into())
-            }
+            Ok(outcome) if outcome.failed => Some(
+                "留存写入失败，已保存的旧记录未改动；本次质量证据未保存，当前统计仍可用".into(),
+            ),
             Ok(outcome)
                 if outcome.skipped > 0
                     || outcome.skipped_bytes > 0
@@ -497,7 +497,7 @@ pub(crate) async fn collect_local_usage(
                 }
                 if outcome.skipped_bytes > 0 {
                     parts.push(format!(
-                        "{} 条既有会话更新因超出字节上限保留旧值",
+                        "{} 条既有会话更新因超出字节上限保留旧值，本次质量证据可能未保存",
                         outcome.skipped_bytes
                     ));
                 }

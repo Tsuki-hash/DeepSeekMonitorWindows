@@ -1,6 +1,6 @@
 import { csvCell } from "./history.ts";
 import type { LocalRow, LocalSnapshot } from "./local-usage";
-import { localEvidence } from "./local-quality.ts";
+import { localEvidence, snapshotQuality } from "./local-quality.ts";
 const fields = [
   "input",
   "output",
@@ -31,7 +31,7 @@ export function localExport(
       sourceLabel: row.sourceLabel || "本机",
       tool: row.tool,
       // 复评 N01：导出保留 client 身份，避免镜像与原生会话在导出中不可区分。
-      clientId: row.clientId || row.tool,
+      clientId: row.clientId || "legacy-unknown",
       sessionId: row.sessionId,
       model: row.model,
       ...localEvidence(row),
@@ -74,6 +74,7 @@ export function localExport(
     generatedAt: new Date(generatedAt).toISOString(),
     stale,
     complete: snapshot.complete !== false,
+    ...snapshotQuality(snapshot),
     sources: (snapshot.sources || []).map((source) => ({
       id: source.id,
       label: source.label,
@@ -113,10 +114,15 @@ export function localExport(
           "collectedAt",
           "stale",
           "complete",
+          "qualityEvidenceRecorded",
+          "qualityWarnings",
           "measurement",
         ],
-        ...records.map((row) => [
-          ...header.map((field) => (row as Record<string, unknown>)[field]),
+        // Empty snapshots still need a metadata row to preserve unknown/clean/risk.
+        ...(records.length ? records : [null]).map((row) => [
+          ...header.map((field) =>
+            row ? (row as Record<string, unknown>)[field] : null,
+          ),
           metadata.source,
           metadata.period,
           metadata.periodKey,
@@ -125,6 +131,8 @@ export function localExport(
           metadata.collectedAt,
           stale,
           metadata.complete,
+          metadata.qualityEvidenceRecorded,
+          metadata.qualityWarnings.join(";"),
           metadata.measurement,
         ]),
       ]

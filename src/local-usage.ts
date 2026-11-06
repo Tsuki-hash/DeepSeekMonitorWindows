@@ -13,7 +13,7 @@ export type LocalRow = {
   sourceLabel?: string;
   id: string;
   tool: string;
-  /** 复评 N01：稳定 client 身份；旧数据缺省时回填 tool。 */
+  /** 复评 N01：稳定 client 身份；旧数据缺省时身份未知，不根据 tool 猜测。 */
   clientId?: string;
   sessionId: string;
   projectKey: string | null;
@@ -31,6 +31,34 @@ export type LocalRow = {
   firstActiveMs: number | null;
   lastActiveMs: number | null;
 };
+export type ClientIdentityStatus = "known" | "mixed" | "unknown";
+export function localClientLabel(clientId?: string | null): string {
+  if (!clientId || clientId === "legacy-unknown") return "旧版身份未知";
+  if (clientId === "claude") return "原生 Claude · claude";
+  if (clientId === "claude-mirror" || clientId.startsWith("cc-mirror:"))
+    return `镜像 · ${clientId}`;
+  return `客户端 · ${clientId}`;
+}
+export function localIdentity(rows: Pick<LocalRow, "clientId">[]) {
+  const clients = new Set(rows.map((row) => row.clientId || "legacy-unknown"));
+  const clientId = clients.size === 1 ? [...clients][0] : null;
+  return {
+    clientId: clientId === "legacy-unknown" ? null : clientId,
+    identityStatus: (clients.size > 1
+      ? "mixed"
+      : !clientId || clientId === "legacy-unknown"
+        ? "unknown"
+        : "known") as ClientIdentityStatus,
+  };
+}
+export function localSessionLabel(
+  row: Pick<
+    LocalRow,
+    "sourceId" | "sourceLabel" | "tool" | "clientId" | "sessionId"
+  >,
+): string {
+  return `${row.sourceLabel || row.sourceId || "本机"} · ${localTools[row.tool] || row.tool} · ${localClientLabel(row.clientId)} · ${row.sessionId}`;
+}
 export type LocalSnapshot = {
   retentionWarning?: string | null;
   collectedAt: number;
@@ -48,6 +76,7 @@ export type LocalSnapshot = {
   }[];
   /** 复评 N03：质量证据（脱敏 code），与 complete 分开。 */
   qualityWarnings?: string[];
+  qualityEvidenceRecorded?: boolean;
 };
 export type LocalUsageStatus = {
   enabled: boolean;
@@ -108,7 +137,7 @@ export function localSessions(rows: LocalRow[]): LocalGroup[] {
   for (const row of rows) {
     // 复评 N01：会话身份必须含 client —— 原生 Claude 与 mirror 可能有
     // 同名 sessionId，只按 tool 分组会把它们合并成一个会话。
-    const client = row.clientId || row.tool;
+    const client = row.clientId || "legacy-unknown";
     const key = `${row.sourceId || "native"}\0${row.tool}\0${client}\0${row.sessionId}`;
     if (!groups.has(key))
       groups.set(key, {

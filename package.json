@@ -24,7 +24,8 @@
     "tauri:build": "tauri build",
     "tauri:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "release:record": "node scripts/release-record.mjs",
-    "test:integration": "node scripts/run-integration-tests.mjs"
+    "test:integration": "node scripts/run-integration-tests.mjs",
+    "test:components": "node scripts/test-settings-components.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
@@ -44,7 +45,8 @@
     "source-map-js": "^1.2.2",
     "typescript": "5.6.3",
     "typescript-eslint": "^8.18.0",
-    "vite": "^6.4.5"
+    "vite": "^6.4.5",
+    "react-test-renderer": "18.3.1"
   },
   "overrides": {
     "minimatch@<11.0.1": "11.0.4"

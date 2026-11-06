@@ -66,3 +66,38 @@ export function qualitySummary(rows: LocalRow[]) {
   }
   return { rows: rows.length, fields, timing };
 }
+
+/** Snapshot-level evidence is independent of read completeness and row coverage.
+ * Missing/old empty evidence stays unknown; old nonempty codes remain useful.
+ * Never copy diagnostic messages or paths into this public projection.
+ */
+export type QualityEvidence = {
+  qualityEvidenceRecorded?: boolean;
+  qualityWarnings?: string[];
+};
+export function snapshotQuality(evidence: QualityEvidence) {
+  const warnings = evidence.qualityWarnings || [];
+  return {
+    qualityEvidenceRecorded:
+      evidence.qualityEvidenceRecorded === true || warnings.length > 0,
+    qualityWarnings: [
+      ...new Set(
+        warnings.map((code) =>
+          /^[a-z][a-z0-9_-]{0,63}$/.test(code)
+            ? code
+            : "quality_warning_redacted",
+        ),
+      ),
+    ].sort(),
+  };
+}
+export function snapshotQualityLabel(evidence: QualityEvidence): string {
+  const quality = snapshotQuality(evidence);
+  if (!quality.qualityEvidenceRecorded) return "质量证据未记录，去重可信度未知";
+  if (!quality.qualityWarnings.length)
+    return "质量检查已记录，未报告风险（不代表已证明无重叠）";
+  const explanation = quality.qualityWarnings.includes("overlap_partial")
+    ? "部分来源范围重叠，合计可能重复计入"
+    : "存在数据质量风险，合计需谨慎使用";
+  return `${explanation} · ${quality.qualityWarnings.join("、")}`;
+}

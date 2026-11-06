@@ -4,6 +4,7 @@ import { ArrowLeft, Folder, Layers, RefreshCw } from "lucide-react";
 import { fmtTokensShort } from "../format";
 import { updateTime } from "../data-display";
 import { errorMessage } from "../error-state";
+import { snapshotQualityLabel } from "../local-quality";
 import { localExport } from "../local-export";
 import { downloadText } from "../download";
 import { LocalSourceSettings } from "./LocalSourceSettings";
@@ -17,6 +18,7 @@ import { shouldBlockLeave } from "../draft-guard";
 import type { LeaveBlocker } from "../leave-guard";
 import {
   localTools,
+  localSessionLabel,
   localProjects,
   localSessions,
   localAverageRate,
@@ -462,6 +464,11 @@ export function LocalUsagePanel({
                   </article>
                 </div>
               )}
+              {snapshot && (
+                <p className="history-message warning" role="status">
+                  {snapshotQualityLabel(snapshot)}
+                </p>
+              )}
               {busy && !snapshot && (
                 <p role="status" className="history-message">
                   正在读取本地记录…
@@ -469,8 +476,11 @@ export function LocalUsagePanel({
               )}
               {selected ? (
                 <>
-                  <p className="local-session-id" title={selected.label}>
-                    {localTools[selected.rows[0].tool]} · {selected.label}
+                  <p
+                    className="local-session-id"
+                    title={localSessionLabel(selected.rows[0])}
+                  >
+                    {localSessionLabel(selected.rows[0])}
                   </p>
                   <p className="local-path" title={selected.path || undefined}>
                     {selected.path || "未归属项目"}
@@ -533,9 +543,15 @@ export function LocalUsagePanel({
                           )}
                         </span>
                         <span className="local-group-copy">
-                          <strong title={group.path || group.label}>
+                          <strong
+                            title={
+                              project != null || tab === "sessions"
+                                ? localSessionLabel(group.rows[0])
+                                : group.path || group.label
+                            }
+                          >
                             {project != null || tab === "sessions"
-                              ? `${localTools[group.rows[0].tool]} · ${group.label}`
+                              ? localSessionLabel(group.rows[0])
                               : group.label}
                           </strong>
                           <small>
@@ -590,12 +606,12 @@ export function LocalUsagePanel({
             <span>当前范围</span>
             <strong
               title={
-                selected?.label ||
+                (selected ? localSessionLabel(selected.rows[0]) : null) ||
                 projects.find((group) => group.key === project)?.label ||
                 "全部本地记录"
               }
             >
-              {selected?.label ||
+              {(selected ? localSessionLabel(selected.rows[0]) : null) ||
                 projects.find((group) => group.key === project)?.label ||
                 "全部本地记录"}
             </strong>
@@ -631,16 +647,11 @@ export function LocalUsagePanel({
               stale={Boolean(error)}
             />
           )}
-          {enabled && snapshot && snapshot.qualityWarnings?.length ? (
-            // 复评 N03：已知重叠等**质量证据**与「读取是否完整」分开显示 ——
-            // complete 仍为 true，但去重可信度下降，用户不该把重复合计
-            // 当成准确值。这里只展示脱敏 code 的可读说明，不含路径。
-            <p className="data-error" role="alert">
-              {snapshot.qualityWarnings.includes("overlap_partial")
-                ? "部分来源范围重叠：重叠部分的用量可能被重复计入，不能当作去重后的合计"
-                : `数据质量提示：${snapshot.qualityWarnings.join("、")}`}
+          {enabled && snapshot && (
+            <p className="history-message" role="status">
+              {snapshotQualityLabel(snapshot)}
             </p>
-          ) : null}
+          )}
           {enabled && (
             <details className="history-details local-export">
               <summary>

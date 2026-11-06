@@ -283,7 +283,9 @@ Both the API key and the usage token are stored in this file, **encrypted with W
 - Copying `config.json` alone to another machine or another user account makes the credentials **undecryptable**; the app then asks you to re-enter them (all other settings are preserved).
 - Plaintext credentials left behind by older versions (v1.2.1 and earlier) are **re-encrypted automatically** the first time the app reads them — no manual step needed.
 - Still do not commit it to any repository, share it, or back it up to cloud storage — encryption only guards against the file being taken, not against a malicious process running as the current user.
-- On a shared computer, clear your Key in Settings and use **退出并忘记账户** under **账户隐私** to remove the usage Token and this application's web sign-in data. **清除 Token** alone does not remove web sign-in caches.
+- On a shared computer, clear your Key in Settings and use **退出并忘记账户** under **账户隐私** to remove the usage Token and this application's web sign-in data. **清除 Token** alone does not remove web sign-in caches. These actions do not automatically remove historical `config.json.corrupt-*` backups or manual copies. Those files may contain old plaintext credentials; handle them securely yourself once recovery is no longer needed.
+
+If the configuration is corrupt or invalid UTF-8, the app reports an error and preserves the original bytes. It does not create a plaintext backup, reset the settings, or overwrite the file. Safely repair or move `config.json` before retrying; do not upload files containing credentials for troubleshooting.
 
 The WebView2 cache created by the web login lives at `%LOCALAPPDATA%\com.deepseek.monitor.windows\EBWebView`. It is local runtime data and should not be committed either.
 
@@ -320,16 +322,18 @@ npm run tauri:build    # build the NSIS installer
 
 The version number lives in three places — `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` (Tauri 2 does not read `package.json`). Running `npm run check:version` before a release prevents shipping an installer whose name does not match its contents.
 
-**Tests**: the frontend runs TypeScript tests directly through Node 22's built-in `node --test` with `--experimental-strip-types`, so **no test framework such as vitest or jest is involved** — and no devDependency was added for it. The backend is plain `cargo test`:
+**Tests**: the frontend runs TypeScript tests directly through Node 22's built-in `node --test` with `--experimental-strip-types`, so **no test framework such as vitest or jest is involved**. Component interaction regressions use `react-test-renderer` via `npm run test:components`. The shared backend gate, `scripts/run-rust-tests.mjs`, probes link capabilities before running `cargo test -- --show-output` so successful-test output remains visible:
 
 ```powershell
 npm test                                  # frontend: tsc -p tsconfig.test.json + node --test
-cargo test --manifest-path src-tauri/Cargo.toml --lib   # backend
+npm run test:components                    # component interaction tests
+node --test scripts/tests/release-gates.test.mjs # gate fault injection, not native capability evidence
+node scripts/run-rust-tests.mjs            # backend and required link capability gate
 ```
 
-Coverage targets the things that break silently: usage accounting (the model-name table in `model_slot`, the six token kinds and the `PROMPT_TOKEN` double-count boundary in `token_breakdown`, the additive semantics of `merge_model_slot`), config I/O (missing fields in old configs falling back to defaults, corrupt configs being quarantined and reset, atomic writes leaving no temp file, credential encryption and plaintext migration), login token parsing (context-feature matching, truncated input not crashing), and the frontend's cross-month padding and unit thresholds. Change any of those and run the tests first.
+Coverage targets the things that break silently: usage accounting (the model-name table in `model_slot`, the six token kinds and the `PROMPT_TOKEN` double-count boundary in `token_breakdown`, the additive semantics of `merge_model_slot`), config I/O (missing fields in old configs falling back to defaults, corrupt configs preserved unchanged with an explicit error, atomic writes leaving no temp file, credential encryption and plaintext migration), login token parsing (context-feature matching, truncated input not crashing), and the frontend's cross-month padding and unit thresholds. Change any of those and run the tests first.
 
-This repository **does not use GitHub Actions**. Run `npm run verify` locally (PowerShell 7+) before pushing: version consistency, frontend tests/lint/build, plus `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`.
+This repository **does not use GitHub Actions**. Run `npm run verify` locally (PowerShell 7+) before pushing: version consistency, frontend unit/component tests, gate fault injection, lint/format/build, `cargo fmt --check`, `cargo clippy -- -D warnings`, the shared Rust gate, engine integration tests, and dependency auditing. Windows file/directory symlinks and junctions are required prerequisites. Missing capabilities or `NOT RUN` test output never count as PASS. `release:record` consumes the same entry point and structured result, exiting nonzero for any NOT RUN. Non-Windows runs do not verify Windows-only assertions.
 
 Optional hardening: `git config core.hooksPath scripts/hooks` enables the repo's pre-push hook, which runs `npm run verify` automatically before every `git push` (skip once with `git push --no-verify`).
 

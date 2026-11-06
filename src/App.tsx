@@ -51,10 +51,9 @@ import {
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
 function App() {
-  const [showDataNotices, setShowDataNotices] = React.useState(false);
   // 复评 R16：设置页需要定位到用量 Token 区块时由这里指定。
   const [settingsTarget, setSettingsTarget] = React.useState<
-    "usageToken" | null
+    "usageToken" | "dataNotices" | null
   >(null);
   const [view, setView] = React.useState<ViewName>("dashboard");
   // 全局离开拦截（复评 F09）：任何导航出口都先问 blocker，草稿不再被静默丢弃。
@@ -663,7 +662,7 @@ function App() {
     // 数据提示）时，焦点由 SettingsPanel 的定向 effect 负责 —— 这里的通用
     // 「聚焦标题」必须跳过，否则后者的 RAF 会把焦点抢回顶部 h1，键盘/读屏
     // 用户还得重新找 Token 区。普通入口（无定向目标）仍聚焦标题。
-    if (view === "settings" && (settingsTarget || showDataNotices)) return;
+    if (view === "settings" && settingsTarget) return;
     // 让 React 先把新视图渲染出来，再找标题。
     const frame = window.requestAnimationFrame(() => {
       const heading = stageRef.current?.querySelector<HTMLElement>(
@@ -673,13 +672,13 @@ function App() {
       heading?.focus();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [view, settingsTarget, showDataNotices]);
+  }, [view, settingsTarget]);
 
   // 复评 T05/T08：与局部出口共用同一提示组件 —— 对话框命名、初始焦点、
   // 焦点归还与提交中禁用都在组件内实现，两个出口行为一致。
   const leavePrompt = pendingLeave ? (
     <LeavePromptDialog
-      subject={pendingLeave.subject}
+      subject={leaveBlocker.current?.subject || pendingLeave.subject}
       submitting={leaveSubmitting}
       onDecide={decideLeave}
     />
@@ -706,7 +705,7 @@ function App() {
                   })}
                   onChoose={(task) => {
                     setOnboardingDismissed(true);
-                    setShowDataNotices(false);
+                    setSettingsTarget(null);
                     // 平台用量与余额都在设置页配置；本地统计在 Agent 页开启。
                     setView(task === "local" ? "local" : "settings");
                   }}
@@ -726,11 +725,11 @@ function App() {
             onRefresh={() => refreshAll()}
             onClose={hideWindow}
             onSettings={() => {
-              setShowDataNotices(false);
+              setSettingsTarget(null);
               setView("settings");
             }}
             onDataStatus={() => {
-              setShowDataNotices(true);
+              setSettingsTarget("dataNotices");
               setView("settings");
             }}
             onDetail={(nextModel) => {
@@ -751,7 +750,6 @@ function App() {
           usageUpdatedAt={usageUpdatedAt}
           balanceError={balanceError}
           usageError={usageError}
-          showDataNotices={showDataNotices}
           targetSection={settingsTarget}
           usage={usage}
           onBalanceLoaded={(nextBalance) => {
@@ -861,12 +859,12 @@ function App() {
       {view === "detail" && (
         <ModelDetailPanel
           onDataStatus={() => {
-            setShowDataNotices(true);
+            setSettingsTarget("dataNotices");
             setView("settings");
           }}
           updatedAt={usageUpdatedAt}
           onSettings={() => {
-            setShowDataNotices(false);
+            setSettingsTarget(null);
             setView("settings");
           }}
           model={model}
@@ -882,7 +880,6 @@ function App() {
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
           onConfigureUsage={() => {
             // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
-            setShowDataNotices(false);
             setSettingsTarget("usageToken");
             setView("settings");
           }}

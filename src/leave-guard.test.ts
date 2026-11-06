@@ -360,3 +360,41 @@ test("R01：跨出口始终只有一个待决意图_保存完成后只执行最�
   await tick();
   assert.deepEqual(navigated, ["global-history"], "只执行最新的出口意图");
 });
+
+test("R07: latest current draft is checked even after old save reports success", async () => {
+  let resolveSave: (value: boolean) => void = () => undefined;
+  let dirty = true;
+  const blocker = make({
+    save: () => new Promise<boolean>((done) => (resolveSave = done)),
+    canLeave: () => !dirty,
+  });
+  const { runner } = harness(blocker);
+  let navigated = false;
+  runner.requestIntent(() => {
+    navigated = true;
+  });
+  runner.decide("save");
+  resolveSave(true);
+  await tick();
+  assert.equal(navigated, false);
+  dirty = false;
+  runner.decide("discard");
+  await tick();
+  assert.equal(navigated, true);
+});
+
+test("R07: superseded success must not consume latest intent with new drafts", async () => {
+  let resolveSave: (value: boolean) => void = () => undefined;
+  const blocker = make({
+    save: () => new Promise<boolean>((done) => (resolveSave = done)),
+    canLeave: () => false,
+  });
+  const { runner } = harness(blocker);
+  const navigated: string[] = [];
+  runner.requestIntent(() => navigated.push("old"));
+  runner.decide("save");
+  runner.requestIntent(() => navigated.push("new"));
+  resolveSave(true);
+  await tick();
+  assert.deepEqual(navigated, []);
+});

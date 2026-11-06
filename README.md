@@ -306,7 +306,9 @@ API Key 和用量 Token 存在这个文件里，**已用 Windows DPAPI 加密**�
 - 把 `config.json` 单独拷到别的机器或别的用户下，凭据**解不开**，应用会提示重新填写（其余设置原样保留）。
 - 旧版本（v1.2.1 及更早）留下的明文凭据，在应用首次读取时**自动加密回写**，无需手工处理。
 - 仍然不要把它提交到任何仓库、分享或备份到云盘——加密只防「文件被顺手拿走」，不防「当前用户下的恶意进程」。
-- 在共享电脑上用完，可在设置页清除 Key，并在「账户隐私」中点「退出并忘记账户」清除用量 Token 和本应用的网页登录数据。仅「清除 Token」不会删除网页登录缓存。
+- 在共享电脑上用完，可在设置页清除 Key，并在「账户隐私」中点「退出并忘记账户」清除用量 Token 和本应用的网页登录数据。仅「清除 Token」不会删除网页登录缓存。上述操作不会自动删除历史版本的 `config.json.corrupt-*` 备份或手动副本；这些文件可能含旧明文凭据，请在确认不再需要恢复后自行安全处理。
+
+配置损坏或不是有效 UTF-8 时，应用会明确报错，并逐字节保留原文件，不生成普通备份、不重置或覆盖。请先安全修复或移走 `config.json` 后重试；不要上传含凭据的文件来排障。
 
 网页登录产生的 WebView2 缓存位于 `%LOCALAPPDATA%\com.deepseek.monitor.windows\EBWebView`，属于本机运行数据，同样不应提交到仓库。
 
@@ -345,16 +347,18 @@ npm run tauri:build    # 打包 NSIS 安装包
 
 版本号散落在 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处（Tauri 2 的配置不会去读 `package.json`），发版前跑一次 `npm run check:version` 可以避免打出名字对不上的安装包。
 
-**测试**：前端用 Node 22 内置的 `node --test` 配合 `--experimental-strip-types` 直接跑 TypeScript 测试，**没有引入 vitest / jest 这类测试框架**（因此也没有新增任何 devDependency）。后端就是标准的 `cargo test`：
+**测试**：前端用 Node 22 内置的 `node --test` 配合 `--experimental-strip-types` 直接跑 TypeScript 测试，**没有引入 vitest / jest 这类测试框架**。组件交互回归另用 `react-test-renderer`，通过 `npm run test:components` 运行。后端门禁共用 `scripts/run-rust-tests.mjs`，先探测链接能力，再执行保留成功输出的 `cargo test -- --show-output`：
 
 ```powershell
 npm test                                  # 前端：tsc -p tsconfig.test.json + node --test
-cargo test --manifest-path src-tauri/Cargo.toml --lib   # 后端
+npm run test:components                    # 组件交互回归
+node --test scripts/tests/release-gates.test.mjs # 门禁故障注入（不是原生能力验收）
+node scripts/run-rust-tests.mjs            # 后端与必需链接能力门禁
 ```
 
-测试覆盖的是「算错了不容易被发现」的那部分：用量口径（`model_slot` 的模型名映射表、`token_breakdown` 的六类 token 归并与 `PROMPT_TOKEN` 双计边界、`merge_model_slot` 的求和语义）、配置读写（旧配置缺字段回退、损坏配置留证重置、原子写不残留临时文件、凭据加解密与明文迁移）、登录 token 解析（上下文特征匹配、截断输入不崩溃），以及前端的跨月补零与单位换算阈值。改动这些地方时，先跑测试再动手。
+测试覆盖的是「算错了不容易被发现」的那部分：用量口径（`model_slot` 的模型名映射表、`token_breakdown` 的六类 token 归并与 `PROMPT_TOKEN` 双计边界、`merge_model_slot` 的求和语义）、配置读写（旧配置缺字段回退、损坏配置原件保留并明确失败、原子写不残留临时文件、凭据加解密与明文迁移）、登录 token 解析（上下文特征匹配、截断输入不崩溃），以及前端的跨月补零与单位换算阈值。改动这些地方时，先跑测试再动手。
 
-本仓库**不再启用 GitHub Actions**。推送前请在本地跑一次 `npm run verify`（PowerShell 7+）：依次执行版本一致性、前端测试/lint/构建，以及 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`。
+本仓库**不再启用 GitHub Actions**。推送前请在本地跑一次 `npm run verify`（PowerShell 7+）：依次执行版本一致性、前端单测/组件测试、门禁故障注入、lint/format/构建，以及 `cargo fmt --check`、`cargo clippy -- -D warnings`、共享 Rust 门禁、引擎集成与依赖审计。Windows 的文件/目录符号链接与 junction 是必需前提；缺能力或测试中的 `NOT RUN` 都不会记为 PASS。`release:record` 使用相同入口和结构化结果，任何 NOT RUN 都以非零退出阻断发行。非 Windows 运行不验证 Windows 专属断言。
 
 可选加固：`git config core.hooksPath scripts/hooks` 启用仓库自带的 pre-push 钩子，`git push` 前自动跑一次 `npm run verify`（单次跳过用 `git push --no-verify`）。
 

@@ -1,3 +1,6 @@
+import { localClientLabel, localIdentity } from "./local-usage.ts";
+import type { ClientIdentityStatus } from "./local-usage";
+import { snapshotQuality } from "./local-quality.ts";
 import type { LocalRow } from "./local-usage";
 import { csvCell } from "./history.ts";
 export type ArchiveScope =
@@ -11,6 +14,9 @@ export type ArchiveRow = Omit<LocalRow, "id" | "projectKey" | "projectPath"> & {
 };
 export type ArchiveSummary = {
   sourceLabel?: string | null;
+  sourceId?: string | null;
+  clientId?: string | null;
+  identityStatus?: ClientIdentityStatus;
   sessionId?: string | null;
   tool?: string | null;
   projectLabel?: string | null;
@@ -24,7 +30,8 @@ export type ArchiveSummary = {
   includesPaths: boolean;
   complete: boolean;
   stale: boolean;
-  /** 复评 T05：质量证据（脱敏 code）。旧档为空 → 展示「质量证据未记录」。 */
+  /** Missing/old empty evidence remains unknown. */
+  qualityEvidenceRecorded?: boolean;
   qualityWarnings?: string[];
   rowCount: number;
 };
@@ -32,6 +39,35 @@ export type ArchiveEntry = Omit<ArchiveSummary, "rowCount"> & {
   engineVersion: string;
   rows: ArchiveRow[];
 };
+export function archiveIdentityLabel(
+  entry: ArchiveSummary | ArchiveEntry,
+): string {
+  const identity = "rows" in entry ? localIdentity(entry.rows) : entry;
+  return identity.identityStatus === "mixed"
+    ? "多个客户端（混合身份）"
+    : localClientLabel(identity.clientId);
+}
+export function archiveSelectionLabel(
+  entry: ArchiveSummary | ArchiveEntry,
+): string {
+  if ("rows" in entry) {
+    const labels = [
+      ...new Set(
+        entry.rows.map(
+          (row) =>
+            `${row.sourceLabel || row.sourceId || "来源未知"} · ${localClientLabel(row.clientId)} · ${row.sessionId}`,
+        ),
+      ),
+    ];
+    return (
+      labels.slice(0, 5).join("；") +
+      (labels.length > 5
+        ? `；另 ${labels.length - 5} 个会话身份（共 ${labels.length} 个）`
+        : "")
+    );
+  }
+  return `${entry.sourceLabel || entry.sourceId || "多个来源"} · ${archiveIdentityLabel(entry)} · ${entry.sessionId || "多个会话"}`;
+}
 export const archiveScopeLabel = (scope: string) =>
   scope === "session" ? "会话" : scope === "project" ? "项目" : "全部记录";
 export function archiveLocalRows(entry: ArchiveEntry): LocalRow[] {
@@ -79,6 +115,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     "stale",
     "includesPaths",
     // 复评 T05：质量证据随归档导出，下游才能区分「读取完整」与「去重可信」。
+    "qualityEvidenceRecorded",
     "qualityWarnings",
   ] as const;
   // 旧归档没有偏移字段：保持 null，不用导出时的电脑时区补写。
@@ -88,6 +125,7 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
     Math.abs(entry.accountingUtcOffsetSeconds) < 86400
       ? entry.accountingUtcOffsetSeconds
       : null;
+  const quality = snapshotQuality(entry);
   // Entry data came from the backend archive whitelist. CSV selects fields again.
   return {
     json: JSON.stringify(
@@ -98,16 +136,8 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
         id: entry.id,
         engineVersion: entry.engineVersion,
         accountingUtcOffsetSeconds: offset,
-        ...Object.fromEntries(
-          metadata.map((field) => [
-            field,
-            field === "qualityWarnings"
-              ? entry.qualityWarnings?.length
-                ? entry.qualityWarnings.join(";")
-                : "quality-evidence-not-recorded"
-              : entry[field],
-          ]),
-        ),
+        ...Object.fromEntries(metadata.map((field) => [field, entry[field]])),
+        ...quality,
         rows: entry.rows.map((row) =>
           Object.fromEntries(
             [...fields, "firstActiveMs", "lastActiveMs"].map((field) => [
@@ -138,10 +168,10 @@ export function archiveExport(entry: ArchiveEntry, retained = false) {
           ),
           ...metadata.map((field) =>
             field === "qualityWarnings"
-              ? entry.qualityWarnings?.length
-                ? entry.qualityWarnings.join(";")
-                : "quality-evidence-not-recorded"
-              : entry[field],
+              ? quality.qualityWarnings.join(";")
+              : field === "qualityEvidenceRecorded"
+                ? quality.qualityEvidenceRecorded
+                : entry[field],
           ),
           offset,
           captureKind,

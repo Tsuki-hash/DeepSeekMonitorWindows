@@ -16,6 +16,7 @@
 // 原先固定 stderr 为空。改用 spawnSync 分别捕获两个流。
 
 import { spawnSync } from "node:child_process";
+import { hasNotRun, readRustGateLog } from "./run-rust-tests.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -149,6 +150,10 @@ const version = JSON.parse(
 
 // 复评 T09：集成子用例的底层日志文件（集成入口写入，随后嵌入本记录）。
 // 没有它，外层只能看到汇总表，无法核验每个用例是否真的执行。
+const rustLogFile = join(
+  tmpdir(),
+  `dsm-rust-log-${process.pid}-${Date.now()}.json`,
+);
 const integrationLogFile = join(
   tmpdir(),
   `dsm-integration-log-${process.pid}-${Date.now()}.json`,
@@ -209,6 +214,13 @@ const integrationCounts = () => {
 const checks = [
   ["版本一致性", "node", ["scripts/check-version.mjs"], true],
   ["前端测试", "npm", ["test"], true],
+  ["组件测试", "npm", ["run", "test:components"], true],
+  [
+    "门禁故障注入测试",
+    "node",
+    ["--test", "scripts/tests/release-gates.test.mjs"],
+    true,
+  ],
   ["前端 lint", "npm", ["run", "lint"], true],
   ["前端 format 检查", "npx", ["prettier", "--check", "."], true],
   ["前端构建", "npm", ["run", "build"], true],
@@ -234,8 +246,8 @@ const checks = [
   ],
   [
     "cargo test",
-    "cargo",
-    ["test", "--manifest-path", "src-tauri/Cargo.toml", "--lib"],
+    "node",
+    ["scripts/run-rust-tests.mjs", "--log-file", rustLogFile],
     true,
   ],
   // 复评 R12：集成与依赖审计也必须进入记录，否则发布结论覆盖不全。
@@ -250,20 +262,15 @@ const checks = [
   ["依赖审计", "node", ["scripts/audit-dependencies.mjs"], true],
 ];
 
-/** 集成测试的「未运行」是退出码 2，与失败(1)语义不同。 */
+/** NOT RUN 是独立结论；成功退出也不能掩盖缺失场景。 */
 const classify = (label, result) => {
-  if (result.ok) return "PASS";
-  if (label.includes("集成") && result.code === 2) return "NOT RUN";
-  return "FAIL";
+  if (result.error || result.signal) return "FAIL";
+  if ((label.includes("集成") || label === "cargo test") && result.code === 2)
+    return "NOT RUN";
+  if (!result.ok) return "FAIL";
+  if (hasNotRun(`${result.stdout}\n${result.stderr}`)) return "NOT RUN";
+  return "PASS";
 };
-
-/**
- * 复评 T14：Rust 测试用 `eprintln!("NOT RUN: ...")` 表达「能力缺失未执行」，
- * libtest 仍记 PASS。发行门禁必须**扫描输出里的 NOT RUN 行**并阻断，
- * 不能只看退出码。
- */
-const notRunMarkers = (text) =>
-  (String(text).match(/NOT RUN[：:]/g) ?? []).length;
 
 const lines = [];
 lines.push(`# 发版证据记录 v${version}`);
@@ -349,28 +356,43 @@ lines.push("| 门禁 | 结论 | 退出码 | 用时 | 测试计数 |");
 lines.push("| - | - | - | - | - |");
 for (const [label, command, commandArgs] of checks) {
   const result = run(command, commandArgs);
-  const verdict = classify(label, result);
+  const rustLog =
+    label === "cargo test" ? readRustGateLog(rustLogFile, result.code) : null;
+  const verdict =
+    label === "cargo test" && !rustLog ? "FAIL" : classify(label, result);
   checkResults.push({ label, command, commandArgs, result, verdict });
   if (verdict === "FAIL") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
-  // 复评 T14：测试输出里出现 `NOT RUN:` 行 → 该项记为未完整执行（发版阻断）。
-  const markers = notRunMarkers(`${result.stdout}\n${result.stderr}`);
-  if (markers > 0) {
-    notRun.push(`${label}（${markers} 个场景 NOT RUN）`);
-  }
   // 复评 Q09：集成入口的 stdout 含多条 `test result:` 行（每子用例一条），
   // exec 只取首个会得到 tests=1。集成项改用结构化子用例日志合计。
   // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机；
   // 日志缺失时按「不可解析」呈现，证据链失败在循环后统一并入 failures。
-  const counts = label.includes("集成")
-    ? loadIntegrationResults()
-      ? integrationCounts()
-      : { passed: 0, failed: 0, ignored: 0, tests: 0, parseable: false }
-    : testCounts(`${result.stdout}\n${result.stderr}`);
+  const unknownCounts = {
+    passed: null,
+    failed: null,
+    ignored: null,
+    tests: null,
+    parseable: false,
+  };
+  const counts =
+    label === "cargo test"
+      ? (rustLog?.rust.counts ?? unknownCounts)
+      : label.includes("集成")
+        ? loadIntegrationResults()
+          ? integrationCounts()
+          : unknownCounts
+        : verdict === "NOT RUN"
+          ? unknownCounts
+          : testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
     `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
 }
+
+lines.push("");
+lines.push(
+  `门禁汇总：${["PASS", "FAIL", "NOT RUN"].map((verdict) => `${verdict}=${checkResults.filter((item) => item.verdict === verdict).length}`).join("；")}。NOT RUN 不计通过。`,
+);
 
 // 复评 Q09：集成检查执行过，但结构化日志丢失/不可解析，属于证据链失败，
 // 必须阻断放行 —— 否则「子用例是否真实执行」无法核验。
@@ -555,6 +577,7 @@ if (out) {
 }
 // 复评 T09：临时集成日志用完即删，清理失败不影响结论。
 try {
+  if (existsSync(rustLogFile)) rmSync(rustLogFile, { force: true });
   if (existsSync(integrationLogFile)) {
     rmSync(integrationLogFile, { force: true });
   }

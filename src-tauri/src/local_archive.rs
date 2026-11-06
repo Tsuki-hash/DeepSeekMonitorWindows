@@ -31,8 +31,8 @@ pub struct ArchiveRow {
     pub source_label: String,
     pub tool: String,
     /// 复评 N01：稳定 client 身份（镜像与原生同名会话各归各）。
-    /// 旧归档文件没有该字段时按空串读入，展示与校验回填 tool。
-    #[serde(default)]
+    /// 旧归档文件没有该字段时保留空串，不根据 tool 猜测原生身份。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
     pub session_id: String,
     pub model: String,
@@ -54,6 +54,10 @@ pub struct ArchiveRow {
     pub timing_coverage: TimingCoverage,
     pub token_accuracy: String,
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveEntry {
@@ -71,10 +75,11 @@ pub struct ArchiveEntry {
     pub includes_paths: bool,
     pub complete: bool,
     pub stale: bool,
-    /// 复评 T05：质量证据（脱敏 code，如 `overlap_partial`），与 `complete`
-    /// （读取是否完整）分开。旧档没有该字段时为空 —— 展示方必须明确标
-    /// 「质量证据未记录」，不能当作「已验证无重叠」。
-    #[serde(default)]
+    /// Snapshot-level risk evidence. Old absent/empty evidence remains unknown.
+    // Do not expand near-limit legacy stores simply by rewriting/deleting them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quality_evidence_recorded: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quality_warnings: Vec<String>,
     pub rows: Vec<ArchiveRow>,
 }
@@ -95,6 +100,11 @@ impl Default for Store {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveSummary {
+    pub source_id: Option<String>,
+    pub client_id: Option<String>,
+    pub identity_status: String,
+    pub quality_evidence_recorded: bool,
+    pub quality_warnings: Vec<String>,
     pub source_label: Option<String>,
     pub session_id: Option<String>,
     pub tool: Option<String>,
@@ -150,25 +160,38 @@ pub fn current_snapshot(
 fn selected<'a>(
     snapshot: &'a LocalSnapshot,
     scope: &ArchiveScope,
-) -> Vec<&'a crate::local_usage::LocalRow> {
-    snapshot
+) -> Result<Vec<&'a crate::local_usage::LocalRow>, String> {
+    // Legacy three-part keys are accepted only when the requested range resolves
+    // to one client identity. Do not silently archive several clients together.
+    if let ArchiveScope::Session { key, project_key } = scope {
+        if key.split('\0').count() == 3 {
+            let clients: BTreeSet<_> = snapshot
+                .rows
+                .iter()
+                .filter(|row| {
+                    *key == format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id)
+                        && project_key
+                            .as_ref()
+                            .is_none_or(|project| matches_project(row, project))
+                })
+                .map(|row| row.client_id.as_str())
+                .collect();
+            if clients.len() > 1 {
+                return Err("旧会话选择对应多个客户端，请刷新并重新选择会话".into());
+            }
+        }
+    }
+    Ok(snapshot
         .rows
         .iter()
         .filter(|row| match scope {
             ArchiveScope::All => true,
             ArchiveScope::Project { key } => matches_project(row, key),
             ArchiveScope::Session { key, project_key } => {
-                // 复评 T02：会话键必须与前端**同一编码**（含 client 身份）。
-                // 前端 `localSessions` 生成 `source\0tool\0client\0session`，
-                // 旧后端只比较三段 `source\0tool\0session` —— 六工具全部不匹配，
-                // 「当前会话」归档一律报「没有可归档记录」。
-                // 这里用同一个 `session_scope_key` 生成与比较，并额外接受
-                // **v1 三段键**（历史调用方/旧数据兼容），但绝不退回只比
-                // sessionId（那会把镜像与原生重新混并）。
                 let client = if row.client_id.is_empty() {
-                    row.tool.as_str()
+                    "legacy-unknown"
                 } else {
-                    row.client_id.as_str()
+                    &row.client_id
                 };
                 let current = session_scope_key(&row.source_id, &row.tool, client, &row.session_id);
                 let legacy = format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id);
@@ -178,7 +201,110 @@ fn selected<'a>(
                         .is_none_or(|project| matches_project(row, project))
             }
         })
-        .collect()
+        .collect())
+}
+
+/// Shared, path-free projection for live snapshots, persistence and summaries.
+/// Unknown future codes are preserved; unsafe diagnostic text becomes a code.
+pub(crate) fn quality_evidence(recorded: bool, warnings: &[String]) -> (bool, Vec<String>) {
+    let codes: BTreeSet<String> = warnings
+        .iter()
+        .map(|code| {
+            let safe = !code.is_empty()
+                && code.len() <= 64
+                && code.as_bytes()[0].is_ascii_lowercase()
+                && code.bytes().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'
+                });
+            if safe {
+                code.clone()
+            } else {
+                "quality_warning_redacted".into()
+            }
+        })
+        .collect();
+    (
+        recorded || !warnings.is_empty(),
+        codes.into_iter().collect(),
+    )
+}
+pub(crate) fn normalize_quality(entry: &mut ArchiveEntry) {
+    (entry.quality_evidence_recorded, entry.quality_warnings) =
+        quality_evidence(entry.quality_evidence_recorded, &entry.quality_warnings);
+}
+pub(crate) fn summary(entry: ArchiveEntry) -> ArchiveSummary {
+    let unique = |values: Vec<&str>| -> Option<String> {
+        let values: BTreeSet<_> = values.into_iter().collect();
+        (values.len() == 1).then(|| (*values.first().unwrap()).to_owned())
+    };
+    let clients: BTreeSet<_> = entry
+        .rows
+        .iter()
+        .map(|row| row.client_id.as_str())
+        .collect();
+    let client_id = unique(
+        entry
+            .rows
+            .iter()
+            .map(|row| row.client_id.as_str())
+            .collect(),
+    )
+    .filter(|client| !client.is_empty());
+    let identity_status = if clients.len() > 1 {
+        "mixed"
+    } else if client_id.is_some() {
+        "known"
+    } else {
+        "unknown"
+    };
+    let (quality_evidence_recorded, quality_warnings) =
+        quality_evidence(entry.quality_evidence_recorded, &entry.quality_warnings);
+    ArchiveSummary {
+        source_id: unique(
+            entry
+                .rows
+                .iter()
+                .map(|row| row.source_id.as_str())
+                .collect(),
+        ),
+        source_label: unique(
+            entry
+                .rows
+                .iter()
+                .map(|row| row.source_label.as_str())
+                .collect(),
+        ),
+        session_id: unique(
+            entry
+                .rows
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect(),
+        ),
+        tool: unique(entry.rows.iter().map(|row| row.tool.as_str()).collect()),
+        project_label: unique(
+            entry
+                .rows
+                .iter()
+                .map(|row| row.project_label.as_deref().unwrap_or(""))
+                .collect(),
+        )
+        .filter(|label| !label.is_empty()),
+        client_id,
+        identity_status: identity_status.into(),
+        quality_evidence_recorded,
+        quality_warnings,
+        id: entry.id,
+        saved_at: entry.saved_at,
+        collected_at: entry.collected_at,
+        period_key: entry.period_key,
+        accounting_utc_offset_seconds: entry.accounting_utc_offset_seconds,
+        scope: entry.scope,
+        includes_paths: entry.includes_paths,
+        complete: entry.complete,
+        stale: entry.stale,
+        row_count: entry.rows.len(),
+    }
 }
 /// 复评 T02：会话范围键的**唯一**编码（与前端 `localSessions` 一致）。
 ///
@@ -225,6 +351,7 @@ pub(crate) fn valid_entry(entry: &ArchiveEntry) -> bool {
                 && text(&row.source_label)
                 && text(&row.model)
                 && text(&row.session_id)
+                && (row.client_id.is_empty() || text(&row.client_id))
                 && matches!(
                     row.tool.as_str(),
                     "opencode" | "claude" | "zcode" | "hermes" | "openclaw" | "dsh"
@@ -306,12 +433,8 @@ pub(crate) fn sanitized_rows(
             source_id: row.source_id.clone(),
             source_label: row.source_label.clone(),
             tool: row.tool.clone(),
-            // 复评 N01：归档保留稳定 client 身份（空则回填展示 tool）。
-            client_id: if row.client_id.is_empty() {
-                row.tool.clone()
-            } else {
-                row.client_id.clone()
-            },
+            // Missing historical identity must remain unknown.
+            client_id: row.client_id.clone(),
             session_id: row.session_id.clone(),
             model: row.model.clone(),
             project_ref: row.project_key.as_ref().map(|key| digest(key)),
@@ -353,7 +476,7 @@ pub fn capture(
 ) -> Result<ArchiveEntry, String> {
     let _guard = lock().lock().map_err(|_| "归档状态不可用")?;
     let mut store = load()?;
-    let selected = selected(snapshot, scope);
+    let selected = selected(snapshot, scope)?;
     if selected.is_empty() {
         return Err("当前范围没有可归档记录".into());
     }
@@ -363,12 +486,18 @@ pub fn capture(
         ArchiveScope::Session { .. } => "session",
     };
     let rows = sanitized_rows(selected, includes_paths);
+    let (quality_evidence_recorded, quality_warnings) = quality_evidence(
+        snapshot.quality_evidence_recorded,
+        &snapshot.quality_warnings,
+    );
     let id = digest(
         &serde_json::to_string(&(
             &snapshot.period_key,
             snapshot.collected_at,
             &snapshot.engine_version,
             snapshot.complete,
+            quality_evidence_recorded,
+            &quality_warnings,
             scope_name,
             includes_paths,
             stale,
@@ -385,7 +514,8 @@ pub fn capture(
     let entry = ArchiveEntry {
         // 复评 T05：把快照的质量证据一并持久化，导出/恢复后仍可判断
         // 「读取完整 ≠ 去重可信」。
-        quality_warnings: snapshot.quality_warnings.clone(),
+        quality_evidence_recorded,
+        quality_warnings,
         id,
         saved_at,
         collected_at: snapshot.collected_at,
@@ -409,25 +539,7 @@ pub fn list() -> Result<Vec<ArchiveSummary>, String> {
     let _guard = lock().lock().map_err(|_| "归档状态不可用")?;
     let mut entries = load()?.entries;
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.saved_at));
-    Ok(entries
-        .into_iter()
-        .map(|entry| ArchiveSummary {
-            source_label: None,
-            session_id: None,
-            tool: None,
-            project_label: None,
-            id: entry.id,
-            saved_at: entry.saved_at,
-            collected_at: entry.collected_at,
-            period_key: entry.period_key,
-            accounting_utc_offset_seconds: entry.accounting_utc_offset_seconds,
-            scope: entry.scope,
-            includes_paths: entry.includes_paths,
-            complete: entry.complete,
-            stale: entry.stale,
-            row_count: entry.rows.len(),
-        })
-        .collect())
+    Ok(entries.into_iter().map(summary).collect())
 }
 pub fn read(id: &str) -> Result<ArchiveEntry, String> {
     if !valid_id(id) {
@@ -438,6 +550,10 @@ pub fn read(id: &str) -> Result<ArchiveEntry, String> {
         .entries
         .into_iter()
         .find(|entry| entry.id == id)
+        .map(|mut entry| {
+            normalize_quality(&mut entry);
+            entry
+        })
         .ok_or("归档不存在，请重新读取列表".into())
 }
 pub fn delete(id: &str) -> Result<(), String> {
@@ -480,6 +596,32 @@ pub fn clear() -> Result<(), String> {
             failed.join("、")
         ))
     }
+}
+
+/// Populate a valid old store close to its real 8 MiB boundary without relying
+/// on whitespace padding (which a rewrite would remove).
+#[cfg(test)]
+pub(crate) fn fill_legacy_fixture(entries: &mut [ArchiveEntry], target_bytes: usize) {
+    let size = |entries: &[ArchiveEntry]| {
+        serde_json::to_vec(&serde_json::json!({"schemaVersion": 1, "entries": entries}))
+            .unwrap()
+            .len()
+    };
+    let mut padding = entries[0].rows[0].clone();
+    padding.model = "p".repeat(2048);
+    let per_row = serde_json::to_vec(&padding).unwrap().len() + 1;
+    let count = (target_bytes - size(entries)) / per_row;
+    entries[0].rows.extend(std::iter::repeat_n(padding, count));
+    let mut remaining = target_bytes - size(entries);
+    for entry in entries.iter_mut() {
+        for row in &mut entry.rows {
+            let growth = remaining.min(2048 - row.model.len());
+            row.model.push_str(&"x".repeat(growth));
+            remaining -= growth;
+        }
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(size(entries), target_bytes);
 }
 
 #[cfg(test)]
@@ -546,16 +688,20 @@ mod tests {
             assert!(!serde_json::to_string(&entry).unwrap().contains("Other"));
             assert_eq!(entry.rows[0].project_path.is_some(), include_paths);
         }
-        assert_eq!(selected(&snap, &scope(None)).len(), 3);
+        assert_eq!(selected(&snap, &scope(None)).unwrap().len(), 3);
         let legacy: ArchiveScope =
             serde_json::from_str(r#"{"kind":"session","key":"native\u0000opencode\u0000s1"}"#)
                 .unwrap();
-        assert_eq!(selected(&snap, &legacy).len(), 3);
+        assert_eq!(selected(&snap, &legacy).unwrap().len(), 3);
         assert_eq!(
-            selected(&snap, &scope(Some("native\0unassigned".into()))).len(),
+            selected(&snap, &scope(Some("native\0unassigned".into())))
+                .unwrap()
+                .len(),
             1
         );
-        assert!(selected(&snap, &scope(Some("absent".into()))).is_empty());
+        assert!(selected(&snap, &scope(Some("absent".into())))
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn capture_gate_rejects_disabled_busy_changed_future_and_other_month() {
@@ -760,6 +906,7 @@ mod tests {
                 project_key: None,
             },
         );
+        let picked = picked.unwrap();
         assert_eq!(picked.len(), 1, "必须选中恰好一行（旧三段键选中零行）");
         assert_eq!(picked[0].client_id, "claude", "只保存所选身份");
         // 镜像的键选中镜像那一行，不与原生混并。
@@ -781,22 +928,153 @@ mod tests {
                 project_key: None,
             },
         );
+        let picked = picked.unwrap();
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].client_id, "claude-mirror");
-        // v1 三段键仍兼容（历史调用方），但会选中同 source/tool/session 的两行 ——
-        // 这是兼容路径，不是默认路径。
+        // Legacy selection is ambiguous and must fail before anything is saved.
         let legacy = format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id);
-        assert_eq!(
-            selected(
-                &snapshot,
-                &ArchiveScope::Session {
-                    key: legacy,
-                    project_key: None,
-                },
-            )
-            .len(),
-            2,
-            "旧键兼容但不作为默认路径"
+        let scope = ArchiveScope::Session {
+            key: legacy,
+            project_key: None,
+        };
+        assert!(selected(&snapshot, &scope)
+            .unwrap_err()
+            .contains("重新选择"));
+        let mut unique = snapshot.clone();
+        unique.rows.retain(|row| row.client_id == "claude");
+        assert_eq!(selected(&unique, &scope).unwrap().len(), 1);
+    }
+    #[test]
+    fn r02_quality_survives_capture_read_summary_and_same_time_changes() {
+        let _dir = TempConfigDir::new("archive-quality-chain");
+        let mut snap = snapshot(1000);
+        snap.quality_evidence_recorded = true;
+        let clean = capture(&snap, &ArchiveScope::All, false, false, 2000).unwrap();
+        assert!(clean.quality_evidence_recorded);
+        assert!(clean.quality_warnings.is_empty());
+        snap.quality_warnings = vec![
+            "overlap_partial".into(),
+            "future_risk".into(),
+            "overlap_partial".into(),
+            "D:\\Private\\SECRET".into(),
+        ];
+        let warned = capture(&snap, &ArchiveScope::All, false, false, 2000).unwrap();
+        assert_ne!(
+            clean.id, warned.id,
+            "quality-only changes cannot reuse a clean archive"
         );
+        let expected = vec![
+            "future_risk".to_string(),
+            "overlap_partial".into(),
+            "quality_warning_redacted".into(),
+        ];
+        assert_eq!(read(&warned.id).unwrap().quality_warnings, expected);
+        let summaries = list().unwrap();
+        let visible = summaries
+            .iter()
+            .find(|entry| entry.id == warned.id)
+            .unwrap();
+        assert!(visible.quality_evidence_recorded);
+        assert_eq!(visible.quality_warnings, expected);
+        assert!(!serde_json::to_string(&read(&warned.id).unwrap())
+            .unwrap()
+            .contains("Private"));
+        // A truly old archive omits both fields and must not become clean evidence.
+        let mut json = serde_json::to_value(Store {
+            schema_version: 1,
+            entries: vec![clean],
+        })
+        .unwrap();
+        let old = json["entries"][0].as_object_mut().unwrap();
+        old.remove("qualityEvidenceRecorded");
+        old.remove("qualityWarnings");
+        for row in old.get_mut("rows").unwrap().as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("clientId");
+        }
+        fs::write(path().unwrap(), serde_json::to_vec(&json).unwrap()).unwrap();
+        let old = list().unwrap().remove(0);
+        assert!(!old.quality_evidence_recorded);
+        assert!(old.quality_warnings.is_empty());
+        assert_eq!(old.identity_status, "unknown");
+        assert!(old.client_id.is_none());
+        assert!(read(&old.id)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.client_id.is_empty()));
+    }
+
+    #[test]
+    fn r13_summary_identifies_mixed_and_known_clients_and_rejects_ambiguous_capture() {
+        let _dir = TempConfigDir::new("archive-identity-summary");
+        let mut snap = snapshot(1000);
+        let mut row = snap.rows[0].clone();
+        row.tool = "claude".into();
+        row.client_id = "claude".into();
+        let mut mirror = row.clone();
+        mirror.client_id = "cc-mirror:variant-b".into();
+        snap.rows = vec![row.clone(), mirror];
+        let legacy = ArchiveScope::Session {
+            key: format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id),
+            project_key: None,
+        };
+        assert!(capture(&snap, &legacy, false, false, 2000)
+            .unwrap_err()
+            .contains("重新选择"));
+        assert!(list().unwrap().is_empty());
+        let mixed = capture(&snap, &ArchiveScope::All, false, false, 2000).unwrap();
+        let mixed_summary = summary(mixed);
+        assert_eq!(mixed_summary.identity_status, "mixed");
+        assert!(mixed_summary.client_id.is_none());
+        let scope = ArchiveScope::Session {
+            key: session_scope_key(&row.source_id, &row.tool, &row.client_id, &row.session_id),
+            project_key: None,
+        };
+        let known = summary(capture(&snap, &scope, false, false, 2000).unwrap());
+        assert_eq!(known.identity_status, "known");
+        assert_eq!(known.client_id.as_deref(), Some("claude"));
+        assert_eq!(known.source_id.as_deref(), Some(row.source_id.as_str()));
+        assert_eq!(known.session_id.as_deref(), Some(row.session_id.as_str()));
+    }
+
+    #[test]
+    fn r02_near_limit_legacy_archive_can_delete_and_save_without_expansion() {
+        let _dir = TempConfigDir::new("archive-legacy-capacity");
+        let mut snap = snapshot(1000);
+        snap.rows.truncate(1);
+        let template = capture(&snap, &ArchiveScope::All, false, false, 2000).unwrap();
+        let mut entries = vec![template.clone(), template];
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.id = digest(&format!("legacy-{index}"));
+            entry.quality_evidence_recorded = false;
+            entry.quality_warnings.clear();
+            entry.rows[0].client_id.clear();
+            entry.rows[0].model = "m".into();
+        }
+        fill_legacy_fixture(&mut entries, MAX_BYTES - 128);
+        let remove = entries[1].id.clone();
+        let survivor = entries[0].id.clone();
+        let bytes = serde_json::to_vec(&Store {
+            schema_version: 1,
+            entries,
+        })
+        .unwrap();
+        assert_eq!(bytes.len(), MAX_BYTES - 128);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("qualityEvidenceRecorded"));
+        assert!(!text.contains("qualityWarnings"));
+        assert!(!text.contains("clientId"));
+        fs::write(path().unwrap(), &bytes).unwrap();
+        delete(&remove).expect("deleting a small legacy archive must not expand surviving rows");
+        assert!(read(&survivor)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.client_id.is_empty()));
+        assert!(!read(&survivor).unwrap().quality_evidence_recorded);
+        let saved = capture(&snap, &ArchiveScope::All, false, false, 3000).unwrap();
+        assert!(saved.quality_evidence_recorded);
+        assert_eq!(list().unwrap().len(), 2);
+        assert!(fs::metadata(path().unwrap()).unwrap().len() <= MAX_BYTES as u64);
     }
 }

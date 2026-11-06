@@ -4,9 +4,12 @@ import { ArrowLeft, RefreshCw } from "lucide-react";
 import { errorMessage } from "../error-state";
 import { fmtTokensShort } from "../format";
 import { downloadText } from "../download";
-import { localSum, localTools } from "../local-usage";
+import { snapshotQualityLabel } from "../local-quality";
+import { localClientLabel, localSum, localTools } from "../local-usage";
 import {
   archiveScopeLabel,
+  archiveIdentityLabel,
+  archiveSelectionLabel,
   archiveExport,
   archiveLocalRows,
 } from "../local-archive";
@@ -210,6 +213,7 @@ export function LocalArchivePanel({
               {selected.stale ? " · 上次结果" : ""}
               {!selected.complete ? " · 来源不完整" : ""}
             </p>
+            <p className="history-message">{archiveSelectionLabel(selected)}</p>
             <div className="history-metrics local-metrics">
               <article className="card">
                 <span>{retained ? "留存会话 Tokens" : "这份快照 Tokens"}</span>
@@ -224,6 +228,9 @@ export function LocalArchivePanel({
                 <strong>{rows.length}</strong>
               </article>
             </div>
+            <p className="history-message warning" role="status">
+              {snapshotQualityLabel(selected)}
+            </p>
             <div className="history-models">
               {selected.rows.slice(0, limit).map((row, index) => (
                 <article
@@ -231,6 +238,9 @@ export function LocalArchivePanel({
                   key={index}
                 >
                   <h2>{localTools[row.tool] || row.tool}</h2>
+                  <p title={row.clientId || "旧版身份未知"}>
+                    {localClientLabel(row.clientId)}
+                  </p>
                   <p className="local-model-name" title={row.model}>
                     {row.model}
                   </p>
@@ -309,23 +319,23 @@ export function LocalArchivePanel({
                   onClick={() => void open(entry.id)}
                 >
                   <span className="local-group-copy">
-                    <strong>
+                    <strong title={archiveSelectionLabel(entry)}>
                       {entry.periodKey} ·{" "}
                       {retained && entry.tool
                         ? localTools[entry.tool] || entry.tool
                         : archiveScopeLabel(entry.scope)}
+                      {` · ${archiveIdentityLabel(entry)}`}
                       {retained && entry.projectLabel
                         ? ` · ${entry.projectLabel}`
                         : ""}
                     </strong>
                     <small>
-                      {retained
-                        ? `${entry.sourceLabel || "本机"} · ${entry.sessionId?.slice(0, 16) || "会话"} · `
-                        : ""}
-                      {time(entry.savedAt)} · {entry.rowCount}条
-                      {entry.stale ? " · 上次结果" : ""}
+                      {entry.sourceLabel || entry.sourceId || "多个来源"} ·{" "}
+                      {entry.sessionId || "多个会话"} · {time(entry.savedAt)} ·{" "}
+                      {entry.rowCount}条{entry.stale ? " · 上次结果" : ""}
                       {!entry.complete ? " · 不完整" : ""}
                     </small>
+                    <small>{snapshotQualityLabel(entry)}</small>
                   </span>
                   <b>查看 ›</b>
                 </button>
@@ -363,6 +373,13 @@ export function LocalArchivePanel({
               <p>
                 确认{confirm === "all" ? clearLabel : singleLabel}
                 ？原工具日志和当前统计不变。
+                {confirm === "one" && selected && (
+                  <>
+                    <br />
+                    {selected.periodKey} · {archiveScopeLabel(selected.scope)} ·{" "}
+                    {archiveSelectionLabel(selected)}
+                  </>
+                )}
               </p>
               <div className="disclosure-actions">
                 <button

@@ -2,7 +2,7 @@
 //!
 //! 这里放的是 `StoredConfig` / `AppConfig` 以及它们的读写与规范化。原先这些定义都嵌在
 //! `lib.rs` 的 `run()` 内部，`#[cfg(test)]` 模块在文件顶层拿不到它们，导致配置层
-//! （H-1 缺字段回退、H-2 原子写入与损坏自愈）完全没有回归测试保护。提升到模块顶层后
+//! （缺字段回退、原子写入与损坏配置保全）完全没有回归测试保护。提升到模块顶层后
 //! 可以在不启动 Tauri 的前提下直接测。
 //!
 //! 读写路径由 `dsm_config_dir()` 决定，测试通过 `DSM_CONFIG_DIR` 环境变量重定向到临时目录。
@@ -206,7 +206,7 @@ pub struct StoredConfig {
 }
 
 impl StoredConfig {
-    /// 缺文件 / 配置损坏时的默认配置。
+    /// 首次运行（缺文件）时的默认配置。
     pub fn with_defaults() -> Self {
         Self {
             refresh_interval_seconds: DEFAULT_REFRESH_INTERVAL_SECONDS,
@@ -242,16 +242,13 @@ pub fn config_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("config.json"))
 }
 
-/// 读取配置。任何异常都不向上传播：
-/// - 文件不存在 → 返回默认值（首次运行）；
-/// - 解析失败 → 把损坏文件改名留证，返回默认值（H-2 的自愈路径）。
+/// 读取配置：文件不存在时返回默认值，读取/解析失败则保留原件并明确失败。
 ///
-/// 之所以把「解析失败」也降级为 Ok：`read_stored_config` 是所有命令的前置步骤，
-/// 一旦它返回 Err，设置页、余额、用量、全部保存动作会一起失效，用户只会看到
-/// 一个与真实原因无关的报错。回退默认值 + 留证文件，用户重填一次凭据即可恢复。
+/// 损坏文本可能含有跨行、转义或截断的旧明文凭据，无法可靠证明文本脱敏完整。
+/// 因此不复制、不改名、不删除损坏文件，也不回退默认值触发后续覆盖。
+/// 用户需先安全修复或移走原件后重试；历史版本生成的备份不在此处自动删除。
 ///
-/// 凭据字段在返回前解密（M-1）。迁移：只要读到的是旧格式（无版本号标记的明文），
-/// 就顺手回写一份加密的。回写失败不影响本次读取——用户拿到可用的配置比迁移成功更重要。
+/// 凭据字段在返回前解密。读取到旧明文时尝试加密迁移；迁移失败保留原件并警告。
 pub fn read_stored_config() -> Result<StoredConfig, String> {
     let _guard = lock_config_io();
     read_stored_config_unlocked()
@@ -263,18 +260,13 @@ fn read_stored_config_unlocked() -> Result<StoredConfig, String> {
         return Ok(StoredConfig::with_defaults());
     }
 
-    let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut config: StoredConfig = match serde_json::from_str(&text) {
-        Ok(config) => config,
-        Err(error) => {
-            let backup = backup_corrupt_config(&path)?;
-            log::warn!(
-                "配置文件解析失败，已备份到 {} 并重置：{error}",
-                backup.display()
-            );
-            return Ok(StoredConfig::with_defaults());
-        }
-    };
+    let raw = fs::read(&path).map_err(|_| "无法读取配置文件，原文件未改动".to_string())?;
+    // 不记录 serde 原始错误：类型错误等诊断可能包含输入中的凭据值。
+    const INVALID_CONFIG: &str = "配置文件损坏或编码无效，原文件已保留，未生成备份或重置。请安全修复或移走 config.json 后重试；历史备份不会自动清理。";
+    // serde 的未知字段跳过路径不负责校验全部字符串，先校验整份 UTF-8。
+    let text = std::str::from_utf8(&raw).map_err(|_| INVALID_CONFIG.to_string())?;
+    let mut config: StoredConfig =
+        serde_json::from_str(text).map_err(|_| INVALID_CONFIG.to_string())?;
     config.refresh_interval_seconds =
         normalize_refresh_interval_seconds(config.refresh_interval_seconds);
 
@@ -353,80 +345,6 @@ fn encrypt_credentials_with(
         }
     }
     Ok(())
-}
-
-/// 把损坏的配置改名留证。时间戳用「秒 + 进程内自增序号」，
-/// 避免同一秒内多次触发时覆盖掉前一次的留证文件。
-fn backup_corrupt_config(path: &PathBuf) -> Result<PathBuf, String> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let backup = path.with_extension(format!("json.corrupt-{stamp}-{seq}"));
-    // 复评 N17：损坏的**旧明文**配置里可能残留凭据。旧实现直接 rename，
-    // 明文凭据就以 `.corrupt-*` 副本长期留在磁盘上，且不随「清除 Key/Token」
-    // 删除 —— 用户以为已经清掉了。
-    // 现在：先按原文尝试脱敏（把疑似凭据字段替换为占位），再写回备份；
-    // 脱敏失败（非 UTF-8 等）则**不落盘备份**，只保留原文件不动，
-    // 由调用方按「无法备份」处理 —— 宁可没有恢复材料，也不静默复制明文。
-    let raw = fs::read(path).map_err(|error| error.to_string())?;
-    let scrubbed = scrub_corrupt_secrets(&raw);
-    match scrubbed {
-        Some(text) => {
-            fs::write(&backup, text).map_err(|error| error.to_string())?;
-            fs::remove_file(path).map_err(|error| error.to_string())?;
-        }
-        None => {
-            // 无法安全脱敏：不动原文件，返回错误让上层明确报告。
-            return Err("损坏配置含无法脱敏的内容，未生成明文备份".into());
-        }
-    }
-    Ok(backup)
-}
-
-/// 复评 N17：把损坏配置文本里疑似凭据的值替换成占位符。
-///
-/// 只做**保守**的文本替换（不改结构、不尝试修复 JSON）：
-/// 匹配 `apiKey` / `usageToken` / `token` 一类字段的字符串值。无法解析为
-/// UTF-8 时返回 `None`（调用方不生成备份）。
-fn scrub_corrupt_secrets(raw: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(raw).ok()?;
-    // 复评 T15：真实字段名是 **snake_case**（`api_key` / `usage_token`，
-    // `StoredConfig` 没有 camelCase rename）。旧实现只搜 camelCase，真实
-    // 凭据值被原样复制到 `.corrupt-*` 副本里。
-    //
-    // 更根本的一点：解析失败说明结构不可信，**文本脱敏不能保证覆盖**
-    //（跨行值、转义键、非标准结构都可能漏）。因此这里只在能确认是
-    // 单行 `key: value` 形态时才脱敏；任何不确定的形态返回 `None`，
-    // 由调用方保留原件、明确报错，而不是生成一个「看起来安全」的副本。
-    const SECRET_KEYS: &[&str] = &["api_key", "usage_token", "apikey", "usagetoken", "token"];
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        let key = SECRET_KEYS.iter().find(|key| {
-            lower.contains(&format!("\"{key}\"")) || lower.contains(&format!("{key}:"))
-        });
-        match key {
-            Some(_) => {
-                // 只接受「单行、恰好一个冒号、值在同行」的形态。
-                let (head, tail) = line.split_once(':')?;
-                if tail.contains('{') || tail.contains('[') {
-                    // 值跨行/嵌套：无法可靠脱敏。
-                    return None;
-                }
-                out.push_str(head);
-                out.push_str(": \"<已脱敏>\",");
-                out.push('\n');
-            }
-            None => {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-    }
-    Some(out)
 }
 
 /// 只接受界面上真实提供的那几档间隔，其余一律退回默认值。
@@ -590,28 +508,60 @@ mod tests {
     }
 
     #[test]
-    fn 损坏的配置_回退默认值_并留下备份文件() {
-        // H-2 的自愈路径：半截 JSON 不能演变成全链路失效，且原文件必须留证。
-        let dir = TempConfigDir::new("read_corrupt");
+    fn 损坏配置_真实读取入口保留原字节_不生成秘密副本() {
+        let cases: &[&[u8]] = &[
+            br#"{"api_key":"synthetic-secret","usage_token":"synthetic-token",!}"#,
+            br#"{"apiKey":"synthetic-secret","usageToken":"synthetic-token",!}"#,
+            b"{\"api_key\":\n\"synthetic-secret\",!}",
+            br#"{"api\u005fkey":"synthetic-secret",!}"#,
+            br#"{"api_key":"synthetic-\u0073ecret",!}"#,
+            br#"{"api_key":"synthetic-secret"#,
+            br#"{"api_key":{"nested":"synthetic-secret"}}"#,
+            br#"{"api_key":"synthetic-secret","api_key":"synthetic-token"}"#,
+            br#"{"refresh_interval_seconds":"synthetic-secret"}"#,
+            b"{\"api_key\":\"synthetic-secret\",\xff}",
+            b"{\"unknown\":\"synthetic-secret\xff\"}",
+        ];
+        for raw in cases {
+            let dir = TempConfigDir::new("corrupt-preserved");
+            let path = config_path().unwrap();
+            fs::write(&path, raw).unwrap();
+            let error = read_stored_config().unwrap_err();
+            assert!(error.contains("原文件已保留"));
+            assert!(!error.contains("synthetic"), "错误不能泄漏输入值");
+            assert_eq!(fs::read(&path).unwrap(), *raw, "原件必须逐字节保留");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            // edit_config 不得把读取失败当默认值再覆盖唯一恢复材料。
+            assert!(edit_config(|_| panic!("损坏配置不得进入写入回调")).is_err());
+            assert_eq!(fs::read(&path).unwrap(), *raw);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn 损坏配置_不删除或修改历史备份() {
+        let dir = TempConfigDir::new("corrupt-history-preserved");
         let path = config_path().unwrap();
-        fs::write(&path, r#"{"api_key":"sk-abc","refresh"#).unwrap();
+        let original = b"{\"api_key\":\"synthetic-secret";
+        let previous = dir.path().join("config.json.corrupt-existing");
+        fs::write(&path, original).unwrap();
+        fs::write(&previous, b"previous-recovery-material").unwrap();
+        let error = read_stored_config().unwrap_err();
+        assert!(error.contains("历史备份不会自动清理"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&previous).unwrap(), b"previous-recovery-material");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
-        let config = read_stored_config().unwrap();
-        assert_eq!(config.refresh_interval_seconds, 60);
-        assert_eq!(config.api_key, None);
-        assert!(!path.exists(), "损坏文件应已被改名移走");
-
-        let backups: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("config.json.corrupt-")
-            })
-            .collect();
-        assert_eq!(backups.len(), 1, "应恰好留下一个备份文件");
+    #[test]
+    fn 正常无凭据配置_读取不创建副本() {
+        let dir = TempConfigDir::new("valid-no-backups");
+        let path = config_path().unwrap();
+        let original = br#"{"refresh_interval_seconds":300,"api_key":null}"#;
+        fs::write(&path, original).unwrap();
+        assert_eq!(read_stored_config().unwrap().refresh_interval_seconds, 300);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

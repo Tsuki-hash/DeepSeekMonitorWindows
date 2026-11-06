@@ -98,6 +98,26 @@ static DSH_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
     kind: LayoutKind::Directory,
 }];
 
+// Lookup-only inputs that the pinned engine reads for OpenClaw.
+static CODEX_LOOKUP_LAYOUTS: &[LayoutRoot] = &[
+    LayoutRoot {
+        relative: ".codex/sessions",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: ".codex/archived_sessions",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: ".config/tokscale/headless/codex",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: "Library/Application Support/tokscale/headless/codex",
+        kind: LayoutKind::Directory,
+    },
+];
+
 pub fn standard_layouts(tool: &str) -> &'static [LayoutRoot] {
     match tool {
         "opencode" => OPENCODE_LAYOUTS,
@@ -106,6 +126,7 @@ pub fn standard_layouts(tool: &str) -> &'static [LayoutRoot] {
         "hermes" => HERMES_LAYOUTS,
         "openclaw" => OPENCLAW_LAYOUTS,
         "dsh" => DSH_LAYOUTS,
+        "codex" => CODEX_LOOKUP_LAYOUTS,
         _ => &[],
     }
 }
@@ -117,42 +138,38 @@ pub const CC_MIRROR_DIR: &str = ".cc-mirror";
 ///
 /// 只做文本解析，不访问目标；调用方拿到文本后仍需按来源策略校验目标
 ///（`reject_link_target` / `probe_path`），不能因为配置里写了就当成合法根。
-pub fn cc_mirror_config_dir(variant_json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(variant_json).ok()?;
-    let raw = value.get("configDir")?.as_str()?.trim();
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw.to_string())
+pub fn cc_mirror_config_dir(variant_json: &str) -> Result<Option<String>, String> {
+    // Match the pinned engine's typed VariantFile. A wrong type in any known
+    // field invalidates the variant; it must never become a default config root.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct VariantFile {
+        name: Option<String>,
+        provider: Option<String>,
+        provider_id: Option<String>,
+        config_dir: Option<String>,
     }
+    let variant: VariantFile = serde_json::from_str(variant_json)
+        .map_err(|_| "cc-mirror variant.json 格式不兼容".to_string())?;
+    let _ = (variant.name, variant.provider, variant.provider_id);
+    Ok(variant.config_dir.and_then(|raw| {
+        let value = raw.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    }))
 }
 
-/// 复评 N04/T06：把一个 `configDir` 声明解析成**绝对路径**，语义与固定上游
-/// `cc_mirror.rs` 严格一致。
-///
-/// 上游的展开规则（`cc_mirror.rs` L119–134）只有三条：
-/// 1. 绝对路径 → 原样使用；
-/// 2. **仅** `~/` 前缀 → 展开到 home 下的相对部分；
-/// 3. 其余（含 `~` 单独一个、`~\x`、普通相对路径）→ 一律按
-///    **variant.json 所在目录**的相对路径处理。
-///
-/// 第九轮把 `~` 与 `~\x` 也展开到 home，那是自创语义：宿主审 `home/projects`，
-/// 而引擎实际探测 `variant/~/projects` —— 校验的根与实际读取的根不是同一个。
-/// 缺省（null / 缺失 / 空串）时回退到 `<variant 目录>/config`（同上游）。
-///
-/// 返回绝对路径；无法解析为绝对路径时返回 `None`（调用方按「无法确认」处理）。
+/// Preserve the pinned engine's Path::join semantics exactly. In particular,
+/// `~//...` must not be sanitized into a child of home while the engine reads a
+/// drive-rooted/UNC target. The caller rejects unsafe declarations before IO.
 pub fn cc_mirror_resolve_root(
     variant_json: &str,
     variant_dir: &std::path::Path,
     home: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    let declared = cc_mirror_config_dir(variant_json);
+) -> Result<std::path::PathBuf, String> {
+    let declared = cc_mirror_config_dir(variant_json)?;
     let resolved = match declared.as_deref() {
         None => variant_dir.join("config"),
-        // 仅 `~/` 前缀展开；`~` 与 `~\x` 走相对路径分支（与上游一致）。
-        Some(raw) if raw.starts_with("~/") => {
-            home.join(raw[2..].replace('\\', "/").trim_start_matches('/'))
-        }
+        Some(raw) if raw.starts_with("~/") => home.join(&raw[2..]),
         Some(raw) => {
             let path = std::path::PathBuf::from(raw);
             if path.is_absolute() {
@@ -162,8 +179,79 @@ pub fn cc_mirror_resolve_root(
             }
         }
     };
-    let resolved = crate::local_sources::normalize_dot_segments(&resolved);
-    resolved.is_absolute().then_some(resolved)
+    if !resolved.is_absolute() {
+        return Err("cc-mirror configDir 无法解析为绝对路径".into());
+    }
+    Ok(resolved)
+}
+
+/// A validated physical read entry, not the containing home. Client scopes
+/// remain distinct where mirror metadata can change the interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRoot {
+    pub parser: String,
+    pub client: String,
+    pub identity: String,
+    pub kind: LayoutKind,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PlanOverlap {
+    pub covered_by: Option<String>,
+    pub partial: bool,
+}
+
+/// Only identical, successful roots prove coverage. Directory ancestry is
+/// evidence of possible overlap, not proof that a specialized SQLite parser
+/// reads every descendant. Never suppress an entire home on one parser's hit.
+pub fn compare_plans(candidate: &[ScanRoot], successful: &[(ScanRoot, String)]) -> PlanOverlap {
+    let owners: Vec<_> = candidate
+        .iter()
+        .filter_map(|entry| {
+            successful
+                .iter()
+                .find(|(root, _)| root == entry)
+                .map(|(_, owner)| owner.clone())
+        })
+        .collect();
+    if !candidate.is_empty() && owners.len() == candidate.len() {
+        let labels: std::collections::BTreeSet<_> = owners.into_iter().collect();
+        return PlanOverlap {
+            covered_by: Some(labels.into_iter().collect::<Vec<_>>().join("、")),
+            partial: false,
+        };
+    }
+    let partial = candidate.iter().any(|entry| {
+        successful.iter().any(|(root, _)| {
+            // OpenClaw's Codex lookup and rollout lane can read the same file.
+            // Cross-parser identity never proves coverage, but this known pair
+            // must retain a possible-overlap warning across separate engine runs.
+            let lookup_pair = matches!(
+                (entry.parser.as_str(), root.parser.as_str()),
+                ("codex", "openclaw") | ("openclaw", "codex")
+            );
+            if entry.parser != root.parser && !lookup_pair {
+                return false;
+            }
+            match (root.kind, entry.kind) {
+                (LayoutKind::File, LayoutKind::File) => root.identity == entry.identity,
+                (LayoutKind::Directory, LayoutKind::File) => {
+                    key_within(&root.identity, &entry.identity)
+                }
+                (LayoutKind::File, LayoutKind::Directory) => {
+                    key_within(&entry.identity, &root.identity)
+                }
+                (LayoutKind::Directory, LayoutKind::Directory) => {
+                    key_within(&root.identity, &entry.identity)
+                        || key_within(&entry.identity, &root.identity)
+                }
+            }
+        })
+    });
+    PlanOverlap {
+        covered_by: None,
+        partial,
+    }
 }
 
 /// 来源身份归一化（复评 T04）。
@@ -369,14 +457,17 @@ mod tests {
     #[test]
     fn f01_cc_mirror配置只解析文本_不访问目标() {
         assert_eq!(
-            cc_mirror_config_dir(r#"{"configDir":"D:\\Mirror\\Proj"}"#),
+            cc_mirror_config_dir(r#"{"configDir":"D:\\Mirror\\Proj"}"#).unwrap(),
             Some(r"D:\Mirror\Proj".to_string())
         );
         // 空/缺失/非法都不产生根。
-        assert_eq!(cc_mirror_config_dir(r#"{"configDir":"   "}"#), None);
-        assert_eq!(cc_mirror_config_dir(r#"{}"#), None);
-        assert_eq!(cc_mirror_config_dir("not json"), None);
-        assert_eq!(cc_mirror_config_dir(r#"{"configDir":123}"#), None);
+        assert_eq!(
+            cc_mirror_config_dir(r#"{"configDir":"   "}"#).unwrap(),
+            None
+        );
+        assert_eq!(cc_mirror_config_dir(r#"{}"#).unwrap(), None);
+        assert!(cc_mirror_config_dir("not json").is_err());
+        assert!(cc_mirror_config_dir(r#"{"configDir":123}"#).is_err());
     }
 
     #[test]
@@ -425,4 +516,175 @@ fn 归一化键的分量级包含检查() {
         &home_key(r"D:\Users\A"),
         &home_key(r"\wsl.localhost\Ubuntu\home\user")
     ));
+}
+
+#[cfg(test)]
+mod round11_tests {
+    use super::*;
+    fn scan(parser: &str, identity: &str, kind: LayoutKind) -> ScanRoot {
+        ScanRoot {
+            parser: parser.into(),
+            client: parser.into(),
+            identity: identity.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn r01_完整实际计划保留两home独有根并标记共享根风险() {
+        let shared = scan("claude", r"d:\shared", LayoutKind::Directory);
+        let first = vec![
+            scan("claude", r"d:\h1\.claude\projects", LayoutKind::Directory),
+            shared.clone(),
+        ];
+        let second = vec![
+            scan("claude", r"d:\h2\.claude\projects", LayoutKind::Directory),
+            shared,
+        ];
+        for (prior, candidate) in [(&first, &second), (&second, &first)] {
+            let success: Vec<_> = prior
+                .iter()
+                .cloned()
+                .map(|root| (root, "成功来源".into()))
+                .collect();
+            let result = compare_plans(candidate, &success);
+            assert_eq!(result.covered_by, None, "20/30 独有根不能随共享 100 被丢弃");
+            assert!(result.partial, "固定引擎不能切根时必须明确总量不可信");
+        }
+        assert_eq!(
+            compare_plans(&second, &[]),
+            PlanOverlap::default(),
+            "失败来源不得登记覆盖"
+        );
+    }
+
+    #[test]
+    fn r01_一个claude宽根不能覆盖另一个home的独有数据库() {
+        let prior = vec![(
+            scan("claude", r"d:\shared", LayoutKind::Directory),
+            "H1".into(),
+        )];
+        let candidate = vec![
+            scan(
+                "claude",
+                r"d:\shared\home2\.claude\projects",
+                LayoutKind::Directory,
+            ),
+            scan("opencode", r"d:\shared\home2\opencode.db", LayoutKind::File),
+            scan("zcode", r"d:\shared\home2\db.sqlite", LayoutKind::File),
+        ];
+        let outcome = compare_plans(&candidate, &prior);
+        assert!(outcome.covered_by.is_none());
+        assert!(outcome.partial);
+    }
+
+    #[test]
+    fn r01_同工具同种根完全成功覆盖才整源跳过() {
+        let root = scan("opencode", r"d:\logs\opencode.db", LayoutKind::File);
+        let successful = vec![(root.clone(), "H1".into())];
+        assert_eq!(
+            compare_plans(std::slice::from_ref(&root), &successful).covered_by,
+            Some("H1".into())
+        );
+        assert_eq!(
+            compare_plans(
+                &[scan("zcode", &root.identity, LayoutKind::File)],
+                &successful
+            ),
+            PlanOverlap::default()
+        );
+        let descendant = scan("opencode", r"d:\logs\opencode.db\child", LayoutKind::File);
+        assert_eq!(
+            compare_plans(&[descendant], &successful),
+            PlanOverlap::default()
+        );
+        let directory = scan("opencode", r"d:\logs", LayoutKind::Directory);
+        let partial = compare_plans(&[directory], &successful);
+        assert!(partial.covered_by.is_none() && partial.partial);
+        let mut mirror = root;
+        mirror.client = "mirror-a".into();
+        assert!(compare_plans(&[mirror], &successful).covered_by.is_none());
+        assert_eq!(compare_plans(&[], &successful), PlanOverlap::default());
+    }
+
+    #[test]
+    fn r03_typed镜像错误不能悄悄变成默认根() {
+        for invalid in [
+            r#"{"name":1}"#,
+            r#"{"provider":{}}"#,
+            r#"{"providerId":false}"#,
+            r#"{"configDir":[]}"#,
+            "[]",
+            "null",
+            "{",
+        ] {
+            assert!(cc_mirror_config_dir(invalid).is_err(), "{invalid}");
+        }
+        for valid in ["{}", r#"{"configDir":null}"#, r#"{"configDir":"  "}"#] {
+            assert_eq!(cc_mirror_config_dir(valid).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn r03_镜像展开逐字采用上游join不清洗前导分隔符() {
+        let home = std::env::temp_dir().join("dsm-mirror-home");
+        let variant = home.join(".cc-mirror/v1");
+        for rest in [
+            "x",
+            "/Windows/System32",
+            "//server/share",
+            r"\Windows",
+            r"\\server\share",
+            r"x\..\y",
+        ] {
+            let json = serde_json::json!({"configDir": format!("~/{rest}")}).to_string();
+            assert_eq!(
+                cc_mirror_resolve_root(&json, &variant, &home).unwrap(),
+                home.join(rest)
+            );
+        }
+        for raw in ["~", r"~\x", "relative/path"] {
+            let json = serde_json::json!({"configDir": raw}).to_string();
+            assert_eq!(
+                cc_mirror_resolve_root(&json, &variant, &home).unwrap(),
+                variant.join(raw)
+            );
+        }
+        assert_eq!(
+            cc_mirror_resolve_root("{}", &variant, &home).unwrap(),
+            variant.join("config")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r03_危险mirror声明必须在目标访问前拒绝() {
+        let home = std::path::Path::new(r"C:\Users\Alice");
+        for raw in [
+            "~//Windows/System32",
+            "~///server/share",
+            r"~/\\server\share",
+        ] {
+            let json = serde_json::json!({"configDir": raw}).to_string();
+            let target = cc_mirror_resolve_root(&json, &home.join(".cc-mirror/v1"), home).unwrap();
+            assert!(crate::local_sources::check_link_chain(
+                &target,
+                crate::local_sources::SourceOrigin::Native
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn r01_openclaw与codex查找lane交集只提示不互相覆盖() {
+        let root = scan(
+            "codex",
+            r"d:\agents\a\agent\codex-home\sessions",
+            LayoutKind::Directory,
+        );
+        let candidate = scan("openclaw", r"d:\agents", LayoutKind::Directory);
+        let result = compare_plans(&[candidate], &[(root, "lookup".into())]);
+        assert!(result.covered_by.is_none() && result.partial);
+        assert_eq!(standard_layouts("codex").len(), 4);
+    }
 }

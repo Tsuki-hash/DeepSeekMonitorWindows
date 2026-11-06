@@ -20,6 +20,10 @@ export type LeaveBlocker = {
   subject: string;
   /** 用户选择「保存并离开」时调用；成功返回 true。 */
   save: () => Promise<boolean>;
+  /** Capture this participant before another participant starts asynchronous work. */
+  prepareSave?: () => () => Promise<boolean>;
+  /** Synchronous final check for forms editable while a save is in flight. */
+  canLeave?: () => boolean;
   /** 放弃修改：清理本地草稿状态。 */
   discard: () => void;
 };
@@ -31,8 +35,16 @@ export type LeaveBlocker = {
  */
 export function useLeaveGuard() {
   const blocker = React.useRef<LeaveBlocker | null>(null);
+  const owner = React.useRef<object | null>(null);
   const register = React.useCallback((next: LeaveBlocker | null) => {
+    const instance = {};
+    owner.current = instance;
     blocker.current = next;
+    return () => {
+      if (owner.current !== instance) return;
+      owner.current = null;
+      blocker.current = null;
+    };
   }, []);
   return { blocker, register };
 }
@@ -116,9 +128,11 @@ export async function resolveLeave(
   decision: LeaveDecision,
   action: () => void,
   isStillCurrent: () => boolean = () => true,
+  canLeave: () => boolean = () => blocker?.canLeave?.() ?? true,
 ): Promise<boolean> {
   if (!blocker) {
     if (decision === "cancel") return false;
+    if (!isStillCurrent() || !canLeave()) return false;
     action();
     return true;
   }
@@ -126,13 +140,14 @@ export async function resolveLeave(
   if (decision === "discard") {
     if (!isStillCurrent()) return false;
     blocker.discard();
+    if (!canLeave()) return false;
     action();
     return true;
   }
   const saved = await blocker.save();
   if (!saved) return false;
   // 保存期间用户可能已取消：此时不得执行导航。
-  if (!isStillCurrent()) return false;
+  if (!isStillCurrent() || !canLeave()) return false;
   action();
   return true;
 }
@@ -199,8 +214,8 @@ export class LeaveDecisionRunner {
     const intent = this.pending;
     if (!intent) return;
     const blocker = this.getBlocker();
-    // 捕获保存结果：被取代的决策完成时，外部 dirty 状态可能还没
-    // 经 React effect 刷新，保存 Promise 的结果才是确定性依据。
+    // 保存结果只证明捕获的版本提交成功。可编辑表单还需同步调用
+    // 最新 owner 的 canLeave，不能把旧 Promise 成功当作整页已干净。
     let saved: boolean | null = decision === "discard" ? true : null;
     const wrapped: LeaveBlocker | null = blocker
       ? {
@@ -219,8 +234,13 @@ export class LeaveDecisionRunner {
       this.submitting = true;
       this.onSubmitting(true);
     }
-    void resolveLeave(wrapped, decision, intent, () =>
-      this.decisions.isCurrent(ticket),
+    const canLeave = () => this.getBlocker()?.canLeave?.() ?? true;
+    void resolveLeave(
+      wrapped,
+      decision,
+      intent,
+      () => this.decisions.isCurrent(ticket),
+      canLeave,
     ).then((left) => {
       if (!this.decisions.isCurrent(ticket)) {
         // 被取代/取消的旧决策：只清理自身。若已有更新决策在途，
@@ -233,7 +253,7 @@ export class LeaveDecisionRunner {
           // 旧保存成功且**最新意图尚未开始新决策**：草稿前提已消失，
           // 直接执行最新意图。若新决策已在途（active != null），由新决策
           // 自己决定，旧完成不得再执行/清除其意图。
-          if (saved === true && this.pending) {
+          if (saved === true && this.pending && canLeave()) {
             const next = this.pending;
             this.pending = null;
             this.onIntentCleared();

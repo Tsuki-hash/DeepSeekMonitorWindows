@@ -11,9 +11,13 @@ Set-Location (Join-Path $PSScriptRoot '..')
 
 # PowerShell 7 默认不把原生命令的非零退出码转为终止错误。
 function Invoke-Check {
-    param([string]$Title, [string]$Executable, [string[]]$Arguments)
+    param([string]$Title, [string]$Executable, [string[]]$Arguments, [switch]$ScenarioGate)
     Write-Host "==> $Title" -ForegroundColor Cyan
     & $Executable @Arguments
+    if ($ScenarioGate -and $LASTEXITCODE -eq 2) {
+        Write-Host "门禁不完整：$Title 存在 NOT RUN 必需场景，不能记为通过。" -ForegroundColor Yellow
+        exit 2
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$Title 失败（退出码 $LASTEXITCODE）"
     }
@@ -22,6 +26,10 @@ function Invoke-Check {
 Invoke-Check '版本一致性' 'node' @('scripts/check-version.mjs')
 
 Invoke-Check '前端测试' 'npm' @('test')
+
+Invoke-Check '组件测试' 'npm' @('run', 'test:components')
+
+Invoke-Check '门禁故障注入测试' 'node' @('--test', 'scripts/tests/release-gates.test.mjs')
 
 Invoke-Check '前端 lint' 'npm' @('run', 'lint')
 
@@ -33,7 +41,8 @@ Invoke-Check 'cargo fmt' 'cargo' @('fmt', '--manifest-path', 'src-tauri/Cargo.to
 
 Invoke-Check 'cargo clippy' 'cargo' @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
 
-Invoke-Check 'cargo test' 'cargo' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--lib')
+# 与发行记录共用能力探针、显式成功输出和结构化结论。关键能力缺失必须非零。
+Invoke-Check 'cargo test（含链接能力探针）' 'node' @('scripts/run-rust-tests.mjs') -ScenarioGate
 
 # 复评 F20/T02：ignored 集成测试默认不跑，不能把「跳过」当成「通过」。
 # 集成入口退出码：0=全部执行且通过，1=有用例失败，2=存在 NOT RUN，
@@ -69,7 +78,7 @@ Invoke-Check '生产依赖安全审计' 'node' @('scripts/audit-dependencies.mjs
 # 复评 T02：有 NOT RUN 时最终措辞必须是「不完整」，
 # 不得让「全部通过」盖过缺失的集成证据。
 if ($gateIncomplete) {
-    Write-Host '门禁通过但不完整：存在 NOT RUN 的集成用例（详见上方黄色提示）。' -ForegroundColor Yellow
+    Write-Host '门禁不完整：存在 NOT RUN 的集成用例（详见上方黄色提示）。' -ForegroundColor Yellow
 } else {
     Write-Host '全部通过。' -ForegroundColor Green
 }

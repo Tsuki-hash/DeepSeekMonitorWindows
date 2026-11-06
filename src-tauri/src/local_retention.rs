@@ -1,7 +1,10 @@
 //! Opt-in latest observed session checkpoints. Never infer deletion or merge
 //! retained sessions into live totals. Background collection is a separate feature.
 use crate::{
-    local_archive::{sanitized_rows, valid_entry, ArchiveEntry, ArchiveSummary},
+    local_archive::{
+        normalize_quality, quality_evidence, sanitized_rows, summary, valid_entry, ArchiveEntry,
+        ArchiveSummary,
+    },
     local_usage::LocalSnapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -117,14 +120,24 @@ fn valid(entry: &ArchiveEntry) -> bool {
     } else {
         row.client_id.as_str()
     };
-    let id_matches = id(
-        &entry.period_key,
-        &row.source_id,
-        &row.tool,
-        client,
-        &row.session_id,
-    )
-    .is_ok_and(|expected| expected == entry.id)
+    let unknown_id_matches = row.client_id.is_empty()
+        && id(
+            &entry.period_key,
+            &row.source_id,
+            &row.tool,
+            "legacy-unknown",
+            &row.session_id,
+        )
+        .is_ok_and(|expected| expected == entry.id);
+    let id_matches = unknown_id_matches
+        || id(
+            &entry.period_key,
+            &row.source_id,
+            &row.tool,
+            client,
+            &row.session_id,
+        )
+        .is_ok_and(|expected| expected == entry.id)
         || legacy_id(
             &entry.period_key,
             &row.source_id,
@@ -268,7 +281,7 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
         BTreeMap::new();
     for row in &snapshot.rows {
         let client = if row.client_id.is_empty() {
-            row.tool.as_str()
+            "legacy-unknown"
         } else {
             row.client_id.as_str()
         };
@@ -288,10 +301,15 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
     let mut shrink_or_same: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
     let mut grow: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
     let mut additions: Vec<ArchiveEntry> = Vec::new();
+    let (quality_evidence_recorded, quality_warnings) = quality_evidence(
+        snapshot.quality_evidence_recorded,
+        &snapshot.quality_warnings,
+    );
     for ((source, tool, client, session), rows) in groups {
         let entry = ArchiveEntry {
             // 复评 T05：留存同样保留质量证据。
-            quality_warnings: snapshot.quality_warnings.clone(),
+            quality_evidence_recorded,
+            quality_warnings: quality_warnings.clone(),
             id: id(&snapshot.period_key, source, tool, client, session)?,
             saved_at: snapshot.collected_at,
             collected_at: snapshot.collected_at,
@@ -319,6 +337,13 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
         }
         if previous.rows == entry.rows
             && previous.complete == entry.complete
+            && quality_evidence(
+                previous.quality_evidence_recorded,
+                &previous.quality_warnings,
+            ) == (
+                entry.quality_evidence_recorded,
+                entry.quality_warnings.clone(),
+            )
             && previous.engine_version == entry.engine_version
             && previous.accounting_utc_offset_seconds == entry.accounting_utc_offset_seconds
         {
@@ -386,25 +411,7 @@ pub fn list() -> Result<Vec<ArchiveSummary>, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
     let mut entries = load()?.entries;
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.saved_at));
-    Ok(entries
-        .into_iter()
-        .map(|entry| ArchiveSummary {
-            source_label: Some(entry.rows[0].source_label.clone()),
-            session_id: Some(entry.rows[0].session_id.clone()),
-            tool: Some(entry.rows[0].tool.clone()),
-            project_label: entry.rows[0].project_label.clone(),
-            id: entry.id,
-            saved_at: entry.saved_at,
-            collected_at: entry.collected_at,
-            period_key: entry.period_key,
-            accounting_utc_offset_seconds: entry.accounting_utc_offset_seconds,
-            scope: entry.scope,
-            includes_paths: false,
-            complete: entry.complete,
-            stale: entry.stale,
-            row_count: entry.rows.len(),
-        })
-        .collect())
+    Ok(entries.into_iter().map(summary).collect())
 }
 pub fn read(id: &str) -> Result<ArchiveEntry, String> {
     validate_id(id)?;
@@ -413,6 +420,10 @@ pub fn read(id: &str) -> Result<ArchiveEntry, String> {
         .entries
         .into_iter()
         .find(|entry| entry.id == id)
+        .map(|mut entry| {
+            normalize_quality(&mut entry);
+            entry
+        })
         .ok_or("会话留存不存在，请重读列表".into())
 }
 pub fn delete(id: &str) -> Result<(), String> {
@@ -594,6 +605,7 @@ mod tests {
             let mut cloned = row.clone();
             cloned.client_id = String::new();
             entries.push(ArchiveEntry {
+                quality_evidence_recorded: false,
                 quality_warnings: Vec::new(),
                 id: legacy,
                 saved_at: first.collected_at,
@@ -612,15 +624,34 @@ mod tests {
             schema_version: SCHEMA_V1,
             entries,
         };
+        let mut legacy_json = serde_json::to_value(&legacy_store).unwrap();
+        for entry in legacy_json["entries"].as_array_mut().unwrap() {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("qualityEvidenceRecorded");
+            entry.as_object_mut().unwrap().remove("qualityWarnings");
+            for row in entry["rows"].as_array_mut().unwrap() {
+                row.as_object_mut().unwrap().remove("clientId");
+            }
+        }
         std::fs::write(
             store_path().unwrap(),
-            serde_json::to_vec(&legacy_store).unwrap(),
+            serde_json::to_vec(&legacy_json).unwrap(),
         )
         .unwrap();
         // 旧库必须可读（第九轮会整体拒读）。
         let loaded = load().expect("旧 schema 库必须可读");
         assert_eq!(loaded.entries.len(), 2, "旧库记录全部保留");
-        assert_eq!(list().unwrap().len(), 2, "旧库列表可用");
+        let summaries = list().unwrap();
+        assert_eq!(summaries.len(), 2, "旧库列表可用");
+        assert!(summaries.iter().all(|entry| entry.client_id.is_none()
+            && entry.identity_status == "unknown"
+            && !entry.quality_evidence_recorded));
+        assert!(loaded
+            .entries
+            .iter()
+            .all(|entry| entry.rows.iter().all(|row| row.client_id.is_empty())));
         // 新采集写入用 v2 身份，且不覆盖旧记录。
         let next = snapshot(2000);
         checkpoint(&next).unwrap();
@@ -976,5 +1007,168 @@ mod tests {
             fs::write(store_path().unwrap(), serde_json::to_vec(&value).unwrap()).unwrap();
             assert!(list().is_err());
         }
+    }
+    #[test]
+    fn r02_quality_only_add_clear_and_unknown_to_recorded_are_persisted() {
+        let _dir = TempConfigDir::new("retention-quality-chain");
+        set_enabled(true).unwrap();
+        let mut first = snapshot(1000);
+        first.quality_evidence_recorded = false;
+        checkpoint(&first).unwrap();
+        assert!(list()
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.quality_evidence_recorded));
+        let mut next = first.clone();
+        next.collected_at = 2000;
+        next.quality_evidence_recorded = true;
+        checkpoint(&next).unwrap();
+        assert!(list()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.quality_evidence_recorded && entry.collected_at == 2000));
+        next.collected_at = 3000;
+        next.quality_warnings = vec![
+            "overlap_partial".into(),
+            "future_risk".into(),
+            "overlap_partial".into(),
+        ];
+        checkpoint(&next).unwrap();
+        for entry in list().unwrap() {
+            assert_eq!(
+                entry.quality_warnings,
+                vec!["future_risk", "overlap_partial"]
+            );
+            assert_eq!(
+                read(&entry.id).unwrap().quality_warnings,
+                entry.quality_warnings
+            );
+            assert_eq!(entry.collected_at, 3000);
+        }
+        let before = fs::read(store_path().unwrap()).unwrap();
+        next.collected_at = 4000;
+        next.quality_warnings = vec!["future_risk".into(), "overlap_partial".into()];
+        checkpoint(&next).unwrap();
+        assert_eq!(
+            fs::read(store_path().unwrap()).unwrap(),
+            before,
+            "ordering/duplicate-only changes are equivalent"
+        );
+        next.quality_warnings.clear();
+        checkpoint(&next).unwrap();
+        for entry in list().unwrap() {
+            assert!(entry.quality_evidence_recorded);
+            assert!(entry.quality_warnings.is_empty());
+            assert_eq!(entry.collected_at, 4000);
+        }
+    }
+
+    #[test]
+    fn r02_quality_growth_over_budget_reports_unsaved_and_preserves_old_bytes() {
+        let _dir = TempConfigDir::new("retention-quality-capacity");
+        set_enabled(true).unwrap();
+        let mut first = snapshot(1000);
+        first.quality_evidence_recorded = true;
+        checkpoint(&first).unwrap();
+        let before = fs::read(store_path().unwrap()).unwrap();
+        let mut next = first.clone();
+        next.collected_at = 2000;
+        next.quality_warnings = vec!["overlap_partial".into()];
+        let outcome = checkpoint_budget(&next, before.len()).unwrap();
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.skipped_bytes, first.rows.len());
+        assert_eq!(fs::read(store_path().unwrap()).unwrap(), before);
+        let retried = checkpoint(&next).unwrap();
+        assert_eq!(retried.written, first.rows.len());
+        assert_eq!(retried.skipped_bytes, 0);
+        assert!(list()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.quality_warnings == ["overlap_partial"]));
+    }
+
+    #[test]
+    fn r02_near_limit_legacy_retention_deletes_and_updates_without_expansion() {
+        let _dir = TempConfigDir::new("retention-legacy-capacity");
+        set_enabled(true).unwrap();
+        let mut snap = snapshot(1000);
+        snap.rows.truncate(1);
+        checkpoint(&snap).unwrap();
+        let template = load().unwrap().entries.remove(0);
+        let mut entries = vec![template; MAX_ENTRIES];
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let row = &mut entry.rows[0];
+            row.session_id = format!("old-{index}");
+            row.model = "m".into();
+            row.client_id.clear();
+            entry.id = legacy_id(
+                &entry.period_key,
+                &row.source_id,
+                &row.tool,
+                &row.session_id,
+            )
+            .unwrap();
+            entry.quality_evidence_recorded = false;
+            entry.quality_warnings.clear();
+        }
+        // Schema 1 historically contains both original four-part IDs and newer
+        // five-part IDs. Keep one small known session to exercise an update.
+        let current = &mut entries[1];
+        current.rows[0].client_id = snap.rows[0].client_id.clone();
+        current.id = id(
+            &current.period_key,
+            &current.rows[0].source_id,
+            &current.rows[0].tool,
+            &current.rows[0].client_id,
+            &current.rows[0].session_id,
+        )
+        .unwrap();
+        let updated_id = current.id.clone();
+        // Old nonempty evidence is exposed as recorded but must not grow every
+        // persisted legacy entry during an unrelated deletion.
+        for entry in &mut entries[2..] {
+            entry.quality_warnings = vec!["overlap_partial".into()];
+        }
+        crate::local_archive::fill_legacy_fixture(&mut entries, MAX_BYTES - 128);
+        let remove = entries.last().unwrap().id.clone();
+        let survivor = entries[0].id.clone();
+        let current_row = entries[1].rows[0].clone();
+        let bytes = serde_json::to_vec(&Store {
+            schema_version: 1,
+            entries,
+        })
+        .unwrap();
+        assert_eq!(bytes.len(), MAX_BYTES - 128);
+        assert!(!std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("qualityEvidenceRecorded"));
+        fs::write(store_path().unwrap(), &bytes).unwrap();
+        assert_eq!(list().unwrap().len(), MAX_ENTRIES);
+        delete(&remove).expect("deleting a small old session must not grow every survivor");
+        let after_delete = fs::read(store_path().unwrap()).unwrap();
+        assert!(!std::str::from_utf8(&after_delete)
+            .unwrap()
+            .contains("qualityEvidenceRecorded"));
+        assert!(read(&survivor)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.client_id.is_empty()));
+        assert!(!read(&survivor).unwrap().quality_evidence_recorded);
+        snap.rows[0].session_id = current_row.session_id;
+        snap.rows[0].model = current_row.model;
+        snap.rows[0].input = Some(7);
+        snap.rows[0].total_tokens = Some(37);
+        snap.collected_at = 2000;
+        snap.quality_evidence_recorded = true;
+        let outcome = checkpoint(&snap).unwrap();
+        assert_eq!(outcome.written, 1);
+        assert_eq!(outcome.skipped_bytes, 0);
+        assert!(!outcome.failed);
+        let updated = read(&updated_id).unwrap();
+        assert_eq!(updated.rows[0].input, Some(7));
+        assert!(updated.quality_evidence_recorded);
+        assert_eq!(list().unwrap().len(), MAX_ENTRIES - 1);
+        assert!(fs::metadata(store_path().unwrap()).unwrap().len() <= MAX_BYTES as u64);
     }
 }
