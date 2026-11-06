@@ -1,6 +1,10 @@
 #!/bin/sh
-# 推送前跑本地门禁（与「不恢复远程 CI」决策配套，见 docs/DECISIONS.md）。
+# 推送前跑本地门禁（与「不恢复远程 CI」的决策配套，见 README 的「本地验证」一节）。
 # 启用：git config core.hooksPath scripts/hooks
 # 单次跳过：git push --no-verify
+#
+# 注意：hook 可以被跳过，因此它不能作为唯一的「已验证」证据。
+# 发版时请用 `npm run release:record -- --out <文件>` 留下可复核的记录
+# （提交 SHA、工具链、各门禁命令结果、锁文件与安装包哈希）。
 echo "==> pre-push: npm run verify（跳过本次请用 --no-verify）"
 exec npm run verify

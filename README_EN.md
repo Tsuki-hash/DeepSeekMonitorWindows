@@ -339,24 +339,35 @@ The installer is produced in `src-tauri/target/release/bundle/nsis/`. If you see
 
 ```text
 DeepSeekMonitorWindows/
-├── .github/workflows/           # CI (version consistency, frontend tests + build, cargo check/clippy/test)
 ├── src/                         # Frontend
-│   ├── main.tsx                 # The entire UI: dashboard, settings, detail page
+│   ├── main.tsx                 # App entry
+│   ├── App.tsx                  # View routing, refresh scheduling, tray publishing
 │   ├── format.ts                # Pure formatting / date helpers (unit tested)
-│   ├── format.test.ts           # Tests for the above
+│   ├── refresh-policy.ts        # Per-channel backoff and tray validity (unit tested)
+│   ├── accounting-clock.ts      # Accounting-date rollover timer (unit tested)
+│   ├── history-failure.ts       # History error classification (unit tested)
+│   ├── onboarding.ts            # First-run task routing (unit tested)
+│   ├── panel-mode.ts            # Compact / expanded panel sizing (unit tested)
 │   └── styles.css               # All styles, including dark and light skins
 ├── src-tauri/                   # Backend
-│   ├── src/lib.rs               # Command wiring, tray, window visibility, HTTP requests
+│   ├── src/lib.rs               # Process wiring: plugins, shared state, commands
+│   ├── src/commands.rs          # Command layer with main-window permission checks
 │   ├── src/config.rs            # Config structs and I/O (unit tested)
 │   ├── src/credentials.rs       # DPAPI encryption of credentials (unit tested)
-│   ├── src/usage.rs             # Usage accounting (unit tested)
+│   ├── src/error.rs             # Stable IPC error kinds
+│   ├── src/usage.rs             # Usage accounting, shared count/amount parsers
+│   ├── src/local_overlap.rs     # Collection-source overlap detection (unit tested)
 │   ├── src/token_sync.rs        # Login token capture and parsing (unit tested)
 │   ├── tauri.conf.json          # Window, bundle, and security configuration
 │   └── capabilities/            # Tauri permissions
 ├── public/assets/               # Icons and static assets
 ├── scripts/check-version.mjs     # verifies the three version numbers agree
+├── scripts/release-record.mjs    # writes a reproducible release evidence record
+├── scripts/verify-release.ps1    # static checks on the built installer
 └── screenshots/                 # README screenshots
 ```
+
+There is no `.github/workflows/` directory: the local `npm run verify` gate replaces remote CI by design.
 
 The UI consists of `App.tsx`, `components/`, and shared styles. The backend has separate configuration, networking, aggregation, synchronization, and tray modules. The mapping from model name to dashboard row lives in `model_slot()` in `src-tauri/src/usage.rs` — that is where to start when changing or adding a model, and the test covering all four model names sits right next to it.
 

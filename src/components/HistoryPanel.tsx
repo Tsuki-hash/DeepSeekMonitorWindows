@@ -113,20 +113,20 @@ export function HistoryPanel({
       } else {
         targets = window.months;
       }
-      // 未加载月份 = 窗口内既不在本次目标、也还没查过的月份。
+      // 未加载月份 = 窗口内**早于本次已覆盖范围**的月份。
+      // 已加载的月份（含本次目标与之前批次）都不算未加载；只有还没查过的更早月份才算。
       const requested = new Set(targets);
-      const previousLoaded = loadedFrom.current;
-      const unloaded = window.months.filter(
-        (month) =>
-          !requested.has(month) &&
-          // 旧批次里已查过的月份不算未加载。
-          !(
-            previousLoaded != null &&
-            month >= previousLoaded &&
-            range === "all" &&
-            !older
-          ),
-      );
+      // 本次请求**计划**覆盖到的最早月份；若中途因鉴权/限流停止，
+      // 实际覆盖范围会回退到「已成功加载的最早月份」（见下方 unloaded 重算）。
+      const plannedFrom = monthsOnly
+        ? loadedFrom.current
+        : (targets[0] ?? null);
+      const unloadedFor = (coveredFrom: string | null) =>
+        window.months.filter(
+          (month) =>
+            !requested.has(month) && coveredFrom != null && month < coveredFrom,
+        );
+      const unloaded = unloadedFor(plannedFrom);
       setBusy(true);
       setError("");
       setRecovery(null);
@@ -164,8 +164,17 @@ export function HistoryPanel({
             });
             if (successful.length) {
               snapshotEpoch.current = requestedEpoch;
+              // 提前停止时，实际覆盖范围比计划小：未查的月份必须继续算「未加载」。
+              const actualFrom = successful
+                .map((month) => month.month)
+                .sort()[0];
               setSnapshot(
-                buildHistory(window, [...successful], [...failed], unloaded),
+                buildHistory(
+                  window,
+                  [...successful],
+                  [...failed],
+                  unloadedFor(actualFrom ?? null),
+                ),
               );
             }
             setFailed(failed);
@@ -192,8 +201,9 @@ export function HistoryPanel({
         }
       }
       // 记录本次已加载到的最早月份，供「继续加载更早月份」使用。
-      if (targets.length && !monthsOnly && range === "all") {
-        loadedFrom.current = targets[0];
+      // 用实际成功的月份而不是计划目标：若最早就那个月失败，边界应停在它之后。
+      if (!monthsOnly && range === "all" && successful.length) {
+        loadedFrom.current = successful.map((month) => month.month).sort()[0];
       }
       setFailed(failed);
       if (failed.length) {

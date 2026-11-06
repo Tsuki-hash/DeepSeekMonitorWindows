@@ -22,7 +22,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets"
+    "tauri:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
+    "release:record": "node scripts/release-record.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
