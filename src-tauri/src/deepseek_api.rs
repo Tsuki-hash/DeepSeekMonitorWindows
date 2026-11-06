@@ -300,13 +300,21 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         &amount.data.biz_data.total,
         cost_total.map(|c| c.total.as_slice()).unwrap_or(&[]),
     );
-    // 费用接口整份缺失（或该模型没有条目）时返回 None，而不是 0.0。
+    // 费用接口整份缺失、或该模型在费用侧**没有条目**时返回 None，而不是 0.0。
+    // 复评 F06：空迭代的 try_fold(0.0) 会得到 Some(0.0)，把「没返回」显示成真实零。
+    // 只有费用侧确实给出了该模型的行（哪怕是显式 0 金额）才算已知。
     let cost_for_model = |model: &str| -> Option<f64> {
         let item = cost_total?;
-        item.total
+        let mut matched = false;
+        let total = item
+            .total
             .iter()
             .filter(|m| m.model == model)
-            .try_fold(0.0, |total, m| Some(total + cost_sum(&m.usage)?))
+            .try_fold(0.0, |total, m| {
+                matched = true;
+                Some(total + cost_sum(&m.usage)?)
+            })?;
+        matched.then_some(total)
     };
 
     // 按槽位归并：迁移期内 deepseek-flash 与旧名可能同时出现在同一份账单里，
@@ -438,18 +446,29 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
                 .extend(day.data.iter().cloned());
         }
     }
+    // 数量侧是否返回过这一天（复评 F07）：只有费用侧有的日期，计数是「未知」，
+    // 不是零用量。空 data 与「平台明确给了 0」必须区分。
+    let amount_dates: std::collections::HashSet<&str> = amount
+        .data
+        .biz_data
+        .days
+        .iter()
+        .map(|day| day.date.as_str())
+        .collect();
     for day in &daily_source {
-        let mut flash = Some(0u64);
-        let mut flash_hit = Some(0u64);
-        let mut flash_miss = Some(0u64);
-        let mut flash_resp = Some(0u64);
-        let mut pro = Some(0u64);
-        let mut pro_hit = Some(0u64);
-        let mut pro_miss = Some(0u64);
-        let mut pro_resp = Some(0u64);
-        let mut total = Some(0u64);
-        let mut flash_other = Some(0u64);
-        let mut pro_other = Some(0u64);
+        let count_known = amount_dates.contains(day.date.as_str());
+        let zero = || if count_known { Some(0u64) } else { None };
+        let mut flash = zero();
+        let mut flash_hit = zero();
+        let mut flash_miss = zero();
+        let mut flash_resp = zero();
+        let mut pro = zero();
+        let mut pro_hit = zero();
+        let mut pro_miss = zero();
+        let mut pro_resp = zero();
+        let mut total = zero();
+        let mut flash_other = zero();
+        let mut pro_other = zero();
         for model_usage in &day.data {
             let breakdown = token_breakdown(&model_usage.usage);
             total = sum_counts(total, breakdown.total);
@@ -706,8 +725,20 @@ mod tests {
         let duplicate = cost.data.biz_data[0].total[0].clone();
         cost.data.biz_data[0].total.push(duplicate);
         let result = build_usage_result(&amount, &cost);
-        assert!((result.models[0].cost.unwrap() - 0.6).abs() < 1e-9);
+        // 费用侧只给了 deepseek-flash；同一槽位的 deepseek-v4-flash 没有费用条目，
+        // 因此合并后的槽位费用是「未知」而不是只累加已知部分（复评 F06）。
+        let flash = result
+            .models
+            .iter()
+            .find(|model| model.key == "flash")
+            .unwrap();
+        assert_eq!(flash.cost, None, "部分别名缺费用时槽位费用未知");
         assert!((result.month_cost.unwrap() - 0.6).abs() < 1e-9);
+        // 重复费用条目本身仍被累加两次（0.3 + 0.3），月总额据此得出。
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("尚未完全对齐")));
     }
 
     #[test]
@@ -803,6 +834,70 @@ mod tests {
         assert_eq!(result.days[0].date, "2026-09-01");
         assert!((result.days[0].total_cost.unwrap() - 0.05).abs() < 1e-9);
         assert!(!result.warnings.is_empty());
+        // 复评 F07：数量侧没有返回这一天，计数必须是未知而不是 0。
+        assert_eq!(
+            result.days[0].total_tokens, None,
+            "只有费用的日期不能被画成零 Token"
+        );
+        assert_eq!(result.days[0].flash_tokens, None);
+        assert_eq!(result.days[0].pro_tokens, None);
+    }
+
+    #[test]
+    fn 费用侧缺某模型时该模型费用为未知而非零_显式零仍为零() {
+        // 复评 F06：费用业务组存在，但只有 Flash，没有 Pro。
+        let mut amount = amount_sample();
+        amount.data.biz_data.total.push(ModelUsage {
+            model: "deepseek-v4-pro".into(),
+            usage: vec![Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "11".into(),
+            }],
+        });
+        let result = build_usage_result(&amount, &cost_sample());
+        let pro = result
+            .models
+            .iter()
+            .find(|model| model.key == "pro")
+            .expect("Pro 行应存在");
+        assert_eq!(pro.cost, None, "费用侧没有 Pro 条目时不能显示 ¥0.00");
+        assert_eq!(pro.total_tokens, Some(11), "数量侧有效数据仍保留");
+        // flash 槽位含 deepseek-flash（有费用）与 deepseek-v4-flash（无费用），
+        // 因此槽位费用为未知；但月总额仍能算出已返回部分的合计。
+        assert!((result.month_cost.unwrap() - 0.30).abs() < 1e-9);
+        assert!(result.models.iter().all(|model| model.cost.is_none()));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("尚未完全对齐")));
+    }
+
+    #[test]
+    fn 费用显式为0的模型仍是已知零() {
+        // 与 F06 的区别：费用侧确实返回了该模型，金额为 0 —— 这是合法零。
+        let mut cost = cost_sample();
+        cost.data.biz_data[0].total.push(ModelUsage {
+            model: "deepseek-v4-pro".into(),
+            usage: vec![Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "0".into(),
+            }],
+        });
+        let mut amount = amount_sample();
+        amount.data.biz_data.total.push(ModelUsage {
+            model: "deepseek-v4-pro".into(),
+            usage: vec![Entry {
+                kind: "RESPONSE_TOKEN".into(),
+                amount: "3".into(),
+            }],
+        });
+        let result = build_usage_result(&amount, &cost);
+        let pro = result
+            .models
+            .iter()
+            .find(|model| model.key == "pro")
+            .unwrap();
+        assert_eq!(pro.cost, Some(0.0), "显式零费用必须保留为已知零");
     }
 
     #[test]
@@ -988,8 +1083,9 @@ mod tests {
         assert_eq!(flash.cache_hit_tokens, Some(110));
         assert_eq!(flash.response_tokens, Some(30));
         assert_eq!(flash.request_count, Some(3));
-        // 0.10 + 0.20（REQUEST 不计费用）
-        assert!((flash.cost.unwrap() - 0.30).abs() < 1e-9);
+        // 0.10 + 0.20（REQUEST 不计费用）只覆盖 deepseek-flash；
+        // 同槽位的 deepseek-v4-flash 没有费用条目，槽位费用因此未知（复评 F06）。
+        assert_eq!(flash.cost, None, "别名缺费用时不能显示部分金额");
         assert!((result.month_cost.unwrap() - 0.30).abs() < 1e-9);
     }
 
