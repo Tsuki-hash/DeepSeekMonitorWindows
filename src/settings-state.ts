@@ -25,6 +25,8 @@ import type { CredentialSnapshot } from "./credential-draft";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
+  newApiKeyRequest,
+  ApiKeyRequests,
   beginUsageTokenOperation,
   isCurrentUsageTokenOperation,
 } from "./api-key-operation";
@@ -39,6 +41,7 @@ import {
 
 // App-lifetime ownership: changing pages must not hide queued login IPC from Clear.
 const usageSyncRequests = new UsageSyncRequests();
+const apiKeyRequests = new ApiKeyRequests();
 
 function useCredentialDraft(
   lifecycle: React.MutableRefObject<{ active: boolean; generation: number }>,
@@ -150,6 +153,9 @@ export function useSettingsState(): SettingsState {
     getCommittedConfig,
   );
   const [status, setStatus] = React.useState("正在读取本地配置");
+  // UI feedback has its own owner. A read must not begin/cancel a Key write,
+  // but its late result also must not replace a newer operation's feedback.
+  const keyStatusGeneration = React.useRef(0);
   const [busy, setBusy] = React.useState(false);
   const preferenceBusy = React.useRef(false);
   const [settingErrors, setSettingErrors] = React.useState<
@@ -188,7 +194,7 @@ export function useSettingsState(): SettingsState {
     // 旧实现只 setConfig，自动刷新/间隔/自启这些局部 state 仍停留在旧值，
     // 于是后端已开启自动刷新、设置页开关却显示关闭（再点一次还会重复开启）。
     const current = capturePage();
-    const syncFromCommitted = (next: AppConfig) => {
+    const syncFromCommitted = (next: AppConfig, updateKeyStatus = true) => {
       if (!current()) return;
       setConfig(next);
       setRefresh(
@@ -196,14 +202,15 @@ export function useSettingsState(): SettingsState {
       );
       setAutoRefresh(next.configReadError ? null : next.autoRefreshEnabled);
       setAutostart(next.configReadError ? null : next.autostart);
-      setStatus(
-        next.configReadError ??
-          (next.apiKeyConfigured
-            ? next.apiKeyPreview
-              ? `已配置 ${next.apiKeyPreview}`
-              : "API Key 已配置"
-            : "未配置 API Key"),
-      );
+      if (next.configReadError || updateKeyStatus)
+        setStatus(
+          next.configReadError ??
+            (next.apiKeyConfigured
+              ? next.apiKeyPreview
+                ? `已配置 ${next.apiKeyPreview}`
+                : "API Key 已配置"
+              : "未配置 API Key"),
+        );
       if (
         !syncOwner.current.requestId ||
         syncOwner.current.ended ||
@@ -224,19 +231,31 @@ export function useSettingsState(): SettingsState {
     // 发起时捕获提交代际，返回时若已有新提交（保存/清除/事件）就丢弃，
     // 避免「旧 GET 最后到达」把已保存凭据回滚成未配置。
     const startedAt = getCommitRevision();
+    const snapshotAtStart = getCommittedConfig();
+    const statusGenerationAtStart = keyStatusGeneration.current;
+    const readOwnsKeyStatus = () =>
+      keyStatusGeneration.current === statusGenerationAtStart;
     void invoke<AppConfig>("get_app_config")
       .then((nextConfig) => {
         if (!applyReadConfig(nextConfig, startedAt)) {
           // 已有更新的提交：用当前已提交配置收敛，不使用这份过期读取。
           const committed = getCommittedConfig();
-          if (committed) syncFromCommitted(committed);
+          if (committed) syncFromCommitted(committed, readOwnsKeyStatus());
           return;
         }
         const committed = getCommittedConfig();
-        if (committed) syncFromCommitted(committed);
+        if (committed) syncFromCommitted(committed, readOwnsKeyStatus());
       })
       .catch((error) => {
         if (!current()) return;
+        // Reads do not increment commitRevision. Also compare the accepted
+        // snapshot so a late mount failure cannot overwrite a newer retry read.
+        if (
+          getCommitRevision() !== startedAt ||
+          getCommittedConfig() !== snapshotAtStart ||
+          !readOwnsKeyStatus()
+        )
+          return;
         // 只有"根本没有 Tauri IPC"才是浏览器预览，属预期情况；真机上失败一律是真实错误，
         // 必须原样透出——否则配置文件损坏会被伪装成"浏览器预览模式"，用户完全无从定位。
         if (!isTauri()) {
@@ -329,6 +348,7 @@ export function useSettingsState(): SettingsState {
   const pasteApiKey = React.useCallback(async () => {
     const current = capturePage();
     if (!current()) return;
+    keyStatusGeneration.current += 1;
     try {
       const text = await navigator.clipboard.readText();
       if (!current()) return;
@@ -346,8 +366,10 @@ export function useSettingsState(): SettingsState {
       if (pending) return pending;
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
+      keyStatusGeneration.current += 1;
       const generation = lifecycle.current.generation;
       const operation = beginApiKeyOperation();
+      const requestId = newApiKeyRequest();
       const current = () =>
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
@@ -356,9 +378,14 @@ export function useSettingsState(): SettingsState {
         setBusy(true);
         setStatus("正在验证 API Key…");
         try {
-          const { config: nextConfig, balance } = await invoke<SavedApiKey>(
-            "save_api_key",
-            { apiKey: submitted.value },
+          const { config: nextConfig, balance } = await apiKeyRequests.save(
+            requestId,
+            (supersededRequestIds) =>
+              invoke<SavedApiKey>("save_api_key", {
+                apiKey: submitted.value,
+                requestId,
+                supersededRequestIds,
+              }),
           );
           setCommittedConfig(nextConfig, balance);
           if (!current() || !isCurrentCredential(nextConfig, "apiKey"))
@@ -389,6 +416,7 @@ export function useSettingsState(): SettingsState {
 
   const clearApiKey = React.useCallback(() => {
     if (!lifecycle.current.active) return;
+    keyStatusGeneration.current += 1;
     const operation = beginApiKeyOperation();
     const revision = keyDraft.current.revision;
     const generation = lifecycle.current.generation;
@@ -397,7 +425,10 @@ export function useSettingsState(): SettingsState {
       lifecycle.current.generation === generation &&
       isCurrentApiKeyOperation(operation);
     setBusy(true);
-    void invoke<AppConfig>("clear_api_key")
+    void apiKeyRequests
+      .clear((cancelledRequestIds) =>
+        invoke<AppConfig>("clear_api_key", { cancelledRequestIds }),
+      )
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
         if (!current() || !isCurrentCredential(nextConfig, "apiKey")) return;

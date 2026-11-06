@@ -228,7 +228,7 @@ pub(crate) fn update_tray_balance(
     total: Option<String>,
     currency: Option<String>,
     stale: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     require_main(&window)?;
     crate::tray::update_balance(
         &app,
@@ -245,29 +245,62 @@ pub(crate) async fn save_api_key(
     window: WebviewWindow,
     app: tauri::AppHandle,
     api_key: String,
+    request_id: String,
+    superseded_request_ids: Vec<String>,
 ) -> Result<SavedApiKey, CommandError> {
     require_main(&window)?;
+    let session = app.state::<ApiKeySession>();
+    let saved = save_api_key_owned(
+        &session,
+        api_key,
+        request_id,
+        &superseded_request_ids,
+        |value| async move { fetch_balance_with_key(&value).await },
+    )
+    .await?;
+    let _ = app.emit("credential-config-changed", &saved.config);
+    Ok(saved)
+}
+
+// Keep command admission before the first verification await. This helper is
+// also used by deterministic regressions that hold an IPC future before its
+// first poll, without starting a window or contacting the real API.
+async fn save_api_key_owned<F>(
+    session: &ApiKeySession,
+    api_key: String,
+    request_id: String,
+    superseded_request_ids: &[String],
+    verify: impl FnOnce(String) -> F,
+) -> Result<SavedApiKey, CommandError>
+where
+    F: std::future::Future<Output = Result<BalanceResult, crate::deepseek_api::ApiError>>,
+{
     let value = api_key.trim().to_string();
     if value.is_empty() {
         return Err("API Key 不能为空".into());
     }
 
-    let generation = app.state::<ApiKeySession>().0.begin()?;
+    let generation = session.begin(request_id, superseded_request_ids)?;
     // 错误种类由来源层给出，这里只补上下文文案，不用文案反推分类。
-    let balance = fetch_balance_with_key(&value).await.map_err(|e| {
-        CommandError::kind(
-            format!("验证未通过，原 Key 未更改：{}", e.message),
-            e.kind,
-            Some("api_key"),
-        )
-    })?;
-    let config = app.state::<ApiKeySession>().0.commit(generation, || {
+    let balance = match verify(value.clone()).await {
+        Ok(balance) => balance,
+        Err(error) => {
+            // Finish only this owner. Failure never revives an older request,
+            // and an older failure must not end a newer successful operation.
+            let _ = session.commit(generation, || Ok(()));
+            return Err(CommandError::kind(
+                format!("验证未通过，原 Key 未更改：{}", error.message),
+                error.kind,
+                Some("api_key"),
+            ));
+        }
+    };
+    let config = session.commit(generation, || {
         to_app_config(crate::config::edit_validated_credential(
             crate::config::ValidatedCredential::ApiKey,
             value,
         )?)
     })?;
-    let _ = app.emit("credential-config-changed", &config);
     Ok(SavedApiKey { config, balance })
 }
 
@@ -281,16 +314,24 @@ pub(crate) struct SavedApiKey {
 pub(crate) fn clear_api_key(
     window: WebviewWindow,
     app: tauri::AppHandle,
+    cancelled_request_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
     require_main(&window)?;
-    let config = app.state::<ApiKeySession>().0.cancel(|| {
+    let config = clear_api_key_owned(&app.state::<ApiKeySession>(), &cancelled_request_ids)?;
+    let _ = app.emit("credential-config-changed", &config);
+    Ok(config)
+}
+
+fn clear_api_key_owned(
+    session: &ApiKeySession,
+    cancelled_request_ids: &[String],
+) -> Result<AppConfig, String> {
+    session.clear(cancelled_request_ids, || {
         to_app_config(edit_config(|config| {
             config.api_key = None;
             Ok(())
         })?)
-    })?;
-    let _ = app.emit("credential-config-changed", &config);
-    Ok(config)
+    })
 }
 
 #[tauri::command]
@@ -566,4 +607,193 @@ pub(crate) async fn usage_token_captured(
     // 登录窗口本地时区给出的月份
     verify_token_with_probes(&value).await?;
     capture_usage_token(&app, value, generation)
+}
+
+#[cfg(all(test, windows))]
+mod api_key_ownership_tests {
+    use super::*;
+    use crate::config::{edit_validated_credential, ValidatedCredential};
+    use crate::deepseek_api::ApiError;
+    use crate::error::ErrorKind;
+    use crate::test_support::TempConfigDir;
+    use std::{cell::Cell, future::Future, task::Poll};
+
+    fn balance() -> BalanceResult {
+        BalanceResult {
+            is_available: true,
+            currency: "CNY".into(),
+            total_balance: "100".into(),
+            granted_balance: "0".into(),
+            topped_up_balance: "100".into(),
+        }
+    }
+
+    // These tests use the production command helper and actual encrypted config
+    // writes in an isolated directory. HTTP is synthetic; no window is launched.
+    #[test]
+    fn r15_key_clear_before_admission_or_during_validation_prevents_disk_resurrection() {
+        for entered in [false, true] {
+            let dir = TempConfigDir::new("r15-key-clear");
+            edit_validated_credential(ValidatedCredential::ApiKey, "SYNTHETIC_K0".into()).unwrap();
+            edit_validated_credential(ValidatedCredential::UsageToken, "SYNTHETIC_TOKEN".into())
+                .unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let key = ApiKeySession::default();
+                let verified = Cell::new(false);
+                let (release, blocked) = tokio::sync::oneshot::channel();
+                let mut old = Box::pin(save_api_key_owned(
+                    &key,
+                    "SYNTHETIC_K1".into(),
+                    "old-key".into(),
+                    &[],
+                    |_| async {
+                        verified.set(true);
+                        blocked.await.unwrap();
+                        Ok(balance())
+                    },
+                ));
+                if entered {
+                    std::future::poll_fn(|cx| {
+                        assert!(old.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                let cleared = clear_api_key_owned(&key, &["old-key".into()]).unwrap();
+                let disk = std::fs::read(dir.join("config.json")).unwrap();
+                assert!(!cleared.api_key_configured);
+                release.send(()).unwrap();
+                let error = old.await.err().expect("cancelled save must fail");
+                assert_eq!(error.code, "cancelled");
+                assert_eq!(verified.get(), entered, "unpolled old save must skip HTTP");
+                assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), disk);
+                let stored = read_stored_config().unwrap();
+                assert_eq!(stored.api_key, None);
+                assert_eq!(stored.usage_token.as_deref(), Some("SYNTHETIC_TOKEN"));
+                assert_eq!(stored.config_revision, cleared.config_revision);
+
+                let new = save_api_key_owned(
+                    &key,
+                    "SYNTHETIC_K3".into(),
+                    "explicit-new-key".into(),
+                    &["old-key".into()],
+                    |_| async { Ok(balance()) },
+                )
+                .await
+                .unwrap();
+                assert!(new.config.api_key_configured);
+                assert!(new.config.api_key_revision > cleared.api_key_revision);
+                assert_eq!(
+                    read_stored_config().unwrap().api_key.as_deref(),
+                    Some("SYNTHETIC_K3")
+                );
+                let encrypted = std::fs::read_to_string(dir.join("config.json")).unwrap();
+                assert!(!encrypted.contains("SYNTHETIC_"));
+                // If the save won the commit lock first, a later clear must
+                // remove that committed value too, rather than only cancel it.
+                clear_api_key_owned(&key, &[]).unwrap();
+                assert_eq!(read_stored_config().unwrap().api_key, None);
+            });
+        }
+    }
+
+    #[test]
+    fn r15_newer_key_success_or_failure_supersedes_unpolled_or_verifying_old_command() {
+        for entered in [false, true] {
+            for succeeds in [false, true] {
+                let dir = TempConfigDir::new("r15-key-replacement");
+                edit_validated_credential(ValidatedCredential::ApiKey, "SYNTHETIC_K0".into())
+                    .unwrap();
+                let original = std::fs::read(dir.join("config.json")).unwrap();
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let key = ApiKeySession::default();
+                    let verified = Cell::new(false);
+                    let (release, blocked) = tokio::sync::oneshot::channel();
+                    let mut old = Box::pin(save_api_key_owned(
+                        &key,
+                        "SYNTHETIC_K1".into(),
+                        "key-one".into(),
+                        &[],
+                        |_| async {
+                            verified.set(true);
+                            blocked.await.unwrap();
+                            Ok(balance())
+                        },
+                    ));
+                    if entered {
+                        std::future::poll_fn(|cx| {
+                            assert!(old.as_mut().poll(cx).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                    }
+                    let next = save_api_key_owned(
+                        &key,
+                        "SYNTHETIC_K2".into(),
+                        "key-two".into(),
+                        &["key-one".into()],
+                        |_| async {
+                            if succeeds {
+                                Ok(balance())
+                            } else {
+                                Err(ApiError::new(
+                                    ErrorKind::CredentialsInvalid,
+                                    "synthetic rejection",
+                                ))
+                            }
+                        },
+                    )
+                    .await;
+                    assert_eq!(next.is_ok(), succeeds);
+                    if !succeeds {
+                        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), original);
+                    }
+                    let newest_disk = std::fs::read(dir.join("config.json")).unwrap();
+                    let newest_revision = crate::config::revision();
+                    release.send(()).unwrap();
+                    assert_eq!(
+                        old.await.err().expect("old save rejected").code,
+                        "cancelled"
+                    );
+                    assert_eq!(verified.get(), entered);
+                    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), newest_disk);
+                    assert_eq!(crate::config::revision(), newest_revision);
+                    assert_eq!(
+                        read_stored_config().unwrap().api_key.as_deref(),
+                        Some(if succeeds {
+                            "SYNTHETIC_K2"
+                        } else {
+                            "SYNTHETIC_K0"
+                        })
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn r15_failed_key_clear_keeps_original_file_and_rejects_unpolled_save() {
+        let dir = TempConfigDir::new("r15-key-clear-failure");
+        // Deterministic read failure, not permission behavior that changes when
+        // run under an administrator. Clear must not replace or repair this file.
+        let original = b"{ synthetic broken configuration";
+        std::fs::write(dir.join("config.json"), original).unwrap();
+        let key = ApiKeySession::default();
+        let error = clear_api_key_owned(&key, &["queued-key".into()]).unwrap_err();
+        assert!(error.contains("配置文件损坏"));
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(save_api_key_owned(
+                &key,
+                "SYNTHETIC_K1".into(),
+                "queued-key".into(),
+                &[],
+                |_| async { panic!("cancelled request must not validate after failed clear") },
+            ))
+            .err()
+            .expect("old command must stay revoked");
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), original);
+    }
 }

@@ -305,6 +305,34 @@ pub fn cost_sum_present(usage: &[Entry]) -> Option<f64> {
     seen.then_some(total)
 }
 
+/// R15-04：先归并同一个原始模型的所有费用片段，再判断金额是否存在。
+/// REQUEST-only / 空片段不污染同模型的有效金额；不同别名仍独立判定，
+/// 不能用一个别名的已知费用掩盖另一个别名缺失的费用。
+pub fn costs_by_model<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a [Entry])>,
+) -> std::collections::BTreeMap<&'a str, Option<f64>> {
+    let mut grouped: std::collections::BTreeMap<&str, Vec<Entry>> =
+        std::collections::BTreeMap::new();
+    for (model, entries) in rows {
+        grouped.entry(model).or_default().extend_from_slice(entries);
+    }
+    grouped
+        .into_iter()
+        .map(|(model, entries)| (model, cost_sum_present(&entries)))
+        .collect()
+}
+
+/// 已归并模型金额的完整合计：空集合、任一未知或非有限值都不是实测零。
+pub fn cost_total_present(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
+    let mut seen = false;
+    let total = values.into_iter().try_fold(0.0, |total, value| {
+        seen = true;
+        let next = total + value?;
+        next.is_finite().then_some(next)
+    })?;
+    seen.then_some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +342,58 @@ mod tests {
             kind: kind.to_string(),
             amount: amount.to_string(),
         }
+    }
+
+    #[test]
+    fn r15_04_模型费用先归并再判存在性_真零缺失和坏值有区别() {
+        for value in ["120", "0"] {
+            let single = vec![entry("REQUEST", "1"), entry("RESPONSE_TOKEN", value)];
+            let request = vec![entry("REQUEST", "1")];
+            let fee = vec![entry("RESPONSE_TOKEN", value)];
+            for fragments in [
+                vec![single.as_slice()],
+                vec![request.as_slice(), &[], fee.as_slice()],
+                vec![fee.as_slice(), request.as_slice(), &[]],
+            ] {
+                let costs =
+                    costs_by_model(fragments.into_iter().map(|entries| ("raw-model", entries)));
+                let expected = Some(value.parse::<f64>().unwrap());
+                assert_eq!(costs.get("raw-model"), Some(&expected));
+                assert_eq!(cost_total_present(costs.values().copied()), expected);
+            }
+        }
+        let request = vec![entry("REQUEST", "1")];
+        let valid = vec![entry("RESPONSE_TOKEN", "120")];
+        let absent = costs_by_model([("a", request.as_slice()), ("a", &[])]);
+        assert_eq!(absent["a"], None);
+        assert_eq!(cost_total_present(absent.values().copied()), None);
+        for value in ["", "invalid", "NaN", "inf", "-1", "1e40"] {
+            let invalid = vec![entry("RESPONSE_TOKEN", value)];
+            for fragments in [
+                vec![valid.as_slice(), invalid.as_slice()],
+                vec![invalid.as_slice(), valid.as_slice()],
+            ] {
+                let costs = costs_by_model(fragments.into_iter().map(|entries| ("a", entries)));
+                assert_eq!(costs["a"], None, "不能过滤实际坏金额：{value}");
+            }
+        }
+        let aliases = costs_by_model([
+            ("deepseek-flash", valid.as_slice()),
+            ("deepseek-v4-flash", request.as_slice()),
+        ]);
+        assert_eq!(aliases["deepseek-flash"], Some(120.0));
+        assert_eq!(aliases["deepseek-v4-flash"], None);
+        assert_eq!(cost_total_present(aliases.values().copied()), None);
+    }
+
+    #[test]
+    fn r15_03_空模型金额集合未知_显式零和有限合计保留() {
+        assert_eq!(cost_total_present([]), None);
+        assert_eq!(cost_total_present([Some(0.0)]), Some(0.0));
+        assert_eq!(cost_total_present([Some(1.0), Some(2.0)]), Some(3.0));
+        assert_eq!(cost_total_present([Some(120.0), None]), None);
+        assert_eq!(cost_total_present([Some(f64::MAX), Some(f64::MAX)]), None);
+        assert_eq!(cost_total_present([Some(f64::NAN)]), None);
     }
 
     // ---------- model_slot ----------

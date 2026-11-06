@@ -21,19 +21,17 @@ pub struct RawModelUsage {
 
 pub fn raw_models(amount_rows: &[ModelUsage], cost_rows: &[ModelUsage]) -> Vec<RawModelUsage> {
     let mut tokens: BTreeMap<&str, Vec<_>> = BTreeMap::new();
-    let mut costs: BTreeMap<&str, Option<f64>> = BTreeMap::new();
     for row in amount_rows {
         tokens
             .entry(&row.model)
             .or_default()
             .extend(row.usage.iter().cloned());
     }
-    for row in cost_rows {
-        let entry = costs.entry(row.model.as_str()).or_insert(Some(0.0));
-        *entry = entry.and_then(|total| {
-            crate::usage::cost_sum_present(&row.usage).map(|value| total + value)
-        });
-    }
+    let costs = crate::usage::costs_by_model(
+        cost_rows
+            .iter()
+            .map(|row| (row.model.as_str(), row.usage.as_slice())),
+    );
     let names: std::collections::BTreeSet<_> = tokens.keys().chain(costs.keys()).copied().collect();
     names
         .into_iter()
@@ -72,6 +70,43 @@ mod tests {
                 kind: kind.into(),
                 amount: amount.into(),
             }],
+        }
+    }
+
+    #[test]
+    fn r15_04_raw费用拆片反序_同模型合并而别名独立() {
+        let amount = [row("deepseek-flash", "RESPONSE_TOKEN", "35")];
+        for value in ["120", "0"] {
+            let mut cost_rows = vec![
+                row("deepseek-flash", "REQUEST", "1"),
+                row("deepseek-flash", "RESPONSE_TOKEN", value),
+                ModelUsage {
+                    model: "deepseek-flash".into(),
+                    usage: vec![],
+                },
+            ];
+            for _ in 0..2 {
+                let result = raw_models(&amount, &cost_rows);
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].cost, Some(value.parse::<f64>().unwrap()));
+                assert_eq!(result[0].total_tokens, Some(35));
+                cost_rows.reverse();
+            }
+        }
+        let costs = [
+            row("deepseek-flash", "RESPONSE_TOKEN", "120"),
+            row("deepseek-v4-flash", "REQUEST", "1"),
+        ];
+        let result = raw_models(&amount, &costs);
+        assert_eq!(result[0].cost, Some(120.0));
+        assert_eq!(result[1].cost, None);
+        assert_eq!(result[1].model, "deepseek-v4-flash");
+        for value in ["", "NaN", "-1"] {
+            let costs = [
+                row("deepseek-flash", "RESPONSE_TOKEN", "120"),
+                row("deepseek-flash", "RESPONSE_TOKEN", value),
+            ];
+            assert_eq!(raw_models(&amount, &costs)[0].cost, None);
         }
     }
     #[test]

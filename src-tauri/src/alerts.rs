@@ -211,7 +211,64 @@ struct Runtime {
     balance_checked_at: Option<u64>,
     budget_checked_at: Option<u64>,
     last_notification_at: Option<u64>,
-    error: Option<String>,
+    errors: RuntimeErrors,
+}
+#[derive(Default)]
+struct RuntimeErrors {
+    configuration: Option<String>,
+    clock: Option<String>,
+    execution: Option<String>,
+    notification: Option<String>,
+}
+impl RuntimeErrors {
+    fn message(&self) -> Option<String> {
+        let messages: Vec<String> = [
+            ("提醒配置检查失败", &self.configuration),
+            ("提醒时钟检查失败", &self.clock),
+            ("提醒执行失败", &self.execution),
+            ("最近一次通知尝试异常", &self.notification),
+        ]
+        .into_iter()
+        .filter_map(|(source, error)| error.as_ref().map(|error| format!("{source}：{error}")))
+        .collect();
+        (!messages.is_empty()).then(|| messages.join("；"))
+    }
+    fn notification_result(&mut self, result: &Result<bool, String>) {
+        match result {
+            // A real system submission AND both receipt writes succeeded. A
+            // suppressed attempt is not evidence that the notification recovered.
+            Ok(true) => self.notification = None,
+            Ok(false) => {}
+            Err(error) => self.notification = Some(error.clone()),
+        }
+    }
+}
+// Every tick passes through this step, including disabled/missing/not-due paths.
+// Recovery belongs to the source that was actually checked, not to "tick Ok".
+fn prepare_tick(
+    errors: &mut RuntimeErrors,
+    snapshot: Result<(u64, config::StoredConfig), String>,
+    now: u64,
+) -> Option<(u64, config::StoredConfig)> {
+    let (revision, config) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            errors.configuration = Some(error);
+            return None;
+        }
+    };
+    if let Err(error) = config.alerts.validate() {
+        errors.configuration = Some(error);
+        return None;
+    }
+    errors.configuration = None;
+    if now == 0 {
+        errors.clock = Some("系统时钟不可用，提醒未执行".into());
+        return None;
+    }
+    errors.clock = None;
+    errors.execution = None;
+    Some((revision, config))
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,7 +314,11 @@ pub fn status(app: &tauri::AppHandle) -> Result<AlertStatus, String> {
             current_budget,
         ),
         quiet_now: quiet(&config.alerts, chrono::Local::now().hour()),
-        error: config.alerts.enabled.then(|| state.error.clone()).flatten(),
+        error: config
+            .alerts
+            .enabled
+            .then(|| state.errors.message())
+            .flatten(),
         options: config.alerts,
         balance_checked_at: current_balance
             .then_some(state.balance_checked_at)
@@ -276,7 +337,8 @@ pub fn save_options(app: &tauri::AppHandle, options: AlertOptions) -> Result<Ale
         .0
         .lock()
         .map_err(|_| "提醒状态不可用")?
-        .error = None;
+        .errors
+        .configuration = None;
     status(app)
 }
 fn submit(
@@ -303,6 +365,18 @@ fn submit(
     )
 }
 fn submit_with(
+    state: &mut Runtime,
+    key: String,
+    kind: Kind,
+    now: u64,
+    send: impl FnOnce(&str) -> Result<(), String>,
+    persist: impl FnMut(&Ledger) -> Result<(), String>,
+) -> Result<bool, String> {
+    let result = attempt_submission(state, key, kind, now, send, persist);
+    state.errors.notification_result(&result);
+    result
+}
+fn attempt_submission(
     state: &mut Runtime,
     key: String,
     kind: Kind,
@@ -347,7 +421,6 @@ pub fn test_notification(app: &tauri::AppHandle) -> Result<(), String> {
         )? {
             return Err("测试通知请间隔至少60秒".into());
         }
-        state.error = None;
         Ok(())
     })?
     .ok_or_else(|| "设置已改变，请重试".into())
@@ -419,19 +492,24 @@ fn poll_identity(kind: Kind, config: &config::StoredConfig, month: (u32, u32)) -
     )
 }
 async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
-    let (revision, config) = config::read_snapshot()?;
+    // Read before acquiring the runtime lock: config writers and final submits
+    // use the same config -> runtime lock order.
+    let snapshot = config::read_snapshot();
+    let now = now_seconds();
+    let runtime = app.state::<AlertRuntime>();
+    let prepared = {
+        let mut state = runtime.0.lock().map_err(|_| "提醒状态不可用")?;
+        prepare_tick(&mut state.errors, snapshot, now)
+    };
+    let Some((revision, config)) = prepared else {
+        return Ok(());
+    };
     if !config.alerts.enabled {
         return Ok(());
-    }
-    config.alerts.validate()?;
-    let now = now_seconds();
-    if now == 0 {
-        return Err("系统时钟不可用，提醒未执行".into());
     }
     let month = crate::usage_watcher::cst_month(SystemTime::now());
     let key = config.api_key.as_deref().filter(|k| !k.is_empty());
     let token = config.usage_token.as_deref().filter(|k| !k.is_empty());
-    let runtime = app.state::<AlertRuntime>();
     let (balance_due, budget_due) = {
         let mut state = runtime.0.lock().map_err(|_| "提醒状态不可用")?;
         let balance_due = config.alerts.low_balance_enabled
@@ -492,7 +570,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
     });
     let balance = outcome(balance, |data| balance_sample(data, &config.alerts));
     let budget = outcome(budget, |data| budget_sample(data, &config.alerts));
-    config::with_current(revision, |current| {
+    let applied = config::with_current(revision, |current| {
         if !current.alerts.enabled
             || current.alerts != config.alerts
             || current.api_key != config.api_key
@@ -508,7 +586,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
             state.balance_state = code;
             state.balance_checked_at = Some(now * 1000);
             if trigger && !quiet_now {
-                match submit(
+                let _ = submit(
                     app,
                     &mut state,
                     identity(
@@ -519,11 +597,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
                     ),
                     Kind::Balance,
                     now,
-                ) {
-                    Ok(true) => state.error = None,
-                    Ok(false) => {}
-                    Err(error) => state.error = Some(error),
-                }
+                );
             }
         }
         if let Some((code, trigger)) = budget {
@@ -532,7 +606,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
             state.budget_checked_at = Some(now * 1000);
             if trigger && !quiet_now && crate::usage_watcher::cst_month(SystemTime::now()) == month
             {
-                match submit(
+                let _ = submit(
                     app,
                     &mut state,
                     identity(
@@ -543,15 +617,18 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
                     ),
                     Kind::Budget,
                     now,
-                ) {
-                    Ok(true) => state.error = None,
-                    Ok(false) => {}
-                    Err(error) => state.error = Some(error),
-                }
+                );
             }
         }
         Ok(())
-    })?;
+    });
+    if let Err(error) = applied {
+        // A poisoned runtime cannot be locked here either; otherwise only the
+        // final config read can fail, and its recovery belongs to preflight.
+        if let Ok(mut state) = runtime.0.lock() {
+            state.errors.configuration = Some(error);
+        }
+    }
     Ok(())
 }
 pub fn start(app: tauri::AppHandle) {
@@ -559,7 +636,7 @@ pub fn start(app: tauri::AppHandle) {
         loop {
             if let Err(error) = tick(&app).await {
                 if let Ok(mut state) = app.state::<AlertRuntime>().0.lock() {
-                    state.error = Some(error);
+                    state.errors.execution = Some(error);
                 }
             }
             tokio::select! {_=config::changed().notified()=>{},_=tokio::time::sleep(Duration::from_secs(60))=>{}}
@@ -570,6 +647,362 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // R15 数据回归：同一合成响应经过生产日期范围与聚合后进入预算判定。
+    // 不改变 budget_sample 的失败关闭语义。
+    #[test]
+    fn r15_01_未来占位不阻预算_当天过去缺失仍失败关闭() {
+        use deepseek_api::regression_samples::{complete_month, period};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for end in [10, 11, 30] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            for day in 11..=end {
+                let empty = deepseek_api::DayUsage {
+                    date: format!("2026-11-{day:02}"),
+                    data: vec![],
+                };
+                amount.data.biz_data.days.push(empty.clone());
+                cost.data.biz_data[0].days.push(empty);
+            }
+            for (threshold, trigger) in [(100.0, true), (120.0, true), (121.0, false)] {
+                let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(budget_sample(data, &options), ("ok".into(), trigger));
+            }
+            for index in [0, 9] {
+                let saved_amount = amount.data.biz_data.days[index].data.clone();
+                let saved_cost = cost.data.biz_data[0].days[index].data.clone();
+                amount.data.biz_data.days[index].data.clear();
+                cost.data.biz_data[0].days[index].data.clear();
+                let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+                assert_eq!(data.month_cost, Some(120.0), "保留月金额不等于放宽日质量");
+                assert_eq!(
+                    budget_sample(data, &Default::default()),
+                    ("invalid_data".into(), false)
+                );
+                amount.data.biz_data.days[index].data = saved_amount;
+                cost.data.biz_data[0].days[index].data = saved_cost;
+            }
+        }
+    }
+
+    #[test]
+    fn r15_01_预算范围跨UTC8午夜扩大_历史月末不能遗漏() {
+        use deepseek_api::regression_samples::{complete_month, period};
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        let empty = deepseek_api::DayUsage {
+            date: "2026-11-11".into(),
+            data: vec![],
+        };
+        amount.data.biz_data.days.push(empty.clone());
+        cost.data.biz_data[0].days.push(empty);
+        for (instant, expected) in [
+            ("2026-11-10T15:59:59Z", ("ok".to_owned(), true)),
+            ("2026-11-10T16:00:00Z", ("invalid_data".to_owned(), false)),
+        ] {
+            let data = deepseek_api::build_usage_result_for_period(
+                &amount,
+                &cost,
+                period(2026, 11, instant),
+            );
+            assert_eq!(budget_sample(data, &Default::default()), expected);
+        }
+        let (mut amount, mut cost) = complete_month(2026, 10, 31);
+        let scope = period(2026, 10, "2026-11-01T04:00:00Z");
+        assert_eq!(
+            budget_sample(
+                deepseek_api::build_usage_result_for_period(&amount, &cost, scope),
+                &Default::default()
+            ),
+            ("ok".into(), true)
+        );
+        amount.data.biz_data.days.pop();
+        cost.data.biz_data[0].days.pop();
+        assert_eq!(
+            budget_sample(
+                deepseek_api::build_usage_result_for_period(&amount, &cost, scope),
+                &Default::default()
+            ),
+            ("invalid_data".into(), false)
+        );
+    }
+
+    #[test]
+    fn r15_03_双空月汇总预算待核对_显式零仍正常未达线() {
+        use deepseek_api::regression_samples::{complete_month, period};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        amount.data.biz_data.total.clear();
+        cost.data.biz_data[0].total.clear();
+        let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+        assert_eq!(data.month_cost, None);
+        assert_eq!(data.days[9].total_cost, Some(120.0));
+        assert_eq!(data.days[9].raw_models[0].cost, Some(120.0));
+        assert_eq!(
+            budget_sample(data, &Default::default()),
+            ("invalid_data".into(), false)
+        );
+        amount.data.biz_data.total = amount.data.biz_data.days[0].data.clone();
+        amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+        cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+        cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+        let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+        assert_eq!(data.month_cost, Some(0.0));
+        assert_eq!(
+            budget_sample(data, &Default::default()),
+            ("ok".into(), false)
+        );
+    }
+
+    #[test]
+    fn r15_04_单行拆行反序与同日拆对象预算一致() {
+        use deepseek_api::regression_samples::{complete_month, period, row};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for mode in 0..4 {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount
+                .data
+                .biz_data
+                .total
+                .push(row("deepseek-flash", &[("PROMPT_TOKEN", "30")]));
+            amount.data.biz_data.days[9]
+                .data
+                .push(row("deepseek-flash", &[("PROMPT_TOKEN", "30")]));
+            let mut rows = vec![
+                row("deepseek-flash", &[("REQUEST", "1")]),
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "120")]),
+                row("deepseek-flash", &[]),
+            ];
+            if mode >= 2 {
+                rows.reverse();
+            }
+            if mode != 0 {
+                cost.data.biz_data[0].total = rows.clone();
+                cost.data.biz_data[0].days[9].data = rows.clone();
+            }
+            if mode == 3 {
+                cost.data.biz_data[0].days.pop();
+                cost.data.biz_data[0]
+                    .days
+                    .extend(rows.into_iter().map(|row| deepseek_api::DayUsage {
+                        date: "2026-11-10".into(),
+                        data: vec![row],
+                    }));
+            }
+            for (threshold, trigger) in [(100.0, true), (120.0, true), (121.0, false)] {
+                let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+                assert_eq!(data.month_cost, Some(120.0));
+                assert_eq!(data.days[9].total_cost, Some(120.0));
+                assert_eq!(data.models[0].total_tokens, Some(35));
+                assert_eq!(data.raw_models[0].cost, Some(120.0));
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(budget_sample(data, &options), ("ok".into(), trigger));
+            }
+        }
+    }
+
+    #[test]
+    fn r15_04_缺费坏值与独立别名缺失仍不触发预算() {
+        use deepseek_api::regression_samples::{complete_month, period, row};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for rows in [
+            vec![row("deepseek-flash", &[("REQUEST", "1")])],
+            vec![row("deepseek-flash", &[]), row("deepseek-flash", &[])],
+            vec![
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "120")]),
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "NaN")]),
+            ],
+            vec![
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "120")]),
+                row("deepseek-v4-flash", &[("REQUEST", "1")]),
+            ],
+        ] {
+            let (amount, mut cost) = complete_month(2026, 11, 10);
+            cost.data.biz_data[0].total = rows.clone();
+            cost.data.biz_data[0].days[9].data = rows;
+            let data = deepseek_api::build_usage_result_for_period(&amount, &cost, scope);
+            assert_eq!(data.month_cost, None);
+            assert_eq!(
+                budget_sample(data, &Default::default()),
+                ("invalid_data".into(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn r15_06_preflight_recovery_clears_only_verified_error_sources() {
+        let mut state = Runtime::default();
+        state.errors.notification = Some("synthetic notification failure".into());
+        assert!(prepare_tick(
+            &mut state.errors,
+            Err("synthetic config read failure".into()),
+            100
+        )
+        .is_none());
+        assert_eq!(
+            state.errors.configuration.as_deref(),
+            Some("synthetic config read failure")
+        );
+        let mut invalid = config::StoredConfig::with_defaults();
+        invalid.alerts.low_balance_cny = f64::NAN;
+        assert!(prepare_tick(&mut state.errors, Ok((1, invalid)), 100).is_none());
+        assert!(state
+            .errors
+            .configuration
+            .as_deref()
+            .unwrap()
+            .contains("余额提醒线"));
+
+        // The shared preflight runs before disabled, missing credentials,
+        // not-due, quiet hours, and below-threshold branches can skip a send.
+        for enabled in [false, true] {
+            let mut restored = config::StoredConfig::with_defaults();
+            restored.alerts.enabled = enabled;
+            state.errors.configuration = Some("old read failure".into());
+            state.errors.clock = Some("old clock failure".into());
+            let (_, restored) = prepare_tick(&mut state.errors, Ok((2, restored)), 100).unwrap();
+            assert!(restored.api_key.is_none());
+            assert!(restored.usage_token.is_none());
+            assert!(state.errors.configuration.is_none());
+            assert!(state.errors.clock.is_none());
+            assert_eq!(
+                state.errors.notification.as_deref(),
+                Some("synthetic notification failure")
+            );
+        }
+        let mut restored = config::StoredConfig::with_defaults();
+        restored.alerts.enabled = true;
+        restored.api_key = Some("synthetic-key".into());
+        state.balance.due("same-poll".into(), 100);
+        state.balance.finish(100, "ok");
+        state.errors.configuration = Some("old read failure".into());
+        let (_, restored) = prepare_tick(&mut state.errors, Ok((3, restored)), 101).unwrap();
+        assert!(!state.balance.due("same-poll".into(), 101));
+        assert!(quiet(&restored.alerts, 23));
+        assert_eq!(
+            balance_sample(
+                deepseek_api::BalanceResult {
+                    is_available: true,
+                    currency: "CNY".into(),
+                    total_balance: "1000".into(),
+                    granted_balance: "0".into(),
+                    topped_up_balance: "1000".into(),
+                },
+                &restored.alerts
+            ),
+            ("ok".into(), false)
+        );
+        assert!(state.errors.configuration.is_none());
+        assert!(state.errors.notification.is_some());
+
+        // A valid config does not prove that the clock recovered.
+        state.errors.configuration = Some("old read failure".into());
+        assert!(prepare_tick(&mut state.errors, Ok((3, restored.clone())), 0).is_none());
+        assert!(state.errors.configuration.is_none());
+        assert!(state.errors.clock.is_some());
+        assert!(state.errors.message().unwrap().contains("提醒时钟检查失败"));
+        assert!(state
+            .errors
+            .message()
+            .unwrap()
+            .contains("最近一次通知尝试异常"));
+        assert!(prepare_tick(&mut state.errors, Ok((3, restored)), 102).is_some());
+        assert!(state.errors.clock.is_none());
+        assert!(state.errors.notification.is_some());
+    }
+
+    #[test]
+    fn r15_06_only_complete_notification_submission_clears_notification_failure() {
+        let mut state = Runtime {
+            ledger: Some(Ledger::default()),
+            ..Default::default()
+        };
+        assert!(submit_with(
+            &mut state,
+            "balance".into(),
+            Kind::Balance,
+            100,
+            |_| Err("synthetic system submission failure".into()),
+            |_| Ok(())
+        )
+        .is_err());
+        assert_eq!(
+            state.errors.notification.as_deref(),
+            Some("synthetic system submission failure")
+        );
+        assert!(prepare_tick(
+            &mut state.errors,
+            Ok((1, config::StoredConfig::with_defaults())),
+            101
+        )
+        .is_some());
+        assert!(state.errors.notification.is_some());
+        assert!(!submit_with(
+            &mut state,
+            "balance".into(),
+            Kind::Balance,
+            101,
+            |_| panic!("cooldown must not send"),
+            |_| panic!("cooldown must not write")
+        )
+        .unwrap());
+        assert!(state.errors.notification.is_some());
+
+        for fail_write in [1, 2] {
+            let mut writes = 0;
+            let result = submit_with(
+                &mut state,
+                format!("test-{fail_write}"),
+                Kind::Test,
+                200,
+                |_| Ok(()),
+                |_| {
+                    writes += 1;
+                    if writes == fail_write {
+                        Err("synthetic receipt failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(state.errors.notification.is_some());
+            assert!(prepare_tick(
+                &mut state.errors,
+                Ok((1, config::StoredConfig::with_defaults())),
+                201
+            )
+            .is_some());
+            assert!(state.errors.notification.is_some());
+        }
+        state.errors.configuration = Some("independent config failure".into());
+        state.errors.clock = Some("independent clock failure".into());
+        assert!(submit_with(
+            &mut state,
+            "successful-test".into(),
+            Kind::Test,
+            300,
+            |_| Ok(()),
+            |_| Ok(())
+        )
+        .unwrap());
+        assert!(state.errors.notification.is_none());
+        assert_eq!(state.last_notification_at, Some(300_000));
+        assert_eq!(
+            state.errors.configuration.as_deref(),
+            Some("independent config failure")
+        );
+        assert_eq!(
+            state.errors.clock.as_deref(),
+            Some("independent clock failure")
+        );
+    }
+
     #[test]
     fn validated_same_value_commit_recovers_only_corresponding_poll_and_keeps_receipts() {
         use config::ValidatedCredential::{ApiKey, UsageToken};

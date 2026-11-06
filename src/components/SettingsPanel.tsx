@@ -22,6 +22,8 @@ import { AlertSettings } from "./AlertSettings";
 import { BrandIcon } from "./BrandIcon";
 import { SettingsSection, Toggle } from "./ui";
 import type { LeaveBlocker } from "../leave-guard";
+import { errorMessage } from "../error-state";
+import { getCommittedConfig } from "../config-store";
 
 // 状态与动作在 useSettingsState（评审 F-09 拆分），本组件只负责视图与文案。
 function SettingsPanel({
@@ -91,6 +93,11 @@ function SettingsPanel({
   } = useSettingsState();
   const { theme, toggleTheme } = useTheme();
   const [retrying, setRetrying] = React.useState(false);
+  const retryPending = React.useRef(false);
+  const [retryError, setRetryError] = React.useState("");
+  React.useEffect(() => {
+    if (!config?.configReadError) setRetryError("");
+  }, [config?.configReadError]);
   const [confirmForget, setConfirmForget] = React.useState(false);
   // One page owner, one registration, and synchronous live participants. A child
   // cleanup cannot republish an old page, nor dispose a newer registration.
@@ -491,7 +498,9 @@ function SettingsPanel({
             )}
             {(balanceError || usageError) && (
               <p className="muted">
-                网络更新失败时，保留上次数据与更新时间；凭据失效时需重新配置。
+                {config?.configReadError
+                  ? "配置无法读取时暂停账户查询。修复本地配置后可重新读取，无需离开设置或提交当前草稿。"
+                  : "网络更新失败时，保留上次数据与更新时间；凭据失效时需重新配置。"}
               </p>
             )}
             {(balanceError || usageError) && onRetry && (
@@ -500,11 +509,35 @@ function SettingsPanel({
                   className="secondary"
                   disabled={retrying || busy}
                   onClick={() => {
+                    // React state alone does not block a second click before
+                    // rerender. Keep one retry owner without touching drafts.
+                    if (retryPending.current || busy) return;
+                    retryPending.current = true;
+                    const retrySnapshot = getCommittedConfig();
                     setRetrying(true);
-                    void onRetry().finally(() => setRetrying(false));
+                    setRetryError("");
+                    void Promise.resolve()
+                      .then(onRetry)
+                      .catch((error) => {
+                        if (
+                          owner.current.active &&
+                          getCommittedConfig() === retrySnapshot
+                        )
+                          setRetryError(errorMessage(error));
+                      })
+                      .finally(() => {
+                        retryPending.current = false;
+                        if (owner.current.active) setRetrying(false);
+                      });
                   }}
                 >
-                  {retrying ? "更新中…" : "重试更新"}
+                  {retrying
+                    ? config?.configReadError
+                      ? "读取中…"
+                      : "更新中…"
+                    : config?.configReadError
+                      ? "重新读取配置"
+                      : "重试更新"}
                 </button>
                 <button
                   className="secondary"
@@ -514,6 +547,11 @@ function SettingsPanel({
                   重新同步用量
                 </button>
               </div>
+            )}
+            {retryError && (
+              <p className="data-error" role="alert">
+                {retryError}
+              </p>
             )}
             {notices.map((notice) => (
               <p className="muted" key={notice}>

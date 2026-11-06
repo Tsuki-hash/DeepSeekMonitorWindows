@@ -137,6 +137,8 @@ g.__settingsIpc = async (command, args) => {
       return true;
     case "begin_tray_balance_session":
       return 1;
+    case "update_tray_balance":
+      return true;
     case "get_alert_status":
       return structuredClone(alerts);
     case "save_alert_options":
@@ -265,7 +267,9 @@ function scenario(name, body) {
       try {
         await body(concurrent);
         assert.equal(
-          [...storage.values()].some((value) => /DRAFT|TOKEN/.test(value)),
+          [...storage.values()].some((value) =>
+            /DRAFT|TOKEN|SYNTHETIC_K/.test(value),
+          ),
           false,
         );
       } finally {
@@ -1540,5 +1544,233 @@ scenario(
     });
     await act(async () => state.startUsageSync());
     assert.equal(state.usageSyncing, true);
+  },
+);
+
+// Synthetic reference backend for the Key IPC contract. Revisions are created
+// at commit time, never preassigned to make an old request look stale. The Rust
+// command regressions separately exercise the real admission and disk helpers.
+function keyBackend() {
+  const revoked = new Set();
+  let owner = null;
+  let persisted = "SYNTHETIC_K0";
+  const validations = [];
+  return {
+    validations,
+    get persisted() {
+      return persisted;
+    },
+    enter(args) {
+      assert.equal(typeof args.requestId, "string");
+      assert.ok(Array.isArray(args.supersededRequestIds));
+      if (revoked.has(args.requestId) || owner === args.requestId)
+        throw new Error("Synthetic cancelled Key request before validation");
+      for (const id of args.supersededRequestIds) revoked.add(id);
+      if (owner) revoked.add(owner);
+      owner = args.requestId;
+      validations.push(args.apiKey);
+    },
+    save(args) {
+      if (owner !== args.requestId || revoked.has(args.requestId))
+        throw new Error("Synthetic cancelled Key commit");
+      owner = null;
+      persisted = args.apiKey;
+      config = nextCredentialConfig("apiKey", true);
+      return { config, balance: { ...balance, totalBalance: "333" } };
+    },
+    fail(args) {
+      if (owner === args.requestId) owner = null;
+      throw new Error("Synthetic new Key verification failure");
+    },
+    clear(args, fails = false) {
+      assert.ok(Array.isArray(args.cancelledRequestIds));
+      for (const id of args.cancelledRequestIds) revoked.add(id);
+      if (owner) revoked.add(owner);
+      owner = null;
+      if (fails) throw new Error("Synthetic Key clear disk failure");
+      persisted = null;
+      config = nextCredentialConfig("apiKey", false);
+      return config;
+    },
+  };
+}
+
+scenario(
+  "R15-02: discard and remount clear rejects unpolled Key save before validation or a new disk revision",
+  async (concurrent) => {
+    const backend = keyBackend();
+    const admission = deferred();
+    handlers.save_api_key = async (args) => {
+      await admission.promise;
+      backend.enter(args);
+      return backend.save(args);
+    };
+    handlers.clear_api_key = (args) => backend.clear(args);
+    await openSettings(concurrent);
+    await change("API Key", "SYNTHETIC_K1");
+    await startKeySave();
+    const old = submitted("save_api_key").at(-1).args;
+    await leave("放弃修改并离开");
+    await click(input("设置"));
+    await click(button("清除 Key"));
+    const clear = submitted("clear_api_key").at(-1).args;
+    assert.ok(clear.cancelledRequestIds.includes(old.requestId));
+    const cleared = getCommittedConfig();
+    assert.equal(backend.persisted, null);
+    await finish(admission, undefined);
+    assert.deepEqual(backend.validations, []);
+    assert.equal(backend.persisted, null);
+    assert.equal(getCommittedConfig(), cleared);
+    assert.equal(input("API Key").props.value, "");
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance, null);
+    assert.equal(dashboard().balanceState, "nokey");
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+  },
+);
+
+for (const entered of [false, true]) {
+  for (const succeeds of [false, true]) {
+    for (const oldRepliesFirst of [false, true]) {
+      scenario(
+        `R15-02: Key replacement ${succeeds ? "succeeds" : "fails"}, old ${entered ? "validating" : "unpolled"}, ${oldRepliesFirst ? "old" : "new"} replies first`,
+        async (concurrent) => {
+          const backend = keyBackend();
+          const oldAdmission = deferred();
+          const oldValidation = deferred();
+          const newValidation = deferred();
+          handlers.save_api_key = async (args) => {
+            if (args.apiKey === "SYNTHETIC_K1") {
+              if (!entered) await oldAdmission.promise;
+              backend.enter(args);
+              await oldValidation.promise;
+              return backend.save(args);
+            }
+            backend.enter(args);
+            await newValidation.promise;
+            return succeeds ? backend.save(args) : backend.fail(args);
+          };
+          await openSettings(concurrent);
+          const original = getCommittedConfig();
+          await change("API Key", "SYNTHETIC_K1");
+          await startKeySave();
+          const first = submitted("save_api_key").at(-1).args;
+          await leave("放弃修改并离开");
+          await click(input("设置"));
+          await change("API Key", "SYNTHETIC_K2");
+          await startKeySave();
+          const next = submitted("save_api_key").at(-1).args;
+          assert.ok(next.supersededRequestIds.includes(first.requestId));
+          const releaseOld = async () => {
+            await finish(oldAdmission, undefined);
+            await finish(oldValidation, undefined);
+          };
+          if (oldRepliesFirst) {
+            await releaseOld();
+            assert.equal(backend.persisted, "SYNTHETIC_K0");
+            assert.equal(button("验证并保存").props.disabled, true);
+          }
+          await finish(newValidation, undefined);
+          const committed = getCommittedConfig();
+          if (!oldRepliesFirst) await releaseOld();
+          assert.equal(
+            backend.persisted,
+            succeeds ? "SYNTHETIC_K2" : "SYNTHETIC_K0",
+          );
+          assert.equal(getCommittedConfig(), succeeds ? committed : original);
+          assert.deepEqual(
+            backend.validations,
+            entered ? ["SYNTHETIC_K1", "SYNTHETIC_K2"] : ["SYNTHETIC_K2"],
+          );
+          assert.equal(
+            input("API Key").props.value,
+            succeeds ? "" : "SYNTHETIC_K2",
+          );
+          assert.equal(button("验证并保存").props.disabled, succeeds);
+          if (!succeeds)
+            assert.match(
+              textOf(renderer.toJSON()),
+              /Synthetic new Key verification failure/,
+            );
+          if (succeeds) await click(input("返回主面板"));
+          else await leave("放弃修改并离开");
+          assert.equal(
+            dashboard().balance.totalBalance,
+            succeeds ? "333" : "100",
+          );
+        },
+      );
+    }
+  }
+}
+
+scenario(
+  "R15-02: new Key after remount waits for clear and becomes the authoritative account",
+  async (concurrent) => {
+    const backend = keyBackend();
+    const clearing = deferred();
+    handlers.clear_api_key = async (args) => {
+      await clearing.promise;
+      return backend.clear(args);
+    };
+    handlers.save_api_key = async (args) => {
+      backend.enter(args);
+      return backend.save(args);
+    };
+    await openSettings(concurrent);
+    await click(button("清除 Key"));
+    const clearArgs = submitted("clear_api_key").at(-1).args;
+    await click(input("返回主面板"));
+    await click(input("设置"));
+    await change("API Key", "SYNTHETIC_K3");
+    await startKeySave();
+    assert.equal(submitted("save_api_key").length, 0);
+    assert.equal(backend.persisted, "SYNTHETIC_K0");
+    await finish(clearing, undefined);
+    const saveArgs = submitted("save_api_key").at(-1).args;
+    assert.equal(
+      clearArgs.cancelledRequestIds.includes(saveArgs.requestId),
+      false,
+    );
+    assert.equal(backend.persisted, "SYNTHETIC_K3");
+    assert.equal(getCommittedConfig().apiKeyConfigured, true);
+    assert.equal(input("API Key").props.value, "");
+    await click(input("返回主面板"));
+    assert.equal(dashboard().balance.totalBalance, "333");
+  },
+);
+
+scenario(
+  "R15-02: failed Key clear preserves the account and error while old save stays revoked",
+  async (concurrent) => {
+    const backend = keyBackend();
+    const admission = deferred();
+    handlers.save_api_key = async (args) => {
+      await admission.promise;
+      backend.enter(args);
+      return backend.save(args);
+    };
+    handlers.clear_api_key = (args) => backend.clear(args, true);
+    await openSettings(concurrent);
+    const original = getCommittedConfig();
+    await change("API Key", "SYNTHETIC_K1");
+    await startKeySave();
+    await leave("放弃修改并离开");
+    await click(input("设置"));
+    await click(button("清除 Key"));
+    await finish(admission, undefined);
+    assert.equal(backend.persisted, "SYNTHETIC_K0");
+    assert.equal(getCommittedConfig(), original);
+    assert.deepEqual(backend.validations, []);
+    assert.match(textOf(renderer.toJSON()), /Synthetic Key clear disk failure/);
+    assert.equal(button("清除 Key").props.disabled, false);
+    handlers.save_api_key = async (args) => {
+      backend.enter(args);
+      return backend.save(args);
+    };
+    await change("API Key", "SYNTHETIC_K3");
+    await startKeySave();
+    assert.equal(backend.persisted, "SYNTHETIC_K3");
+    assert.equal(getCommittedConfig().apiKeyConfigured, true);
   },
 );

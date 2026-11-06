@@ -347,32 +347,91 @@ pub struct UsageResult {
     pub month_cost: Option<f64>,
 }
 
+/// 查询月和请求开始时的 UTC+8 记账日共同限定质量检查范围。
+/// 当前月只要求月初至源日，历史月要求完整自然月；响应回来时不重新读时钟。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UsagePeriod {
+    first: chrono::NaiveDate,
+    last: chrono::NaiveDate,
+    month_end: chrono::NaiveDate,
+}
+
+impl UsagePeriod {
+    pub(crate) fn at(
+        year: u32,
+        month: u32,
+        source_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self, String> {
+        let year = i32::try_from(year).map_err(|_| "非法的用量查询年份")?;
+        let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).ok_or("非法的用量查询月份")?;
+        let month_end = first
+            .checked_add_months(chrono::Months::new(1))
+            .and_then(|next| next.pred_opt())
+            .ok_or("用量查询月份超出范围")?;
+        let source_date = source_time
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("UTC+8"))
+            .date_naive();
+        if first > source_date {
+            return Err("不能查询尚未开始的记账月".into());
+        }
+        Ok(Self {
+            first,
+            last: source_date.min(month_end),
+            month_end,
+        })
+    }
+
+    fn parse_date(date: &str) -> Option<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()
+            .filter(|parsed| parsed.to_string() == date)
+    }
+
+    fn includes_day(self, date: &str) -> bool {
+        Self::parse_date(date).is_some_and(|date| (self.first..=self.last).contains(&date))
+    }
+
+    fn is_query_month(self, date: &str) -> bool {
+        Self::parse_date(date).is_some_and(|date| (self.first..=self.month_end).contains(&date))
+    }
+}
+
+pub(crate) fn build_usage_result_for_period(
+    amount: &AmountResp,
+    cost: &CostResp,
+    period: UsagePeriod,
+) -> UsageResult {
+    build_usage_result_inner(amount, cost, Some(period))
+}
+
+/// 旧算术单测只关注返回行，生产请求必须走显式月份/源日期入口。
+#[cfg(test)]
+pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
+    build_usage_result_inner(amount, cost, None)
+}
+
 /// 纯聚合：amount/cost 响应 → 界面用量结构。新旧模型名归并、费用口径均在此。
 ///
 /// **缺失不等于零**：费用接口没有返回某模型/日期时，费用为 `None`；计数解析失败时
 /// 对应计数为 `None`。两者都不会被静默补成 0，而是产生质量警告，让界面显示「—」。
-pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
+fn build_usage_result_inner(
+    amount: &AmountResp,
+    cost: &CostResp,
+    period: Option<UsagePeriod>,
+) -> UsageResult {
     let cost_total = cost.data.biz_data.first();
     let raw_models = crate::usage_history::raw_models(
         &amount.data.biz_data.total,
         cost_total.map(|c| c.total.as_slice()).unwrap_or(&[]),
     );
-    // 费用接口整份缺失、或该模型在费用侧**没有条目**时返回 None，而不是 0.0。
-    // 复评 F06：空迭代的 try_fold(0.0) 会得到 Some(0.0)，把「没返回」显示成真实零。
-    // 只有费用侧确实给出了该模型的行（哪怕是显式 0 金额）才算已知。
-    let cost_for_model = |model: &str| -> Option<f64> {
-        let item = cost_total?;
-        let mut matched = false;
-        let total = item
-            .total
-            .iter()
-            .filter(|m| m.model == model)
-            .try_fold(0.0, |total, m| {
-                matched = true;
-                Some(total + crate::usage::cost_sum_present(&m.usage)?)
-            })?;
-        matched.then_some(total)
-    };
+    // R15-04：月槽位、月总额和历史共用按原始模型归并后的 presence 口径。
+    let monthly_costs = crate::usage::costs_by_model(
+        cost_total
+            .into_iter()
+            .flat_map(|item| &item.total)
+            .map(|row| (row.model.as_str(), row.usage.as_slice())),
+    );
+    let cost_for_model = |model: &str| monthly_costs.get(model).copied().flatten();
 
     // 按槽位归并：迁移期内 deepseek-flash 与旧名可能同时出现在同一份账单里，
     // 它们其实是同一个模型，必须累加，否则前端只取第一个会漏掉另一部分用量。
@@ -475,22 +534,31 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     // 为零、部分未知以及明确全零。没有未知模型时 other_sum 自然为 None。
     models.extend(other_sum);
 
-    // 按日费用：任一模型的金额无法解析就让该日为未知，不丢半个数字。
-    let mut cost_by_date: std::collections::HashMap<String, Option<f64>> =
-        std::collections::HashMap::new();
+    // R15-04：先按日期收齐所有片段，再按原始模型合并费用条目。
+    // 同日期多个 day 对象与单个对象必须产生相同的日额、raw 和模型额。
+    let mut grouped_cost_days: std::collections::BTreeMap<&str, Vec<&ModelUsage>> =
+        std::collections::BTreeMap::new();
     if let Some(item) = cost_total {
         for day in &item.days {
-            let entry = cost_by_date.entry(day.date.clone()).or_insert(Some(0.0));
-            *entry = entry.and_then(|total| {
-                day.data
-                    .iter()
-                    .try_fold(0.0, |sum, m| {
-                        Some(sum + crate::usage::cost_sum_present(&m.usage)?)
-                    })
-                    .map(|sum| total + sum)
-            });
+            grouped_cost_days
+                .entry(&day.date)
+                .or_default()
+                .extend(&day.data);
         }
     }
+    let cost_by_date: std::collections::BTreeMap<String, Option<f64>> = grouped_cost_days
+        .into_iter()
+        .map(|(date, rows)| {
+            let costs = crate::usage::costs_by_model(
+                rows.into_iter()
+                    .map(|row| (row.model.as_str(), row.usage.as_slice())),
+            );
+            (
+                date.to_owned(),
+                crate::usage::cost_total_present(costs.values().copied()),
+            )
+        })
+        .collect();
 
     let mut days = Vec::new();
     // 复评 N10：**先按 date 合并所有片段**，再派生 summary / raw / 槽位。
@@ -687,7 +755,7 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     // 而 `total:[]`（有分组但没有任何模型）还会得到 0，与 `biz_data=[]`
     // 的正确 None 不同。这里：
     // 1. 数量侧返回了模型、费用侧缺任何一个 → 整月费用未知（不是部分和）；
-    // 2. 有费用分组但 total 为空、且数量侧非空 → 未知（空组不是显式零）；
+    // 2. 有费用分组但 total 为空 → 未知（两侧都空也不是显式零）；
     // 3. 每个数量模型都有显式费用（含显式 0）→ 正常求值（0 是合法值）；
     // 4. 只有日级缺项、月级齐全 → 保持有效月费用（不受日缺项牵连）。
     let amount_month_models: std::collections::HashSet<&str> = amount
@@ -708,23 +776,20 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         })
         .unwrap_or_default();
     let month_models_aligned = amount_month_models.is_subset(&cost_month_models);
-    let month_cost: Option<f64> = cost_total.and_then(|item| {
-        if !month_models_aligned {
-            return None;
-        }
-        if item.total.is_empty() && !amount_month_models.is_empty() {
-            // 空费用组在有数量模型的上下文里不是「显式零」。
-            return None;
-        }
-        item.total.iter().try_fold(0.0, |total, m| {
-            Some(total + crate::usage::cost_sum_present(&m.usage)?)
-        })
-    });
+    let month_cost = if month_models_aligned {
+        crate::usage::cost_total_present(monthly_costs.values().copied())
+    } else {
+        None
+    };
 
-    let mut warnings = usage_alignment_warnings(amount, cost, &days);
+    let mut warnings = usage_alignment_warnings(amount, cost, &days, period);
     if raw_models
         .iter()
-        .chain(days.iter().flat_map(|day| &day.raw_models))
+        .chain(
+            days.iter()
+                .filter(|day| period.is_none_or(|scope| scope.includes_day(&day.date)))
+                .flat_map(|day| &day.raw_models),
+        )
         .any(|model| model.data_warning.is_some())
     {
         warnings.push("平台 Token 计数异常，受影响的历史字段保留为未知".into());
@@ -769,6 +834,7 @@ fn usage_alignment_warnings(
     amount: &AmountResp,
     cost: &CostResp,
     days: &[UsageDaySummary],
+    period: Option<UsagePeriod>,
 ) -> Vec<String> {
     let cost_total = cost.data.biz_data.first();
     let amount_models: std::collections::HashSet<&str> = amount
@@ -793,10 +859,17 @@ fn usage_alignment_warnings(
         .biz_data
         .days
         .iter()
+        .filter(|day| period.is_none_or(|scope| scope.includes_day(&day.date)))
         .map(|day| day.date.as_str())
         .collect();
     let cost_dates: std::collections::HashSet<&str> = cost_total
-        .map(|item| item.days.iter().map(|day| day.date.as_str()).collect())
+        .map(|item| {
+            item.days
+                .iter()
+                .filter(|day| period.is_none_or(|scope| scope.includes_day(&day.date)))
+                .map(|day| day.date.as_str())
+                .collect()
+        })
         .unwrap_or_default();
 
     // R14-07：同模型允许拆成多行。比较原始模型 ID 的去重集合，不能把
@@ -807,14 +880,28 @@ fn usage_alignment_warnings(
         || !cost_dates.is_subset(&amount_dates)
         || days
             .iter()
+            .filter(|day| period.is_none_or(|scope| scope.includes_day(&day.date)))
             .any(|day| day.total_cost.is_none() || day.total_tokens.is_none());
+    // 两侧同时缺失的过去/当日也必须被发现。未来空日仍留在结果中为 None，
+    // 但不参加当前质量判定；次日新请求会自动扩大应覆盖范围。
+    let missing_dates = period.is_some_and(|scope| {
+        (0..=(scope.last - scope.first).num_days()).any(|offset| {
+            let date = (scope.first + chrono::Duration::days(offset)).to_string();
+            !amount_dates.contains(date.as_str()) || !cost_dates.contains(date.as_str())
+        })
+    });
+    let unexpected_dates =
+        period.is_some_and(|scope| days.iter().any(|day| !scope.is_query_month(&day.date)));
 
     let mut warnings = Vec::new();
     if models_mismatch {
         warnings.push("费用与 Token 数据尚未完全对齐，请稍后刷新".into());
     }
-    if dates_mismatch {
+    if dates_mismatch || missing_dates {
         warnings.push("部分日期缺少费用或数量，相关数值按未知显示".into());
+    }
+    if unexpected_dates {
+        warnings.push("平台返回无效日期或查询月份以外的数据，请稍后刷新核对".into());
     }
     warnings
 }
@@ -864,6 +951,10 @@ pub async fn fetch_usage_with_token(
     month: u32,
     year: u32,
 ) -> Result<UsageResult, ApiError> {
+    // 在任何网络等待之前固定 UTC+8 源日期，避免跨午夜后把尚未查询到的
+    // 新一天纳入旧请求；同一个范围同时用于首页/历史和后台预算。
+    let period = UsagePeriod::at(year, month, chrono::Utc::now())
+        .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
     let client = http_client().map_err(|error| ApiError::new(ErrorKind::Unavailable, error))?;
     let amount_url =
         format!("https://platform.deepseek.com/api/v0/usage/amount?month={month}&year={year}");
@@ -884,7 +975,7 @@ pub async fn fetch_usage_with_token(
     }
     validate_usage_entries(&amount, &cost)
         .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
-    Ok(build_usage_result(&amount, &cost))
+    Ok(build_usage_result_for_period(&amount, &cost, period))
 }
 
 fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), String> {
@@ -912,9 +1003,378 @@ fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), St
     Ok(())
 }
 
+/// 合成响应供数据和预算回归共同使用，不访问平台或实际账户。
+#[cfg(test)]
+pub(crate) mod regression_samples {
+    use super::*;
+
+    pub(crate) fn row(model: &str, entries: &[(&str, &str)]) -> ModelUsage {
+        ModelUsage {
+            model: model.into(),
+            usage: entries
+                .iter()
+                .map(|(kind, value)| Entry {
+                    kind: (*kind).into(),
+                    amount: (*value).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// 月额120，最后一天120，之前每天明确零；数量/费用两侧完整且对齐。
+    pub(crate) fn complete_month(year: u32, month: u32, days: u32) -> (AmountResp, CostResp) {
+        let counts = vec![row(
+            "deepseek-flash",
+            &[
+                ("PROMPT_CACHE_HIT_TOKEN", "10"),
+                ("PROMPT_CACHE_MISS_TOKEN", "20"),
+                ("RESPONSE_TOKEN", "5"),
+                ("REQUEST", "1"),
+            ],
+        )];
+        let zero_counts = vec![row(
+            "deepseek-flash",
+            &[
+                ("PROMPT_CACHE_HIT_TOKEN", "0"),
+                ("PROMPT_CACHE_MISS_TOKEN", "0"),
+                ("RESPONSE_TOKEN", "0"),
+                ("REQUEST", "0"),
+            ],
+        )];
+        let costs = vec![row(
+            "deepseek-flash",
+            &[("REQUEST", "1"), ("RESPONSE_TOKEN", "120")],
+        )];
+        let zero_costs = vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0")])];
+        let amount = AmountResp {
+            data: AmountData {
+                biz_data: AmountBiz {
+                    total: counts.clone(),
+                    days: (1..=days)
+                        .map(|day| DayUsage {
+                            date: format!("{year:04}-{month:02}-{day:02}"),
+                            data: if day == days {
+                                counts.clone()
+                            } else {
+                                zero_counts.clone()
+                            },
+                        })
+                        .collect(),
+                },
+            },
+        };
+        let cost = CostResp {
+            data: CostData {
+                biz_data: vec![CostBiz {
+                    total: costs.clone(),
+                    days: (1..=days)
+                        .map(|day| DayUsage {
+                            date: format!("{year:04}-{month:02}-{day:02}"),
+                            data: if day == days {
+                                costs.clone()
+                            } else {
+                                zero_costs.clone()
+                            },
+                        })
+                        .collect(),
+                }],
+            },
+        };
+        (amount, cost)
+    }
+
+    pub(crate) fn period(year: u32, month: u32, instant: &str) -> UsagePeriod {
+        UsagePeriod::at(
+            year,
+            month,
+            instant.parse::<chrono::DateTime<chrono::Utc>>().unwrap(),
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::regression_samples::{complete_month, period, row};
     use super::*;
+
+    #[test]
+    fn r15_01_未来空日不改变当前质量且不伪装零() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for end in [10, 11, 30] {
+            for sides in [0, 1, 2] {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                for day in 11..=end {
+                    let empty = DayUsage {
+                        date: format!("2026-11-{day:02}"),
+                        data: vec![],
+                    };
+                    if sides != 1 {
+                        amount.data.biz_data.days.push(empty.clone());
+                    }
+                    if sides != 0 {
+                        cost.data.biz_data[0].days.push(empty);
+                    }
+                }
+                let result = build_usage_result_for_period(&amount, &cost, scope);
+                assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+                assert_eq!(result.month_cost, Some(120.0));
+                assert_eq!(result.days[9].total_cost, Some(120.0));
+                for day in result
+                    .days
+                    .iter()
+                    .filter(|day| day.date.as_str() > "2026-11-10")
+                {
+                    assert_eq!(day.total_cost, None);
+                    assert_eq!(day.total_tokens, None);
+                    assert!(day.raw_models.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r15_01_当前与过去缺日空日和单侧缺失仍然警告() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for day_index in [0, 8, 9] {
+            for mode in 0..4 {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                match mode {
+                    0 => {
+                        amount.data.biz_data.days.remove(day_index);
+                        cost.data.biz_data[0].days.remove(day_index);
+                    }
+                    1 => {
+                        amount.data.biz_data.days[day_index].data.clear();
+                        cost.data.biz_data[0].days[day_index].data.clear();
+                    }
+                    2 => {
+                        cost.data.biz_data[0].days[day_index].data.clear();
+                    }
+                    _ => {
+                        amount.data.biz_data.days[day_index].data.clear();
+                    }
+                }
+                let result = build_usage_result_for_period(&amount, &cost, scope);
+                assert!(!result.warnings.is_empty());
+                assert_eq!(result.month_cost, Some(120.0), "日缺失不清空可靠月额");
+            }
+        }
+    }
+
+    #[test]
+    fn r15_01_跨UTC8午夜旧范围不变_新请求纳入新一天() {
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        let empty = DayUsage {
+            date: "2026-11-11".into(),
+            data: vec![],
+        };
+        amount.data.biz_data.days.push(empty.clone());
+        cost.data.biz_data[0].days.push(empty);
+        let before = period(2026, 11, "2026-11-10T15:59:59Z");
+        let after = period(2026, 11, "2026-11-10T16:00:00Z");
+        assert!(build_usage_result_for_period(&amount, &cost, before)
+            .warnings
+            .is_empty());
+        assert!(!build_usage_result_for_period(&amount, &cost, after)
+            .warnings
+            .is_empty());
+        assert!(
+            build_usage_result_for_period(&amount, &cost, before)
+                .warnings
+                .is_empty(),
+            "旧请求不重读时钟"
+        );
+    }
+
+    #[test]
+    fn r15_01_历史月检查到月末_闰年与UTC8月界独立() {
+        for (year, month, days, instant) in [
+            (2026, 10, 31, "2026-10-31T15:59:59Z"),
+            (2026, 10, 31, "2026-10-31T16:00:00Z"),
+            (2026, 10, 31, "2026-11-10T04:00:00Z"),
+            (2028, 2, 29, "2028-03-01T04:00:00Z"),
+        ] {
+            let (mut amount, mut cost) = complete_month(year, month, days);
+            let scope = period(year, month, instant);
+            assert!(build_usage_result_for_period(&amount, &cost, scope)
+                .warnings
+                .is_empty());
+            amount.data.biz_data.days.pop();
+            cost.data.biz_data[0].days.pop();
+            assert!(!build_usage_result_for_period(&amount, &cost, scope)
+                .warnings
+                .is_empty());
+        }
+        assert!(UsagePeriod::at(2026, 12, "2026-11-10T04:00:00Z".parse().unwrap()).is_err());
+        assert!(UsagePeriod::at(2026, 13, "2026-11-10T04:00:00Z".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn r15_01_未来原始字段警告只在纳入范围后出现_坏日期仍拒绝() {
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        amount.data.biz_data.days.push(DayUsage {
+            date: "2026-11-11".into(),
+            data: vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "1.5")])],
+        });
+        cost.data.biz_data[0].days.push(DayUsage {
+            date: "2026-11-11".into(),
+            data: vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0")])],
+        });
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        let result = build_usage_result_for_period(&amount, &cost, scope);
+        assert!(result.warnings.is_empty());
+        assert!(
+            result.days[10].raw_models[0].data_warning.is_some(),
+            "原始证据仍保留"
+        );
+        assert!(!build_usage_result_for_period(
+            &amount,
+            &cost,
+            period(2026, 11, "2026-11-11T04:00:00Z")
+        )
+        .warnings
+        .is_empty());
+        for date in [
+            "2026-10-31",
+            "2026-12-01",
+            "2026-11-31",
+            "2026-11-1",
+            "bad-date",
+        ] {
+            amount.data.biz_data.days[10].date = date.into();
+            cost.data.biz_data[0].days[10].date = date.into();
+            assert!(
+                !build_usage_result_for_period(&amount, &cost, scope)
+                    .warnings
+                    .is_empty(),
+                "{date}"
+            );
+        }
+    }
+
+    #[test]
+    fn r15_03_双空月汇总未知_日历史有效金额与显式零保留() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for zero_day in [false, true] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total.clear();
+            cost.data.biz_data[0].total.clear();
+            if zero_day {
+                cost.data.biz_data[0].days[9].data =
+                    vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0")])];
+            }
+            let result = build_usage_result_for_period(&amount, &cost, scope);
+            assert_eq!(result.month_cost, None);
+            assert!(!result.warnings.is_empty());
+            assert!(result.raw_models.is_empty());
+            let expected = Some(if zero_day { 0.0 } else { 120.0 });
+            assert_eq!(result.days[9].total_cost, expected);
+            assert_eq!(result.days[9].raw_models[0].cost, expected);
+        }
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        amount.data.biz_data.total = amount.data.biz_data.days[0].data.clone();
+        amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+        cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+        cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+        let result = build_usage_result_for_period(&amount, &cost, scope);
+        assert_eq!(result.month_cost, Some(0.0));
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.days[9].total_cost, Some(0.0));
+    }
+
+    #[test]
+    fn r15_04_费用单行拆行反序与拆day等价_数量PROMPT不重计() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for mode in 0..4 {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount
+                .data
+                .biz_data
+                .total
+                .push(row("deepseek-flash", &[("PROMPT_TOKEN", "30")]));
+            amount.data.biz_data.days[9]
+                .data
+                .push(row("deepseek-flash", &[("PROMPT_TOKEN", "30")]));
+            let mut fragments = vec![
+                row("deepseek-flash", &[("REQUEST", "1")]),
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "120")]),
+                row("deepseek-flash", &[]),
+            ];
+            if mode >= 2 {
+                fragments.reverse();
+            }
+            if mode != 0 {
+                cost.data.biz_data[0].total = fragments.clone();
+                cost.data.biz_data[0].days[9].data = fragments.clone();
+            }
+            if mode == 3 {
+                cost.data.biz_data[0].days.pop();
+                cost.data.biz_data[0]
+                    .days
+                    .extend(fragments.into_iter().map(|row| DayUsage {
+                        date: "2026-11-10".into(),
+                        data: vec![row],
+                    }));
+            }
+            let result = build_usage_result_for_period(&amount, &cost, scope);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert_eq!(result.month_cost, Some(120.0));
+            assert_eq!(result.models[0].cost, Some(120.0));
+            assert_eq!(result.models[0].total_tokens, Some(35));
+            assert_eq!(result.days.len(), 10);
+            assert_eq!(result.days[9].total_cost, Some(120.0));
+            assert_eq!(result.days[9].total_tokens, Some(35));
+            for raw in [&result.raw_models[0], &result.days[9].raw_models[0]] {
+                assert_eq!(raw.cost, Some(120.0));
+                assert_eq!(raw.total_tokens, Some(35));
+                assert_eq!(raw.model, "deepseek-flash");
+            }
+        }
+    }
+
+    #[test]
+    fn r15_04_整个模型无金额或真实金额非法仍未知_别名不互相掩盖() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for entries in [
+            vec![],
+            vec![("REQUEST", "1")],
+            vec![("RESPONSE_TOKEN", "NaN")],
+            vec![("RESPONSE_TOKEN", "-1")],
+            vec![("RESPONSE_TOKEN", "")],
+        ] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            let fragments = vec![row("deepseek-flash", &[]), row("deepseek-flash", &entries)];
+            cost.data.biz_data[0].total = fragments.clone();
+            cost.data.biz_data[0].days[9].data = fragments;
+            let result = build_usage_result_for_period(&amount, &cost, scope);
+            assert_eq!(result.month_cost, None);
+            assert_eq!(result.models[0].cost, None);
+            assert_eq!(result.days[9].total_cost, None);
+            assert_eq!(result.raw_models[0].cost, None);
+            assert_eq!(result.days[9].raw_models[0].cost, None);
+            // 另一个原始别名缺费时，Flash 槽位和月/日不能只输出已知的120。
+            cost.data.biz_data[0].total = vec![
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "120")]),
+                row("deepseek-v4-flash", &entries),
+            ];
+            cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+            amount
+                .data
+                .biz_data
+                .total
+                .push(row("deepseek-v4-flash", &[("RESPONSE_TOKEN", "1")]));
+            amount.data.biz_data.days[9]
+                .data
+                .push(row("deepseek-v4-flash", &[("RESPONSE_TOKEN", "1")]));
+            let result = build_usage_result_for_period(&amount, &cost, scope);
+            assert_eq!(result.month_cost, None);
+            assert_eq!(result.models[0].cost, None);
+            assert_eq!(result.days[9].total_cost, None);
+            assert_eq!(result.raw_models[0].cost, Some(120.0));
+            assert_eq!(result.raw_models[1].cost, None);
+        }
+    }
 
     /// 同一合成响应同时经过月槽位、日汇总和原始模型三条展示路径。
     fn r14_response(amount_rows: serde_json::Value, cost_rows: serde_json::Value) -> UsageResult {

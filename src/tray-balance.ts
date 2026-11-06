@@ -7,82 +7,123 @@ type Transport = (
   command: string,
   args?: Record<string, unknown>,
 ) => Promise<unknown>;
+type RetryClock = {
+  setTimeout: (
+    callback: () => void,
+    delay: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+};
+const retryClock: RetryClock = {
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
 
-/** A renderer must acquire its own native epoch; local sequences never span reloads. */
+/**
+ * App cleanup must stop the old publisher before starting its replacement.
+ * An already-sent update has an older allocated epoch; a late begin response
+ * after stop never publishes. Native allocation alone does not change owner.
+ */
 export class TrayBalancePublisher {
   private transport: Transport;
+  private clock: RetryClock;
   private active = true;
-  private starting = false;
+  private running = false;
   private session: number | null = null;
-  /** 复评 N13：发布失败后的有界退避状态与唯一待重试 timer。 */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryGeneration = 0;
   private retryDelay = 0;
   private revision = 0;
+  private publishedRevision = 0;
   private latest: TrayBalance | null = null;
-  constructor(transport: Transport) {
+  constructor(transport: Transport, clock: RetryClock = retryClock) {
     this.transport = transport;
+    this.clock = clock;
   }
-  async start() {
-    if (!this.active || this.starting || this.session !== null) return;
-    this.starting = true;
-    try {
-      const session = await this.transport("begin_tray_balance_session");
-      if (
-        !this.active ||
-        typeof session !== "number" ||
-        !Number.isSafeInteger(session) ||
-        session <= 0
-      )
-        return;
-      this.session = session;
-      this.publish();
-    } catch {
-      // A later balance change retries initialization; no browser storage is needed.
-    } finally {
-      this.starting = false;
-    }
+  start() {
+    return this.ensureSessionAndPublish();
   }
   update(value: TrayBalance) {
     if (!this.active) return;
-    this.latest = value;
+    this.latest = { ...value };
     this.revision++;
-    if (this.session === null) void this.start();
-    else this.publish();
+    void this.ensureSessionAndPublish();
   }
   stop() {
     this.active = false;
-    // 复评 N13：销毁时取消待重试，不留 timer。
+    this.latest = null;
+    this.retryGeneration++;
     if (this.retryTimer !== null) {
-      clearTimeout(this.retryTimer);
+      this.clock.clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
   }
-  private publish() {
-    if (!this.active || this.session === null || !this.latest) return;
-    // 复评 N13：发布失败必须**重试**。旧实现 `.catch(() => undefined)` 直接吞掉
-    // 失败：原生 set_text/tooltip 一次失败后，若凭据已清除又没有新变化，
-    // 托盘会长期停留在旧金额且没有任何补救。
-    // 这里用单飞 + 有界退避 + 最新代际：成功才结束，失败按 1/2/4/8/16 秒
-    //（上限 30 秒）重试；期间有更新的发布则用最新值重试，旧值不覆盖新值。
-    const revision = this.revision;
-    void this.transport("update_tray_balance", {
-      session: this.session,
-      revision,
-      ...this.latest,
-    })
-      .then(() => {
-        if (revision === this.revision) this.retryDelay = 0;
-      })
-      .catch(() => this.scheduleRetry());
+  private async ensureSessionAndPublish() {
+    // 握手与发布共用单飞和唯一退避 timer。update 只替换待发布快照，
+    // 不绕过失败退避，也不会在旧请求尚未完成时并发发布。
+    if (!this.active || this.running || this.retryTimer !== null) return;
+    this.running = true;
+    try {
+      if (this.session === null) {
+        const session = await this.transport("begin_tray_balance_session");
+        if (!this.active) return;
+        if (
+          typeof session !== "number" ||
+          !Number.isSafeInteger(session) ||
+          session <= 0
+        ) {
+          throw new Error("托盘会话不可用");
+        }
+        this.session = session;
+        this.retryDelay = 0;
+        // begin 只分配 epoch，不再修改原生 owner。尚无余额时也必须通过
+        // 首次发布 null 初始化托盘，只有仍存活的实例才能提交这个 epoch。
+        if (this.latest === null) {
+          this.latest = { total: null, currency: null, stale: false };
+          this.revision++;
+        }
+      }
+      while (
+        this.active &&
+        this.latest !== null &&
+        this.publishedRevision < this.revision
+      ) {
+        const revision = this.revision;
+        const accepted = await this.transport("update_tray_balance", {
+          session: this.session,
+          revision,
+          ...this.latest,
+        });
+        if (!this.active) return;
+        if (accepted === false) {
+          // 原生已由较新 epoch 接管。旧实例不能重新握手争夺 owner。
+          this.stop();
+          return;
+        }
+        if (accepted !== true) throw new Error("托盘发布确认不可用");
+        // 成功只确认实际发送的代际。在途期间的新值（包括清 Key 的 null）
+        // 继续由这个循环发送；失败后的 timer 同样只读取最新快照。
+        this.publishedRevision = revision;
+        this.retryDelay = 0;
+      }
+    } catch {
+      // 没有 session 时重试握手；菜单/tooltip 的初始化同样走首次发布。
+      // 已有 session 时重发最新 revision；不依赖下一次外部 update。
+      this.scheduleRetry();
+    } finally {
+      this.running = false;
+    }
   }
   private scheduleRetry() {
     if (!this.active || this.retryTimer !== null) return;
-    // 有界退避：1s 起，逐次翻倍，上限 30s。持续失败只保留一个 timer。
+    // 持续失败按 1/2/4/8/16/30 秒退避，之后保持 30 秒，直到恢复或 stop。
     this.retryDelay =
       this.retryDelay === 0 ? 1000 : Math.min(this.retryDelay * 2, 30_000);
-    this.retryTimer = setTimeout(() => {
+    const generation = ++this.retryGeneration;
+    this.retryTimer = this.clock.setTimeout(() => {
+      if (!this.active || generation !== this.retryGeneration) return;
       this.retryTimer = null;
-      this.publish();
+      void this.ensureSessionAndPublish();
     }, this.retryDelay);
   }
 }

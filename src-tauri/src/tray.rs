@@ -20,18 +20,19 @@ struct TrayOverview {
 }
 #[derive(Default)]
 struct BalanceOrder {
+    allocated_session: u64,
     session: u64,
     revision: u64,
 }
 impl BalanceOrder {
-    fn begin(&mut self, clear: impl FnOnce() -> Result<(), String>) -> Result<u64, String> {
+    fn begin(&mut self) -> Result<u64, String> {
         let next = self
-            .session
+            .allocated_session
             .checked_add(1)
             .ok_or("托盘会话已耗尽，请重启应用")?;
-        clear()?;
-        self.session = next;
-        self.revision = 0;
+        // 分配不等于激活：已卸载 renderer 的 begin 即使迟到入场，
+        // 也不能清空托盘或使当前 owner 失效。首次成功 update 才接管。
+        self.allocated_session = next;
         Ok(next)
     }
     fn update(
@@ -39,13 +40,24 @@ impl BalanceOrder {
         session: u64,
         revision: u64,
         apply: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
-        if session == 0 || session != self.session || revision <= self.revision {
-            return Ok(());
+    ) -> Result<bool, String> {
+        // true = 已应用或同 owner 的幂等确认；false = 无效/被新 owner 取代。
+        // 原生菜单与 tooltip 都成功才推进 owner 和 revision，失败允许原代际重试。
+        if session == 0
+            || session > self.allocated_session
+            || session < self.session
+            || revision == 0
+        {
+            return Ok(false);
+        }
+        if session == self.session && revision <= self.revision {
+            // 同会话重试已提交的 revision 是幂等成功，不误报被新 owner 取代。
+            return Ok(true);
         }
         apply()?;
+        self.session = session;
         self.revision = revision;
-        Ok(())
+        Ok(true)
     }
 }
 fn set_balance_caption(
@@ -66,7 +78,7 @@ fn set_balance_caption(
 pub(crate) fn begin_balance_session(app: &tauri::AppHandle) -> Result<u64, String> {
     let overview = app.try_state::<TrayOverview>().ok_or("托盘尚未就绪")?;
     let mut order = overview.order.lock().map_err(|_| "托盘状态不可用")?;
-    order.begin(|| set_balance_caption(app, &overview, "余额：尚未取得"))
+    order.begin()
 }
 pub fn balance_caption(
     total: Option<&str>,
@@ -97,7 +109,7 @@ pub(crate) fn update_balance(
     total: Option<&str>,
     currency: Option<&str>,
     stale: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let caption = balance_caption(total, currency, stale)?;
     let overview = app.try_state::<TrayOverview>().ok_or("托盘尚未就绪")?;
     let mut order = overview.order.lock().map_err(|_| "托盘状态不可用")?;
@@ -355,49 +367,128 @@ mod overview_tests {
     fn reload_accepts_new_session_clear_and_rejects_old_or_out_of_order_updates() {
         let mut order = BalanceOrder::default();
         let mut caption = String::new();
-        let old = order.begin(|| Ok(())).unwrap();
-        order
+        let old = order.begin().unwrap();
+        assert!(order
             .update(old, 40, || {
                 caption = "old".into();
                 Ok(())
             })
-            .unwrap();
-        let current = order
-            .begin(|| {
-                caption.clear();
-                Ok(())
-            })
-            .unwrap();
-        order
+            .unwrap());
+        let current = order.begin().unwrap();
+        assert_eq!(caption, "old", "分配 epoch 不改变已提交的托盘内容");
+        assert!(order
             .update(current, 1, || {
                 caption = "new".into();
                 Ok(())
             })
-            .unwrap();
-        order
+            .unwrap());
+        assert!(order
             .update(current, 2, || {
                 caption.clear();
                 Ok(())
             })
-            .unwrap();
-        for (session, revision) in [(old, 100), (current, 1), (0, 100), (current + 1, 100)] {
-            order
+            .unwrap());
+        for (session, revision) in [(old, 100), (0, 100), (current + 1, 100), (current, 0)] {
+            assert!(!order
                 .update(session, revision, || panic!("obsolete update applied"))
-                .unwrap();
+                .unwrap());
+        }
+        for revision in [1, 2] {
+            assert!(order
+                .update(current, revision, || panic!("duplicate update applied"))
+                .unwrap());
         }
         assert!(caption.is_empty());
         assert!(order
             .update(current, 3, || Err("native failure".into()))
             .is_err());
-        order
+        assert_eq!(order.revision, 2);
+        assert!(order
             .update(current, 3, || {
                 caption = "retry".into();
                 Ok(())
             })
-            .unwrap();
+            .unwrap());
         assert_eq!(caption, "retry");
-        assert!(order.begin(|| Err("clear failed".into())).is_err());
         assert_eq!(order.session, current);
+    }
+    #[test]
+    fn stopped_renderer_late_begin_only_reserves_and_does_not_supersede_current_owner() {
+        let mut order = BalanceOrder::default();
+        let current = order.begin().unwrap();
+        let mut caption = "unknown";
+        assert!(order
+            .update(current, 1, || {
+                caption = "current";
+                Ok(())
+            })
+            .unwrap());
+        // 旧 renderer 的 begin 命令本体现在才入场。前端 stop 会拒绝它的
+        // 迟到回执，因此只留一个未激活的预留 epoch，不清空新 owner。
+        let orphan = order.begin().unwrap();
+        assert!(orphan > current);
+        assert_eq!(order.allocated_session, orphan);
+        assert_eq!(order.session, current);
+        assert_eq!(order.revision, 1);
+        assert_eq!(caption, "current");
+        assert!(order
+            .update(current, 2, || {
+                caption = "cleared";
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(caption, "cleared");
+    }
+    #[test]
+    fn first_publication_partial_failure_retries_same_epoch_and_revision() {
+        let mut order = BalanceOrder::default();
+        let old = order.begin().unwrap();
+        assert!(order.update(old, 9, || Ok(())).unwrap());
+        let current = order.begin().unwrap();
+        let mut caption = "old";
+        let mut tooltip = "old";
+        assert!(order
+            .update(current, 1, || {
+                caption = "cleared";
+                Err("tooltip failed".into())
+            })
+            .is_err());
+        assert_eq!(caption, "cleared");
+        assert_eq!(tooltip, "old");
+        assert_eq!(order.session, old);
+        assert_eq!(order.revision, 9);
+        assert!(order
+            .update(current, 1, || {
+                caption = "cleared";
+                tooltip = "cleared";
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(caption, "cleared");
+        assert_eq!(tooltip, "cleared");
+        assert_eq!(order.session, current);
+        assert_eq!(order.revision, 1);
+        assert!(!order
+            .update(old, 10, || panic!("old owner restored after clear"))
+            .unwrap());
+    }
+    #[test]
+    fn allocated_epoch_must_publish_positive_revision_and_counter_exhaustion_preserves_owner() {
+        let mut order = BalanceOrder::default();
+        let session = order.begin().unwrap();
+        assert!(!order
+            .update(session, 0, || panic!("zero revision applied"))
+            .unwrap());
+        assert!(!order
+            .update(session + 1, 1, || panic!("unallocated epoch applied"))
+            .unwrap());
+        assert_eq!(order.session, 0);
+        assert!(order.update(session, 1, || Ok(())).unwrap());
+        order.allocated_session = u64::MAX;
+        assert!(order.begin().is_err());
+        assert_eq!(order.session, session);
+        assert_eq!(order.revision, 1);
+        assert!(order.update(session, 2, || Ok(())).unwrap());
     }
     #[test]
     fn 托盘标明最近成功与旧数据_清除不遗留数字() {

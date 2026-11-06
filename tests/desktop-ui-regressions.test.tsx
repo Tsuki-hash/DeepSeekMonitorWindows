@@ -6,7 +6,8 @@ import { readFileSync } from "node:fs";
 import { App } from "../src/App";
 import { DashboardPanel } from "../src/components/DashboardPanel";
 import { AlertSettings } from "../src/components/AlertSettings";
-import { setCommittedConfig } from "../src/config-store";
+import { SettingsPanel } from "../src/components/SettingsPanel";
+import { getCommittedConfig, setCommittedConfig } from "../src/config-store";
 import { invalidateUsageRequests } from "../src/usage-api";
 
 // Synthetic IPC and renderer checks only. They do not measure native Windows
@@ -115,6 +116,8 @@ g.__settingsIpc = async (command, args) => {
       return usage;
     case "begin_tray_balance_session":
       return 1;
+    case "update_tray_balance":
+      return true;
     case "is_main_window_visible":
       return true;
     case "get_desktop_options":
@@ -336,6 +339,313 @@ scenario(
       1,
     );
     assert.ok(text().includes("合成配置无权限"));
+  },
+);
+
+for (const configured of [false, true]) {
+  scenario(
+    `R15-07: settings rereads repaired ${configured ? "configured" : "empty"} config without submitting drafts`,
+    async (concurrent) => {
+      config = baseConfig({
+        apiKeyConfigured: false,
+        usageTokenConfigured: false,
+        configReadError: "synthetic unreadable config",
+      });
+      await mount(<App />, concurrent);
+      await click(button("打开设置"));
+      await change("API Key", "SYNTHETIC_UNSAVED_KEY");
+      await click(button("方式二：手动粘贴 token"));
+      await change("用量 Token", "SYNTHETIC_UNSAVED_TOKEN");
+      await change("余额提醒线", "22");
+      const beforeReads = submitted("get_app_config").length;
+      const beforeBalance = submitted("fetch_balance").length;
+      const beforeUsage = submitted("fetch_usage").length;
+      const keyRevision = config.apiKeyRevision;
+      const tokenRevision = config.usageTokenRevision;
+      config = {
+        ...config,
+        configRevision: ++revision,
+        configReadError: null,
+        // Empty recovery deliberately keeps both credential revisions the same.
+        apiKeyRevision: configured ? revision : keyRevision,
+        usageTokenRevision: configured ? revision : tokenRevision,
+        apiKeyConfigured: configured,
+        usageTokenConfigured: configured,
+      };
+      await click(button("重新读取配置"));
+      assert.equal(submitted("get_app_config").length, beforeReads + 1);
+      const settings = renderer.root.findByType(SettingsPanel).props;
+      assert.equal(settings.balanceState, configured ? "ok" : "nokey");
+      assert.equal(settings.usageState, configured ? "ok" : "nokey");
+      assert.equal(settings.balanceError, "");
+      assert.equal(settings.usageError, configured ? "" : "未配置用量 Token");
+      assert.equal(text().includes("synthetic unreadable config"), false);
+      assert.equal(
+        submitted("fetch_balance").length,
+        beforeBalance + Number(configured),
+      );
+      assert.equal(
+        submitted("fetch_usage").length,
+        beforeUsage + Number(configured),
+      );
+      assert.equal(input("API Key").props.value, "SYNTHETIC_UNSAVED_KEY");
+      assert.equal(input("用量 Token").props.value, "SYNTHETIC_UNSAVED_TOKEN");
+      assert.equal(input("余额提醒线").props.value, "22");
+      assert.equal(submitted("save_api_key").length, 0);
+      assert.equal(submitted("save_usage_token").length, 0);
+      assert.equal(submitted("save_alert_options").length, 0);
+      if (!configured) {
+        assert.equal(getCommittedConfig()?.apiKeyRevision, keyRevision);
+        assert.equal(getCommittedConfig()?.usageTokenRevision, tokenRevision);
+      }
+    },
+  );
+}
+
+scenario(
+  "R15-07: one retry owner preserves bad config and releases after read rejection",
+  async (concurrent) => {
+    config = baseConfig({
+      apiKeyConfigured: false,
+      usageTokenConfigured: false,
+      configReadError: "synthetic config remains unreadable",
+    });
+    await mount(<App />, concurrent);
+    await click(button("打开设置"));
+    await change("API Key", "SYNTHETIC_DRAFT");
+    const beforeReads = submitted("get_app_config").length;
+    const beforeFetches =
+      submitted("fetch_balance").length + submitted("fetch_usage").length;
+    const firstRead = deferred();
+    handlers.get_app_config = () => firstRead.promise;
+    const retry = button("重新读取配置").props.onClick;
+    await act(async () => {
+      retry();
+      retry();
+    });
+    await flush();
+    assert.equal(submitted("get_app_config").length, beforeReads + 1);
+    assert.equal(button("读取中…").props.disabled, true);
+    await act(async () => firstRead.resolve({ ...config }));
+    await flush();
+    assert.ok(text().includes(config.configReadError));
+    assert.equal(button("重新读取配置").props.disabled, false);
+    assert.equal(
+      submitted("fetch_balance").length + submitted("fetch_usage").length,
+      beforeFetches,
+    );
+    handlers.get_app_config = () =>
+      Promise.reject(new Error("synthetic IPC read failure"));
+    await click(button("重新读取配置"));
+    assert.equal(button("重新读取配置").props.disabled, false);
+    assert.ok(text().includes(config.configReadError));
+    assert.ok(text().includes("重新读取配置失败，请重试"));
+    assert.equal(input("API Key").props.value, "SYNTHETIC_DRAFT");
+    assert.equal(submitted("save_api_key").length, 0);
+    assert.equal(
+      submitted("fetch_balance").length + submitted("fetch_usage").length,
+      beforeFetches,
+    );
+    // Recovery arriving AFTER the failed retry must clear its local read error too.
+    config = baseConfig();
+    await emit("credential-config-changed", config);
+    assert.equal(text().includes("重新读取配置失败，请重试"), false);
+    assert.equal(text().includes("synthetic config remains unreadable"), false);
+    assert.equal(input("API Key").props.value, "SYNTHETIC_DRAFT");
+  },
+);
+
+for (const lateFailure of [false, true]) {
+  scenario(
+    `R15-07: late retry ${lateFailure ? "rejection" : "response"} cannot overwrite a newer committed account`,
+    async (concurrent) => {
+      config = baseConfig({
+        apiKeyConfigured: false,
+        usageTokenConfigured: false,
+        configReadError: "synthetic stale config error",
+      });
+      await mount(<App />, concurrent);
+      await click(button("打开设置"));
+      await change("API Key", "SYNTHETIC_KEEP_DRAFT");
+      const stale = { ...config };
+      const pending = deferred();
+      handlers.get_app_config = () => pending.promise;
+      await click(button("重新读取配置"));
+      config = baseConfig();
+      await emit("credential-config-changed", config);
+      await act(async () => {
+        if (lateFailure)
+          pending.reject(new Error("synthetic stale IPC failure"));
+        else pending.resolve(stale);
+      });
+      await flush();
+      assert.equal(getCommittedConfig()?.configRevision, config.configRevision);
+      const settings = renderer.root.findByType(SettingsPanel).props;
+      assert.equal(settings.balanceState, "ok");
+      assert.equal(settings.usageState, "ok");
+      assert.equal(settings.balanceError, "");
+      assert.equal(settings.usageError, "");
+      assert.equal(text().includes(stale.configReadError), false);
+      assert.equal(text().includes("重新读取配置失败，请重试"), false);
+      assert.equal(input("API Key").props.value, "SYNTHETIC_KEEP_DRAFT");
+      assert.equal(submitted("save_api_key").length, 0);
+    },
+  );
+}
+
+for (const recovery of ["retry read", "commit event"]) {
+  scenario(
+    `R15-07: a late mount read rejection cannot replace status recovered by ${recovery}`,
+    async (concurrent) => {
+      config = baseConfig({
+        apiKeyConfigured: false,
+        usageTokenConfigured: false,
+        configReadError: "synthetic broken config before mounting settings",
+      });
+      await mount(<App />, concurrent);
+      const mountRead = deferred();
+      handlers.get_app_config = () => mountRead.promise;
+      const beforeMountReads = submitted("get_app_config").length;
+      await click(button("打开设置"));
+      assert.equal(submitted("get_app_config").length, beforeMountReads + 1);
+      await change("API Key", "SYNTHETIC_KEEP_MOUNT_DRAFT");
+      await click(button("方式二：手动粘贴 token"));
+      await change("用量 Token", "SYNTHETIC_KEEP_MOUNT_TOKEN");
+      config = baseConfig();
+      if (recovery === "retry read") {
+        handlers.get_app_config = () => ({ ...config });
+        await click(button("重新读取配置"));
+        assert.equal(submitted("get_app_config").length, beforeMountReads + 2);
+      } else {
+        await emit("credential-config-changed", config);
+      }
+      assert.ok(text().includes(`已配置 ${config.apiKeyPreview}`));
+      assert.ok(text().includes("用量 Token 已配置"));
+      await act(async () =>
+        mountRead.reject(new Error("synthetic obsolete mount read failure")),
+      );
+      await flush();
+      assert.equal(
+        text().includes("synthetic obsolete mount read failure"),
+        false,
+      );
+      assert.ok(text().includes(`已配置 ${config.apiKeyPreview}`));
+      assert.ok(text().includes("用量 Token 已配置"));
+      const settings = renderer.root.findByType(SettingsPanel).props;
+      assert.equal(settings.balanceState, "ok");
+      assert.equal(settings.usageState, "ok");
+      assert.equal(settings.balanceError, "");
+      assert.equal(settings.usageError, "");
+      assert.equal(getCommittedConfig()?.configRevision, config.configRevision);
+      assert.equal(input("API Key").props.value, "SYNTHETIC_KEEP_MOUNT_DRAFT");
+      assert.equal(
+        input("用量 Token").props.value,
+        "SYNTHETIC_KEEP_MOUNT_TOKEN",
+      );
+      assert.equal(submitted("save_api_key").length, 0);
+      assert.equal(submitted("save_usage_token").length, 0);
+    },
+  );
+}
+
+for (const operationState of ["pending", "failed"]) {
+  for (const mountOutcome of ["resolve", "reject"]) {
+    scenario(
+      `R15-07: old mount ${mountOutcome} preserves ${operationState} candidate Key feedback`,
+      async (concurrent) => {
+        await mount(<App />, concurrent);
+        const accepted = getCommittedConfig();
+        const mountRead = deferred();
+        handlers.get_app_config = () => mountRead.promise;
+        await click(input("设置"));
+        await change("API Key", "SYNTHETIC_FAILED_CANDIDATE");
+        const candidate = deferred();
+        handlers.save_api_key = () => candidate.promise;
+        await click(button("验证并保存"));
+        assert.ok(text().includes("正在验证 API Key…"));
+        if (operationState === "failed") {
+          await act(async () =>
+            candidate.reject(
+              new Error("synthetic candidate Key verification failure"),
+            ),
+          );
+          await flush();
+        }
+        const expected =
+          operationState === "failed"
+            ? "synthetic candidate Key verification failure"
+            : "正在验证 API Key…";
+        assert.ok(text().includes(expected));
+        await act(async () => {
+          if (mountOutcome === "resolve") mountRead.resolve({ ...config });
+          else
+            mountRead.reject(
+              new Error("synthetic obsolete same-version read failure"),
+            );
+        });
+        await flush();
+        assert.ok(text().includes(expected));
+        assert.equal(
+          text().includes("synthetic obsolete same-version read failure"),
+          false,
+        );
+        assert.equal(
+          input("API Key").props.value,
+          "SYNTHETIC_FAILED_CANDIDATE",
+        );
+        assert.equal(getCommittedConfig(), accepted);
+        assert.equal(
+          renderer.root.findByType(SettingsPanel).props.balanceState,
+          "ok",
+        );
+        assert.equal(submitted("save_api_key").length, 1);
+        if (operationState === "pending") {
+          await act(async () =>
+            candidate.reject(
+              new Error("synthetic candidate Key verification failure"),
+            ),
+          );
+          await flush();
+          assert.ok(
+            text().includes("synthetic candidate Key verification failure"),
+          );
+        }
+      },
+    );
+  }
+}
+
+scenario(
+  "R15-07: a real unreadable snapshot still supersedes candidate Key feedback",
+  async (concurrent) => {
+    await mount(<App />, concurrent);
+    const mountRead = deferred();
+    handlers.get_app_config = () => mountRead.promise;
+    await click(input("设置"));
+    await change("API Key", "SYNTHETIC_KEEP_BAD_CANDIDATE");
+    handlers.save_api_key = () =>
+      Promise.reject(new Error("synthetic candidate Key verification failure"));
+    await click(button("验证并保存"));
+    assert.ok(text().includes("synthetic candidate Key verification failure"));
+    config = baseConfig({
+      apiKeyConfigured: false,
+      usageTokenConfigured: false,
+      configReadError: "synthetic authoritative config read error",
+    });
+    await act(async () => mountRead.resolve({ ...config }));
+    await flush();
+    assert.ok(text().includes(config.configReadError));
+    assert.equal(
+      text().includes("synthetic candidate Key verification failure"),
+      false,
+    );
+    assert.equal(getCommittedConfig()?.configRevision, config.configRevision);
+    const settings = renderer.root.findByType(SettingsPanel).props;
+    assert.equal(settings.balanceState, "error");
+    assert.equal(settings.usageState, "error");
+    assert.equal(settings.balanceError, config.configReadError);
+    assert.equal(settings.usageError, config.configReadError);
+    assert.equal(input("API Key").props.value, "SYNTHETIC_KEEP_BAD_CANDIDATE");
   },
 );
 

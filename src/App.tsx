@@ -475,16 +475,34 @@ function App() {
   // one owner above; neither a stale GET nor its failure may reset them.
   const reloadConfig = React.useCallback(() => {
     const startedAt = getCommitRevision();
+    const snapshotAtStart = getCommittedConfig();
     return invoke<AppConfig>("get_app_config")
       .then((config) => {
         applyReadConfig(config, startedAt);
         return getCommittedConfig();
       })
-      .catch(() => null);
+      .catch(() =>
+        // A late read failure owns neither a newer commit nor another accepted
+        // read. In either case the current snapshot remains the result.
+        getCommitRevision() !== startedAt ||
+        getCommittedConfig() !== snapshotAtStart
+          ? getCommittedConfig()
+          : null,
+      );
   }, []);
   React.useEffect(() => {
     void reloadConfig();
   }, [reloadConfig]);
+  const retrySettingsUpdate = React.useCallback(async () => {
+    if (getCommittedConfig()?.configReadError) {
+      // The unreadable snapshot intentionally blocks account fetches. Reread it
+      // first; the store subscriber owns recovery and any credential refreshes,
+      // including trusted-empty recovery with unchanged credential revisions.
+      if (!(await reloadConfig())) throw new Error("重新读取配置失败，请重试");
+      return;
+    }
+    await refreshAll(true);
+  }, [reloadConfig, refreshAll]);
 
   // 面板是否可见。窗口隐藏不会卸载 WebView，所以自动刷新定时器必须靠这个状态显式暂停，
   // 否则面板整天收在托盘里也会按时打接口。该状态由 Rust 侧在显隐时发的事件驱动
@@ -835,7 +853,7 @@ function App() {
           usageState={usageState}
           balanceErrorCode={balanceErrorCode}
           usageErrorCode={usageErrorCode}
-          onRetry={() => refreshAll(true)}
+          onRetry={retrySettingsUpdate}
           balanceUpdatedAt={balanceUpdatedAt}
           usageUpdatedAt={usageUpdatedAt}
           balanceError={balanceError}

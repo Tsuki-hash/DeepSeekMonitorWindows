@@ -23,7 +23,43 @@ pub struct SyncSession(Mutex<SessionState>);
 
 /// API Key 操作使用独立会话，不能与网页登录的取消/清理相互作废。
 #[derive(Default)]
-pub struct ApiKeySession(pub SyncSession);
+pub struct ApiKeySession(SyncSession);
+
+impl ApiKeySession {
+    /// Use the same tombstone protocol as Token sync, but on a separate lock and
+    /// request set. A delayed Key command cannot invalidate a newer Key owner or
+    /// close/cancel the platform login window.
+    pub fn begin(
+        &self,
+        request_id: String,
+        superseded_request_ids: &[String],
+    ) -> Result<u64, String> {
+        self.0
+            .begin_usage(
+                request_id,
+                superseded_request_ids,
+                UsageSyncKind::Manual,
+                || (),
+            )
+            .map(|status| status.generation)
+    }
+
+    pub fn commit<T>(
+        &self,
+        generation: u64,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.0.commit(generation, action)
+    }
+
+    pub fn clear<T>(
+        &self,
+        cancelled_request_ids: &[String],
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.0.clear_usage(cancelled_request_ids, action)
+    }
+}
 
 #[derive(Default)]
 struct SessionState {
@@ -508,27 +544,30 @@ mod tests {
         let key = ApiKeySession::default();
         let usage = SyncSession::default();
         let usage_generation = usage.begin().unwrap();
-        let old = key.0.begin().unwrap();
+        let old = key.begin("old-key".into(), &[]).unwrap();
         let mut stored = Some("original");
-        key.0.cancel(|| stored = None);
+        key.clear(&[], || {
+            stored = None;
+            Ok(())
+        })
+        .unwrap();
         assert!(key
-            .0
             .commit(old, || {
                 stored = Some("late");
                 Ok(())
             })
             .is_err());
         assert_eq!(stored, None);
-        let first = key.0.begin().unwrap();
-        let second = key.0.begin().unwrap();
-        key.0
-            .commit(second, || {
-                stored = Some("new");
-                Ok(())
-            })
+        let first = key.begin("first-key".into(), &[]).unwrap();
+        let second = key
+            .begin("second-key".into(), &["first-key".into()])
             .unwrap();
+        key.commit(second, || {
+            stored = Some("new");
+            Ok(())
+        })
+        .unwrap();
         assert!(key
-            .0
             .commit(first, || {
                 stored = Some("old");
                 Ok(())
@@ -536,6 +575,76 @@ mod tests {
             .is_err());
         assert_eq!(stored, Some("new"));
         assert!(usage.is_current(usage_generation));
+    }
+
+    #[test]
+    fn r15_key_clear_revokes_all_queued_saves_in_every_admission_order() {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let key = ApiKeySession::default();
+            let token = SyncSession::default();
+            let login = token
+                .begin_usage("web-owner".into(), &[], UsageSyncKind::Web, || ())
+                .unwrap();
+            let ids = ["old-key".to_string(), "replacement-key".to_string()];
+            let mut stored = Some("original-key");
+            let mut admitted = Vec::new();
+            for operation in order {
+                if operation == 2 {
+                    key.clear(&ids, || {
+                        stored = None;
+                        Ok(())
+                    })
+                    .unwrap();
+                } else if let Ok(generation) = key.begin(ids[operation].clone(), &ids[..operation])
+                {
+                    admitted.push(generation);
+                }
+            }
+            for generation in admitted {
+                assert!(key
+                    .commit::<()>(generation, || panic!("old key must not reach persistence"))
+                    .is_err());
+            }
+            for request in &ids {
+                assert!(key.begin(request.clone(), &[]).is_err());
+            }
+            assert_eq!(stored, None);
+            let latest = key.begin("explicit-new-key".into(), &[]).unwrap();
+            // Old replay carries its own supersession list. Reject it before
+            // touching the new owner, not just before writing the old value.
+            assert!(key.begin(ids[1].clone(), &ids[..1]).is_err());
+            key.commit(latest, || {
+                stored = Some("new-key");
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(stored, Some("new-key"));
+            assert!(token.is_current(login.generation));
+        }
+    }
+
+    #[test]
+    fn r15_failed_key_clear_keeps_revocation_and_allows_explicit_retry() {
+        let key = ApiKeySession::default();
+        let old = key.begin("entered-key".into(), &[]).unwrap();
+        let result = key.clear::<()>(
+            &["queued-key".into()],
+            || Err("synthetic disk error".into()),
+        );
+        assert_eq!(result.unwrap_err(), "synthetic disk error");
+        assert!(key.begin("queued-key".into(), &[]).is_err());
+        assert!(key
+            .commit::<()>(old, || panic!("failed clear still invalidates old save"))
+            .is_err());
+        let new = key.begin("explicit-retry".into(), &[]).unwrap();
+        assert!(key.commit(new, || Ok(())).is_ok());
     }
 
     #[test]
