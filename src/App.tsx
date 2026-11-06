@@ -18,6 +18,7 @@ import { errorInfo } from "./error-state";
 import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
 import { msUntilNextAccountingDate } from "./accounting-clock";
 import { balancePublishable } from "./refresh-policy";
+import { useChannelScheduler } from "./use-channel-scheduler";
 import {
   initialChannelState,
   onChannelFailure,
@@ -38,6 +39,7 @@ import { panelModeLabel, suggestedMode } from "./panel-mode";
 import type { PanelMode } from "./panel-mode";
 import { Maximize2, Minimize2 } from "lucide-react";
 import { attemptLeave, resolveLeave, useLeaveGuard } from "./leave-guard";
+import { LeaveDecisions } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
 import { draftGuardActions, draftGuardText } from "./draft-guard";
 
@@ -45,6 +47,10 @@ import { draftGuardActions, draftGuardText } from "./draft-guard";
 
 function App() {
   const [showDataNotices, setShowDataNotices] = React.useState(false);
+  // 复评 R16：设置页需要定位到用量 Token 区块时由这里指定。
+  const [settingsTarget, setSettingsTarget] = React.useState<
+    "usageToken" | null
+  >(null);
   const [view, setView] = React.useState<ViewName>("dashboard");
   // 全局离开拦截（复评 F09）：任何导航出口都先问 blocker，草稿不再被静默丢弃。
   const { blocker: leaveBlocker, register: registerLeaveBlocker } =
@@ -53,6 +59,10 @@ function App() {
     action: () => void;
     subject: string;
   } | null>(null);
+  // 复评 R08：保存是异步的，用户可能在途中取消或连点。
+  // 用代际令牌确保只有最新决策能执行导航，且保存中禁用按钮。
+  const leaveDecisions = React.useRef(new LeaveDecisions());
+  const [leaveSubmitting, setLeaveSubmitting] = React.useState(false);
   const [model, setModel] = React.useState<ModelName>("flash");
 
   const [balance, setBalance] = React.useState<BalanceData | null>(null);
@@ -104,8 +114,11 @@ function App() {
     refreshIntervalRef.current = refreshIntervalSeconds;
   }, [refreshIntervalSeconds]);
   const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(false);
-  // 通道状态（暂停/退避）变化时递增，用于重建调度链。
-  const [scheduleRevision, setScheduleRevision] = React.useState(0);
+  // 每通道独立的状态版本（复评 R01）：一个通道的变化不得重排另一个通道。
+  const [channelRevision, setChannelRevision] = React.useState({
+    balance: 0,
+    usage: 0,
+  });
 
   // silent=true 表示后台刷新：已有数据时保留旧值，不再把面板打回「查询中…」骨架，
   // 否则开启 1 分钟自动刷新后会周期性闪烁。若当前没有可用数据（首次或上次失败），
@@ -123,8 +136,11 @@ function App() {
   const applyChannel = React.useCallback(
     (name: "balance" | "usage", next: ChannelState) => {
       channels.current[name] = next;
-      // 通道状态变化后重启调度，让新的延迟立即生效。
-      setScheduleRevision((value) => value + 1);
+      // 只递增本通道的版本：另一通道的 timer 与截止时间保持不变。
+      setChannelRevision((value) => ({
+        ...value,
+        [name]: value[name] + 1,
+      }));
     },
     [],
   );
@@ -304,13 +320,30 @@ function App() {
     void reloadConfig();
   }, [reloadConfig]);
 
-  // 本地统计是否开启：引导卡与历史页都要用真实状态，不能写死 false。
+  // 本地统计是否开启（复评 R09）：引导卡与历史页都要用真实状态。
+  // 原实现只在启动时读一次，用户在同会话里启停本地采集后引导仍显示旧状态。
+  // 现在封装成可重读函数，并在进入首页/Agent 页时刷新（开关就在这些页面上）。
   const [localEnabled, setLocalEnabled] = React.useState(false);
-  React.useEffect(() => {
-    void invoke<{ enabled: boolean }>("get_local_usage")
-      .then((status) => setLocalEnabled(status.enabled === true))
-      .catch(() => undefined);
+  const [localStatusLoaded, setLocalStatusLoaded] = React.useState(false);
+  const reloadLocalStatus = React.useCallback(() => {
+    return invoke<{ enabled: boolean }>("get_local_usage")
+      .then((status) => {
+        setLocalEnabled(status.enabled === true);
+        setLocalStatusLoaded(true);
+        return status.enabled === true;
+      })
+      .catch(() => {
+        setLocalStatusLoaded(true);
+        return null;
+      });
   }, []);
+  React.useEffect(() => {
+    void reloadLocalStatus();
+  }, [reloadLocalStatus]);
+  // 每次回到首页或 Agent 页都重新读取：这两个页面可能刚改过开关。
+  React.useEffect(() => {
+    if (view === "dashboard" || view === "local") void reloadLocalStatus();
+  }, [reloadLocalStatus, view]);
 
   // 面板是否可见。窗口隐藏不会卸载 WebView，所以自动刷新定时器必须靠这个状态显式暂停，
   // 否则面板整天收在托盘里也会按时打接口。该状态由 Rust 侧在显隐时发的事件驱动
@@ -340,58 +373,39 @@ function App() {
     };
   }, [refreshAll]);
 
-  React.useEffect(() => {
-    if (!autoRefreshEnabled || !windowVisible) {
-      return;
-    }
-    // 两路各自调度（评审 P2）：余额与用量互不影响。
-    // 未配置/失效凭据的通道直接暂停，不让它把健康通道的周期拖到 1 小时。
-    // 用 setTimeout 链而非 setInterval：睡眠唤醒后 interval 可能连发补帧，
-    // 链式调度总是等上一次结束后再计时。
-    let cancelled = false;
-    const timers = new Set<number>();
-    const schedule = (
-      channel: "balance" | "usage",
-      run: (silent: boolean) => Promise<unknown>,
-    ) => {
-      if (cancelled) return;
-      // 直接使用状态机已经算好的延迟（复评 F05）：失败后 120/240/…，暂停时探测间隔。
-      const state = channels.current[channel];
-      const delay = scheduledDelaySeconds({
-        ...state,
-        // 用户改过间隔后，未进入退避的通道跟随新间隔。
-        nextDelaySeconds:
-          state.failures === 0 && !state.paused
-            ? refreshIntervalSeconds
-            : state.nextDelaySeconds,
-      });
-      const timer = window.setTimeout(() => {
-        timers.delete(timer);
-        if (cancelled) return;
-        // 暂停通道：不联网，但保留定时器以便凭据恢复后重新纳入调度。
-        if (channels.current[channel].paused) {
-          schedule(channel, run);
-          return;
-        }
-        void run(true).finally(() => schedule(channel, run));
-      }, delay * 1000);
-      timers.add(timer);
-    };
-    schedule("balance", loadBalance);
-    schedule("usage", loadUsage);
-    return () => {
-      cancelled = true;
-      timers.forEach((timer) => window.clearTimeout(timer));
-      timers.clear();
-    };
-  }, [
-    autoRefreshEnabled,
-    loadBalance,
-    loadUsage,
-    refreshIntervalSeconds,
-    scheduleRevision,
-    windowVisible,
-  ]);
+  // 两路各自独立调度（复评 R01）：每个通道有自己的 timer 与截止时间，
+  // 一个通道完成不会推迟另一个通道的退避截止时间。
+  const balanceDelay = scheduledDelaySeconds({
+    ...channels.current.balance,
+    nextDelaySeconds:
+      channels.current.balance.failures === 0 &&
+      !channels.current.balance.paused
+        ? refreshIntervalSeconds
+        : channels.current.balance.nextDelaySeconds,
+  });
+  const usageDelay = scheduledDelaySeconds({
+    ...channels.current.usage,
+    nextDelaySeconds:
+      channels.current.usage.failures === 0 && !channels.current.usage.paused
+        ? refreshIntervalSeconds
+        : channels.current.usage.nextDelaySeconds,
+  });
+  useChannelScheduler({
+    enabled: autoRefreshEnabled,
+    visible: windowVisible,
+    paused: channels.current.balance.paused,
+    delaySeconds: balanceDelay,
+    run: () => loadBalance(true),
+    revision: channelRevision.balance,
+  });
+  useChannelScheduler({
+    enabled: autoRefreshEnabled,
+    visible: windowVisible,
+    paused: channels.current.usage.paused,
+    delaySeconds: usageDelay,
+    run: () => loadUsage(true),
+    revision: channelRevision.usage,
+  });
 
   // 面板尺寸（评审 P2）：用户显式切换后固定，不再被视图建议覆盖。
   const [manualMode, setManualMode] = React.useState<PanelMode | null>(null);
@@ -403,7 +417,8 @@ function App() {
   }, [mode]);
 
   // 配置尚未读取完成时不展示引导，避免把老用户当新手（复评 F12）。
-  const configLoaded = configSnapshot !== null;
+  // 复评 R09：加载完成条件必须覆盖所依赖的状态，否则启动瞬间可能用默认值判断。
+  const configLoaded = configSnapshot !== null && localStatusLoaded;
   const showOnboarding =
     configLoaded &&
     shouldShowOnboarding({
@@ -431,16 +446,24 @@ function App() {
       const pending = pendingLeave;
       if (!pending) return;
       if (decision === "cancel") {
+        // 取消使当前令牌失效：保存途中迟到的成功也不得导航。
+        leaveDecisions.current.cancel(leaveDecisions.current.begin());
         setPendingLeave(null);
+        setLeaveSubmitting(false);
         return;
       }
-      void resolveLeave(leaveBlocker.current, decision, pending.action).then(
-        (left) => {
-          if (left) setPendingLeave(null);
-        },
-      );
+      if (leaveSubmitting) return; // 连点只认第一次
+      const ticket = leaveDecisions.current.begin();
+      setLeaveSubmitting(true);
+      void resolveLeave(leaveBlocker.current, decision, pending.action, () =>
+        leaveDecisions.current.isCurrent(ticket),
+      ).then((left) => {
+        leaveDecisions.current.finish(ticket);
+        setLeaveSubmitting(false);
+        if (left) setPendingLeave(null);
+      });
     },
-    [leaveBlocker, pendingLeave],
+    [leaveBlocker, leaveSubmitting, pendingLeave],
   );
 
   const hideWindow = React.useCallback(() => {
@@ -576,14 +599,55 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [view]);
 
+  // 复评 R17：提示出现时把焦点移入，关闭后还回原处，读屏用户不会「丢失」。
+  const leavePromptRef = React.useRef<HTMLDivElement>(null);
+  const leaveReturnFocus = React.useRef<HTMLElement | null>(null);
+  React.useEffect(() => {
+    if (!pendingLeave) {
+      const node = leaveReturnFocus.current;
+      leaveReturnFocus.current = null;
+      if (node?.isConnected) node.focus();
+      return;
+    }
+    // 记录触发控件，再把焦点移入提示的第一个按钮。
+    leaveReturnFocus.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const frame = window.requestAnimationFrame(() => {
+      leavePromptRef.current?.querySelector<HTMLElement>("button")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingLeave]);
+
   const leavePrompt = pendingLeave ? (
-    <div className="leave-guard" role="alertdialog" aria-modal="false">
-      <p>{draftGuardText(pendingLeave.subject)}</p>
+    <div
+      ref={leavePromptRef}
+      className="leave-guard"
+      role="alertdialog"
+      aria-modal="false"
+      aria-labelledby="leave-guard-title"
+      aria-describedby="leave-guard-desc"
+    >
+      <p id="leave-guard-title" className="leave-guard-title">
+        {draftGuardText(pendingLeave.subject)}
+      </p>
+      <p id="leave-guard-desc" className="muted">
+        选择后才会离开；保存失败会留在当前页。
+      </p>
       <div className="disclosure-actions">
-        <button className="primary" onClick={() => decideLeave("save")}>
-          {draftGuardActions.save}
+        <button
+          className="primary"
+          disabled={leaveSubmitting}
+          onClick={() => decideLeave("save")}
+        >
+          {leaveSubmitting ? "保存中…" : draftGuardActions.save}
         </button>
-        <button className="secondary" onClick={() => decideLeave("discard")}>
+        <button
+          className="secondary"
+          disabled={leaveSubmitting}
+          onClick={() => decideLeave("discard")}
+        >
           {draftGuardActions.discard}
         </button>
         <button className="secondary" onClick={() => decideLeave("cancel")}>
@@ -660,6 +724,7 @@ function App() {
           balanceError={balanceError}
           usageError={usageError}
           showDataNotices={showDataNotices}
+          targetSection={settingsTarget}
           usage={usage}
           onBalanceLoaded={(nextBalance) => {
             balanceRequestId.current += 1;
@@ -754,7 +819,10 @@ function App() {
           }}
           onRefreshIntervalChanged={setRefreshIntervalSeconds}
           onAutoRefreshChanged={setAutoRefreshEnabled}
-          onBack={() => setView("dashboard")}
+          onBack={() => {
+            setSettingsTarget(null);
+            setView("dashboard");
+          }}
         />
       )}
       {view === "detail" && (
@@ -780,8 +848,9 @@ function App() {
           onBack={() => navigate(() => setView("dashboard"))}
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
           onConfigureUsage={() => {
-            // 复评 F10：直接进入设置页并定位到用量 Token 区块。
+            // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
             setShowDataNotices(false);
+            setSettingsTarget("usageToken");
             setView("settings");
           }}
         />
