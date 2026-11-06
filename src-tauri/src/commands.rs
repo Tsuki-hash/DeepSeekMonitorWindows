@@ -133,9 +133,13 @@ pub(crate) struct LocalDataOverview {
     usage_token_configured: bool,
     local_enabled: bool,
     local_collecting: bool,
-    archive_entries: usize,
-    retention_entries: usize,
-    retention_bytes: u64,
+    /// 归档/留存读取结果：区分「不存在（0）」「存在但读不出（unknown）」。
+    /// `None` 表示无法读取 —— 磁盘数据可能仍在，不能显示成 0 条。
+    archive_entries: Option<usize>,
+    archive_error: Option<String>,
+    retention_entries: Option<usize>,
+    retention_bytes: Option<u64>,
+    retention_error: Option<String>,
     /// `None` 表示读取失败或超出扫描预算 —— 不能显示成 0 KiB。
     engine_cache_bytes: Option<u64>,
     /// 引擎缓存可能包含源会话标题；停止采集不代表缓存被删。
@@ -159,8 +163,9 @@ fn directory_size(path: &std::path::Path) -> CacheSize {
     // 有预算地递归统计：限制条目数与深度，且不跟随符号链接/junction，
     // 避免为了显示大小反而引入卡顿或越界扫描。
     fn walk(dir: &std::path::Path, depth: usize, entries_left: &mut usize) -> Result<u64, ()> {
+        // 复评 R10：遍历不完整必须传播 Unknown，不能把「没扫到的子树」当成 0。
         if depth > CACHE_SCAN_MAX_DEPTH || *entries_left == 0 {
-            return Ok(0);
+            return Err(());
         }
         let reader = std::fs::read_dir(dir).map_err(|_| ())?;
         let mut total = 0u64;
@@ -212,17 +217,26 @@ pub(crate) fn get_local_data_overview(
     let local_enabled = local_enabled(&mut state)?;
     let local_collecting = state.busy;
     drop(state);
-    let capacity = crate::local_retention::capacity().ok();
+    // 复评 R11：读取失败不能折算成 0 条 —— 用户会据此误判「没有数据」。
+    let (archive_entries, archive_error) = match crate::local_archive::list() {
+        Ok(list) => (Some(list.len()), None),
+        Err(error) => (None, Some(error)),
+    };
+    let (retention_entries, retention_bytes, retention_error) =
+        match crate::local_retention::capacity() {
+            Ok(value) => (Some(value.entries), Some(value.bytes), None),
+            Err(error) => (None, None, Some(error)),
+        };
     Ok(LocalDataOverview {
         api_key_configured: config.api_key_configured,
         usage_token_configured: config.usage_token_configured,
         local_enabled,
         local_collecting,
-        archive_entries: crate::local_archive::list()
-            .map(|list| list.len())
-            .unwrap_or(0),
-        retention_entries: capacity.as_ref().map(|value| value.entries).unwrap_or(0),
-        retention_bytes: capacity.as_ref().map(|value| value.bytes).unwrap_or(0),
+        archive_entries,
+        archive_error,
+        retention_entries,
+        retention_bytes,
+        retention_error,
         engine_cache_bytes: match engine_cache_path() {
             Ok(path) => match directory_size(&path) {
                 CacheSize::Known(bytes) => Some(bytes),
@@ -246,7 +260,11 @@ pub(crate) fn clear_local_engine_cache(
 ) -> Result<(), String> {
     require_main(&window)?;
     let collector = app.state::<crate::local_usage::LocalCollector>();
-    let path = {
+    // 复评 R18：路径解析必须在占用 busy **之前**完成。
+    // 否则配置路径异常（APPDATA 缺失等）会让 `?` 提前返回，busy 永久残留，
+    // 之后每次采集都被误判为「正在采集」。
+    let path = engine_cache_path()?;
+    {
         // 复评 F14：检查与删除必须共享同一把锁，否则释放后再删除的窗口里，
         // 后台采集可以开始写缓存，形成删除与写入竞态。
         // 这里在锁内把 busy 置位（占用采集槽位），删除完成后再释放。
@@ -260,19 +278,24 @@ pub(crate) fn clear_local_engine_cache(
         if let Some(cancel) = state.cancel.take() {
             cancel.notify_one();
         }
-        engine_cache_path()?
-    };
+    }
     // 删除在锁外进行（避免跨 IO 持有同步 Mutex），但 busy 已置位，采集无法插队。
     let outcome = match std::fs::remove_dir_all(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err("引擎缓存无法清理，请稍后重试".into()),
     };
-    let mut state = collector.inner.lock().map_err(|_| "采集状态不可用")?;
-    state.busy = false;
-    state.snapshot = None;
-    state.last_error = None;
-    state.last_scan_failed = false;
+    // 释放槽位：即使上面的删除失败也要执行，保证下一次采集能开始。
+    // 用 `map_err` 而不是 `?`：锁中毒时也要尽力清 busy，再返回错误。
+    match collector.inner.lock() {
+        Ok(mut state) => {
+            state.busy = false;
+            state.snapshot = None;
+            state.last_error = None;
+            state.last_scan_failed = false;
+        }
+        Err(_) => return Err("采集状态不可用，清理已中止；请重启应用".into()),
+    }
     outcome
 }
 
