@@ -566,10 +566,16 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg(test)]
 #[path = "tray_placement_tests.rs"]
+// 这些场景名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod placement_tests;
 
 #[cfg(test)]
 #[path = "tray_restore_tests.rs"]
+// 这些场景名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod restore_tests;
 
 #[cfg(test)]

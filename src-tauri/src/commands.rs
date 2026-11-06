@@ -635,9 +635,7 @@ mod usage_config_read_tests {
             let dir = TempConfigDir::new(&format!("r31-usage-config-{tag}"));
             let path = dir.join("config.json");
             std::fs::write(&path, original).unwrap();
-            let error = read_usage_config()
-                .err()
-                .expect("must reject unreadable config");
+            let error = read_usage_config().expect_err("must reject unreadable config");
             assert_eq!(error.code, "config_read_error");
             assert_eq!(error.credential, None);
             assert!(!error.retryable);
@@ -653,9 +651,7 @@ mod usage_config_read_tests {
         // unlike permission bits when the test runner has elevated privileges.
         let path = dir.join("config.json");
         std::fs::create_dir(&path).unwrap();
-        let error = read_usage_config()
-            .err()
-            .expect("must reject unreadable config");
+        let error = read_usage_config().expect_err("must reject unreadable config");
         assert_eq!(error.code, "config_read_error");
         assert_eq!(error.credential, None);
         assert!(!error.retryable);
@@ -670,6 +666,9 @@ mod usage_config_read_tests {
 }
 
 #[cfg(all(test, windows))]
+// `SavedApiKey` 没有实现 Debug，`Result::expect_err` 用不了；这些断言
+// 只需要错误值本身，`.err().expect(..)` 是合适写法。
+#[allow(clippy::ok_expect)]
 mod api_key_ownership_tests {
     use super::*;
     use crate::config::{edit_validated_credential, ValidatedCredential};

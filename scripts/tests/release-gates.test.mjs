@@ -313,6 +313,10 @@ function execute(
         env: {
           ...process.env,
           NODE_OPTIONS: `--import ${JSON.stringify(pathToFileURL(preload).href)}`,
+          // 被测实例必须知道自己在测试上下文里：它会反向调用
+          // release-record.mjs，而后者默认也跑本测试文件 —— 不标记就会
+          // 无限递归，外层把递归失败误记成「门禁故障注入测试 失败」。
+          DSM_GATE_SELF_TEST: "1",
           DSM_GATE_TEST_SCENARIO: scenario,
           DSM_GATE_TEST_REPORT_FAILURE: reportFailure,
           DSM_GATE_TEST_REPLACE_AFTER_READ: replaceAfterRead,

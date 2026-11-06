@@ -76,6 +76,10 @@ fn ready_response(seconds: u64, result: Result<(), VerifyFailure>) -> Step {
 }
 
 #[derive(Clone)]
+// 测试替身的字段类型刻意写成内联形态：拆成 type 别名会把「键是
+// (来源, 月份)、值是按顺序到达的响应队列」这层含义藏到文件另一处，
+// 阅读这些场景时反而要多跳一次。这里只放宽这一个 lint。
+#[allow(clippy::type_complexity)]
 struct Network {
     clock: Clock,
     steps: Rc<RefCell<HashMap<(String, u32), VecDeque<Step>>>>,
@@ -1447,15 +1451,17 @@ fn r22_无效UTF8膨胀按解码后最坏字节预留_来源与载荷均有硬�
     ));
     assert!(!can_collect_more(usize::MAX, u64::MAX));
 
-    let mut state = CandidateVerificationState::default();
-    state.pending = (0..MAX_VERIFICATION_FILES)
-        .map(|i| CandidateFile {
-            path: PathBuf::from(format!("pending-{i}")),
-            stamp: (1, None),
-            tokens: vec![A.into()],
-            remaining_this_round: 1,
-        })
-        .collect();
+    let mut state = CandidateVerificationState {
+        pending: (0..MAX_VERIFICATION_FILES)
+            .map(|i| CandidateFile {
+                path: PathBuf::from(format!("pending-{i}")),
+                stamp: (1, None),
+                tokens: vec![A.into()],
+                remaining_this_round: 1,
+            })
+            .collect(),
+        ..CandidateVerificationState::default()
+    };
     let retained = state.collect_for_round(&mut CacheScanState::default(), |_| {
         panic!("没有预留下一整批来源容量时不得继续扫描或逐出未试来源")
     });

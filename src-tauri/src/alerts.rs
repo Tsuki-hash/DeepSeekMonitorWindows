@@ -911,6 +911,9 @@ pub fn start(app: tauri::AppHandle) {
 }
 
 #[cfg(test)]
+// 测试名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 

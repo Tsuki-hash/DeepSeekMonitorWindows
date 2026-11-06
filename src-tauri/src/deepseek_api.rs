@@ -1257,6 +1257,9 @@ pub(crate) mod regression_samples {
 }
 
 #[cfg(test)]
+// 测试名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod tests {
     use super::regression_samples::{
         amount_body, append_daily_model, checked_result, complete_month, missing_month_token_rows,

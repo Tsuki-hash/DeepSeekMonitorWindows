@@ -403,6 +403,9 @@ async fn verify_candidates(
 
 /// 生产调度、30 秒整批 deadline、多月探针与取消链。回归只替换时钟/等待与
 /// 单月 HTTP 请求，不另写一个模拟调度器，也不缩短生产 deadline 来碰运气。
+// 这些参数就是生产调度所需的全部状态；打包成结构体只是把同一组
+// 依赖换个地方列，且会让「回归注入点」在调用处不可见。保留平铺形式。
+#[allow(clippy::too_many_arguments)]
 async fn verify_candidates_with<N, W, Wait, V, Request>(
     scan: &mut CacheScanState,
     verification: &mut CandidateVerificationState,
@@ -770,14 +773,23 @@ pub(crate) fn open_login_window(
 
 #[cfg(test)]
 #[path = "login_close_tests.rs"]
+// 这些场景名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod login_close_tests;
 
 #[cfg(test)]
 #[path = "cache_fairness_tests.rs"]
+// 这些场景名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod cache_fairness_tests;
 
 #[cfg(test)]
 #[path = "probe_cancellation_tests.rs"]
+// 这些场景名用中文描述被测行为，是项目既有约定；改成拼音或英文会丢掉可读性。
+// 仅放宽这一个 lint。
+#[allow(non_snake_case)]
 mod probe_cancellation_tests;
 
 /// 启动后台 watcher：周期扫缓存 + 目录事件即时唤醒，直到捕获成功、窗口关闭、

@@ -659,7 +659,7 @@ mod tests {
 
     fn assert_order(scan: &CacheScanState, paths: &[&str]) {
         let actual: Vec<_> = scan.order.iter().map(|(path, _)| path.as_path()).collect();
-        let expected: Vec<_> = paths.iter().map(|path| Path::new(path)).collect();
+        let expected: Vec<_> = paths.iter().map(Path::new).collect();
         assert_eq!(actual, expected);
     }
 

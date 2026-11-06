@@ -241,12 +241,21 @@ const checks = [
   ],
   ["前端测试", "npm", ["test"], true],
   ["组件测试", "npm", ["run", "test:components"], true],
-  [
-    "门禁故障注入测试",
-    "node",
-    ["--test", "scripts/tests/release-gates.test.mjs"],
-    true,
-  ],
+  // 门禁故障注入测试会反向调用 release-record.mjs 来验证拒绝逻辑。
+  // 若在这里也跑它，被测实例又跑一次故障注入测试 —— 无限递归，
+  // 且外层会把递归造成的失败记成「门禁故障注入测试 失败」。
+  // 因此只在**非嵌套**上下文里执行该项；嵌套实例由
+  // DSM_GATE_SELF_TEST 标记识别（由本进程在启动子测试时设置）。
+  ...(process.env.DSM_GATE_SELF_TEST === "1"
+    ? []
+    : [
+        [
+          "门禁故障注入测试",
+          "node",
+          ["--test", "scripts/tests/release-gates.test.mjs"],
+          true,
+        ],
+      ]),
   ["前端 lint", "npm", ["run", "lint"], true],
   ["前端 format 检查", "npx", ["prettier", "--check", "."], true],
   ["前端构建", "npm", ["run", "build"], true],
