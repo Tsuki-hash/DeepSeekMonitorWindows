@@ -35,4 +35,24 @@ Invoke-Check 'cargo clippy' 'cargo' @('clippy', '--manifest-path', 'src-tauri/Ca
 
 Invoke-Check 'cargo test' 'cargo' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--lib')
 
+# 复评 F20：ignored 集成测试默认不跑，不能把「跳过」当成「通过」。
+# 退出码约定：0=通过，2=未运行（缺合成目录），其他=失败。
+# 「未运行」不阻断普通开发门禁，但会打印明确警告，且发版记录会据此判定证据不足。
+Write-Host '==> 引擎集成测试（显式 ignored）' -ForegroundColor Cyan
+& node @('scripts/run-integration-tests.mjs')
+$integrationExit = $LASTEXITCODE
+if ($integrationExit -eq 0) {
+    Write-Host '集成测试通过。' -ForegroundColor Green
+}
+elseif ($integrationExit -eq 2) {
+    Write-Host '集成测试未运行：缺少 DSM_TEST_LOCAL_USAGE_HOME 合成目录。' -ForegroundColor Yellow
+    Write-Host '   本次门禁不包含引擎集成证据；发版前必须补齐，不能记为通过。' -ForegroundColor Yellow
+}
+else {
+    throw "引擎集成测试失败（退出码 $integrationExit）"
+}
+
+# 复评 F19：依赖告警纳入门禁（开发依赖曾出现 high）。
+Invoke-Check '生产依赖安全审计' 'npm' @('audit', '--package-lock-only', '--ignore-scripts', '--omit=dev')
+
 Write-Host '全部通过。' -ForegroundColor Green

@@ -29,6 +29,7 @@ Write-Host "大小：$([math]::Round($installer.Length / 1MB, 2)) MiB"
 Write-Host "SHA-256：$hash"
 
 $failed = $false
+$inconclusive = @()
 if ($ExpectedSha256) {
     $expected = $ExpectedSha256.ToLowerInvariant()
     if ($hash -ne $expected) {
@@ -40,6 +41,10 @@ if ($ExpectedSha256) {
         Write-Host "✅ 哈希与期望值一致" -ForegroundColor Green
     }
 }
+else {
+    Write-Host "⚠ 未提供 -ExpectedSha256：哈希已计算，但无法比对" -ForegroundColor Yellow
+    $inconclusive += "未提供期望哈希"
+}
 
 # 在二进制中检索仓库名。NSIS 安装包内嵌了前端 bundle，字符串以 UTF-8 出现。
 $bytes = [IO.File]::ReadAllBytes($installer.FullName)
@@ -50,12 +55,16 @@ $legacyRepo = 'Tsuki-hash/DeepSeekMonitorWin/releases'
 $hasCurrent = $text.Contains($currentRepo)
 $hasLegacy = $text.Contains($legacyRepo)
 
+# 三态结论（复评 F17）：找不到字符串既不能算通过，也不能算失败 —— 它是「无法判定」。
+$inconclusive = @()
 if ($hasCurrent) {
     Write-Host "✅ 二进制包含当前仓库地址：$currentRepo" -ForegroundColor Green
 }
 else {
-    Write-Host "⚠ 二进制中未检索到当前仓库地址：$currentRepo" -ForegroundColor Yellow
-    Write-Host "   可能是压缩/编码方式不同；请在安装后手工点一次「检查更新」确认。"
+    Write-Host "⚠ 无法判定：二进制中未检索到当前仓库地址。" -ForegroundColor Yellow
+    Write-Host "   压缩后的 NSIS 内容可能不以明文 UTF-8 出现；此项不能作为通过证据。"
+    Write-Host "   必须安装后手工点一次「检查更新」确认。"
+    $inconclusive += "新仓库地址未在二进制中找到"
 }
 if ($hasLegacy) {
     Write-Host "❌ 二进制仍包含旧仓库地址：$legacyRepo" -ForegroundColor Red
@@ -63,7 +72,9 @@ if ($hasLegacy) {
     $failed = $true
 }
 else {
-    Write-Host "✅ 未发现旧仓库地址" -ForegroundColor Green
+    # 同样只是「未发现」：压缩包里没有明文不等于内嵌程序里没有旧地址。
+    Write-Host "⚠ 未发现旧仓库地址（仅限明文检索）" -ForegroundColor Yellow
+    $inconclusive += "旧仓库地址未以明文出现"
 }
 
 # 版本号（NSIS 产品名常含版本，但更可靠的是与 package.json 对照）
@@ -73,11 +84,20 @@ if ($installer.Name -match [regex]::Escape($packageVersion)) {
     Write-Host "✅ 文件名包含版本 $packageVersion" -ForegroundColor Green
 }
 else {
-    Write-Host "⚠ 文件名未包含版本 $packageVersion，请人工确认产物与标签对应" -ForegroundColor Yellow
+    Write-Host "⚠ 无法判定：文件名未包含版本 $packageVersion。" -ForegroundColor Yellow
+    Write-Host "   文件名不是 PE 版本信息，不能作为版本与提交对应的证据。"
+    $inconclusive += "文件名与版本不匹配"
 }
 
 if ($failed) {
-    Write-Host "`n静态校验未通过。" -ForegroundColor Red
+    Write-Host "`n结论：FAIL。发现确定的错误，不能放行。" -ForegroundColor Red
     exit 1
 }
-Write-Host "`n静态校验通过。仍需安装后手工验收：检查更新、托盘、通知、DPI。" -ForegroundColor Green
+if ($inconclusive.Count -gt 0) {
+    Write-Host "`n结论：INCONCLUSIVE。以下项无法静态判定：" -ForegroundColor Yellow
+    foreach ($item in $inconclusive) { Write-Host "  - $item" }
+    Write-Host "  必须安装后手工验收：检查更新、托盘、通知、DPI、升级。"
+    Write-Host "  本脚本不会把它当成通过。"
+    exit 2
+}
+Write-Host "`n结论：PASS（静态）。仍需安装后手工验收。" -ForegroundColor Green

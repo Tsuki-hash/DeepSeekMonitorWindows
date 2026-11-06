@@ -33,26 +33,48 @@ const out = option("out");
 const installer = option("installer");
 
 const run = (command, commandArgs) => {
+  const started = Date.now();
   try {
+    const stdout = execFileSync(command, commandArgs, {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // Windows 上 npm/npx 是 .cmd 包装脚本，不通过 shell 解析会 ENOENT。
+      shell: process.platform === "win32",
+    });
     return {
       ok: true,
-      output: execFileSync(command, commandArgs, {
-        cwd: root,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        // Windows 上 npm/npx 是 .cmd 包装脚本，不通过 shell 解析会 ENOENT。
-        shell: process.platform === "win32",
-      }).trim(),
+      code: 0,
+      stdout: String(stdout),
+      stderr: "",
+      seconds: (Date.now() - started) / 1000,
     };
   } catch (error) {
     return {
       ok: false,
-      output: `${error.status ?? "?"}: ${(error.stderr ?? error.message ?? "").trim()}`,
+      code: typeof error.status === "number" ? error.status : 1,
+      stdout: String(error.stdout ?? ""),
+      stderr: String(error.stderr ?? error.message ?? ""),
+      seconds: (Date.now() - started) / 1000,
     };
   }
 };
 
-const git = (...commandArgs) => run("git", commandArgs).output;
+/** 从输出里提取测试通过/失败/忽略数，便于审计「有多少是真的跑了」。 */
+const testCounts = (text) => {
+  const pick = (label) => {
+    const match = new RegExp(`${label}\s+(\d+)`).exec(text);
+    return match ? Number(match[1]) : null;
+  };
+  return {
+    passed: pick("pass"),
+    failed: pick("fail"),
+    ignored: pick("ignored"),
+    tests: pick("tests"),
+  };
+};
+
+const git = (...commandArgs) => run("git", commandArgs).stdout.trim();
 
 const sha256 = (path) =>
   createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -116,7 +138,7 @@ for (const [label, command, commandArgs] of [
   ["Rust", "cargo", ["--version"]],
   ["rustc", "rustc", ["--version"]],
 ]) {
-  lines.push(`- ${label}：\`${run(command, commandArgs).output}\``);
+  lines.push(`- ${label}：\`${run(command, commandArgs).stdout.trim()}\``);
 }
 lines.push("");
 
@@ -135,30 +157,63 @@ lines.push("## 门禁命令与结果");
 lines.push("");
 lines.push("> 这些命令由本脚本重新运行；结果记录的是本次运行，不是历史记录。");
 lines.push("");
+const failures = [];
+const checkResults = [];
 for (const [label, command, commandArgs] of checks) {
   const result = run(command, commandArgs);
-  const summary = result.ok
-    ? (result.output.split("\n").filter(Boolean).slice(-1)[0] ?? "通过")
-    : (result.output.split("\n").filter(Boolean).slice(-1)[0] ?? "失败");
+  checkResults.push({ label, result });
+  if (!result.ok) failures.push(label);
+  const counts = testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
     `- ${result.ok ? "✅" : "❌"} ${label}：\`${command} ${commandArgs.join(" ")}\``,
   );
-  lines.push(`  - 结果：${summary.slice(0, 200)}`);
+  lines.push(`  - 退出码：${result.code} · 用时 ${result.seconds.toFixed(1)}s`);
+  if (counts.tests != null || counts.passed != null) {
+    lines.push(
+      `  - 测试计数：tests=${counts.tests ?? "?"} pass=${counts.passed ?? "?"} ` +
+        `fail=${counts.failed ?? "?"} ignored=${counts.ignored ?? "?"}`,
+    );
+  }
 }
 lines.push("");
+lines.push("### 完整输出");
+lines.push("");
+lines.push("> 审计需要原始 stdout/stderr，不截断。");
+lines.push("");
+for (const { label, result } of checkResults) {
+  lines.push(`<details><summary>${label}（退出码 ${result.code}）</summary>`);
+  lines.push("");
+  lines.push("```text");
+  lines.push((result.stdout || "(stdout 为空)").trim());
+  if (result.stderr.trim()) {
+    lines.push("");
+    lines.push("[stderr]");
+    lines.push(result.stderr.trim());
+  }
+  lines.push("```");
+  lines.push("");
+  lines.push("</details>");
+  lines.push("");
+}
 
 lines.push("## 安装包");
 lines.push("");
+let installerStatus = "missing";
 if (installer) {
   try {
     const path = resolve(installer);
     lines.push(`- 文件：\`${path}\``);
     lines.push(`- SHA-256：\`${sha256(path)}\``);
+    installerStatus = "hashed";
   } catch (error) {
-    lines.push(`- 读取失败：${error.message}`);
+    lines.push(`- ❌ 读取失败：${error.message}`);
+    installerStatus = "failed";
+    failures.push("安装包读取");
   }
 } else {
-  lines.push("- 未提供 `--installer`，本次未记录安装包哈希。");
+  lines.push(
+    "- ⚠ 未提供 `--installer`：本次**未**记录安装包哈希，不能作为「安装包已验收」的证据。",
+  );
 }
 lines.push("");
 lines.push("## 未覆盖项（需真机验收）");
@@ -170,10 +225,30 @@ lines.push(
   "- 本次未做 CPU/内存/启动耗时采样，性能结论只基于代码结构，不含实测数值。",
 );
 
+lines.push("");
+lines.push("## 结论");
+lines.push("");
+if (failures.length) {
+  lines.push(
+    `❌ 未通过：${failures.join("、")} 失败。本次记录不能作为放行证据。`,
+  );
+} else if (installerStatus !== "hashed") {
+  lines.push(
+    "⚠ 门禁命令全部通过，但安装包未校验：只能作为「源码门禁」证据，不是完整发版证据。",
+  );
+} else {
+  lines.push("✅ 门禁命令全部通过且记录了安装包哈希；仍需真机与安装升级验收。");
+}
+
 const text = lines.join("\n") + "\n";
 if (out) {
   writeFileSync(resolve(out), text, "utf8");
   console.log(resolve(out));
 } else {
   console.log(text);
+}
+// 复评 F18：失败必须传播到退出码，外层不能只看「报告已生成」就放行。
+if (failures.length) {
+  console.error(`失败项：${failures.join("、")}`);
+  process.exitCode = 1;
 }
