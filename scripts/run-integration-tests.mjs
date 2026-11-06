@@ -29,6 +29,8 @@
 // 退出码：0 全部 PASS / 1 有用例 FAIL / 2 有用例 NOT RUN / 3 配置或 fixture 错误
 //        4 工具执行错误（cargo 缺失、编译失败等，结论未知）
 
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -46,6 +48,8 @@ const keep = process.argv.includes("--keep");
 const logArgIndex = process.argv.indexOf("--log-file");
 const logFile = logArgIndex >= 0 ? process.argv[logArgIndex + 1] : undefined;
 const engine = join(root, "src-tauri/resources/local-usage/tokscale.exe");
+/** 复评 N15：探针专用缓存 profile（临时目录，随 fixture 一并清理）。 */
+let probeProfile = "";
 
 /** 第五轮复评 Q10：保留 spawn 启动错误（ENOENT/ENOEXEC 等）的原始字段。 */
 function spawnError(error) {
@@ -131,6 +135,34 @@ const cargoEnv = () => ({
   DSM_TEST_LOCAL_USAGE_SECOND_HOME: fixture.second,
 });
 
+/**
+ * 复评 N14：**任何子进程启动前**先核验固定引擎（manifest 存在、体积、
+ * SHA-256）。旧实现「见到 exe 就执行」—— 一个错误的二进制（甚至无害 stub）
+ * 会被真的跑起来，探针结果再决定后续分类。生产路径的 SHA 校验没有失效，
+ * 但开发门禁不应先执行未验证的二进制。
+ *
+ * 返回 `null` 表示校验通过；否则返回原因字符串。
+ */
+function verifyPinnedEngine() {
+  if (!existsSync(engine)) return "缺少固定引擎";
+  let manifest;
+  try {
+    manifest = JSON.parse(
+      readFileSync(join(root, "scripts", "local-usage-engine.json"), "utf8"),
+    );
+  } catch {
+    return "引擎 manifest 无法读取";
+  }
+  const expected = String(manifest.sha256 ?? "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expected)) return "引擎 manifest 缺少有效 sha256";
+  const bytes = readFileSync(engine);
+  const limit = Number(manifest.maxBytes ?? 50 * 1024 * 1024);
+  if (bytes.length > limit) return `引擎超过体积上限（${bytes.length} 字节）`;
+  const actual = createHash("sha256").update(bytes).digest("hex");
+  if (actual !== expected) return `引擎 SHA-256 不匹配（实际 ${actual}）`;
+  return null;
+}
+
 /** 用引擎解析一次，返回记录数；失败返回 null。 */
 function probeEngine(home) {
   const result = spawnSync(
@@ -151,7 +183,11 @@ function probeEngine(home) {
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
       env: {
+        // 复评 N15：**不继承**父进程的 TOKSCALE_CONFIG_DIR / 定价缓存变量 ——
+        // 旧实现只覆盖 PRICING_CACHE_ONLY，stub 会收到父值并可能读写真实
+        // 用户配置/缓存。这里用临时目录做专用 profile，并显式清空继承值。
         ...process.env,
+        TOKSCALE_CONFIG_DIR: probeProfile,
         TOKSCALE_PRICING_CACHE_ONLY: "1",
         DO_NOT_TRACK: "1",
       },
@@ -306,16 +342,29 @@ if (externalHome) {
   );
 }
 
-if (!existsSync(engine)) {
-  console.error(
-    `未运行：缺少固定引擎 ${engine}。请先执行 npm run local-usage:prepare。`,
-  );
-  console.error(
-    "本次结论：INTEGRATION NOT RUN —— 不能把 ignored 项计入「通过」。",
-  );
-  if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
-  flushLogs();
-  process.exit(2);
+// 复评 N14：启动任何子进程前先核验固定引擎（manifest + 体积 + SHA-256）。
+{
+  const reason = verifyPinnedEngine();
+  if (reason) {
+    console.error(
+      `未运行：${reason}（${engine}）。请先执行 npm run local-usage:prepare。`,
+    );
+    console.error(
+      "本次结论：INTEGRATION NOT RUN —— 不能把 ignored 项计入「通过」。",
+    );
+    if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+    flushLogs();
+    process.exit(2);
+  }
+}
+
+// 复评 N15：探针使用**专用缓存 profile**（临时目录），不继承父进程配置。
+{
+  const profileRoot =
+    cleanup ?? mkdtempSync(join(tmpdir(), "dsm-probe-profile-"));
+  probeProfile = join(profileRoot, "probe-profile");
+  mkdirSync(probeProfile, { recursive: true });
+  if (!cleanup) cleanup = profileRoot;
 }
 
 // 复评 T10：无论哪种模式，先确认 fixture 里有**当月**数据可被引擎解析。
