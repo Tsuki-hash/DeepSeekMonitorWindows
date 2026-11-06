@@ -35,7 +35,13 @@ function audit(extraArgs) {
   try {
     const result = spawnSync(
       "npm",
-      ["audit", "--package-lock-only", "--ignore-scripts", ...extraArgs],
+      [
+        "audit",
+        "--json",
+        "--package-lock-only",
+        "--ignore-scripts",
+        ...extraArgs,
+      ],
       {
         cwd: root,
         encoding: "utf8",
@@ -73,27 +79,43 @@ function audit(extraArgs) {
     if (toolFailure) {
       return { state: "error", code, stdout, stderr, signal, spawnError };
     }
-    // 合法 findings：exit 1 且输出里有非零计数（不要求 `found` 前缀 ——
-    // 新版 npm 会输出 `1 high severity vulnerability`）。
-    const zero = /found\s+0\s+vulnerabilit/i.test(stdout);
-    const nonZero =
-      /found\s+[1-9]\d*\s+vulnerabilit/i.test(stdout) ||
-      /(?:^|\n)\s*(\d+)\s+[a-z]+\s+severity\s+vulnerabilit/i.test(stdout) ||
-      // `1 high severity vulnerability` 这类不带 "found" 的汇总行。
-      /(?:^|\n)\s*[1-9]\d*\s+[a-z]+\s+vulnerabilit/i.test(stdout);
-    if (code === 1) {
-      // npm audit 用 exit 1 表示「有漏洞」；文本没给计数也算 findings
-      // （结论方向已由退出码确定），但要保留原始输出供复核。
-      return { state: "findings", code, stdout, stderr, signal, spawnError };
+    // 复评 R15：用 `--json` 的结构化结果分类，而不是靠人类可读摘要。
+    // 旧实现把所有 exit 1 判成 findings —— npm 在**网络失败**时也用 exit 1
+    //（ECONNREFUSED / 代理错误），于是「审计没跑成功」被写成「发现漏洞」。
+    // 现在先解析 JSON：`error` 字段或缺失 metadata 就是工具/网络失败（error）；
+    // 只有拿到 `metadata.vulnerabilities` 计数才能谈 findings/clean。
+    let parsed = null;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      parsed = null;
     }
-    if (code === 0 && zero && !nonZero) {
-      return { state: "clean", code, stdout, stderr, signal, spawnError };
-    }
-    if (code === 0 && nonZero) {
-      // 退出码说没问题、文本说有漏洞：自相矛盾，不能判 clean。
+    const jsonError = parsed?.error
+      ? String(parsed.error.summary ?? parsed.error.code ?? parsed.error)
+      : null;
+    const totals = parsed?.metadata?.vulnerabilities;
+    const counted =
+      totals && typeof totals.total === "number" ? totals.total : null;
+    if (jsonError != null) {
+      // 网络/配置/工具错误：结论未知（不是「发现漏洞」）。
       return { state: "error", code, stdout, stderr, signal, spawnError };
     }
-    // 没有任何可解析结论：审计没跑成功（网络、配置、工具错误）。
+    if (counted == null) {
+      // 没有 schema 或没有计数：无法判定，按未知处理。
+      return { state: "error", code, stdout, stderr, signal, spawnError };
+    }
+    if (code === 1) {
+      // 退出码 1 + 结构化计数：只有计数**非零**才是真漏洞。
+      if (counted > 0) {
+        return { state: "findings", code, stdout, stderr, signal, spawnError };
+      }
+      // exit 1 但计数为 0：自相矛盾，不能判 clean 也不能判 findings。
+      return { state: "error", code, stdout, stderr, signal, spawnError };
+    }
+    if (code === 0 && counted === 0) {
+      return { state: "clean", code, stdout, stderr, signal, spawnError };
+    }
+    // exit 0 但计数非零：矛盾，按未知处理。
     return { state: "error", code, stdout, stderr, signal, spawnError };
   } finally {
     rmSync(dir, { recursive: true, force: true });
