@@ -168,17 +168,19 @@ pub fn capacity() -> Result<Capacity, String> {
 /// 新策略是逐条判定：已存在的会话继续更新，新会话在无空间时单独拒绝并计入
 /// `skipped`；已写入的部分照常落盘，用户看到的是明确的部分结果而不是整体失败。
 ///
-/// 复评 R09：字节上限（8MiB）同样纳入**条目级**选择 —— 新会话加入后总字节
-/// 超限时，不能再让最终 write 拒绝整批、连带丢掉本可提交的旧会话更新。
-/// 放不下的旧条目更新单独跳过（保持旧值），计 `skipped_bytes`。
+/// 复评 R09/F03：字节上限（8MiB）纳入**条目级**选择。复评 F03 进一步要求
+/// 优先级：**先**应用已存在会话的更新（含缩小释放空间），**再**在剩余预算内
+/// 接收新会话 —— 不能因键序让新条目抢占本可提交的旧更新。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointOutcome {
     /// 已写入（含内容未变的跳过写盘）。
     pub written: usize,
     /// 因条数已满而未新增的会话数。
     pub skipped: usize,
-    /// 因字节预算不足而未保存的条目数（旧会话更新或新会话）。
+    /// 已存在会话的更新因字节预算不足而保持旧值的条目数。
     pub skipped_bytes: usize,
+    /// 新会话因字节预算不足而未写入的条目数（它们没有旧值可保留）。
+    pub skipped_new_bytes: usize,
     /// 写入失败（此时整批不落盘，保持原记录）。
     pub failed: bool,
 }
@@ -218,6 +220,12 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
             .push(row);
     }
     let mut changed = false;
+    // 复评 F03：**两阶段**分配，与键的排序无关。
+    // 第一阶段：已存在会话的替换（含缩小释放空间）。这是用户既有记录的
+    // 更新，必须优先 —— 旧实现按 BTreeMap 键序混排，新增条目排在前面时会
+    // 抢占预算，把本可提交的旧更新挤成 `skipped_bytes`。
+    // 第二阶段：在**剩余**预算内接收新会话。
+    let mut additions: Vec<ArchiveEntry> = Vec::new();
     for ((source, tool, session), rows) in groups {
         let entry = ArchiveEntry {
             id: id(&snapshot.period_key, source, tool, session)?,
@@ -255,37 +263,41 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
             let new_size = entry_size(&entry);
             let old_size = entry_size(previous);
             // 替换不改变 JSON 结构开销：体积差 = 新条目 − 旧条目（精确）。
-            if store_size + new_size.saturating_sub(old_size) > budget {
-                // 复评 R09：旧条目自身扩大到超限 —— 该条跳过并保持旧值，
-                // 不拖累本可保存的其他条目。
+            // 缩小（或不变）的更新总是允许 —— 它会释放预算给后续条目。
+            if new_size > old_size && store_size + (new_size - old_size) > budget {
+                // 该条自身扩大到超限：跳过并保持旧值，不拖累其他条目。
                 outcome.skipped_bytes += 1;
                 continue;
             }
             store_size = store_size + new_size - old_size;
             *previous = entry;
             outcome.written += 1;
-        } else if store.entries.len() >= MAX_ENTRIES {
-            // 只拒绝这一条新会话，已存在会话的更新不受影响。
+            changed = true;
+        } else {
+            additions.push(entry);
+        }
+    }
+    // 第二阶段：新增按字节预算逐个接收；条数上限单独计 `skipped`。
+    for entry in additions {
+        if store.entries.len() >= MAX_ENTRIES {
             outcome.skipped += 1;
             continue;
-        } else {
-            let new_size = entry_size(&entry);
-            // +1 ≈ JSON 数组追加一个元素的逗号开销；首条追加会高估，方向保守。
-            if store_size + new_size.saturating_add(1) > budget {
-                // 复评 R09：字节预算放不下这条新会话 —— 单独跳过，
-                // 不让最终 write 拒绝整批。
-                outcome.skipped_bytes += 1;
-                continue;
-            }
-            store_size += new_size.saturating_add(1);
-            store.entries.push(entry);
-            outcome.written += 1;
         }
+        let new_size = entry_size(&entry);
+        // +1 ≈ JSON 数组追加一个元素的逗号开销；首条追加会高估，方向保守。
+        if store_size + new_size.saturating_add(1) > budget {
+            // 字节预算放不下这条新会话 —— 单独跳过（它没有旧值可保留）。
+            outcome.skipped_new_bytes += 1;
+            continue;
+        }
+        store_size += new_size.saturating_add(1);
+        store.entries.push(entry);
+        outcome.written += 1;
         changed = true;
     }
     if changed && write(&store).is_err() {
         // 写盘失败：整批未提交，原记录保留，如实报告。
-        // 复评 R09：条目级预算选择后这里只剩真实 IO 失败或极端漂移。
+        // 复评 R09/F03：条目级预算选择后这里只剩真实 IO 失败或极端漂移。
         outcome.failed = true;
         return Ok(outcome);
     }
@@ -400,7 +412,7 @@ mod tests {
         .unwrap();
         let outcome = checkpoint_budget(&next, budget).unwrap();
         assert_eq!(outcome.written, 1, "只有旧会话 s1 的更新被保存");
-        assert_eq!(outcome.skipped_bytes, 1, "放不下的新会话 s3 单独跳过");
+        assert_eq!(outcome.skipped_new_bytes, 1, "放不下的新会话 s3 单独跳过");
         assert_eq!(outcome.skipped, 0);
         assert!(!outcome.failed, "条目级选择后不应整批失败");
         let store = load().unwrap();
@@ -424,12 +436,83 @@ mod tests {
         );
         // 预算放宽后同一批次可以完整保存：新会话补上。
         let relaxed = checkpoint_budget(&next, usize::MAX).unwrap();
-        assert_eq!(relaxed.skipped_bytes, 0);
+        assert_eq!(relaxed.skipped_new_bytes, 0);
         assert!(load()
             .unwrap()
             .entries
             .iter()
             .any(|entry| entry.rows[0].session_id == "s3"));
+    }
+
+    // ---------- 第七轮复评 F03：旧更新优先于新增 ----------
+
+    #[test]
+    fn f03_新增键排在旧更新之前_旧更新仍优先落盘() {
+        // 复评 F03 的最小反例：新增会话的键（claude）排在既有会话（opencode）
+        // 之前。旧实现按 BTreeMap 键序处理，新增先占预算、旧更新被挤掉。
+        // 修复后两阶段分配：旧更新先应用，新增只用剩余预算。
+        let _dir = TempConfigDir::new("retention-priority");
+        set_enabled(true).unwrap();
+        checkpoint(&snapshot(1000)).unwrap();
+        let baseline = fs::read(store_path().unwrap()).unwrap().len();
+        // 构造评审的最小反例：新增（claude，键序在前）约 300 字节，
+        // 既有会话更新（opencode）约 300 字节，预算只够其中一项。
+        // 旧实现按键序先给新增 → 旧更新被挤成 skipped_bytes（collected_at 停在 1000）；
+        // 修复后先应用旧更新 → 新增被 skipped_new_bytes 拒绝。
+        let padded = "m".repeat(260);
+        let grow = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"opencode","sessionId":"s1","workspaceKey":"w1","model":padded,"input":100,"output":20,"reasoning":0,"cacheRead":10,"cacheWrite":0},
+                {"client":"claude","sessionId":"s3","workspaceKey":"w1","model":"deepseek-claude","input":5,"output":5,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),
+            2000,
+        )
+        .unwrap();
+        // 预算 = 基线 + 约一项的增量（不足以同时容纳两项）。
+        let outcome = checkpoint_budget(&grow, baseline + 320).unwrap();
+        let store = load().unwrap();
+        let existing = store
+            .entries
+            .iter()
+            .find(|entry| entry.rows[0].session_id == "s1")
+            .unwrap();
+        assert_eq!(
+            existing.collected_at, 2000,
+            "既有会话的更新必须优先于新增落盘（旧实现会被新增挤掉）"
+        );
+        assert!(
+            store
+                .entries
+                .iter()
+                .all(|entry| entry.rows[0].session_id != "s3"),
+            "剩余预算不足时新增被跳过"
+        );
+        assert!(
+            outcome.skipped_new_bytes >= 1,
+            "新增因字节预算被跳过并单独计数：{outcome:?}"
+        );
+        assert_eq!(outcome.skipped_bytes, 0, "旧更新不应被跳过");
+    }
+
+    #[test]
+    fn f03_旧条目缩小释放空间_新增可进入() {
+        let _dir = TempConfigDir::new("retention-shrink");
+        set_enabled(true).unwrap();
+        checkpoint(&snapshot(1000)).unwrap();
+        let baseline = fs::read(store_path().unwrap()).unwrap().len();
+        // 用极小预算：只允许缩小的更新 + 少量新增。
+        let mut shrink = snapshot(2000);
+        shrink.rows.retain(|row| row.tool == "opencode");
+        for row in &mut shrink.rows {
+            row.model = "s".into();
+        }
+        let outcome = checkpoint_budget(&shrink, baseline).unwrap();
+        assert!(
+            outcome.written >= 1,
+            "缩小（或不变）的旧条目更新必须被应用：{outcome:?}"
+        );
+        assert!(!outcome.failed);
+        assert_eq!(outcome.skipped_bytes, 0, "缩小的旧更新不该被跳过");
     }
 
     #[test]

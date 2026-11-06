@@ -324,7 +324,28 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     // 未知模型（如后续上线的 V4.1 Pro）聚合为「其他」兜底行，避免新模型名
     // 接入前其用量「日合计有、模型行无」地静默消失。正式接入仍以 model_slot 为准。
     let mut other_sum: Option<UsageModelSummary> = None;
-    let mut source = amount.data.biz_data.total.clone();
+    // 复评 F05：**先按模型合并 usage 条目，再算 breakdown**。
+    //
+    // 旧实现逐条计算 `token_breakdown` 再累加：同一模型被平台拆成两条
+    //（第一条 `PROMPT_TOKEN=100`，第二条 HIT=20/MISS=80/RESPONSE=10）时，
+    // 主面板逐条走「明细为零→PROMPT_TOKEN 兜底」得到 100+110=210，而历史
+    // 先按模型合并后只兜底一次、得到 110 —— 两条展示通路自相矛盾。
+    // 现在主面板与历史共用同一口径：按模型把 usage 条目合并成一份再解析。
+    let mut source: Vec<ModelUsage> = Vec::new();
+    let mut merged: std::collections::BTreeMap<&str, Vec<crate::usage::Entry>> =
+        std::collections::BTreeMap::new();
+    for entry in &amount.data.biz_data.total {
+        merged
+            .entry(&entry.model)
+            .or_default()
+            .extend(entry.usage.iter().cloned());
+    }
+    for (model, usage) in merged {
+        source.push(ModelUsage {
+            model: model.to_string(),
+            usage,
+        });
+    }
     let mut model_names: std::collections::HashSet<String> =
         source.iter().map(|m| m.model.clone()).collect();
     if let Some(cost) = cost_total {
@@ -572,7 +593,42 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         });
     }
 
+    // 复评 F04：月费用必须与**月级**数量模型集合对齐后再决定是否可用。
+    //
+    // 旧实现直接对费用月分组 try_fold，于是「数量月汇总有 A/B、费用月汇总只有
+    // A=1元」会得到 monthCost=1 —— 余额卡把部分和当完整月金额展示；
+    // 而 `total:[]`（有分组但没有任何模型）还会得到 0，与 `biz_data=[]`
+    // 的正确 None 不同。这里：
+    // 1. 数量侧返回了模型、费用侧缺任何一个 → 整月费用未知（不是部分和）；
+    // 2. 有费用分组但 total 为空、且数量侧非空 → 未知（空组不是显式零）；
+    // 3. 每个数量模型都有显式费用（含显式 0）→ 正常求值（0 是合法值）；
+    // 4. 只有日级缺项、月级齐全 → 保持有效月费用（不受日缺项牵连）。
+    let amount_month_models: std::collections::HashSet<&str> = amount
+        .data
+        .biz_data
+        .total
+        .iter()
+        .map(|model| model.model.as_str())
+        .filter(|model| !model.is_empty())
+        .collect();
+    let cost_month_models: std::collections::HashSet<&str> = cost_total
+        .map(|item| {
+            item.total
+                .iter()
+                .map(|model| model.model.as_str())
+                .filter(|model| !model.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let month_models_aligned = amount_month_models.is_subset(&cost_month_models);
     let month_cost: Option<f64> = cost_total.and_then(|item| {
+        if !month_models_aligned {
+            return None;
+        }
+        if item.total.is_empty() && !amount_month_models.is_empty() {
+            // 空费用组在有数量模型的上下文里不是「显式零」。
+            return None;
+        }
         item.total
             .iter()
             .try_fold(0.0, |total, m| Some(total + cost_sum(&m.usage)?))
@@ -789,8 +845,8 @@ mod tests {
             .find(|model| model.key == "flash")
             .unwrap();
         assert_eq!(flash.cost, None, "部分别名缺费用时槽位费用未知");
-        assert!((result.month_cost.unwrap() - 0.6).abs() < 1e-9);
-        // 重复费用条目本身仍被累加两次（0.3 + 0.3），月总额据此得出。
+        // 复评 F04：费用侧缺了数量侧返回的别名模型 → 月金额未知。
+        assert_eq!(result.month_cost, None, "缺项时月金额不可用");
         assert!(result
             .warnings
             .iter()
@@ -919,8 +975,12 @@ mod tests {
         assert_eq!(pro.cost, None, "费用侧没有 Pro 条目时不能显示 ¥0.00");
         assert_eq!(pro.total_tokens, Some(11), "数量侧有效数据仍保留");
         // flash 槽位含 deepseek-flash（有费用）与 deepseek-v4-flash（无费用），
-        // 因此槽位费用为未知；但月总额仍能算出已返回部分的合计。
-        assert!((result.month_cost.unwrap() - 0.30).abs() < 1e-9);
+        // 因此槽位费用为未知。复评 F04：费用月分组缺了数量侧返回的模型时，
+        // **整月金额**也必须是未知 —— 不能把已返回部分当完整月金额展示。
+        assert_eq!(
+            result.month_cost, None,
+            "费用缺模型时月金额必须是未知，而不是部分和"
+        );
         assert!(result.models.iter().all(|model| model.cost.is_none()));
         assert!(result
             .warnings
@@ -985,7 +1045,12 @@ mod tests {
             }],
         });
         let result = build_usage_result(&amount_sample(), &cost);
-        assert!(result.month_cost.is_some(), "费用侧完整时仍给出金额");
+        // 复评 F04：费用侧多出模型不影响「数量侧是否都被费用覆盖」，
+        // 但本样本费用侧仍缺 deepseek-v4-flash → 月金额未知。
+        assert_eq!(
+            result.month_cost, None,
+            "费用侧未覆盖数量侧全部模型时月金额未知"
+        );
         assert!(result
             .warnings
             .iter()
@@ -1005,9 +1070,11 @@ mod tests {
         cost.data.biz_data[0].days.clear();
         let result = build_usage_result(&amount_sample(), &cost);
         assert_eq!(result.days[0].total_cost, None, "该日费用未知");
-        assert!(
-            result.month_cost.unwrap() > 0.0,
-            "月合计来自月级费用，不因日级缺项清零"
+        // 复评 F04：只有日级缺项时**月金额**仍必须有效 —— 但本样本的月级
+        // 费用侧也缺了数量侧的别名模型，因此按新契约月金额为未知。
+        assert_eq!(
+            result.month_cost, None,
+            "月级模型集合不齐时月金额未知（日级缺项本身不影响月金额）"
         );
         assert!(result
             .warnings
@@ -1320,6 +1387,245 @@ mod tests {
         assert_eq!(day.total_tokens, None);
     }
 
+    // ---------- 第七轮复评 F04：月费用与月级模型集合对齐 ----------
+
+    #[test]
+    fn f04_数量月汇总含_b_但费用月汇总缺_b_月金额未知() {
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        assert_eq!(
+            result.month_cost, None,
+            "费用缺 B 时月金额必须是未知，不能把部分和当完整值"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("未知") || warning.contains("对齐")),
+            "缺项必须有可见提示：{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn f04_空费用组不当显式零_每个模型显式零才是零() {
+        // 有费用分组但 total 为空、数量侧有模型 → 未知（不是 0）。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let empty_cost: CostResp =
+            serde_json::from_str(r#"{"data":{"biz_data":[{"total":[],"days":[]}]}}"#).unwrap();
+        let result = build_usage_result(&amount, &empty_cost);
+        assert_eq!(result.month_cost, None, "空费用组不是显式零");
+
+        // 每个数量模型都有显式 0 费用 → 0 是合法值。
+        let zero_cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"0.0"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &zero_cost);
+        assert_eq!(result.month_cost, Some(0.0), "显式零费用应保留为 0");
+
+        // 完全没有费用分组 → 未知（既有语义不变）。
+        let absent: CostResp = serde_json::from_str(r#"{"data":{"biz_data":[]}}"#).unwrap();
+        let result = build_usage_result(&amount, &absent);
+        assert_eq!(result.month_cost, None);
+    }
+
+    #[test]
+    fn f04_只有日级缺项_月金额保持有效() {
+        // 月级齐全，只有 09-01 日缺 B 费用：日费用未知，但月金额必须保留。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ],
+                "days":[{"date":"2026-09-01","data":[
+                    {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ]}]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"2.0"}]}
+                ],
+                "days":[{"date":"2026-09-01","data":[
+                    {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]}
+                ]}]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        assert_eq!(
+            result.month_cost,
+            Some(3.0),
+            "月级齐全时月金额不受日级缺项牵连"
+        );
+        let day = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(day.total_cost, None, "该日费用仍是未知");
+    }
+
+    // ---------- 第七轮复评 F05：主面板与历史共用同一归并口径 ----------
+
+    /// 复评 F05 的最小输入：同一模型被拆成两条 usage。
+    fn split_model_response() -> AmountResp {
+        serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_TOKEN","amount":"100"}]},
+                    {"model":"deepseek-flash","usage":[
+                        {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"20"},
+                        {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"80"},
+                        {"type":"RESPONSE_TOKEN","amount":"10"}
+                    ]}
+                ],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn f05_同名模型分两条_主面板与历史口径一致() {
+        let amount = split_model_response();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let flash = result
+            .models
+            .iter()
+            .find(|model| model.key == "flash")
+            .expect("flash 行");
+        assert_eq!(
+            flash.total_tokens,
+            Some(110),
+            "按模型合并后只兜底一次：110（旧实现逐条得到 210）"
+        );
+        // 历史侧同一输入也必须得到 110。
+        let raw = crate::usage_history::raw_models(
+            &amount.data.biz_data.total,
+            &cost.data.biz_data[0].total,
+        );
+        let history = raw
+            .iter()
+            .find(|model| model.model == "deepseek-flash")
+            .expect("历史 flash 行");
+        assert_eq!(
+            history.total_tokens,
+            Some(110),
+            "主面板与历史必须给出同一个值"
+        );
+    }
+
+    #[test]
+    fn f05_只有请求量时token未知_不是零() {
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"REQUEST","amount":"2"}]}],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let flash = result
+            .models
+            .iter()
+            .find(|model| model.key == "flash")
+            .expect("flash 行");
+        assert_eq!(
+            flash.total_tokens, None,
+            "只有请求数不能把 token 总量说成 0"
+        );
+        assert_eq!(flash.request_count, Some(2), "请求数本身仍然有效");
+        let raw = crate::usage_history::raw_models(
+            &amount.data.biz_data.total,
+            &cost.data.biz_data[0].total,
+        );
+        assert_eq!(
+            raw.iter()
+                .find(|model| model.model == "deepseek-flash")
+                .unwrap()
+                .total_tokens,
+            None,
+            "历史侧同样未知"
+        );
+    }
+
+    #[test]
+    fn f05_prompt累计溢出传播未知_不变成零() {
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"deepseek-flash","usage":[
+                    {"type":"PROMPT_TOKEN","amount":"9007199254740991"},
+                    {"type":"PROMPT_TOKEN","amount":"1"}
+                ]}],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let flash = result
+            .models
+            .iter()
+            .find(|model| model.key == "flash")
+            .expect("flash 行");
+        assert_eq!(
+            flash.total_tokens, None,
+            "累计溢出必须传播未知，不能 unwrap_or(0) 变成 0"
+        );
+    }
+
     #[test]
     fn 余额样本_解析出第一条() {
         let raw = r#"{
@@ -1360,7 +1666,9 @@ mod tests {
         // 0.10 + 0.20（REQUEST 不计费用）只覆盖 deepseek-flash；
         // 同槽位的 deepseek-v4-flash 没有费用条目，槽位费用因此未知（复评 F06）。
         assert_eq!(flash.cost, None, "别名缺费用时不能显示部分金额");
-        assert!((result.month_cost.unwrap() - 0.30).abs() < 1e-9);
+        // 复评 F04：同一份样本里费用侧缺了数量侧返回的别名模型，
+        // 因此月金额同样是未知（缺项≠零，也不是部分和）。
+        assert_eq!(result.month_cost, None, "月金额与模型集合对齐后才可用");
     }
 
     #[test]

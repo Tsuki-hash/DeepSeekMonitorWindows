@@ -24,7 +24,14 @@ pub enum LayoutKind {
 /// ZCode 的默认扫描是 `.zcode/projects` 下的 JSONL 加上精确的
 /// `.zcode/cli/db/db.sqlite`；`.zcode` 下其他自定义库不在默认扫描范围内。
 /// DSH 的真实默认根是 `.dsh/sessions`，OpenClaw 是 `.openclaw/agents`。
-/// Hermes 的上游默认根当前仍按整个 `.hermes` 对待（暂无更细的上游证据）。
+///
+/// 复评 F01：固定引擎在 `--home` 模式下**仍然**加入若干内建额外根（`--home`
+/// 只禁用环境变量根）。这些根同样会实际读取数据，必须进入同一份扫描计划，
+/// 否则 home 与单工具来源会在这些位置上重复统计或漏掉：
+/// - Claude：`.claude/transcripts`，以及 `.cc-mirror/*/variant.json` 的
+///   `configDir`（动态、可能指向 home 之外，见 `discover_cc_mirror_roots`）；
+/// - Hermes：`AppData/Local/hermes`（`state.db` / `profiles`）；
+/// - OpenClaw 旧名入口：`.clawdbot/agents`、`.moltbot/agents`、`.moldbot/agents`。
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutRoot {
     pub relative: &'static str,
@@ -35,10 +42,17 @@ static OPENCODE_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
     relative: ".local/share/opencode",
     kind: LayoutKind::Directory,
 }];
-static CLAUDE_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
-    relative: ".claude/projects",
-    kind: LayoutKind::Directory,
-}];
+static CLAUDE_LAYOUTS: &[LayoutRoot] = &[
+    LayoutRoot {
+        relative: ".claude/projects",
+        kind: LayoutKind::Directory,
+    },
+    // 复评 F01：内建 transcripts 根。
+    LayoutRoot {
+        relative: ".claude/transcripts",
+        kind: LayoutKind::Directory,
+    },
+];
 static ZCODE_LAYOUTS: &[LayoutRoot] = &[
     LayoutRoot {
         relative: ".zcode/projects",
@@ -49,14 +63,36 @@ static ZCODE_LAYOUTS: &[LayoutRoot] = &[
         kind: LayoutKind::File,
     },
 ];
-static HERMES_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
-    relative: ".hermes",
-    kind: LayoutKind::Directory,
-}];
-static OPENCLAW_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
-    relative: ".openclaw/agents",
-    kind: LayoutKind::Directory,
-}];
+static HERMES_LAYOUTS: &[LayoutRoot] = &[
+    LayoutRoot {
+        relative: ".hermes",
+        kind: LayoutKind::Directory,
+    },
+    // 复评 F01：内建 AppData 根（state.db / profiles）。
+    LayoutRoot {
+        relative: "AppData/Local/hermes",
+        kind: LayoutKind::Directory,
+    },
+];
+static OPENCLAW_LAYOUTS: &[LayoutRoot] = &[
+    LayoutRoot {
+        relative: ".openclaw/agents",
+        kind: LayoutKind::Directory,
+    },
+    // 复评 F01：固定上游同样读取的三个旧名入口。
+    LayoutRoot {
+        relative: ".clawdbot/agents",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: ".moltbot/agents",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: ".moldbot/agents",
+        kind: LayoutKind::Directory,
+    },
+];
 static DSH_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
     relative: ".dsh/sessions",
     kind: LayoutKind::Directory,
@@ -71,6 +107,23 @@ pub fn standard_layouts(tool: &str) -> &'static [LayoutRoot] {
         "openclaw" => OPENCLAW_LAYOUTS,
         "dsh" => DSH_LAYOUTS,
         _ => &[],
+    }
+}
+
+/// 复评 F01：`cc_mirror` 的 variant 配置文件位置（相对 home）。
+pub const CC_MIRROR_DIR: &str = ".cc-mirror";
+
+/// 复评 F01：从一个 variant.json 的**已解析文本**里取出 `configDir`。
+///
+/// 只做文本解析，不访问目标；调用方拿到文本后仍需按来源策略校验目标
+///（`reject_link_target` / `probe_path`），不能因为配置里写了就当成合法根。
+pub fn cc_mirror_config_dir(variant_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(variant_json).ok()?;
+    let raw = value.get("configDir")?.as_str()?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
     }
 }
 
@@ -243,6 +296,61 @@ mod tests {
     #[test]
     fn r02_未知工具没有布局根() {
         assert!(standard_layouts("unknown").is_empty());
+    }
+
+    // ---------- 第七轮复评 F01：扫描计划必须覆盖引擎的内建额外根 ----------
+
+    #[test]
+    fn f01_内建额外根进入标准布局() {
+        // 复评 F01：`--home` 只禁用环境变量根，引擎仍会读这些内建根；
+        // 若它们不在计划里，home 与单工具来源会在同一位置重复统计。
+        let claude = standard_layouts("claude");
+        assert!(
+            claude
+                .iter()
+                .any(|root| root.relative == ".claude/transcripts"),
+            "Claude 内建 transcripts 根必须在扫描计划里"
+        );
+        let hermes = standard_layouts("hermes");
+        assert!(
+            hermes
+                .iter()
+                .any(|root| root.relative == "AppData/Local/hermes"),
+            "Hermes 内建 AppData 根必须在扫描计划里"
+        );
+        let openclaw = standard_layouts("openclaw");
+        for legacy in [".clawdbot/agents", ".moltbot/agents", ".moldbot/agents"] {
+            assert!(
+                openclaw.iter().any(|root| root.relative == legacy),
+                "OpenClaw 旧名入口 {legacy} 必须在扫描计划里"
+            );
+        }
+    }
+
+    #[test]
+    fn f01_cc_mirror配置只解析文本_不访问目标() {
+        assert_eq!(
+            cc_mirror_config_dir(r#"{"configDir":"D:\\Mirror\\Proj"}"#),
+            Some(r"D:\Mirror\Proj".to_string())
+        );
+        // 空/缺失/非法都不产生根。
+        assert_eq!(cc_mirror_config_dir(r#"{"configDir":"   "}"#), None);
+        assert_eq!(cc_mirror_config_dir(r#"{}"#), None);
+        assert_eq!(cc_mirror_config_dir("not json"), None);
+        assert_eq!(cc_mirror_config_dir(r#"{"configDir":123}"#), None);
+    }
+
+    #[test]
+    fn f01_内建根同样参与后代覆盖判定() {
+        // home 的 transcripts 根被覆盖时，指向它的工具来源应判重。
+        let layout_root = format!(
+            "{}\\{}",
+            normalize(r"D:\U"),
+            normalize(".claude/transcripts")
+        );
+        assert!(is_within(&layout_root, r"D:\U\.claude\transcripts\s.jsonl"));
+        // 而 home 下的自定义目录不在任何内建根内，必须照常采集。
+        assert!(!is_within(&layout_root, r"D:\U\custom\s2.jsonl"));
     }
 }
 

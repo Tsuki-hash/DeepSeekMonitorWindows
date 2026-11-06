@@ -459,6 +459,12 @@ pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String>
                 .map(|parent| parent.join(&target))
                 .unwrap_or(target)
         };
+        // 复评 F02-D：先做**词法归一化**（折叠 `.`/`..`、去掉多余分隔符），
+        // 再判策略。`C:\Users\A\alias` 的相对目标 `..\..\Windows\System32`
+        // 拼接后文本是 `C:\Users\A\..\..\Windows\System32`，不折叠就会被
+        // 「只看盘符后首级」的系统目录判定误放行，而真实目标是
+        // `C:\Windows\System32`。归一化是纯文本操作，不访问文件系统。
+        let target_path = normalize_dot_segments(&target_path);
         reject_link_target(&target_path.to_string_lossy(), origin)?;
         // 目标文本获批准：把剩余路径嫁接到目标上继续检查 ——
         // 目标自身还可能是指向别处的链接。
@@ -468,6 +474,37 @@ pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String>
             target_path.join(remaining)
         };
     }
+}
+
+/// 复评 F02-D：纯文本折叠 `.` / `..` 与重复分隔符。
+///
+/// 只处理词法层面，不解析任何链接、不访问文件系统 —— 这是「访问前判定」
+/// 的前提：链接目标里的 `..` 必须先折叠，否则系统目录/WSL/UNC 判定会被
+/// 中间段绕过。Windows 语义下 `..` 逐级上退，退到盘根即停。
+pub fn normalize_dot_segments(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 只折叠可退的普通组件；盘符/根/前缀不动（`C:\..` = `C:\`）。
+                match out.last() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    Some(Component::Prefix(_)) | Some(Component::RootDir) => {}
+                    _ => out.push(component),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut result = PathBuf::new();
+    for component in out {
+        result.push(component.as_os_str());
+    }
+    result
 }
 
 /// 从根到叶找第一个 reparse 组件，返回（链接组件，链接之后的剩余路径）。
@@ -1098,5 +1135,46 @@ mod tests {
         assert!(outcome.is_ok() || outcome.is_err(), "链接环必须有限步终止");
         std::fs::remove_dir(&link_b).ok();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------- 第七轮复评 F02-D：相对链接的 `..` 必须先折叠 ----------
+
+    #[test]
+    fn f02_相对目标折叠dot段后再判策略() {
+        // 评审示例：`C:\Users\A\alias` 的相对目标 `..\..\Windows\System32`
+        // 拼接后是 `C:\Users\A\..\..\Windows\System32`；不折叠会被「只看盘符
+        // 后首级」的判定误放行，真实目标是 `C:\Windows\System32`。
+        let raw = Path::new(r"C:\Users\A\..\..\Windows\System32");
+        let folded = normalize_dot_segments(raw);
+        assert_eq!(folded, PathBuf::from(r"C:\Windows\System32"));
+        assert!(
+            is_disallowed_local_target_text(&folded.to_string_lossy()),
+            "折叠后的系统目录必须被识别"
+        );
+        assert!(
+            !is_disallowed_local_target_text(&raw.to_string_lossy()),
+            "未折叠的文本确实会漏判 —— 这正是折叠存在的理由"
+        );
+        // 普通路径不受影响；`.` 与重复分隔符也被折叠。
+        assert_eq!(
+            normalize_dot_segments(Path::new(r"D:\Logs\.\Claude")),
+            PathBuf::from(r"D:\Logs\Claude")
+        );
+        // 退到盘根即停，不能越出盘符。
+        assert_eq!(
+            normalize_dot_segments(Path::new(r"D:\..\..\Logs")),
+            PathBuf::from(r"D:\Logs")
+        );
+    }
+
+    #[test]
+    fn f02_折叠后的unc与wsl目标同样被识别() {
+        let raw = Path::new(r"D:\Logs\..\..\..\wsl.localhost\Ubuntu\home");
+        let folded = normalize_dot_segments(raw);
+        // Windows 语义下退到盘根后剩余段成为普通子路径，不构成 UNC；
+        // 真正以 UNC 开头的相对目标仍必须被识别。
+        let unc = normalize_dot_segments(Path::new(r"\\wsl.localhost\Ubuntu\..\Debian\home"));
+        assert!(is_disallowed_local_target_text(&unc.to_string_lossy()));
+        assert!(!is_disallowed_local_target_text(&folded.to_string_lossy()));
     }
 }

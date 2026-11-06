@@ -136,15 +136,25 @@ pub fn token_breakdown(usage: &[Entry]) -> TokenBreakdown {
     let detailed = result.cache_hit.is_some() && result.cache_miss.is_some();
     let known_hit = result.cache_hit.unwrap_or(0);
     let known_miss = result.cache_miss.unwrap_or(0);
+    // 复评 F05：只有 REQUEST 没有任何 token 种类时，total 不是「0」而是**未知**
+    //（有请求数据不等于 token 明确为零）。与 usage_history 的 has_tokens 规则一致。
+
     if !detailed {
         // 明细缺失：总量与「未归类」都无法完整重建，保留其余有效分段。
         result.total = None;
         result.other = None;
     } else if prompt_valid && known_hit == 0 && known_miss == 0 {
         // 平台只给了输入总量：兜底计入 total，与历史口径保持一致。
-        let prompt = prompt_total.unwrap_or(0);
-        result.total = add(result.total, Some(prompt));
-        result.other = add(result.other, Some(prompt));
+        // 复评 F05：`prompt_total` 为 None（累加溢出）时必须传播 None，
+        // 不能 `unwrap_or(0)` 把溢出变成「零」。
+        if prompt_seen && prompt_total.is_none() {
+            result.total = None;
+            result.other = None;
+        } else {
+            let prompt = prompt_total.unwrap_or(0);
+            result.total = add(result.total, Some(prompt));
+            result.other = add(result.other, Some(prompt));
+        }
     } else if prompt_valid && prompt_total.unwrap_or(0) > 0 {
         let prompt = prompt_total.unwrap_or(0);
         let detail_sum = known_hit + known_miss;
@@ -155,6 +165,14 @@ pub fn token_breakdown(usage: &[Entry]) -> TokenBreakdown {
         }
     } else if prompt_seen && !prompt_valid && known_hit == 0 && known_miss == 0 {
         // 唯一的输入来源坏掉，且明细为零：总量不可信，不能显示成零。
+        result.total = None;
+        result.other = None;
+    }
+    // 复评 F05：有条目但**全是 REQUEST**（没有任何 token 种类）时，total 不是
+    // 「0」而是**未知**（有请求数据不等于 token 明确为零）。
+    // 空输入仍保持全零 —— 没有条目就是没有用量，这是既有语义。
+    let request_only = !usage.is_empty() && !usage.iter().any(|entry| entry.kind != "REQUEST");
+    if request_only {
         result.total = None;
         result.other = None;
     }

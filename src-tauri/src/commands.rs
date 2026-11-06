@@ -478,15 +478,26 @@ pub(crate) async fn collect_local_usage(
             Ok(outcome) if outcome.failed => {
                 Some("留存写入失败，已保存的旧记录未改动；当前统计仍可用".into())
             }
-            Ok(outcome) if outcome.skipped > 0 || outcome.skipped_bytes > 0 => {
-                // 复评 R09：条数满与字节超限分别报告，旧会话更新不再被整批拖累。
+            Ok(outcome)
+                if outcome.skipped > 0
+                    || outcome.skipped_bytes > 0
+                    || outcome.skipped_new_bytes > 0 =>
+            {
+                // 复评 R09/F03：三类跳过分别报告，旧会话更新不再被整批拖累，
+                // 且「保留旧值」与「新会话未留存」的语义不同，不能混为一谈。
                 let mut parts = Vec::new();
                 if outcome.skipped > 0 {
-                    parts.push(format!("{} 条新会话未保存", outcome.skipped));
+                    parts.push(format!("{} 条新会话因条数已满未保存", outcome.skipped));
+                }
+                if outcome.skipped_new_bytes > 0 {
+                    parts.push(format!(
+                        "{} 条新会话因超出字节上限未保存",
+                        outcome.skipped_new_bytes
+                    ));
                 }
                 if outcome.skipped_bytes > 0 {
                     parts.push(format!(
-                        "{} 条更新因超出字节上限保持旧值",
+                        "{} 条既有会话更新因超出字节上限保留旧值",
                         outcome.skipped_bytes
                     ));
                 }
