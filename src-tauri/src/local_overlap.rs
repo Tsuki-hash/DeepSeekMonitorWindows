@@ -127,17 +127,20 @@ pub fn cc_mirror_config_dir(variant_json: &str) -> Option<String> {
     }
 }
 
-/// 复评 N04：把一个 `configDir` 声明解析成**绝对路径**。
+/// 复评 N04/T06：把一个 `configDir` 声明解析成**绝对路径**，语义与固定上游
+/// `cc_mirror.rs` 严格一致。
 ///
-/// 上游（`cc_mirror.rs`）支持三种写法，旧实现只处理绝对路径：
-/// - 绝对路径：原样使用；
-/// - `~/xxx` 与 `~`：展开到 home；
-/// - 相对路径：相对 **variant.json 所在目录**（上游回退到 variant/config 语义）。
+/// 上游的展开规则（`cc_mirror.rs` L119–134）只有三条：
+/// 1. 绝对路径 → 原样使用；
+/// 2. **仅** `~/` 前缀 → 展开到 home 下的相对部分；
+/// 3. 其余（含 `~` 单独一个、`~\x`、普通相对路径）→ 一律按
+///    **variant.json 所在目录**的相对路径处理。
 ///
-/// 缺省（null / 缺失 / 空串）时回退到 `<variant 目录>/config`。
+/// 第九轮把 `~` 与 `~\x` 也展开到 home，那是自创语义：宿主审 `home/projects`，
+/// 而引擎实际探测 `variant/~/projects` —— 校验的根与实际读取的根不是同一个。
+/// 缺省（null / 缺失 / 空串）时回退到 `<variant 目录>/config`（同上游）。
 ///
-/// 返回绝对路径；任何无法解析的形态都返回 `None`（调用方按「无法确认」处理，
-/// 不假定完整）。
+/// 返回绝对路径；无法解析为绝对路径时返回 `None`（调用方按「无法确认」处理）。
 pub fn cc_mirror_resolve_root(
     variant_json: &str,
     variant_dir: &std::path::Path,
@@ -146,8 +149,8 @@ pub fn cc_mirror_resolve_root(
     let declared = cc_mirror_config_dir(variant_json);
     let resolved = match declared.as_deref() {
         None => variant_dir.join("config"),
-        Some("~") => home.to_path_buf(),
-        Some(raw) if raw.starts_with("~/") || raw.starts_with("~\\") => {
+        // 仅 `~/` 前缀展开；`~` 与 `~\x` 走相对路径分支（与上游一致）。
+        Some(raw) if raw.starts_with("~/") => {
             home.join(raw[2..].replace('\\', "/").trim_start_matches('/'))
         }
         Some(raw) => {

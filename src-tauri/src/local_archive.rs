@@ -71,6 +71,11 @@ pub struct ArchiveEntry {
     pub includes_paths: bool,
     pub complete: bool,
     pub stale: bool,
+    /// 复评 T05：质量证据（脱敏 code，如 `overlap_partial`），与 `complete`
+    /// （读取是否完整）分开。旧档没有该字段时为空 —— 展示方必须明确标
+    /// 「质量证据未记录」，不能当作「已验证无重叠」。
+    #[serde(default)]
+    pub quality_warnings: Vec<String>,
     pub rows: Vec<ArchiveRow>,
 }
 #[derive(Serialize, Deserialize)]
@@ -153,7 +158,21 @@ fn selected<'a>(
             ArchiveScope::All => true,
             ArchiveScope::Project { key } => matches_project(row, key),
             ArchiveScope::Session { key, project_key } => {
-                *key == format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id)
+                // 复评 T02：会话键必须与前端**同一编码**（含 client 身份）。
+                // 前端 `localSessions` 生成 `source\0tool\0client\0session`，
+                // 旧后端只比较三段 `source\0tool\0session` —— 六工具全部不匹配，
+                // 「当前会话」归档一律报「没有可归档记录」。
+                // 这里用同一个 `session_scope_key` 生成与比较，并额外接受
+                // **v1 三段键**（历史调用方/旧数据兼容），但绝不退回只比
+                // sessionId（那会把镜像与原生重新混并）。
+                let client = if row.client_id.is_empty() {
+                    row.tool.as_str()
+                } else {
+                    row.client_id.as_str()
+                };
+                let current = session_scope_key(&row.source_id, &row.tool, client, &row.session_id);
+                let legacy = format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id);
+                (*key == current || *key == legacy)
                     && project_key
                         .as_ref()
                         .is_none_or(|project| matches_project(row, project))
@@ -161,6 +180,14 @@ fn selected<'a>(
         })
         .collect()
 }
+/// 复评 T02：会话范围键的**唯一**编码（与前端 `localSessions` 一致）。
+///
+/// `sourceId\0tool\0clientId\0sessionId`。前后端必须共用这一份定义，
+/// 否则「当前会话」归档会因键不匹配而选中零行。
+pub fn session_scope_key(source: &str, tool: &str, client: &str, session: &str) -> String {
+    format!("{source}\0{tool}\0{client}\0{session}")
+}
+
 fn matches_project(row: &crate::local_usage::LocalRow, key: &str) -> bool {
     row.project_key.as_deref() == Some(key)
         || row.project_key.is_none() && key == format!("{}\0unassigned", row.source_id)
@@ -356,6 +383,9 @@ pub fn capture(
         return Err("已保留12份归档，请先删除不需要的记录；未自动覆盖".into());
     }
     let entry = ArchiveEntry {
+        // 复评 T05：把快照的质量证据一并持久化，导出/恢复后仍可判断
+        // 「读取完整 ≠ 去重可信」。
+        quality_warnings: snapshot.quality_warnings.clone(),
         id,
         saved_at,
         collected_at: snapshot.collected_at,
@@ -702,5 +732,71 @@ mod tests {
         assert!(crate::local_usage::local_period(u64::MAX).is_none());
         snap.period_key = "2026-13".into();
         assert!(capture(&snap, &ArchiveScope::All, false, false, 2000).is_err());
+    }
+
+    /// 复评 T02：后端必须接受**前端生成**的会话键（含 client）。
+    #[test]
+    fn t02_会话归档接受前端含client的键() {
+        let snapshot = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"claude","sessionId":"s1","model":"m","input":10,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"claude-mirror","sessionId":"s1","model":"m","input":20,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[],"sessions":[]}),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(snapshot.rows.len(), 2);
+        // 前端 localSessions 生成的键：source\0tool\0client\0session。
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.client_id == "claude")
+            .unwrap();
+        let key = session_scope_key(&row.source_id, &row.tool, &row.client_id, &row.session_id);
+        let picked = selected(
+            &snapshot,
+            &ArchiveScope::Session {
+                key: key.clone(),
+                project_key: None,
+            },
+        );
+        assert_eq!(picked.len(), 1, "必须选中恰好一行（旧三段键选中零行）");
+        assert_eq!(picked[0].client_id, "claude", "只保存所选身份");
+        // 镜像的键选中镜像那一行，不与原生混并。
+        let mirror = snapshot
+            .rows
+            .iter()
+            .find(|row| row.client_id == "claude-mirror")
+            .unwrap();
+        let mirror_key = session_scope_key(
+            &mirror.source_id,
+            &mirror.tool,
+            &mirror.client_id,
+            &mirror.session_id,
+        );
+        let picked = selected(
+            &snapshot,
+            &ArchiveScope::Session {
+                key: mirror_key,
+                project_key: None,
+            },
+        );
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].client_id, "claude-mirror");
+        // v1 三段键仍兼容（历史调用方），但会选中同 source/tool/session 的两行 ——
+        // 这是兼容路径，不是默认路径。
+        let legacy = format!("{}\0{}\0{}", row.source_id, row.tool, row.session_id);
+        assert_eq!(
+            selected(
+                &snapshot,
+                &ArchiveScope::Session {
+                    key: legacy,
+                    project_key: None,
+                },
+            )
+            .len(),
+            2,
+            "旧键兼容但不作为默认路径"
+        );
     }
 }

@@ -140,9 +140,7 @@ pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, ApiE
     // 整读，15 秒超时不限制体积；异常/超长响应会先吃满内存。
     let text = read_bounded_body(response, MAX_RESPONSE_BYTES)
         .await
-        .map_err(|error| {
-            ApiError::new(ErrorKind::Unavailable, format!("读取余额响应失败：{error}"))
-        })?;
+        .map_err(|error| body_error_to_api("读取余额响应失败", error))?;
     let parsed = BalanceResponse::from_json(&text)
         .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
     parse_balance(parsed).map_err(|message| ApiError::new(ErrorKind::InvalidData, message))
@@ -151,17 +149,52 @@ pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, ApiE
 /// 复评 N18：官方响应体的字节上限（16MiB，与采集输出同量级）。
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// 复评 N18/T11：响应体读取失败的类型化原因。
+///
+/// 旧实现把所有失败压成一个 `String`，调用方再统一映射成 `InvalidData` ——
+/// 于是「200 头之后断流 / 超时」这类**传输**故障被当成数据格式错误，
+/// 通道退避被清零、历史批次继续连打下一个月。这里保留类型，让上层按
+/// 传输 / 超限 / 编码分别映射（不靠解析中文文案猜）。
+enum BodyError {
+    /// 传输层故障（连接中断、超时、分块错误）。
+    Transport(String),
+    /// 超过字节上限。
+    TooLarge(usize),
+    /// 编码或结构不可用。
+    Invalid(String),
+}
+
 /// 复评 N18：按块读取响应体，超过上限立即失败。
-async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<String, String> {
+async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<String, BodyError> {
     let mut response = response;
     let mut buffer: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| BodyError::Transport(error.to_string()))?
+    {
         if buffer.len() + chunk.len() > limit {
-            return Err(format!("响应超过 {limit} 字节上限，已停止读取"));
+            return Err(BodyError::TooLarge(limit));
         }
         buffer.extend_from_slice(&chunk);
     }
-    String::from_utf8(buffer).map_err(|_| "响应不是有效 UTF-8".to_string())
+    String::from_utf8(buffer).map_err(|_| BodyError::Invalid("响应不是有效 UTF-8".into()))
+}
+
+/// 复评 T11：把 `BodyError` 映射成 API 错误（传输 → Unavailable，保留退避）。
+fn body_error_to_api(label: &str, error: BodyError) -> ApiError {
+    match error {
+        BodyError::Transport(message) => {
+            ApiError::new(ErrorKind::Unavailable, format!("{label}：{message}"))
+        }
+        BodyError::TooLarge(limit) => ApiError::new(
+            ErrorKind::InvalidData,
+            format!("{label}：超过 {limit} 字节上限"),
+        ),
+        BodyError::Invalid(message) => {
+            ApiError::new(ErrorKind::InvalidData, format!("{label}：{message}"))
+        }
+    }
 }
 
 /// 用量 Token 校验失败的性质。
@@ -204,10 +237,14 @@ pub async fn verify_usage_token(token: &str, month: u32, year: u32) -> Result<()
         .map_err(|_| VerifyFailure::Transient)?;
     match resp.status().as_u16() {
         200 => {
-            let parsed = resp
-                .json::<AmountResp>()
+            // 复评 T16：Token 验证也走统一的有界读取，不再 `json()` 整读 ——
+            // 官方端点的巨大 200 响应不该先吃满内存。超限/编码按 Transient
+            // 处理（候选凭据不提交，原凭据不变）。
+            let body = read_bounded_body(resp, MAX_RESPONSE_BYTES)
                 .await
                 .map_err(|_| VerifyFailure::Transient)?;
+            let parsed: AmountResp =
+                serde_json::from_str(&body).map_err(|_| VerifyFailure::Transient)?;
             let valid = parsed
                 .data
                 .biz_data
@@ -819,9 +856,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     // 复评 N18：同上，用量响应也走有界读取后再解析。
     let body = read_bounded_body(resp, MAX_RESPONSE_BYTES)
         .await
-        .map_err(|error| {
-            ApiError::new(ErrorKind::InvalidData, format!("读取用量数据失败：{error}"))
-        })?;
+        .map_err(|error| body_error_to_api("读取用量数据失败", error))?;
     serde_json::from_slice::<T>(body.as_bytes()).map_err(|error| {
         ApiError::new(ErrorKind::InvalidData, format!("解析用量数据失败：{error}"))
     })

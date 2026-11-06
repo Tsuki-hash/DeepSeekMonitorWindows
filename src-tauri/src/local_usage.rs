@@ -502,16 +502,29 @@ pub async fn collect_sources(
                 // 只在**同一工具**的登记里查找 —— 一种工具的覆盖不得推成另一解析器。
                 // junction 别名使原始字符串不命中、canonical 又与 home 根不等，
                 // 只有用 home 逐个解析后的布局根才能证明同源。
-                if let Some(entry) = tool_path {
+                // 复评 T04：这段覆盖检查对**所有来源**生效，不只单工具路径。
+                // 旧实现用 `if let Some(entry) = tool_path` 包住，于是两个主目录
+                // 都配置了指向同一物理根的 `extraScanPaths` 时，各自采集并直接
+                // 相加（评审示例：两 home 各有独有 20/30、共享 100 → 250 而非 150）。
+                // 现在按来源的**解析器工具**（home 来源用其自身覆盖根所属工具）
+                // 逐工具查全局登记。
+                {
                     let candidate_key = home_key(&canonical.to_string_lossy());
                     let roots = layout_roots.lock().map_err(|_| "采集状态不可用")?;
-                    let hit = roots.get(&entry.tool).and_then(|per_tool| {
-                        per_tool
-                            .iter()
-                            .find(|(root, _)| {
-                                crate::local_overlap::key_within(root, &candidate_key)
-                            })
-                            .map(|(_, label)| label.clone())
+                    let tools: Vec<&str> = match &tool_path {
+                        Some(entry) => vec![entry.tool.as_str()],
+                        // home 来源：它与任何已登记根的交集都要按工具判定。
+                        None => roots.keys().map(String::as_str).collect(),
+                    };
+                    let hit = tools.iter().find_map(|tool| {
+                        roots.get(*tool).and_then(|per_tool| {
+                            per_tool
+                                .iter()
+                                .find(|(root, _)| {
+                                    crate::local_overlap::key_within(root, &candidate_key)
+                                })
+                                .map(|(_, label)| label.clone())
+                        })
                     });
                     drop(roots);
                     if let Some(covering) = hit {
@@ -531,11 +544,19 @@ pub async fn collect_sources(
                     // 自定义目录），改为**明确报告部分重叠**，让用户知道数值
                     // 可能重复，而不是静默双计或静默漏采。
                     let roots = layout_roots.lock().map_err(|_| "采集状态不可用")?;
-                    let overlaps_home = roots.get(&entry.tool).is_some_and(|per_tool| {
-                        per_tool
-                            .keys()
-                            .any(|root| crate::local_overlap::key_within(&candidate_key, root))
-                    });
+                    // 复评 T04：对所有来源按工具检查「候选根**包含**已登记根」。
+                    let overlaps_home = match &tool_path {
+                        Some(entry) => roots.get(&entry.tool).is_some_and(|per_tool| {
+                            per_tool
+                                .keys()
+                                .any(|root| crate::local_overlap::key_within(&candidate_key, root))
+                        }),
+                        None => roots.values().any(|per_tool| {
+                            per_tool
+                                .keys()
+                                .any(|root| crate::local_overlap::key_within(&candidate_key, root))
+                        }),
+                    };
                     drop(roots);
                     if overlaps_home {
                         // 部分重叠：照常采集（保证宽根下的独有数据不丢），
@@ -592,7 +613,13 @@ pub async fn collect_sources(
                 // 复评 R06：单工具来源用隔离 home 执行，不检查用户 settings。
                 // 复评 N06：辅助配置文件同样被引擎读取，必须纳入预审。
                 if tool_path.is_none() {
-                    let aux = audit_engine_aux_configs(&canonical, origin)?;
+                    // 复评 T08：辅助配置审计也是同步 IO，走有界执行器。
+                    let aux_home = canonical.clone();
+                    let aux_origin = origin;
+                    let aux =
+                        run_bounded_io(move || audit_engine_aux_configs(&aux_home, aux_origin))
+                            .await
+                            .and_then(|value| value)?;
                     if !aux.is_empty() {
                         if let Ok(mut map) = engine_settings_notice.lock() {
                             map.insert(id.clone(), aux[0]);
@@ -918,16 +945,60 @@ where
 /// 发现文件链接（含断链）即拒绝该来源。目录链接不进入：引擎的通用遍历
 /// 不跟随目录链接，标准布局根上的目录链接由布局解析按策略单独解析登记。
 fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
+    audit_root_for_reparse_budgeted(root, &mut AuditBudget::default())
+}
+
+/// 复评 T07：链接预审的**共享预算与去环状态**。
+///
+/// 旧实现每次递归调用都新建 `visited` 计数，也没有已访问目录身份集合：
+/// 自回链（A→A）或 A↔B 回链会让每一层都重置预算，递归可以一直走到资源
+/// 耗尽，且仍占着唯一的 IO 许可。这里把预算与去环集合在**整次预审**内共享：
+/// - `entries`：全树累计条目上限；
+/// - `depth`：最大递归深度；
+/// - `seen`：已访问的**真实目录身份**（canonical），回链立即终止。
+#[derive(Default)]
+struct AuditBudget {
+    entries: usize,
+    depth: usize,
+    seen: std::collections::BTreeSet<std::path::PathBuf>,
+}
+
+/// 复评 T07：目录递归深度上限（与链接跳数上限同量级）。
+const REPARSE_AUDIT_MAX_DEPTH: usize = 8;
+
+fn audit_root_for_reparse_budgeted(
+    root: &Path,
+    budget: &mut AuditBudget,
+) -> Result<ReparseAudit, String> {
+    // 去环：同一真实目录只审一次；回到已审目录直接视为已完成。
+    let identity = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !budget.seen.insert(identity) {
+        return Ok(ReparseAudit::Clean);
+    }
+    budget.depth += 1;
+    if budget.depth > REPARSE_AUDIT_MAX_DEPTH {
+        budget.depth -= 1;
+        return Ok(ReparseAudit::Incomplete("目录层级过深，链接预审未完整"));
+    }
+    let outcome = audit_root_for_reparse_inner(root, budget);
+    budget.depth -= 1;
+    outcome
+}
+
+fn audit_root_for_reparse_inner(
+    root: &Path,
+    budget: &mut AuditBudget,
+) -> Result<ReparseAudit, String> {
     let mut stack = vec![root.to_path_buf()];
-    let mut visited = 0usize;
+    let visited = &mut budget.entries;
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(_) => return Ok(ReparseAudit::Incomplete("子目录无法读取，链接预审未完整")),
         };
         for entry in entries {
-            visited += 1;
-            if visited > REPARSE_AUDIT_MAX_ENTRIES {
+            *visited += 1;
+            if *visited > REPARSE_AUDIT_MAX_ENTRIES {
                 return Ok(ReparseAudit::Incomplete("目录过大，链接预审未完整"));
             }
             let Ok(entry) = entry else {
@@ -1130,10 +1201,15 @@ fn audit_engine_aux_configs(
         match read_bounded(&path, 256 * 1024) {
             Ok(text) => {
                 if text.len() > 256 * 1024 {
-                    warnings.push("辅助配置超过上限，显示名未采用");
-                } else if serde_json::from_slice::<serde_json::Value>(&text).is_err() {
-                    // jsonc 允许注释，这里只记录「无法解析」，不拒绝来源。
-                    warnings.push("辅助配置无法解析，显示名未采用");
+                    // 复评 T09：超限不能只警告 —— 固定引擎仍会 `read_to_string`
+                    // 整份原文件（30 秒超时不限制峰值内存）。这里**拒绝该来源**，
+                    // 因为宿主无法保证引擎读取是有界的。
+                    return Err(format!("引擎辅助配置（{relative}）超过 256KiB，拒绝采集"));
+                }
+                // 复评 T09：上游支持 JSONC（含注释），宿主不能用 serde_json 的
+                // 严格解析结果去判断「未采用」—— 只做形态提示，不误报。
+                if text.contains(&b'\0') {
+                    warnings.push("辅助配置含异常字节，显示名可能未采用");
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1178,8 +1254,13 @@ fn read_engine_config_roots(
         .fold(home.to_path_buf(), |base, part| base.join(part));
     crate::local_sources::check_link_chain(&primary, origin)
         .map_err(|error| format!("引擎配置（{}）路径未通过检查：{error}", primary.display()))?;
+    // 复评 T17：上游按**读取结果**（`read_to_string`）选择备用，而不是
+    // 只按 `open` 成功。旧实现 `File::open` 成功就选主配置，随后读取失败
+    // 或非 UTF-8 时直接报错 —— 合法备用本可用却整源不可用。
+    // 这里用有界读取判断「是否真的能读出内容」，读失败才走备用。
+    let primary_readable = read_bounded(&primary, 256 * 1024).is_ok();
     let mut configs: Vec<std::path::PathBuf> = Vec::new();
-    if std::fs::File::open(&primary).is_ok() {
+    if primary_readable {
         configs.push(primary);
     } else {
         let fallback = [
@@ -2107,9 +2188,29 @@ mod tests {
             );
             std::fs::remove_dir(&junction).ok();
         } else {
-            eprintln!("NOT RUN：当前环境无法创建 junction");
+            // 复评 T14：junction 由普通用户即可创建（`mklink /J` 不需要
+            // SeCreateSymbolicLinkPrivilege）。这里创建失败说明环境异常，
+            // 必须让测试 **FAIL** —— 旧实现只 eprintln! 就正常返回，
+            // libtest 记 PASS，门禁会把「没跑」当成「通过」。
+            panic!("junction 创建失败：环境异常，链接场景未验证");
         }
-        // 目录符号链接需要创建符号链接权限，没有权限时明确跳过。
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 复评 T14：**符号链接能力探针**。`symlink_dir`/`symlink_file` 需要
+    /// SeCreateSymbolicLinkPrivilege（或开发者模式）。这里把「是否具备能力」
+    /// 与「链接场景是否通过」拆开：不具备能力时本测试标记为 ignored 语义
+    /// 的显式跳过（打印机器可读的 `NOT RUN:` 前缀），具备能力时必须真实断言。
+    ///
+    /// 发行门禁（release-record）会统计 `NOT RUN:` 行并阻断，不再把它当 PASS。
+    #[cfg(windows)]
+    #[test]
+    fn t14_符号链接场景按能力显式执行() {
+        let base = std::env::temp_dir().join(format!("dsm-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real-dir")).unwrap();
+        std::fs::write(base.join("real.log"), b"x").unwrap();
+
         let dir_link = base.join("dir-link");
         match std::os::windows::fs::symlink_dir(base.join("real-dir"), &dir_link) {
             Ok(()) => {
@@ -2119,10 +2220,13 @@ mod tests {
                 );
                 std::fs::remove_dir(&dir_link).ok();
             }
-            Err(error) => {
-                eprintln!("NOT RUN：当前环境无法创建目录符号链接（{error}）");
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                // ERROR_PRIVILEGE_NOT_HELD：能力缺失，明确 NOT RUN。
+                eprintln!("NOT RUN: 缺少创建符号链接权限，目录链接场景未执行");
             }
+            Err(error) => panic!("目录符号链接创建异常：{error}"),
         }
+
         let file_link = base.join("file-link.log");
         match std::os::windows::fs::symlink_file(base.join("real.log"), &file_link) {
             Ok(()) => {
@@ -2132,9 +2236,10 @@ mod tests {
                 );
                 std::fs::remove_file(&file_link).ok();
             }
-            Err(error) => {
-                eprintln!("NOT RUN：当前环境无法创建文件符号链接（{error}）");
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("NOT RUN: 缺少创建符号链接权限，文件链接场景未执行");
             }
+            Err(error) => panic!("文件符号链接创建异常：{error}"),
         }
         let _ = std::fs::remove_dir_all(&base);
     }

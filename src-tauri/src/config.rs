@@ -393,20 +393,37 @@ fn backup_corrupt_config(path: &PathBuf) -> Result<PathBuf, String> {
 /// UTF-8 时返回 `None`（调用方不生成备份）。
 fn scrub_corrupt_secrets(raw: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(raw).ok()?;
+    // 复评 T15：真实字段名是 **snake_case**（`api_key` / `usage_token`，
+    // `StoredConfig` 没有 camelCase rename）。旧实现只搜 camelCase，真实
+    // 凭据值被原样复制到 `.corrupt-*` 副本里。
+    //
+    // 更根本的一点：解析失败说明结构不可信，**文本脱敏不能保证覆盖**
+    //（跨行值、转义键、非标准结构都可能漏）。因此这里只在能确认是
+    // 单行 `key: value` 形态时才脱敏；任何不确定的形态返回 `None`，
+    // 由调用方保留原件、明确报错，而不是生成一个「看起来安全」的副本。
+    const SECRET_KEYS: &[&str] = &["api_key", "usage_token", "apikey", "usagetoken", "token"];
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
-        let looks_secret = ["\"apikey\"", "\"usagetoken\"", "\"token\""]
-            .iter()
-            .any(|key| lower.contains(key));
-        if looks_secret && line.contains(':') {
-            let (head, _) = line.split_once(':')?;
-            out.push_str(head);
-            out.push_str(": \"<已脱敏>\",");
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
+        let key = SECRET_KEYS.iter().find(|key| {
+            lower.contains(&format!("\"{key}\"")) || lower.contains(&format!("{key}:"))
+        });
+        match key {
+            Some(_) => {
+                // 只接受「单行、恰好一个冒号、值在同行」的形态。
+                let (head, tail) = line.split_once(':')?;
+                if tail.contains('{') || tail.contains('[') {
+                    // 值跨行/嵌套：无法可靠脱敏。
+                    return None;
+                }
+                out.push_str(head);
+                out.push_str(": \"<已脱敏>\",");
+                out.push('\n');
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
     }
     Some(out)

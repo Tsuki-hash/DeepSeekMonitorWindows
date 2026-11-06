@@ -34,6 +34,27 @@ struct Store {
     schema_version: u32,
     entries: Vec<ArchiveEntry>,
 }
+/// 复评 T01：留存库 schema 版本。
+///
+/// - **v1**：ID = SHA256(JSON([period, source, tool, session]))，行内没有
+///   client 身份（第九轮之前的格式）。
+/// - **v2**：ID = SHA256(JSON([period, source, tool, **client**, session]))，
+///   行内带 `clientId`。
+///
+/// 第九轮把 ID 改成五元组却仍写 schema 1，导致任何**旧**留存库在 `valid()`
+/// 里都算不出匹配 ID，整个 store 被拒读（历史不可读、后续留存停止）。
+/// 现在显式区分版本，并保留 v1 的校验路径。
+const SCHEMA_V1: u32 = 1;
+const SCHEMA_V2: u32 = 2;
+
+/// 复评 T01：v1 旧 ID（不含 client）。
+fn legacy_id(period: &str, source: &str, tool: &str, session: &str) -> Result<String, String> {
+    let value =
+        serde_json::to_vec(&(period, source, tool, session)).map_err(|_| "留存标识不可用")?;
+    Ok(format!("{:x}", Sha256::digest(value)))
+}
+
+/// 复评 N01/T01：v2 ID（含 client 身份）。
 fn id(
     period: &str,
     source: &str,
@@ -87,20 +108,31 @@ fn valid(entry: &ArchiveEntry) -> bool {
         return false;
     }
     let row = &entry.rows[0];
-    // 复评 N01：校验也要含 client 身份（旧 schema 无 client_id 时回填 tool）。
+    // 复评 T01：ID 可能是 **v1 四元组**（旧库，不含 client）或 **v2 五元组**
+    //（第九轮之后）。旧实现只认五元组，于是任何旧库记录都校验失败、整个
+    // store 被拒读。这里两种都接受 —— 但**行内身份一致性**仍严格要求：
+    // 同一条留存里的所有行必须属于同一 source/tool/session/client。
     let client = if row.client_id.is_empty() {
         row.tool.as_str()
     } else {
         row.client_id.as_str()
     };
-    id(
+    let id_matches = id(
         &entry.period_key,
         &row.source_id,
         &row.tool,
         client,
         &row.session_id,
     )
-    .is_ok_and(|id| id == entry.id)
+    .is_ok_and(|expected| expected == entry.id)
+        || legacy_id(
+            &entry.period_key,
+            &row.source_id,
+            &row.tool,
+            &row.session_id,
+        )
+        .is_ok_and(|expected| expected == entry.id);
+    id_matches
         && entry.rows.iter().all(|other| {
             other.source_id == row.source_id
                 && other.tool == row.tool
@@ -128,7 +160,9 @@ fn load() -> Result<Store, String> {
     }
     let store: Store =
         serde_json::from_slice(&bytes).map_err(|_| "会话留存损坏，未覆盖；可显式清空后恢复")?;
-    if store.schema_version != 1
+    // 复评 T01：schema 1（旧库，v1 ID）与 schema 2（v2 ID）都可读；
+    // 只有真正结构损坏/版本未知才拒绝。
+    if !matches!(store.schema_version, SCHEMA_V1 | SCHEMA_V2)
         || store.entries.len() > MAX_ENTRIES
         || store.entries.iter().any(|entry| !valid(entry))
         || store
@@ -256,6 +290,8 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
     let mut additions: Vec<ArchiveEntry> = Vec::new();
     for ((source, tool, client, session), rows) in groups {
         let entry = ArchiveEntry {
+            // 复评 T05：留存同样保留质量证据。
+            quality_warnings: snapshot.quality_warnings.clone(),
             id: id(&snapshot.period_key, source, tool, client, session)?,
             saved_at: snapshot.collected_at,
             collected_at: snapshot.collected_at,
@@ -538,6 +574,84 @@ mod tests {
         assert_eq!(updated.collected_at, 2000);
     }
 
+    // ---------- 第十轮复评 T01：旧库（v1 四元组 ID）升级不拒读 ----------
+
+    #[test]
+    fn t01_旧schema库仍可读取且新写入使用新身份() {
+        let _dir = TempConfigDir::new("retention-legacy");
+        set_enabled(true).unwrap();
+        // 手工构造一份**旧格式** store：schema 1 + 四元组 ID + 无 clientId。
+        let first = snapshot(1000);
+        let mut entries: Vec<ArchiveEntry> = Vec::new();
+        for row in &first.rows {
+            let legacy = legacy_id(
+                &first.period_key,
+                &row.source_id,
+                &row.tool,
+                &row.session_id,
+            )
+            .unwrap();
+            let mut cloned = row.clone();
+            cloned.client_id = String::new();
+            entries.push(ArchiveEntry {
+                quality_warnings: Vec::new(),
+                id: legacy,
+                saved_at: first.collected_at,
+                collected_at: first.collected_at,
+                period_key: first.period_key.clone(),
+                accounting_utc_offset_seconds: first.accounting_utc_offset_seconds,
+                engine_version: first.engine_version.clone(),
+                scope: "session".into(),
+                includes_paths: false,
+                complete: first.complete,
+                stale: false,
+                rows: sanitized_rows(vec![&cloned], false),
+            });
+        }
+        let legacy_store = Store {
+            schema_version: SCHEMA_V1,
+            entries,
+        };
+        std::fs::write(
+            store_path().unwrap(),
+            serde_json::to_vec(&legacy_store).unwrap(),
+        )
+        .unwrap();
+        // 旧库必须可读（第九轮会整体拒读）。
+        let loaded = load().expect("旧 schema 库必须可读");
+        assert_eq!(loaded.entries.len(), 2, "旧库记录全部保留");
+        assert_eq!(list().unwrap().len(), 2, "旧库列表可用");
+        // 新采集写入用 v2 身份，且不覆盖旧记录。
+        let next = snapshot(2000);
+        checkpoint(&next).unwrap();
+        let store = load().unwrap();
+        assert!(
+            store.entries.iter().any(|entry| {
+                legacy_id(
+                    &entry.period_key,
+                    &entry.rows[0].source_id,
+                    &entry.rows[0].tool,
+                    &entry.rows[0].session_id,
+                )
+                .is_ok_and(|expected| expected == entry.id)
+            }),
+            "旧记录仍以 v1 身份存在，未被新写入挤掉"
+        );
+        assert!(
+            store.entries.iter().any(|entry| {
+                id(
+                    &entry.period_key,
+                    &entry.rows[0].source_id,
+                    &entry.rows[0].tool,
+                    &entry.rows[0].client_id,
+                    &entry.rows[0].session_id,
+                )
+                .is_ok_and(|expected| expected == entry.id)
+            }),
+            "新记录使用 v2 身份"
+        );
+    }
+
     // ---------- 第七轮复评 F03：旧更新优先于新增 ----------
 
     #[test]
@@ -804,7 +918,8 @@ mod tests {
         );
         for data in [
             b"broken".to_vec(),
-            br#"{"schemaVersion":2,"entries":[]}"#.to_vec(),
+            // 复评 T01：schema 1/2 都是合法版本，这里用**未知版本**验证拒绝路径。
+            br#"{"schemaVersion":99,"entries":[]}"#.to_vec(),
             vec![b' '; MAX_BYTES + 1],
         ] {
             fs::write(store_path().unwrap(), &data).unwrap();
