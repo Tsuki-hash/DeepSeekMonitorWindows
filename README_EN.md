@@ -19,11 +19,11 @@ Windows 10 / 11 only. Built with Tauri 2, React 18, and Rust.
 
 **This project is not an official DeepSeek product and is not affiliated with DeepSeek.**
 
-Version 1.3.0 provides persistent Account / Agent / History navigation. Open Agent directly for projects and sessions; exports and archives live under Data, and collection controls under Collection settings. Version 1.3.0 includes adjustable transparency, full history, trend readings, and collapsed zero-usage models. Download it from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.0).
+Version 1.3.1 builds on the persistent Account / Agent / History navigation from 1.3.0 and focuses on data trust and failure recovery: a missing cost response no longer renders as ¥0.00, balance and usage back off independently, history stops by failure kind and can retry only failed months, a stale month total is no longer labelled as this month, and local collection detects overlapping sources. Download published builds from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest).
 
 ## Screenshots
 
-The 1.3.0 installer was updated on 2026-10-10 with this feature set and UI changes.
+No 1.3.1 installer has been published yet; the 1.3.0 installer was updated on 2026-10-10.
 
 | Dark skin | Light skin |
 | :---: | :---: |
@@ -45,7 +45,7 @@ The 1.3.0 installer was updated on 2026-10-10 with this feature set and UI chang
 
 </details>
 
-*These screenshots show the current 1.3.0 interface with synthetic sample data and contain no real account information.*
+*These screenshots show the 1.3.0 interface with synthetic sample data and contain no real account information; see the update notes below for the 1.3.1 UI changes.*
 
 <details>
 <summary>View balance and budget reminder settings</summary>
