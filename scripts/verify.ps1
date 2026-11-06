@@ -45,8 +45,11 @@ if ($integrationExit -eq 0) {
     Write-Host '集成测试通过。' -ForegroundColor Green
 }
 elseif ($integrationExit -eq 2) {
-    Write-Host '集成测试未运行：缺少 DSM_TEST_LOCAL_USAGE_HOME 合成目录。' -ForegroundColor Yellow
-    Write-Host '   本次门禁不包含引擎集成证据；发版前必须补齐，不能记为通过。' -ForegroundColor Yellow
+    Write-Host '集成测试未完整运行：存在 NOT RUN 项（合成 fixture 覆盖不足）。' -ForegroundColor Yellow
+    Write-Host '   本次门禁不包含完整引擎集成证据；发版前必须补齐，不能记为通过。' -ForegroundColor Yellow
+}
+elseif ($integrationExit -eq 3) {
+    throw '集成测试配置或 fixture 错误（退出码 3）：请先修正 fixture，不能当作产品失败或通过。'
 }
 else {
     throw "引擎集成测试失败（退出码 $integrationExit）"

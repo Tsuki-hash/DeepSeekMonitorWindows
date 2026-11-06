@@ -2,23 +2,22 @@
 // 生成可复核的发版证据记录。
 //
 // 背景（评审 P2）：README 明确不再启用 Actions，本地 verify 是唯一门禁，但
-// pre-push 可以被跳过，运行结果也没有留档。发版时如果只贴一句「本地测试通过」，
-// 事后无法核对到底跑了什么、在哪个提交、用什么工具链。
+// pre-push 可以被跳过，运行结果也没有留档。
 //
-// 这个脚本只做三件不产生副作用的事：
-// 1. 记录提交 SHA、分支、工具链版本、锁文件摘要；
-// 2. 记录 verify 相关命令与它们的结果（由调用方传入或重新运行）；
-// 3. 若给出安装包路径，记录其 SHA-256。
+// 复评 R12：记录只跑普通 cargo test，没有集成与依赖审计，于是「门禁全部通过」
+// 与 verify 实际覆盖不一致。这里改为复用**同一份门禁清单**，逐项记录
+// PASS/FAIL/NOT RUN，并在发布阶段要求没有 NOT RUN。
 //
-// 用法：
-//   node scripts/release-record.mjs --out release-record.md
-//   node scripts/release-record.mjs --out release-record.md --installer <exe>
+// 复评 R13：测试计数正则被模板字符串吃掉了反斜杠，且 Rust 的
+// `191 passed; 0 failed; 4 ignored` 与 Node 的 `pass 123` 格式不同。
+// 现在分别解析，无法解析时明确写「不可解析」而不是填零。
 //
-// 输出是 Markdown，可直接贴进 release notes 或保留在本地存档。
+// 复评 R14：成功命令也可能向 stderr 写警告，execFileSync 的成功路径
+// 原先固定 stderr 为空。改用 spawnSync 分别捕获两个流。
 
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,46 +31,76 @@ const option = (name) => {
 const out = option("out");
 const installer = option("installer");
 
+/** 运行一条命令，始终记录 stdout 与 stderr（复评 R14）。 */
 const run = (command, commandArgs) => {
   const started = Date.now();
-  try {
-    const stdout = execFileSync(command, commandArgs, {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      // Windows 上 npm/npx 是 .cmd 包装脚本，不通过 shell 解析会 ENOENT。
-      shell: process.platform === "win32",
-    });
-    return {
-      ok: true,
-      code: 0,
-      stdout: String(stdout),
-      stderr: "",
-      seconds: (Date.now() - started) / 1000,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      code: typeof error.status === "number" ? error.status : 1,
-      stdout: String(error.stdout ?? ""),
-      stderr: String(error.stderr ?? error.message ?? ""),
-      seconds: (Date.now() - started) / 1000,
-    };
-  }
+  const result = spawnSync(command, commandArgs, {
+    cwd: root,
+    encoding: "utf8",
+    // Windows 上 npm/npx 是 .cmd 包装脚本，需要 shell 解析。
+    shell: process.platform === "win32",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return {
+    ok: result.status === 0 && !result.error,
+    code: typeof result.status === "number" ? result.status : 1,
+    stdout: String(result.stdout ?? ""),
+    // 成功路径同样保留 stderr：编译警告与诊断都在这里。
+    stderr:
+      String(result.stderr ?? "") + (result.error ? String(result.error) : ""),
+    seconds: (Date.now() - started) / 1000,
+  };
 };
 
-/** 从输出里提取测试通过/失败/忽略数，便于审计「有多少是真的跑了」。 */
+/**
+ * 解析测试计数（复评 R13）。
+ *
+ * - Node test runner：`# pass 145` / `ℹ pass 145`
+ * - Rust libtest：`test result: ok. 191 passed; 0 failed; 4 ignored; ...`
+ *
+ * 两种格式各用一个**字面量**正则，无法解析时返回 null 并在报告里写「不可解析」。
+ */
 const testCounts = (text) => {
-  const pick = (label) => {
-    const match = new RegExp(`${label}\s+(\d+)`).exec(text);
-    return match ? Number(match[1]) : null;
+  const node = {
+    passed: /^\W*pass\s+(\d+)/m,
+    failed: /^\W*fail\s+(\d+)/m,
+    ignored: /^\W*skipped\s+(\d+)/m,
+    tests: /^\W*tests\s+(\d+)/m,
   };
-  return {
-    passed: pick("pass"),
-    failed: pick("fail"),
-    ignored: pick("ignored"),
-    tests: pick("tests"),
+  const rust = {
+    passed: /(\d+)\s+passed/,
+    failed: /(\d+)\s+failed/,
+    ignored: /(\d+)\s+ignored/,
+    tests: null,
   };
+  const pick = (patterns) => {
+    for (const pattern of Object.values(patterns)) {
+      if (!pattern) continue;
+      const match = pattern.exec(text);
+      if (match) return Number(match[1]);
+    }
+    return null;
+  };
+  const values = {
+    passed: pick({ node: node.passed, rust: rust.passed }),
+    failed: pick({ node: node.failed, rust: rust.failed }),
+    ignored: pick({ node: node.ignored, rust: rust.ignored }),
+    tests: pick({ node: node.tests }),
+  };
+  // Rust 没有 tests 总数行，可由 passed+failed+ignored 推出。
+  if (values.tests == null) {
+    const parts = [values.passed, values.failed, values.ignored];
+    values.tests = parts.every((value) => value != null)
+      ? parts.reduce((sum, value) => sum + value, 0)
+      : null;
+  }
+  const parseable = Object.values(values).every((value) => value != null);
+  return { ...values, parseable };
+};
+
+const formatCounts = (counts) => {
+  if (!counts.parseable) return "不可解析（原始输出见下）";
+  return `tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
 };
 
 const git = (...commandArgs) => run("git", commandArgs).stdout.trim();
@@ -83,17 +112,22 @@ const version = JSON.parse(
   readFileSync(join(root, "package.json"), "utf8"),
 ).version;
 
-// 只读命令：不修改工作区，也不联网。
+/**
+ * 唯一门禁清单：与 `scripts/verify.ps1` 保持一致（复评 R12）。
+ *
+ * `releaseCritical: true` 表示发版必须真实执行并通过；`NOT RUN` 不放行。
+ */
 const checks = [
-  ["版本一致性", "node", ["scripts/check-version.mjs"]],
-  ["前端测试", "npm", ["test"]],
-  ["前端 lint", "npm", ["run", "lint"]],
-  ["前端 format 检查", "npx", ["prettier", "--check", "."]],
-  ["前端构建", "npm", ["run", "build"]],
+  ["版本一致性", "node", ["scripts/check-version.mjs"], true],
+  ["前端测试", "npm", ["test"], true],
+  ["前端 lint", "npm", ["run", "lint"], true],
+  ["前端 format 检查", "npx", ["prettier", "--check", "."], true],
+  ["前端构建", "npm", ["run", "build"], true],
   [
     "cargo fmt",
     "cargo",
     ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--", "--check"],
+    true,
   ],
   [
     "cargo clippy",
@@ -107,13 +141,25 @@ const checks = [
       "-D",
       "warnings",
     ],
+    true,
   ],
   [
     "cargo test",
     "cargo",
     ["test", "--manifest-path", "src-tauri/Cargo.toml", "--lib"],
+    true,
   ],
+  // 复评 R12：集成与依赖审计也必须进入记录，否则发布结论覆盖不全。
+  ["引擎集成测试", "node", ["scripts/run-integration-tests.mjs"], true],
+  ["依赖审计", "node", ["scripts/audit-dependencies.mjs"], true],
 ];
+
+/** 集成测试的「未运行」是退出码 2，与失败(1)语义不同。 */
+const classify = (label, result) => {
+  if (result.ok) return "PASS";
+  if (label.includes("集成") && result.code === 2) return "NOT RUN";
+  return "FAIL";
+};
 
 const lines = [];
 lines.push(`# 发版证据记录 v${version}`);
@@ -155,41 +201,40 @@ lines.push("");
 
 lines.push("## 门禁命令与结果");
 lines.push("");
-lines.push("> 这些命令由本脚本重新运行；结果记录的是本次运行，不是历史记录。");
+lines.push("> 与 `scripts/verify.ps1` 使用同一份清单；结果记录的是本次运行。");
 lines.push("");
 const failures = [];
+const notRun = [];
 const checkResults = [];
+lines.push("| 门禁 | 结论 | 退出码 | 用时 | 测试计数 |");
+lines.push("| - | - | - | - | - |");
 for (const [label, command, commandArgs] of checks) {
   const result = run(command, commandArgs);
-  checkResults.push({ label, result });
-  if (!result.ok) failures.push(label);
+  const verdict = classify(label, result);
+  checkResults.push({ label, command, commandArgs, result, verdict });
+  if (verdict === "FAIL") failures.push(label);
+  if (verdict === "NOT RUN") notRun.push(label);
   const counts = testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
-    `- ${result.ok ? "✅" : "❌"} ${label}：\`${command} ${commandArgs.join(" ")}\``,
+    `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
-  lines.push(`  - 退出码：${result.code} · 用时 ${result.seconds.toFixed(1)}s`);
-  if (counts.tests != null || counts.passed != null) {
-    lines.push(
-      `  - 测试计数：tests=${counts.tests ?? "?"} pass=${counts.passed ?? "?"} ` +
-        `fail=${counts.failed ?? "?"} ignored=${counts.ignored ?? "?"}`,
-    );
-  }
 }
 lines.push("");
 lines.push("### 完整输出");
 lines.push("");
-lines.push("> 审计需要原始 stdout/stderr，不截断。");
+lines.push("> 审计需要原始 stdout/stderr，不截断；成功命令的 stderr 也保留。");
 lines.push("");
-for (const { label, result } of checkResults) {
-  lines.push(`<details><summary>${label}（退出码 ${result.code}）</summary>`);
+for (const { label, result, verdict } of checkResults) {
+  lines.push(
+    `<details><summary>${label} — ${verdict}（退出码 ${result.code}）</summary>`,
+  );
   lines.push("");
   lines.push("```text");
+  lines.push(`[command] ${result.command ?? ""}`);
   lines.push((result.stdout || "(stdout 为空)").trim());
-  if (result.stderr.trim()) {
-    lines.push("");
-    lines.push("[stderr]");
-    lines.push(result.stderr.trim());
-  }
+  lines.push("");
+  lines.push("[stderr]");
+  lines.push(result.stderr.trim() || "(stderr 为空)");
   lines.push("```");
   lines.push("");
   lines.push("</details>");
@@ -230,14 +275,18 @@ lines.push("## 结论");
 lines.push("");
 if (failures.length) {
   lines.push(
-    `❌ 未通过：${failures.join("、")} 失败。本次记录不能作为放行证据。`,
+    `❌ FAIL：${failures.join("、")} 失败。本次记录不能作为放行证据。`,
+  );
+} else if (notRun.length) {
+  lines.push(
+    `⚠ 发布不放行：${notRun.join("、")} 为 NOT RUN。开发门禁可接受，发版不可。`,
   );
 } else if (installerStatus !== "hashed") {
   lines.push(
     "⚠ 门禁命令全部通过，但安装包未校验：只能作为「源码门禁」证据，不是完整发版证据。",
   );
 } else {
-  lines.push("✅ 门禁命令全部通过且记录了安装包哈希；仍需真机与安装升级验收。");
+  lines.push("✅ 门禁全部 PASS 且记录了安装包哈希；仍需真机与安装升级验收。");
 }
 
 const text = lines.join("\n") + "\n";
@@ -247,8 +296,11 @@ if (out) {
 } else {
   console.log(text);
 }
-// 复评 F18：失败必须传播到退出码，外层不能只看「报告已生成」就放行。
+// 失败必须传播到退出码；NOT RUN 在发版语境下同样不放行。
 if (failures.length) {
   console.error(`失败项：${failures.join("、")}`);
   process.exitCode = 1;
+} else if (notRun.length) {
+  console.error(`未运行项（发版不放行）：${notRun.join("、")}`);
+  process.exitCode = 2;
 }
