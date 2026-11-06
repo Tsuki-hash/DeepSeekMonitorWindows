@@ -13,11 +13,10 @@ import { LocalArchivePanel } from "./LocalArchivePanel";
 import { LocalBackgroundSettings } from "./LocalBackgroundSettings";
 import { LocalDataManagement } from "./LocalDataManagement";
 import { localPeriodKey } from "../local-archive";
-import {
-  draftGuardActions,
-  draftGuardText,
-  shouldBlockLeave,
-} from "../draft-guard";
+import { shouldBlockLeave } from "../draft-guard";
+import { LeaveDecisions, resolveLeave } from "../leave-guard";
+import type { LeaveDecision } from "../leave-guard";
+import { LeavePromptDialog } from "./LeavePromptDialog";
 import {
   localTools,
   localProjects,
@@ -247,9 +246,49 @@ export function LocalUsagePanel({
   const [pendingLeave, setPendingLeave] = React.useState<(() => void) | null>(
     null,
   );
+  // 复评 T05：局部出口与全局共用同一决策控制器 —— 保存是异步的，
+  // 途中取消后迟到的成功不得导航；连点只提交一次。
+  const leaveDecisions = React.useRef(new LeaveDecisions());
+  const [leaveSubmitting, setLeaveSubmitting] = React.useState(false);
   const guarded = (action: () => void) => {
     if (shouldBlockLeave(sourceDirty)) setPendingLeave(() => action);
     else action();
+  };
+  // 与 App 的 decideLeave 同构：保存/放弃/取消都经过代际令牌校验。
+  const decideLeave = (decision: LeaveDecision) => {
+    const pending = pendingLeave;
+    if (!pending) return;
+    if (decision === "cancel") {
+      // 取消使当前令牌失效：只撤销导航，不声称能撤回已提交的保存。
+      leaveDecisions.current.cancel(leaveDecisions.current.begin());
+      setPendingLeave(null);
+      setLeaveSubmitting(false);
+      return;
+    }
+    if (leaveSubmitting) return; // 连点只认第一次
+    const ticket = leaveDecisions.current.begin();
+    setLeaveSubmitting(true);
+    void resolveLeave(
+      {
+        dirty: true,
+        subject: "采集目录",
+        save: async () => (await saveSourceRef.current?.()) ?? false,
+        discard: () => {
+          setSourceDirty(false);
+          setSourceRevision((value) => value + 1);
+        },
+      },
+      decision,
+      pending,
+      () => leaveDecisions.current.isCurrent(ticket),
+    ).then((left) => {
+      leaveDecisions.current.finish(ticket);
+      setLeaveSubmitting(false);
+      if (left) {
+        setSourceDirty(false);
+        setPendingLeave(null);
+      }
+    });
   };
   // 把草稿状态登记到 App 级拦截器：底部主导航、返回按钮都走同一条出口。
   React.useEffect(() => {
@@ -567,46 +606,11 @@ export function LocalUsagePanel({
           )}
         </div>
         {pendingLeave && (
-          <div className="history-message warning" role="alert">
-            <p>{draftGuardText("采集目录")}</p>
-            <div className="disclosure-actions">
-              <button
-                className="secondary"
-                onClick={() => {
-                  const action = pendingLeave;
-                  // 复评 F09：先真的保存，成功后才执行原本的离开动作。
-                  void (async () => {
-                    const saved = await saveSourceRef.current?.();
-                    if (!saved) return; // 保存失败：留在当前页，草稿保留
-                    setSourceDirty(false);
-                    setPendingLeave(null);
-                    action?.();
-                  })();
-                }}
-              >
-                {draftGuardActions.save}
-              </button>
-              <button
-                className="secondary"
-                onClick={() => {
-                  const action = pendingLeave;
-                  setPendingLeave(null);
-                  setSourceDirty(false);
-                  // 复评 R07：放弃必须让子组件重挂载并重读已保存值。
-                  setSourceRevision((value) => value + 1);
-                  action();
-                }}
-              >
-                {draftGuardActions.discard}
-              </button>
-              <button
-                className="secondary"
-                onClick={() => setPendingLeave(null)}
-              >
-                {draftGuardActions.cancel}
-              </button>
-            </div>
-          </div>
+          <LeavePromptDialog
+            subject="采集目录"
+            submitting={leaveSubmitting}
+            onDecide={decideLeave}
+          />
         )}
         <div hidden={workspace !== "settings"}>
           <LocalSourceSettings
@@ -742,7 +746,16 @@ export function LocalUsagePanel({
             localEnabled={enabled}
             onMode={backgroundMode}
           />
-          <LocalDataManagement />
+          <LocalDataManagement
+            refreshSignal={`${busy}-${snapshot?.collectedAt ?? 0}-${enabled}`}
+            onOpenArchiveManager={() => {
+              // 复评 T07：读取错误的恢复入口必须真实可达，且停止后续轮询。
+              control.current.sequence++;
+              tracker.current.reset();
+              setBusy(false);
+              setArchiveView("manual");
+            }}
+          />
           <details className="history-details local-explanation">
             <summary>关于本地数据与速度</summary>
             <p>

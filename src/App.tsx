@@ -41,7 +41,7 @@ import { Maximize2, Minimize2 } from "lucide-react";
 import { attemptLeave, resolveLeave, useLeaveGuard } from "./leave-guard";
 import { LeaveDecisions } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
-import { draftGuardActions, draftGuardText } from "./draft-guard";
+import { LeavePromptDialog } from "./components/LeavePromptDialog";
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
@@ -478,7 +478,14 @@ function App() {
   // 不在用户不知情时启用自动联网。
   React.useEffect(() => {
     let cancelled = false;
+    // 复评 T11：check() 每次都会重新挂账，visibilitychange 反复触发时若不清掉
+    // 旧 timer，会积累多条每日链（卸载只清最近一个 ID）。
+    // 任意时刻只保留一个待触发的日期 timer。
     let timer = 0;
+    const arm = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(check, msUntilNextAccountingDate());
+    };
     const check = () => {
       if (cancelled) return;
       // currentUsageSnapshot 自带跨月拒绝；这里把它当作「日期变化探测器」。
@@ -496,7 +503,7 @@ function App() {
           setUsage(retained);
         }
       }
-      timer = window.setTimeout(check, msUntilNextAccountingDate());
+      arm();
     };
     // 同时监听系统唤醒：睡眠跨月时定时器可能被推迟。
     const onVisible = () => {
@@ -599,62 +606,14 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [view]);
 
-  // 复评 R17：提示出现时把焦点移入，关闭后还回原处，读屏用户不会「丢失」。
-  const leavePromptRef = React.useRef<HTMLDivElement>(null);
-  const leaveReturnFocus = React.useRef<HTMLElement | null>(null);
-  React.useEffect(() => {
-    if (!pendingLeave) {
-      const node = leaveReturnFocus.current;
-      leaveReturnFocus.current = null;
-      if (node?.isConnected) node.focus();
-      return;
-    }
-    // 记录触发控件，再把焦点移入提示的第一个按钮。
-    leaveReturnFocus.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    const frame = window.requestAnimationFrame(() => {
-      leavePromptRef.current?.querySelector<HTMLElement>("button")?.focus();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [pendingLeave]);
-
+  // 复评 T05/T08：与局部出口共用同一提示组件 —— 对话框命名、初始焦点、
+  // 焦点归还与提交中禁用都在组件内实现，两个出口行为一致。
   const leavePrompt = pendingLeave ? (
-    <div
-      ref={leavePromptRef}
-      className="leave-guard"
-      role="alertdialog"
-      aria-modal="false"
-      aria-labelledby="leave-guard-title"
-      aria-describedby="leave-guard-desc"
-    >
-      <p id="leave-guard-title" className="leave-guard-title">
-        {draftGuardText(pendingLeave.subject)}
-      </p>
-      <p id="leave-guard-desc" className="muted">
-        选择后才会离开；保存失败会留在当前页。
-      </p>
-      <div className="disclosure-actions">
-        <button
-          className="primary"
-          disabled={leaveSubmitting}
-          onClick={() => decideLeave("save")}
-        >
-          {leaveSubmitting ? "保存中…" : draftGuardActions.save}
-        </button>
-        <button
-          className="secondary"
-          disabled={leaveSubmitting}
-          onClick={() => decideLeave("discard")}
-        >
-          {draftGuardActions.discard}
-        </button>
-        <button className="secondary" onClick={() => decideLeave("cancel")}>
-          {draftGuardActions.cancel}
-        </button>
-      </div>
-    </div>
+    <LeavePromptDialog
+      subject={pendingLeave.subject}
+      submitting={leaveSubmitting}
+      onDecide={decideLeave}
+    />
   ) : null;
 
   return (
