@@ -18,6 +18,8 @@ namespace DeepSeekMonitor.ReleaseVerification
         public int FileBuildPart { get; set; }
         public int FilePrivatePart { get; set; }
         public bool IsPreRelease { get; set; }
+        // Offset in the input snapshot, not a signature scan or a second file read.
+        public int FixedFileInfoOffset { get; internal set; }
     }
 
     public sealed class PeVersionSnapshot
@@ -28,6 +30,7 @@ namespace DeepSeekMonitor.ReleaseVerification
         private readonly int resourceStart;
         private readonly int resourceLength;
         private readonly List<ReleaseVersionInfo> versions = new List<ReleaseVersionInfo>();
+        private readonly Dictionary<uint, VersionLayout> layouts = new Dictionary<uint, VersionLayout>();
         private static readonly Encoding Utf16 = new UnicodeEncoding(false, false, true);
 
         private static void Bounds(byte[] data, long offset, long length)
@@ -174,13 +177,46 @@ namespace DeepSeekMonitor.ReleaseVerification
                         int offset = reader.MapRva(rva, size);
                         var blob = new byte[(int)size];
                         Buffer.BlockCopy(data, offset, blob, 0, blob.Length);
-                        reader.ReadVersion(blob, String.Format("{0:X8}/{1:X4}", name.Key, language.Key));
+                        reader.ReadVersion(blob, String.Format("{0:X8}/{1:X4}", name.Key, language.Key), language.Key, offset);
                     }
                 }
             }
             if (typeCount == 0 || reader.versions.Count == 0)
                 throw new InvalidDataException("PE version resource is unavailable");
+            reader.ValidateTranslations();
             return reader.versions.ToArray();
+        }
+
+        private sealed class VersionLayout
+        {
+            public HashSet<string> Tables;
+            public HashSet<string> Translations;
+            public bool NsisSelectedTable;
+        }
+
+        private void ValidateTranslations()
+        {
+            foreach (var layout in layouts.Values)
+            {
+                if (!layout.Tables.IsSubsetOf(layout.Translations))
+                    throw new InvalidDataException("Unreferenced version StringTable");
+                if (layout.Translations.SetEquals(layout.Tables)) continue;
+                // NSIS 3.11 ExportToStream stores one selected table per language
+                // resource, but advertises all languages (selected language first).
+                // Do not merely allow extra Translation entries: every entry must
+                // resolve to its actual language resource, with the same complete
+                // mapping. Read() still returns every table for release-rule checks.
+                if (!layout.NsisSelectedTable)
+                    throw new InvalidDataException("Unsupported cross-resource Translation mapping");
+                foreach (string key in layout.Translations)
+                {
+                    uint language = Convert.ToUInt32(key.Substring(0, 4), 16);
+                    VersionLayout target;
+                    if (!layouts.TryGetValue(language, out target) || !target.NsisSelectedTable ||
+                        !target.Tables.Contains(key) || !target.Translations.SetEquals(layout.Translations))
+                        throw new InvalidDataException("Missing or inconsistent cross-resource Translation target");
+                }
+            }
         }
 
         private sealed class Block
@@ -249,13 +285,23 @@ namespace DeepSeekMonitor.ReleaseVerification
             return true;
         }
 
-        private void ReadVersion(byte[] blob, string resource)
+        private static bool IsContainer(Block block)
+        {
+            // An empty container's wType does not change the size of its value.
+            // Windows tools emit 1; NSIS 3.11 emits 0. Leaf types remain strict.
+            return (block.Type == 0 || block.Type == 1) && block.ValueLength == 0;
+        }
+
+        private void ReadVersion(byte[] blob, string resource, uint language, int snapshotOffset)
         {
             var root = ReadBlock(blob, 0, blob.Length);
             if (root.Key != "VS_VERSION_INFO" || root.Type != 0 || root.ValueLength != 52 || root.ValueStart > root.End - 52)
                 throw new InvalidDataException("Missing VS_FIXEDFILEINFO");
             int value = root.ValueStart;
-            if (U32(blob, value) != 0xFEEF04BD || U32(blob, value + 4) != 0x00010000)
+            uint structureVersion = U32(blob, value + 4);
+            // NSIS 3.11 zero-initializes dwStrucVersion. Both known encodings
+            // carry the same 52-byte fixed structure; unknown versions fail closed.
+            if (U32(blob, value) != 0xFEEF04BD || (structureVersion != 0 && structureVersion != 0x00010000))
                 throw new InvalidDataException("Unsupported VS_FIXEDFILEINFO signature/version");
             for (int index = root.End; index < blob.Length; index++)
                 if (blob[index] != 0) throw new InvalidDataException("Extra data after VS_VERSION_INFO");
@@ -267,12 +313,15 @@ namespace DeepSeekMonitor.ReleaseVerification
             var translations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             bool sawStrings = false;
             bool sawVariables = false;
+            bool nsisContainers = structureVersion == 0;
+            string firstTranslation = null;
             foreach (var child in Children(blob, value + 52, root.End))
             {
                 if (child.Key == "VarFileInfo")
                 {
-                    if (sawVariables || child.Type != 1 || child.ValueLength != 0)
+                    if (sawVariables || !IsContainer(child))
                         throw new InvalidDataException("Invalid or duplicate VarFileInfo");
+                    nsisContainers &= child.Type == 0;
                     sawVariables = true;
                     bool sawTranslation = false;
                     foreach (var translation in Children(blob, child.ValueStart, child.End))
@@ -285,18 +334,21 @@ namespace DeepSeekMonitor.ReleaseVerification
                         for (int index = 0; index < translation.ValueLength; index += 4)
                         {
                             string key = String.Format("{0:X4}{1:X4}", U16(blob, translation.ValueStart + index), U16(blob, translation.ValueStart + index + 2));
+                            if (firstTranslation == null) firstTranslation = key;
                             if (!translations.Add(key)) throw new InvalidDataException("Duplicate version Translation mapping");
                         }
                     }
                     continue;
                 }
-                if (child.Key != "StringFileInfo" || child.Type != 1 || child.ValueLength != 0 || sawStrings)
+                if (child.Key != "StringFileInfo" || !IsContainer(child) || sawStrings)
                     throw new InvalidDataException("Unsupported version information block");
+                nsisContainers &= child.Type == 0;
                 sawStrings = true;
                 foreach (var table in Children(blob, child.ValueStart, child.End))
                 {
-                    if (table.Type != 1 || table.ValueLength != 0 || !IsLanguageCodePage(table.Key) || !tableKeys.Add(table.Key))
+                    if (!IsContainer(table) || !IsLanguageCodePage(table.Key) || !tableKeys.Add(table.Key))
                         throw new InvalidDataException("Invalid or duplicate version string table");
+                    nsisContainers &= table.Type == 0;
                     var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var field in Children(blob, table.ValueStart, table.End))
                     {
@@ -306,14 +358,21 @@ namespace DeepSeekMonitor.ReleaseVerification
                     string fileVersion, productVersion;
                     fields.TryGetValue("FileVersion", out fileVersion);
                     fields.TryGetValue("ProductVersion", out productVersion);
-                    versions.Add(Version(resource + "/" + table.Key, majorMinor, buildRevision, fileFlags, fileVersion, productVersion));
+                    var version = Version(resource + "/" + table.Key, majorMinor, buildRevision, fileFlags, fileVersion, productVersion);
+                    version.FixedFileInfoOffset = checked(snapshotOffset + value);
+                    versions.Add(version);
                 }
             }
-            // Do not silently accept an arbitrary/unreferenced StringTable that
-            // Windows version lookup would not select. Unknown fallback layouts
-            // are inconclusive rather than a wider definition of valid metadata.
-            if (!sawVariables || !sawStrings || versions.Count == before || !translations.SetEquals(tableKeys))
+            // Missing mappings remain unsupported. Cross-resource mappings are
+            // validated only after all language resources have been parsed.
+            if (!sawVariables || !sawStrings || versions.Count == before || translations.Count == 0)
                 throw new InvalidDataException("Missing or inconsistent version Translation/StringTable mapping");
+            layouts.Add(language, new VersionLayout {
+                Tables = tableKeys, Translations = translations,
+                NsisSelectedTable = nsisContainers && tableKeys.Count == 1 && firstTranslation != null &&
+                    tableKeys.Contains(firstTranslation) &&
+                    Convert.ToUInt32(firstTranslation.Substring(0, 4), 16) == language
+            });
         }
 
         private static ReleaseVersionInfo Version(string resource, uint majorMinor, uint buildRevision,

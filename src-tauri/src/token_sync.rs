@@ -17,8 +17,8 @@ use std::{
 /// 单文件读取上限。WebView2 的缓存文件绝大多数远小于此，设上限是为了避免
 /// 偶发的巨型文件把整个 watcher 循环卡住。
 const MAX_CACHE_FILE_BYTES: u64 = 20 * 1024 * 1024;
-const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_SCAN_FILES: usize = 250;
+pub(crate) const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_SCAN_FILES: usize = 250;
 const MAX_SCAN_ENTRIES: usize = 5000;
 const MAX_SCAN_DURATION: Duration = Duration::from_millis(250);
 
@@ -221,17 +221,17 @@ pub struct CachedCandidate {
     pub stamp: Stamp,
 }
 
-/// 分轮收集缓存目录里通过上下文校验的候选 token（按文件遍历顺序，轮内按值去重）。
+/// 分轮收集缓存目录里通过上下文校验的候选 token（按文件遍历顺序，文件内按值去重）。
 ///
 /// 「收集」与「验证」分离（评审 F-25）：本函数只负责收集，token 的网络验证由
 /// 调用方在扫描完成后统一进行——单个候选的验证（HTTP 超时上限 15s）不再卡住
 /// 其余文件的扫描。
 ///
 /// 已读标记的语义（评审 F-07 实测加固）：
-/// - 无候选、超出单文件上限、或 token 均为已知重复的文件 → 立即记入 `seen`；
+/// - 无候选或超出单文件上限的文件 → 立即记入 `seen`；
 /// - 不可读、增长中或因取消中止的文件 → 不标记，后续遍历重新尝试；
-/// - 产出新候选的文件**暂不标记**，由验证方决定：明确拒绝（401/403）才回写
-///   标记；瞬时失败（网络/服务端）保持未标记，下一轮自动重试——否则一次
+/// - 含候选的每个来源文件**暂不标记**，由验证方决定：全部明确拒绝（401/403）才
+///   回写标记；跨文件重复候选也不能未经验证提前标记。瞬时失败保持未标记——否则一次
 ///   网络抖动就会把有效 Token 静默压制到文件内容变化为止。
 pub fn collect_webview_cached_usage_tokens(scan: &mut CacheScanState) -> Vec<CachedCandidate> {
     collect_webview_cached_usage_tokens_while(scan, || true)
@@ -247,7 +247,7 @@ pub fn collect_webview_cached_usage_tokens_while(
     collect_cached_usage_tokens_in(scan, &cache_dir, keep_scanning)
 }
 
-fn collect_cached_usage_tokens_in(
+pub(crate) fn collect_cached_usage_tokens_in(
     scan: &mut CacheScanState,
     cache_dir: &Path,
     mut keep_scanning: impl FnMut() -> bool,
@@ -261,7 +261,6 @@ fn collect_cached_usage_tokens_in(
     let mut read_bytes = 0u64;
     let mut visited_entries = 0usize;
     let start = Instant::now();
-    let mut known_tokens = std::collections::HashSet::new();
     loop {
         if !keep_scanning()
             || read_files >= MAX_SCAN_FILES
@@ -321,6 +320,9 @@ fn collect_cached_usage_tokens_in(
             continue;
         };
         // 同一个缓存文件可能同时保留旧会话与新会话，不能只试第一个。
+        // 只在本文件内去重：另一来源的同值候选尚未通过/明确拒绝时，不应让
+        // 当前文件进入 seen；也不让前一文件的重复值改变本文件跨轮候选游标。
+        let mut known_tokens = std::collections::HashSet::new();
         let new_tokens: Vec<_> = extract_user_api_tokens(&text)
             .into_iter()
             .filter(|token| known_tokens.insert(token.clone()))
@@ -588,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_命中候选_重复文件与无候选文件记入已读() {
+    fn collect_命中候选_重复来源保持未读且只有无候选文件记入已读() {
         // 借 TempConfigDir 的全局锁串行化 LOCALAPPDATA 操作，并借它的路径当根目录
         let dir = TempConfigDir::new("collect-candidates");
         let cache = dir
@@ -609,12 +611,16 @@ mod tests {
             None => std::env::remove_var("LOCALAPPDATA"),
         }
 
-        // 同 token 的两个文件只出一个候选（首个文件）；候选文件保持未标记，
-        // 等待验证结果决定是否回写；重复文件与无候选文件立即记入已读
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].token, token);
-        assert_eq!(found[0].path, cache.join("f_000001"));
-        assert_eq!(scan.seen.len(), 2, "候选文件应保持未标记");
+        // 同 Token 的两个来源均等待自己的验证结果，不依赖 read_dir 的枚举顺序。
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|candidate| candidate.token == token));
+        assert!(found
+            .iter()
+            .any(|candidate| candidate.path == cache.join("f_000001")));
+        assert!(found
+            .iter()
+            .any(|candidate| candidate.path == cache.join("f_000002")));
+        assert_eq!(scan.seen.len(), 1, "所有候选来源都应保持未标记");
     }
 
     // —— CacheScanState 惰性 LRU（白盒：直接操作内部状态） ——

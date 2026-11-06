@@ -9,7 +9,7 @@ import type { RawModelUsage, UsageResult } from "../src/types";
 // Synthetic component events and ref requests only. No browser is started:
 // .focus() mocks record requests, never pretend to deliver native focus events.
 // Real Tab/Enter/Space, activeElement, live announcements and Windows/WebView2
-// still require docs/REVIEW21_HISTORY_VIEWPORT_REGRESSIONS.md manual acceptance.
+// still require the R21/R22 viewport documents' manual acceptance.
 const g = globalThis as any;
 g.IS_REACT_ACT_ENVIRONMENT = true;
 const NativeDate = Date;
@@ -172,6 +172,7 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
   let left = 0;
   let barWidth = 24;
   const gap = 3;
+  const visualWidths = new Map<string, number>();
   const nodes = new Map<string, any>();
   const writes: number[] = [];
   const focusRequests: string[] = [];
@@ -227,6 +228,9 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
     setBarWidth(next: number) {
       barWidth = next;
     },
+    setVisualWidth(date: string, next: number) {
+      visualWidths.set(date, next);
+    },
     actualFocus(date: string | null) {
       ownerDocument.activeElement = date == null ? null : nodes.get(date);
     },
@@ -250,7 +254,7 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
               100 +
               days.findIndex((day) => day.date === date) * (barWidth + gap) -
               left,
-            width: barWidth,
+            width: visualWidths.get(date) ?? barWidth,
           }),
         });
       }
@@ -266,6 +270,38 @@ const months: Day[] = Array.from({ length: 12 }, (_, index) => ({
 const nextMonth: Day = { date: "2027-01-01", value: 13 };
 const previousMonth: Day = { date: "2025-12-01", value: 0 };
 const monthChart = (days = months) => chart(days, { monthly: true });
+const protections = ["pin", "actual-focus", "escape-focus"] as const;
+type Protection = (typeof protections)[number];
+
+async function protectMonth(
+  view: any,
+  viewport: ReturnType<typeof monthlyViewport>,
+  date: string,
+  protection: Protection,
+) {
+  if (protection === "pin") {
+    await act(async () => button(view, date).props.onClick());
+  } else {
+    viewport.actualFocus(date);
+    await act(async () => button(view, date).props.onFocus());
+    if (protection === "escape-focus") await key(button(view, date), "Escape");
+  }
+}
+
+function assertProtection(
+  view: any,
+  viewport: ReturnType<typeof monthlyViewport>,
+  date: string,
+  protection: Protection,
+) {
+  if (protection === "escape-focus") assertDismissed(view);
+  else assertSelected(view, date, protection === "pin");
+  assert.equal(
+    viewport.container.ownerDocument.activeElement,
+    protection === "pin" ? null : viewport.node(date),
+  );
+  assert.deepEqual(viewport.focusRequests, []);
+}
 
 test("R21 history: only active owns the selection inset; keyboard focus stays distinct", () => {
   // Source-contract assertion only: computed CSS and WebView2 paint remain manual.
@@ -362,6 +398,247 @@ for (const concurrent of [false, true]) {
       );
     });
   }
+
+  for (const protection of protections) {
+    for (const edge of ["left", "right"] as const) {
+      for (const scrollEvent of ["delivered", "pending"] as const) {
+        test(`R22 monthly: ${protection}, ${edge}-clipped 1px and ${scrollEvent} scroll keep their anchor on pure append (${mode})`, async () => {
+          const viewport = monthlyViewport(months);
+          await render(
+            monthChart(),
+            concurrent,
+            async (view) => {
+              const date = months[4].date;
+              viewport.container.scrollLeft = 81;
+              await act(async () => group(view).props.onScroll());
+              await protectMonth(view, viewport, date, protection);
+              // The user deliberately leaves just 1px of the protected bar visible.
+              // A pending event must use this position, not the earlier snapshot.
+              const left = edge === "left" ? 131 : 28;
+              viewport.container.scrollLeft = left;
+              if (scrollEvent === "delivered")
+                await act(async () => group(view).props.onScroll());
+              const anchor = edge === "left" ? date : months[1].date;
+              const oldPixel = viewport.node(date).getBoundingClientRect().left;
+              const anchorPixel = viewport
+                .node(anchor)
+                .getBoundingClientRect().left;
+              const writes = viewport.writes.length;
+              const days = [...months, nextMonth];
+              viewport.setDays(days);
+              await update(view, monthChart(days));
+              assert.equal(viewport.container.scrollLeft, left);
+              assert.equal(
+                viewport.node(date).getBoundingClientRect().left,
+                oldPixel,
+              );
+              assert.equal(
+                viewport.node(anchor).getBoundingClientRect().left,
+                anchorPixel,
+              );
+              assert.equal(
+                viewport.writes.length,
+                writes,
+                "append must not repair intentional clipping",
+              );
+              await act(async () => viewport.resize());
+              assert.equal(
+                viewport.writes.length,
+                writes,
+                "unchanged observer replay must not scroll",
+              );
+              assertProtection(view, viewport, date, protection);
+
+              // A genuine prepend still restores the same date, with the same
+              // intentional clipping, instead of preserving the numeric scrollLeft.
+              const prepended = [previousMonth, ...days];
+              viewport.setDays(prepended);
+              await update(view, monthChart(prepended));
+              assert.equal(viewport.container.scrollLeft, left + 27);
+              assert.equal(
+                viewport.node(date).getBoundingClientRect().left,
+                oldPixel,
+              );
+              assert.equal(
+                viewport.node(anchor).getBoundingClientRect().left,
+                anchorPixel,
+              );
+              assertProtection(view, viewport, date, protection);
+            },
+            viewport.createNodeMock,
+          );
+        });
+      }
+    }
+
+    for (const layout of [
+      { name: "new right clipping", left: 81, width: 54, expected: 105 },
+      { name: "worse right clipping", left: 55, width: 54, expected: 105 },
+      { name: "unchanged left clipping", left: 158, width: 54, expected: 158 },
+      {
+        name: "wider with left clipping",
+        left: 158,
+        width: 108,
+        expected: 158,
+      },
+      { name: "wider with right clipping", left: 55, width: 108, expected: 55 },
+    ]) {
+      test(`R22 monthly: ${protection} resize corrects only added occlusion, ${layout.name} (${mode})`, async () => {
+        const viewport = monthlyViewport(months);
+        await render(
+          monthChart(),
+          concurrent,
+          async (view) => {
+            const date = months[5].date;
+            viewport.container.scrollLeft = 108;
+            await act(async () => group(view).props.onScroll());
+            await protectMonth(view, viewport, date, protection);
+            viewport.container.scrollLeft = layout.left;
+            await act(async () => group(view).props.onScroll());
+            const writes = viewport.writes.length;
+            viewport.setWidth(layout.width);
+            await act(async () => viewport.resize());
+            assert.equal(viewport.container.scrollLeft, layout.expected);
+            assert.equal(
+              viewport.writes.length,
+              writes + (layout.expected === layout.left ? 0 : 1),
+            );
+            if (layout.expected !== layout.left) {
+              const rect = viewport.node(date).getBoundingClientRect();
+              assert.ok(rect.left >= 100);
+              assert.ok(rect.left + rect.width <= 100 + layout.width);
+            }
+            assertProtection(view, viewport, date, protection);
+            const settledWrites = viewport.writes.length;
+            await act(async () => viewport.resize());
+            assert.equal(viewport.writes.length, settledWrites);
+          },
+          viewport.createNodeMock,
+        );
+      });
+    }
+
+    for (const sizing of [
+      {
+        name: "growth, left clip unchanged",
+        left: 158,
+        width: 30,
+        expected: 188,
+        anchored: true,
+      },
+      {
+        name: "growth, right clip worsened",
+        left: 55,
+        width: 30,
+        expected: 114,
+        anchored: false,
+      },
+      {
+        name: "shrinkage hides last left pixel",
+        left: 158,
+        width: 18,
+        expected: 105,
+        anchored: false,
+      },
+      {
+        name: "shrinkage clears right clip",
+        left: 55,
+        width: 18,
+        expected: 43,
+        anchored: true,
+      },
+    ]) {
+      test(`R22 monthly: ${protection} bar resize respects visibility, ${sizing.name} (${mode})`, async () => {
+        const viewport = monthlyViewport(months);
+        await render(
+          monthChart(),
+          concurrent,
+          async (view) => {
+            const date = months[5].date;
+            viewport.container.scrollLeft = 108;
+            await act(async () => group(view).props.onScroll());
+            await protectMonth(view, viewport, date, protection);
+            viewport.container.scrollLeft = sizing.left;
+            await act(async () => group(view).props.onScroll());
+            const anchor = sizing.left === 158 ? date : months[2].date;
+            const oldPixel = viewport.node(anchor).getBoundingClientRect().left;
+            viewport.setBarWidth(sizing.width);
+            await act(async () => viewport.resize());
+            assert.equal(viewport.container.scrollLeft, sizing.expected);
+            const rect = viewport.node(date).getBoundingClientRect();
+            if (sizing.anchored)
+              assert.equal(
+                viewport.node(anchor).getBoundingClientRect().left,
+                oldPixel,
+              );
+            else {
+              assert.ok(rect.left >= 100);
+              assert.ok(rect.left + rect.width <= 181);
+            }
+            assertProtection(view, viewport, date, protection);
+          },
+          viewport.createNodeMock,
+        );
+      });
+    }
+  }
+
+  test(`R22 monthly: actual focus still wins when narrowing cannot fit the pin and focus (${mode})`, async () => {
+    const viewport = monthlyViewport(months, 162);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        viewport.container.scrollLeft = 27;
+        await act(async () => group(view).props.onScroll());
+        const pinned = months[5].date;
+        const focused = months[2].date;
+        await protectMonth(view, viewport, pinned, "pin");
+        await protectMonth(view, viewport, focused, "actual-focus");
+        viewport.setWidth(54);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 54);
+        assert.equal(viewport.node(focused).getBoundingClientRect().left, 100);
+        assertSelected(view, pinned, true);
+        assert.equal(
+          viewport.container.ownerDocument.activeElement,
+          viewport.node(focused),
+        );
+        assert.deepEqual(viewport.focusRequests, []);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R22 monthly: widening only the pinned bar cannot evict unchanged actual focus (${mode})`, async () => {
+    const viewport = monthlyViewport(months, 162);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        viewport.container.scrollLeft = 27;
+        await act(async () => group(view).props.onScroll());
+        const pinned = months[6].date;
+        const focused = months[1].date;
+        await protectMonth(view, viewport, pinned, "pin");
+        await protectMonth(view, viewport, focused, "actual-focus");
+        const writes = viewport.writes.length;
+        // A changed bounding width need not change the other button's geometry.
+        viewport.setVisualWidth(pinned, 48);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 27);
+        assert.equal(viewport.writes.length, writes);
+        assert.equal(viewport.node(focused).getBoundingClientRect().left, 100);
+        assertSelected(view, pinned, true);
+        assert.equal(
+          viewport.container.ownerDocument.activeElement,
+          viewport.node(focused),
+        );
+        assert.deepEqual(viewport.focusRequests, []);
+      },
+      viewport.createNodeMock,
+    );
+  });
 
   test(`R21 monthly: rendered refs, focus requests and stale focus state are not actual focus (${mode})`, async () => {
     const viewport = monthlyViewport(months);

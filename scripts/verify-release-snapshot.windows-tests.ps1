@@ -1,5 +1,5 @@
 #requires -Version 7.0
-# 第 21 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
+# 第 21/22 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
 # 用户在 Windows 本机 NTFS 上运行。只读用户提供的真实 PE，所有修改仅在新建
 # 隔离目录的测试副本中进行；绝不启动、安装或签名候选 PE，不构建项目。
 # 这不是既有的 release-version-pure-functions，也不算安装/升级验收。
@@ -23,6 +23,7 @@ $null = New-Item -ItemType Directory -Path $scriptsDirectory
 Copy-Item -LiteralPath $packagePath -Destination (Join-Path $evidence 'package.json')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-file-snapshot.cs') -Destination $scriptsDirectory
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-pe-version.cs') -Destination $scriptsDirectory
+Add-Type -Path (Join-Path $scriptsDirectory 'release-pe-version.cs')
 $script:CaseNumber = 0
 $script:AssertionNumber = 0
 
@@ -190,18 +191,41 @@ $markerBytes = [Text.Encoding]::UTF8.GetBytes("`0Tsuki-hash/DeepSeekMonitorWindo
 $baseBytes.CopyTo($fixtureB, 0)
 $markerBytes.CopyTo($fixtureB, $baseBytes.Length)
 [byte[]]$fixtureA = $fixtureB.Clone()
-$fixedStructures = 0
-for ($index = 0; $index -le $fixtureA.Length - 16; $index++) {
-    if ($fixtureA[$index] -eq 0xBD -and $fixtureA[$index + 1] -eq 0x04 -and
-        $fixtureA[$index + 2] -eq 0xEF -and $fixtureA[$index + 3] -eq 0xFE -and
-        [BitConverter]::ToUInt32($fixtureA, $index + 4) -eq 0x00010000) {
-        # 只改测试副本 VS_FIXEDFILEINFO 的 FileVersion build bit，文本版本保持原样。
-        $different = [BitConverter]::ToUInt32($fixtureA, $index + 12) -bxor [uint32]0x00010000
-        [BitConverter]::GetBytes([uint32]$different).CopyTo($fixtureA, $index + 12)
-        $fixedStructures += 1
-    }
+$baseInfos = @([DeepSeekMonitor.ReleaseVerification.PeVersionSnapshot]::Read($fixtureB))
+# 偏移必须来自完整解析成功的 RT_VERSION 资源，不在全文件扫描签名。
+# NSIS 3.11 的 dwStrucVersion=0；overlay/压缩数据中的同签名不能成为修改目标。
+# 同一 root 可包含多个 StringTable，因此先去重，防止 XOR 两次又恢复原版本。
+$fixedOffsets = @($baseInfos.FixedFileInfoOffset | Sort-Object -Unique)
+Assert-Case ($fixedOffsets.Count -gt 0) '找到真实 RT_VERSION 固定字段偏移用于构造不同版本 A'
+foreach ($offset in $fixedOffsets) {
+    $different = [BitConverter]::ToUInt32($fixtureA, $offset + 12) -bxor [uint32]0x00010000
+    [BitConverter]::GetBytes([uint32]$different).CopyTo($fixtureA, $offset + 12)
 }
-Assert-Case ($fixedStructures -gt 0) '找到真实 PE 固定版本结构用于构造不同版本 A'
+$changedInfos = @([DeepSeekMonitor.ReleaseVerification.PeVersionSnapshot]::Read($fixtureA))
+Assert-Case ($changedInfos.Count -eq $baseInfos.Count) 'A/B 保留同一组真实资源表'
+for ($index = 0; $index -lt $baseInfos.Count; $index++) {
+    $before = $baseInfos[$index]; $after = $changedInfos[$index]
+    Assert-Case ($after.Resource -ceq $before.Resource -and $after.FixedFileInfoOffset -eq $before.FixedFileInfoOffset -and
+        $after.FileMajorPart -eq $before.FileMajorPart -and $after.FileMinorPart -eq $before.FileMinorPart -and
+        $after.FileBuildPart -eq ($before.FileBuildPart -bxor 1) -and $after.FilePrivatePart -eq $before.FilePrivatePart -and
+        $after.FileVersion -ceq $before.FileVersion -and $after.ProductVersion -ceq $before.ProductVersion -and
+        $after.IsPreRelease -eq $before.IsPreRelease) "每个实际表的固定 build 已改变、文本保持原样：$($before.Resource)"
+}
+$sourceHash = Get-BytesHash $baseBytes
+$resourceEvidence = @(for ($index = 0; $index -lt $baseInfos.Count; $index++) {
+    $before = $baseInfos[$index]; $after = $changedInfos[$index]
+    [ordered]@{
+        resource = $before.Resource
+        fixedFileInfoOffset = $before.FixedFileInfoOffset
+        structureVersion = [BitConverter]::ToUInt32($fixtureB, $before.FixedFileInfoOffset + 4)
+        fileVersion = $before.FileVersion
+        productVersion = $before.ProductVersion
+        fixedFileVersionB = '{0}.{1}.{2}.{3}' -f $before.FileMajorPart, $before.FileMinorPart, $before.FileBuildPart, $before.FilePrivatePart
+        fixedFileVersionA = '{0}.{1}.{2}.{3}' -f $after.FileMajorPart, $after.FileMinorPart, $after.FileBuildPart, $after.FilePrivatePart
+    }
+})
+[ordered]@{ sourceInstallerSha256 = $sourceHash; resources = $resourceEvidence; actualToolchainVersion = 'User must record; not inferred from PE layout' } |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'source-resource-evidence.json') -Encoding utf8
 $hashA = Get-BytesHash $fixtureA
 $hashB = Get-BytesHash $fixtureB
 Assert-Case ($hashA -cne $hashB) 'A/B 是不同字节和哈希'
@@ -282,7 +306,7 @@ foreach ($barrier in @('AFTER_HASH', 'BEFORE_VERSION')) {
 
 # 以下专门核对 helper 的同进程释放，不冒充上面的真实主流程用例。
 # 子进程退出会自动关闭句柄，因此仅“子进程退出后可写”不能证明 Dispose 正确。
-Add-Type -Path @((Join-Path $scriptsDirectory 'release-file-snapshot.cs'), (Join-Path $scriptsDirectory 'release-pe-version.cs'))
+Add-Type -Path (Join-Path $scriptsDirectory 'release-file-snapshot.cs')
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -354,6 +378,9 @@ $summary = [ordered]@{
     executable = $pwsh
     fixtureSha256A = $hashA
     fixtureSha256B = $hashB
+    sourceInstallerSha256 = $sourceHash
+    fixedFileInfoOffsets = $fixedOffsets
+    resources = $resourceEvidence
     evidenceDirectory = $evidence
     installationAcceptance = 'NOT RUN'
 } | ConvertTo-Json -Depth 5

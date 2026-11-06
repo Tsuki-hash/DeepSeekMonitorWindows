@@ -14,7 +14,7 @@
 - 文件共享限制作用于 NTFS 文件对象，因此从另一 hardlink 写入也应被拒绝。规范目标的祖先改名被目录句柄阻止。输入 junction/别名若能解析到支持的规范目标，则检查的是输出中明确列出的**被锁文件**；别名本身后来被重新指向，不会改变这次捕获的字节或让资源改从新目标读取。
 - 只读一次完整字节数组。SHA-256、仓库字符串、PE 基本结构以及 **RT_VERSION 版本资源全部来自同一个数组**。不再调用 `.NET FileVersionInfo.GetVersionInfo`，因为它可能把未锁定 `.mui` 侧车中的字符串与 exe 的固定字段合并，不能作为“所有字段来自此安装包”的保证。
 - `release-pe-version.cs` 解析 PE32/PE32+ 的资源 RVA、资源三级目录、固定版本字段和全部语言字符串表。要求 VERSIONINFO 使用唯一 numeric 名称 ID 1；校验目录 named/numeric 分区及 numeric ID 严格升序、无重复，不能把 Windows 不采用的任意名称当作版本资源。另检查边界、截断、重叠节、块长度、UTF-16、重复字段和严格八位十六进制表键；不存在或不能可靠解析时为 INCONCLUSIVE。多个语言资源/字符串表都须满足原版本规则，不能只挑一个匹配语言。
-- 本校验器还要求唯一 `VarFileInfo/Translation` 与全部 `StringTable` 一一匹配。不把缺失映射或仅存在任意语言表解释成可用版本，不猜测 Windows 的默认语言回退；缺失、重复或不一致为 INCONCLUSIVE。**这是保守的支持限制，不是 Windows 规定 VarFileInfo 必需**，部分合法但省略 Var 的 PE 也会被阻断；真实 NSIS 兼容性仍须用户验收。
+- 本校验器要求唯一 `VarFileInfo/Translation`，每个本地 `StringTable` 都必须有映射。通常要求同一资源内一一对应；第 22 轮另支持 NSIS 3.11 的“每语言一个表、Translation 列出所有语言”布局，额外映射必须由同一快照中相应语言的真实版本资源兑现，且映射全集一致。缺失、重复、不一致或未知跨资源布局为 INCONCLUSIVE。**这是保守的支持限制，不是 Windows 规定 VarFileInfo 必需**。具体支持边界和待运行矩阵见 [第 22 轮 NSIS 资源兼容说明](REVIEW22_NSIS_RESOURCE_COMPATIBILITY.md)；不能把合成 fixture 当作真实包验收。
 - 原文件名 token、stable `x.y.z`/`x.y.z.0`、固定 revision、可缺省 ProductVersion、预发行标记、仓库证据和三态优先级保持：确定哈希错误/旧仓库为 FAIL / 1；其他不足为 INCONCLUSIVE / 2；全部静态要求满足才为 PASS / 0。已发现的 FAIL 不会被后续锁、I/O 或资源异常清除。
 
 这是有意保守的本机 NTFS 方案。非 Windows、网络共享、FAT/ReFS、无法取得卷 GUID、目录访问权限不足、共享锁冲突、无法确认身份、资源布局不支持或读取失败，都不能报 PASS。不要关闭这些检查以获得绿色结果。长路径和 Unicode 路径也须实际验收；支持与否以本机 API 是否完整成功为准，不能静默降级。
@@ -39,6 +39,8 @@ pwsh -NoProfile -File scripts/verify-release-pe-bytes.static-tests.ps1
 
 仅用合成 PE 字节和原版本规则验证：PE32/PE32+、缺省 ProductVersion、多语言表全部检查、缺失/错配 Translation、固定字段与文本冲突、预发行标记、表键空白/非 hex、重复 FileVersion、非标准名称 ID 2、目录分区错位、语言 ID 乱序/重复、目录/数据 RVA 越界、错误目录层级、短块、签名错误、部分 VA 重叠及截断。它不运行发行校验主流程，也不测试 Windows 共享模式。所有新增断言仍待用户执行。
 
+第 22 轮补充 NSIS v311 源码格式的精确合成资源：`dwStrucVersion=0`、三个空容器 `wType=0`、单资源/分语言资源、1252/936 代码页和当前语言优先的 Translation；仍保留标准结构版本/容器类型组合。覆盖未知结构版本、未知容器或叶类型、跨资源映射无目标/错代码页/不一致、第二语言文本/固定/ProductVersion 冲突、截断和 overlay 签名诱饵。它们是按生成器源码构造的字节，不是由本轮编译得到的 exe。
+
 另从父入口 AST 提取真实的返回协议校验纯函数，对缺完成、仅完成、错计数、未完成、重复/非末尾完成、虚假 passed/failed、坏序号、失败/非布尔断言和非零退出进行合成故障注入；完整记录须能通过。这些协议断言与 C# 解析断言一起计入 `pe-bytes`，仍只是源码回归证据。
 
 ### 3. 必需的 Windows 真实主流程屏障回归
@@ -51,13 +53,13 @@ pwsh -NoProfile -File scripts/verify-release-snapshot.windows-tests.ps1 `
 
 这是发布前必须完成的独立 Windows 验收，不与跨平台源码门禁合并计数。非 Windows 必须保持未执行，不能冒充通过。要求 PowerShell 7+ Core、本机 NTFS 和当前源码版本的真实 PE。证据目录必须尚不存在。脚本只读取提供的原件，所有写入、替换和签名失效的修改都仅发生在新建隔离目录中；**不会执行、安装、签名该 PE，也不会构建项目**。
 
-- B 为当前真实 PE 的隔离副本，追加当前仓库明文 marker，使仓库辅助证据可控。A 从 B 的副本修改固定 FileVersion build 位，文本保持不变。自算哈希只用于构造回归，不是发行来源证明；这些副本不应发布。
+- B 为当前真实 PE 的隔离副本，追加当前仓库明文 marker，使仓库辅助证据可控。A 仅修改解析器完整验证后返回的各个 `RT_VERSION` 固定字段偏移，先去重，再改变 FileVersion build 位；逐表重新读取确认文本不变、固定版本已变。第 22 轮已移除要求 `dwStrucVersion=0x10000` 的全文件签名扫描，兼容 NSIS 的 0 且不修改 overlay 中的签名诱饵。自算哈希只用于构造回归，不是发行来源证明；这些副本不应发布。
 - 先对未插入屏障的完整脚本副本验证 B 为静态 PASS / 0，A 为真实固定版本不符的 INCONCLUSIVE / 2。若输入版本不受支持、自带旧仓库字符串、缺资源或文件锁环境不支持，测试必须失败，不能跳过该基线后宣称竞态通过。
 - 用命名事件，在完整脚本副本中的“哈希完成后”和“版本读取前”两个固定位置暂停。不是依赖 `Sleep` 猜时序，也不替换哈希、PE 解析或文件锁实现；生产脚本仅有注释锚点，没有测试参数或绕过检查的开关。
 - 每个屏障分别尝试：同路径覆盖、原子替换、重命名 A 后换 B、删除 A 后换 B、A → B → A、另一 hardlink 写入、父目录改名后重建路径。修改必须明确因 sharing/lock violation 被拒；普通权限错误不算成功。主流程继续后必须仍报告 A 的哈希和不符的固定版本，INCONCLUSIVE / 2，不能静态 PASS。即便结束哈希等于 A，也不能代替“修改确被拒绝”的证据。
 - 子进程退出后同一修改必须可成功，以排除错误路径/ACL 造成的假阳性。另有**明确标成 helper-only** 的同进程案例：Open 期间拒写、Dispose 后文件可写且祖先可改名、Open 在更深父目录锁冲突时回收已获取的叶/祖先句柄。不能单凭子进程退出后可写，声称 `Dispose` 已验证。
 - 额外主流程案例覆盖已有可写句柄、空格路径、缺期望哈希、错误哈希优先、普通文本不能冒充 PE、旧仓库 FAIL 优先，以及先发生哈希 FAIL 再抛资源解析异常仍保持 FAIL / 1；非标准版本名称 ID 2、目录分区错位也走完整脚本，要求 INCONCLUSIVE / 2。
-- 每例保存完整 stdout/stderr、真实退出码、屏障名称、修改结果/异常和断言。全部完成才生成独立 scope 为 `release-snapshot-windows-main-flow` 的 summary；helper-only 断言单独标识，安装验收仍为 NOT RUN。超时、未到屏障、进程失败、未完成或缺少汇总都不能作为通过。
+- 每例保存完整 stdout/stderr、真实退出码、屏障名称、修改结果/异常和断言；另保存输入原件的 SHA-256、资源路径、结构版本、固定字段偏移和文本/固定版本。实际打包工具版本必须由用户记录，不能从 PE 布局推断。全部完成才生成独立 scope 为 `release-snapshot-windows-main-flow` 的 summary；helper-only 断言单独标识，安装验收仍为 NOT RUN。超时、未到屏障、进程失败、未完成或缺少汇总都不能作为通过。
 
 ## 仍需用户完成的 Windows 文件/路径验收
 

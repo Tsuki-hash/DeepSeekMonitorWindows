@@ -97,14 +97,44 @@ function restoreViewport(
         retained.find((bar) => isVisible(bar, previous)) ?? retained[0];
       const moved = current.bars.find((bar) => bar.date === anchor?.date);
       if (anchor && moved) left = previous.left + moved.left - anchor.left;
-      // 缩窄窗口时保住原本可见的固定柱／真实焦点。两者放不下时真实焦点优先。
-      // 用户自行滚出视口的旧选择不拉回，也不调用 focus / scrollIntoView。
+      // 只修正缩窄／柱宽变化新增的遮挡；纯 append / prepend 不能把用户主动
+      // 留在边缘的部分可见柱拉回。两者放不下时真实焦点优先，不调用 focus。
+      let visibilityCorrected = false;
       for (const date of protectedDates) {
         const old = previous.bars.find((bar) => bar.date === date);
         const bar = current.bars.find((bar) => bar.date === date);
-        if (old && bar && isVisible(old, previous)) {
+        if (
+          !old ||
+          !bar ||
+          !isVisible(old, previous) ||
+          (current.width >= previous.width &&
+            Math.abs(bar.width - old.width) <= 0.5 &&
+            !visibilityCorrected)
+        )
+          continue;
+        // 在日期锚点恢复后比较每一侧的裁切量，不把既有裁切误判为新增遮挡。
+        const oldLeftClip = Math.max(0, previous.left - old.left);
+        const oldRightClip = Math.max(
+          0,
+          old.left + old.width - previous.left - previous.width,
+        );
+        const leftClip = Math.max(0, left - bar.left);
+        const rightClip = Math.max(
+          0,
+          bar.left + bar.width - left - current.width,
+        );
+        // 柱自身缩短也可能吃掉原先仅剩的可见像素，即使左裁切量没有增加。
+        const becameHidden =
+          bar.left + bar.width <= left || bar.left >= left + current.width;
+        if (
+          leftClip > oldLeftClip + 0.5 ||
+          rightClip > oldRightClip + 0.5 ||
+          becameHidden
+        ) {
           left = Math.max(left, bar.left + bar.width - current.width);
           left = Math.min(left, bar.left);
+          // 固定柱变宽后的修正若遮挡真实焦点，后者仍有最后决定权。
+          visibilityCorrected = true;
         }
       }
     }

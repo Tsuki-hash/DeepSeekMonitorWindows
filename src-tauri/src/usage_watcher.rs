@@ -10,7 +10,12 @@
 //! （平台归档旧数据后固定月会恒失败）。
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
+};
 
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::cache_watch;
@@ -20,7 +25,7 @@ use crate::sync_script::USAGE_SYNC_POLL_JS;
 use crate::sync_session::SyncSession;
 use crate::token_sync::{
     collect_webview_cached_usage_tokens_while, mark_seen, webview_cache_dir, CacheScanState,
-    CachedCandidate,
+    CachedCandidate, Stamp,
 };
 
 /// 仅用于识别并清除历史 title 通道残留，不再解析其中的 token。
@@ -32,6 +37,224 @@ const MAX_WATCH_ROUNDS: u32 = 1200;
 const FAST_POLL_MS: u64 = 1500;
 const SLOW_POLL_MS: u64 = 4000;
 const FAST_POLL_ROUNDS: u32 = 20;
+const CANDIDATE_BATCH_BUDGET: Duration = Duration::from_secs(30);
+/// 只保存来源指纹与游标，不长期保存 Token。溢出仅遗忘最旧进度，不标 seen。
+const MAX_VERIFICATION_FILES: usize = 4096;
+/// 明确拒绝仅用位图保存；所有文件合计至多 2 MiB，不随重试次数增长。
+const MAX_REJECTION_WORDS: usize = 256 * 1024;
+// 缓存是二进制：from_utf8_lossy 最坏把一个无效字节扩成三字节 U+FFFD。
+// 不缩窄既有解析契约，预留完整解码后最坏批次，而不是把原始 IO 字节当 String 大小。
+const MAX_COLLECTED_TOKEN_BYTES: u64 = 3 * crate::token_sync::MAX_SCAN_BYTES;
+const MAX_PENDING_TOKEN_BYTES: u64 = 2 * MAX_COLLECTED_TOKEN_BYTES;
+
+fn can_collect_more(pending_sources: usize, pending_token_bytes: u64) -> bool {
+    pending_sources <= MAX_VERIFICATION_FILES - crate::token_sync::MAX_SCAN_FILES
+        && pending_token_bytes <= MAX_PENDING_TOKEN_BYTES - MAX_COLLECTED_TOKEN_BYTES
+}
+
+#[derive(Default)]
+struct CandidateVerificationState {
+    files: HashMap<PathBuf, FileVerificationProgress>,
+    sequence: u64,
+    // 只有未完成首遍的来源保留内存快照；有容量时仍继续扫描后部文件。
+    // 预留完整下一扫描批的容量，才允许新收集，不能逐出未尝试候选。
+    pending: Vec<CandidateFile>,
+    fresh_sources: HashSet<PathBuf>,
+    prefer_fresh: bool,
+    prefer_pending_next: bool,
+}
+
+struct FileVerificationProgress {
+    stamp: Stamp,
+    // 同一元数据下读到不同快照也必须重置，不能继承旧快照的明确拒绝。
+    fingerprint: [u8; 32],
+    next_candidate: usize,
+    untried: usize,
+    rejected: Vec<u64>,
+    rejected_count: usize,
+    first_observed: u64,
+    last_attempt: u64,
+    last_observed: u64,
+}
+
+struct CandidateFile {
+    path: PathBuf,
+    stamp: Stamp,
+    tokens: Vec<String>,
+    remaining_this_round: usize,
+}
+
+impl FileVerificationProgress {
+    fn is_rejected(&self, index: usize) -> bool {
+        self.rejected[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn reject(&mut self, index: usize) {
+        if !self.is_rejected(index) {
+            self.rejected[index / 64] |= 1u64 << (index % 64);
+            self.rejected_count += 1;
+        }
+    }
+}
+
+impl CandidateVerificationState {
+    fn next_sequence(&mut self) -> u64 {
+        if self.sequence == u64::MAX {
+            let mut values: Vec<_> = self
+                .files
+                .values()
+                .flat_map(|progress| {
+                    [
+                        progress.first_observed,
+                        progress.last_attempt,
+                        progress.last_observed,
+                    ]
+                })
+                .filter(|value| *value > 0)
+                .collect();
+            values.sort_unstable();
+            values.dedup();
+            for progress in self.files.values_mut() {
+                progress.first_observed =
+                    values.binary_search(&progress.first_observed).unwrap() as u64 + 1;
+                if progress.last_attempt > 0 {
+                    progress.last_attempt =
+                        values.binary_search(&progress.last_attempt).unwrap() as u64 + 1;
+                }
+                progress.last_observed =
+                    values.binary_search(&progress.last_observed).unwrap() as u64 + 1;
+            }
+            self.sequence = values.len() as u64;
+        }
+        self.sequence += 1;
+        self.sequence
+    }
+
+    fn collect_for_round(
+        &mut self,
+        scan: &mut CacheScanState,
+        collect: impl FnOnce(&mut CacheScanState) -> Vec<CachedCandidate>,
+    ) -> Vec<CachedCandidate> {
+        let pending_bytes: u64 = self
+            .pending
+            .iter()
+            .flat_map(|file| &file.tokens)
+            .map(|token| token.len() as u64)
+            .sum();
+        let can_collect = can_collect_more(self.pending.len(), pending_bytes);
+        let mut candidates = if can_collect {
+            collect(scan)
+        } else {
+            Vec::new()
+        };
+        let fresh_sources: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        // 同一路径新读取的候选快照替换驻留快照，由 prepare 比较 stamp/内容指纹。
+        let pending = std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter(|file| !fresh_sources.contains(&file.path));
+        candidates.extend(pending.flat_map(|file| {
+            let CandidateFile {
+                path,
+                stamp,
+                tokens,
+                ..
+            } = file;
+            tokens.into_iter().map(move |token| CachedCandidate {
+                token,
+                path: path.clone(),
+                stamp,
+            })
+        }));
+        // 新批与驻留批交替优先。若这轮目录刚结束，仍保留上个新批的优先身份，
+        // 不让首批慢文件挡住第 251 个文件，也不让不断新增文件压掉旧批的 B。
+        if !fresh_sources.is_empty() {
+            self.fresh_sources = fresh_sources;
+        }
+        self.prefer_fresh = !self.prefer_pending_next;
+        self.prefer_pending_next = !self.prefer_pending_next;
+        candidates
+    }
+
+    fn prepare(&mut self, candidates: Vec<CachedCandidate>) -> Vec<CandidateFile> {
+        let mut positions = HashMap::new();
+        let mut files: Vec<CandidateFile> = Vec::new();
+        for candidate in candidates {
+            let index = *positions.entry(candidate.path.clone()).or_insert_with(|| {
+                files.push(CandidateFile {
+                    path: candidate.path.clone(),
+                    stamp: candidate.stamp,
+                    tokens: Vec::new(),
+                    remaining_this_round: 0,
+                });
+                files.len() - 1
+            });
+            files[index].tokens.push(candidate.token);
+        }
+        for file in &mut files {
+            file.remaining_this_round = file.tokens.len();
+            let mut digest = Sha256::new();
+            for token in &file.tokens {
+                digest.update((token.len() as u64).to_le_bytes());
+                digest.update(token.as_bytes());
+            }
+            let fingerprint: [u8; 32] = digest.finalize().into();
+            let observed = self.next_sequence();
+            let progress =
+                self.files
+                    .entry(file.path.clone())
+                    .or_insert_with(|| FileVerificationProgress {
+                        stamp: file.stamp,
+                        fingerprint,
+                        next_candidate: 0,
+                        untried: file.tokens.len(),
+                        rejected: vec![0; file.tokens.len().div_ceil(64)],
+                        rejected_count: 0,
+                        first_observed: observed,
+                        last_attempt: 0,
+                        last_observed: observed,
+                    });
+            if progress.stamp != file.stamp || progress.fingerprint != fingerprint {
+                *progress = FileVerificationProgress {
+                    stamp: file.stamp,
+                    fingerprint,
+                    next_candidate: 0,
+                    untried: file.tokens.len(),
+                    rejected: vec![0; file.tokens.len().div_ceil(64)],
+                    rejected_count: 0,
+                    first_observed: observed,
+                    last_attempt: 0,
+                    last_observed: observed,
+                };
+            }
+            progress.last_observed = observed;
+            file.remaining_this_round -= progress.rejected_count;
+        }
+        // collect_for_round 预留解码后整批容量，合并后至多 4096 来源/192 MiB Token 载荷，
+        // 位图仍小于 2 MiB。当前来源排序最新，淘汰只能遗忘已完成首遍的旧来源。
+        // 跨批次状态不保存候选原文，指纹/位图也不写磁盘或日志。
+        let mut words: usize = self.files.values().map(|p| p.rejected.len()).sum();
+        if self.files.len() > MAX_VERIFICATION_FILES || words > MAX_REJECTION_WORDS {
+            let mut observed: Vec<_> = self
+                .files
+                .iter()
+                .map(|(path, progress)| (path.clone(), progress.last_observed))
+                .collect();
+            observed.sort_by_key(|(_, observed)| *observed);
+            for (path, _) in observed {
+                if self.files.len() <= MAX_VERIFICATION_FILES && words <= MAX_REJECTION_WORDS {
+                    break;
+                }
+                if let Some(progress) = self.files.remove(&path) {
+                    words -= progress.rejected.len();
+                }
+            }
+        }
+        files
+    }
+}
 
 /// 东八区当前 (月, 年)。平台按北京时间记账，试调月不能用本机时区：
 /// 海外机器在月初会把「北京时间的新月」错算成上个月。
@@ -126,62 +349,153 @@ async fn while_current<T>(
     }
 }
 
-/// 收集到的候选逐一验证：
-/// - 通过 → 返回该 token，来源文件保持未标记（成功即同步结束，状态随之丢弃）；
-/// - 明确拒绝 → 回写已读标记，后续轮次不再弹出；
-/// - 瞬时失败 → 保持未标记，下一轮自动重试（否则一次网络抖动会把有效
-///   Token 静默压制到文件内容变化为止）。
-///
-/// 日志只落计数，token 本身与缓存原文绝不进日志。
+/// 同一 watcher 的轮次共享验证进度：未尝试候选优先，暂不可用候选轮转到后面。
+/// 只有同一文件快照的全部候选明确拒绝，才回写 seen；通过与取消均短路。
 async fn verify_candidates(
     scan: &mut CacheScanState,
+    verification: &mut CandidateVerificationState,
     candidates: Vec<CachedCandidate>,
     is_current: impl Fn() -> bool,
 ) -> Option<String> {
-    if candidates.is_empty() {
+    let probes = verify_probe_months(SystemTime::now());
+    verify_candidates_with(
+        scan,
+        verification,
+        candidates,
+        &probes,
+        is_current,
+        Instant::now,
+        |deadline| tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)),
+        |token, month, year| async move { verify_usage_token(&token, month, year).await },
+    )
+    .await
+}
+
+/// 生产调度、30 秒整批 deadline、多月探针与取消链。回归只替换时钟/等待与
+/// 单月 HTTP 请求，不另写一个模拟调度器，也不缩短生产 deadline 来碰运气。
+async fn verify_candidates_with<N, W, Wait, V, Request>(
+    scan: &mut CacheScanState,
+    verification: &mut CandidateVerificationState,
+    candidates: Vec<CachedCandidate>,
+    probes: &[(u32, u32)],
+    is_current: impl Fn() -> bool,
+    now: N,
+    wait_until: W,
+    mut verify: V,
+) -> Option<String>
+where
+    N: Fn() -> Instant,
+    W: Fn(Instant) -> Wait,
+    Wait: std::future::Future<Output = ()>,
+    V: FnMut(String, u32, u32) -> Request,
+    Request: std::future::Future<Output = Result<(), VerifyFailure>>,
+{
+    if !is_current() || candidates.is_empty() {
         return None;
     }
-    let probes = verify_probe_months(SystemTime::now());
+    let deadline = now() + CANDIDATE_BATCH_BUDGET;
+    let mut files = verification.prepare(candidates);
+    let mut order: Vec<_> = (0..files.len()).collect();
+    order.sort_by_key(|index| {
+        let file = &files[*index];
+        let progress = &verification.files[&file.path];
+        let fresh = verification.fresh_sources.contains(&file.path);
+        let preferred = fresh == verification.prefer_fresh;
+        // 首遍按来源原始顺序续跑，不能每轮把同文件 B 放回所有文件的 A 后面。
+        // 首遍完成后的暂不可用重试才按最近尝试时间轮转。
+        (
+            !preferred,
+            if progress.untried > 0 {
+                progress.first_observed
+            } else {
+                progress.last_attempt
+            },
+        )
+    });
+    let (mut untried, mut retry): (VecDeque<_>, VecDeque<_>) = order
+        .into_iter()
+        .partition(|index| verification.files[&files[*index].path].untried > 0);
     let mut rejected = 0usize;
     let mut unavailable = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut files: std::collections::HashMap<_, (crate::token_sync::Stamp, bool)> =
-        std::collections::HashMap::new();
-    for candidate in candidates {
+    while let Some(index) = untried.pop_front().or_else(|| retry.pop_front()) {
         if !is_current() {
             return None;
         }
-        let file = files
-            .entry(candidate.path.clone())
-            .or_insert((candidate.stamp, true));
-        if Instant::now() >= deadline {
-            file.1 = false;
-            continue;
+        if now() >= deadline {
+            break;
         }
+        let file = &mut files[index];
+        let cursor = verification.files[&file.path].next_candidate;
+        let token = &file.tokens[cursor];
         let outcome = while_current(
-            tokio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                probe_token(&candidate.token, &probes),
-            ),
+            async {
+                tokio::select! {
+                    biased;
+                    _ = wait_until(deadline) => ProbeOutcome::Unavailable,
+                    result = probe_token_with(probes, |month, year| {
+                        verify(token.clone(), month, year)
+                    }) => result,
+                }
+            },
             &is_current,
         )
-        .await?
-        .unwrap_or(ProbeOutcome::Unavailable);
+        .await?;
+        if outcome == ProbeOutcome::Passed {
+            return Some(token.clone());
+        }
+        let attempt = verification.next_sequence();
+        let progress = verification.files.get_mut(&file.path)?;
+        progress.last_attempt = attempt;
+        progress.untried = progress.untried.saturating_sub(1);
+        file.remaining_this_round -= 1;
         match outcome {
-            ProbeOutcome::Passed => return Some(candidate.token),
             ProbeOutcome::Rejected => {
                 rejected += 1;
+                progress.reject(cursor);
             }
             ProbeOutcome::Unavailable => {
                 unavailable += 1;
-                file.1 = false;
+            }
+            ProbeOutcome::Passed => unreachable!(),
+        }
+        // 明确拒绝的候选跨轮跳过；未尝试/超时的位不置位，不能误计为全部拒绝。
+        if progress.rejected_count == file.tokens.len() {
+            mark_seen(scan, file.path.clone(), file.stamp);
+            verification.files.remove(&file.path);
+        } else {
+            progress.next_candidate = (1..=file.tokens.len())
+                .map(|offset| (cursor + offset) % file.tokens.len())
+                .find(|next| !progress.is_rejected(*next))
+                .expect("尚未全部明确拒绝时必有可重试候选");
+            if file.remaining_this_round > 0 {
+                if progress.untried > 0 {
+                    untried.push_back(index);
+                } else {
+                    retry.push_back(index);
+                }
             }
         }
     }
-    for (path, (stamp, all_rejected)) in files {
-        if all_rejected {
-            mark_seen(scan, path, stamp);
-        }
+    if is_current()
+        && files.iter().any(|file| {
+            verification
+                .files
+                .get(&file.path)
+                .is_some_and(|progress| progress.untried > 0)
+        })
+    {
+        // 有界保留尚未完成首遍的来源；首遍完成后仅留下不含 Token 的游标/位图。
+        // 仍使用原快照与 stamp；后续文件更新不继承旧 stamp 的 seen 标记。
+        // 长期驻留时按来源分组，只保存一份路径，避免短 Token × 长路径放大。
+        verification.pending = files
+            .into_iter()
+            .filter(|file| {
+                verification
+                    .files
+                    .get(&file.path)
+                    .is_some_and(|progress| progress.untried > 0)
+            })
+            .collect();
     }
     if unavailable > 0 {
         log::warn!(
@@ -197,12 +511,15 @@ async fn verify_candidates(
 /// 收集 + 验证的完整一轮（两者分离，见 token_sync 的收集语义）。
 async fn collect_and_verify(
     scan: &mut CacheScanState,
+    verification: &mut CandidateVerificationState,
     app: &tauri::AppHandle,
     generation: u64,
 ) -> Option<String> {
     let is_current = || app.state::<SyncSession>().is_current(generation);
-    let candidates = collect_webview_cached_usage_tokens_while(scan, is_current);
-    verify_candidates(scan, candidates, is_current).await
+    let candidates = verification.collect_for_round(scan, |scan| {
+        collect_webview_cached_usage_tokens_while(scan, is_current)
+    });
+    verify_candidates(scan, verification, candidates, is_current).await
 }
 
 /// 缓存预扫描（点击同步时先跑一次）：收集候选并逐个验证，命中即返回。
@@ -221,9 +538,14 @@ pub(crate) async fn prescan_cached_token(
     })
     .await
     .ok()?;
-    verify_candidates(&mut scan, candidates, || {
-        app.state::<SyncSession>().is_current(generation)
-    })
+    // 预扫描是一次独立尝试，结束即释放进度；不把旧快照或凭据留给下一代同步。
+    // watcher 自己持有跨轮状态，故最多重新尝试一次前导慢候选，随后继续其后候选。
+    verify_candidates(
+        &mut scan,
+        &mut CandidateVerificationState::default(),
+        candidates,
+        || app.state::<SyncSession>().is_current(generation),
+    )
     .await
 }
 
@@ -395,6 +717,10 @@ pub(crate) fn open_login_window(
 #[path = "login_close_tests.rs"]
 mod login_close_tests;
 
+#[cfg(test)]
+#[path = "cache_fairness_tests.rs"]
+mod cache_fairness_tests;
+
 /// 启动后台 watcher：周期扫缓存 + 目录事件即时唤醒，直到捕获成功、窗口关闭、
 /// 代际更替或轮次上限。每条退出路径都落日志（评审 F-23），内容不含任何凭据。
 pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
@@ -402,12 +728,15 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
         // 登录页加载并触发平台 API 请求需要时间，等待后再开始扫缓存
         std::thread::sleep(Duration::from_secs(3));
         let mut scan = CacheScanState::default();
+        let mut verification = CandidateVerificationState::default();
         // 缓存目录可能尚未创建（首次登录时 WebView2 还没落盘），每轮空闲时
         // 检查监听存活、失效就重新拉起；拉起失败自然退回定时轮询
         let cache_dir = webview_cache_dir();
         let mut change_signal = cache_dir.as_deref().and_then(cache_watch::spawn);
         let mut watch_unavailable_logged = false;
         let mut idle_rounds = 0u32;
+        // 约五分钟是轮次入口的停止条件，并非总耗时硬上限：预扫描、此处前面的
+        // 3s 启动等待、最后一轮扫描/30s 验证及休眠都不被这个 deadline 截断。
         let deadline = Instant::now() + Duration::from_secs(300);
         for _ in 0..MAX_WATCH_ROUNDS {
             // 新一轮同步已开始：本 watcher 作废
@@ -422,9 +751,12 @@ pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
                 end_sync_session(&app, generation);
                 return;
             }
-            if let Some(token) =
-                tauri::async_runtime::block_on(collect_and_verify(&mut scan, &app, generation))
-            {
+            if let Some(token) = tauri::async_runtime::block_on(collect_and_verify(
+                &mut scan,
+                &mut verification,
+                &app,
+                generation,
+            )) {
                 if !app.state::<SyncSession>().is_current(generation) {
                     return;
                 }
