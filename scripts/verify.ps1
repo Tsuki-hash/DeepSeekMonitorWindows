@@ -53,19 +53,8 @@ else {
 }
 
 # 复评 F19：依赖告警纳入门禁（开发依赖曾出现 high）。
-# 用独立的空 userconfig 隔离开发者个人 .npmrc：某些机器的全局 allow-scripts
-# 设置会让 project-scoped audit 直接报 EALLOWSCRIPTS，那是环境问题而不是项目缺陷。
-# 用环境变量指定 userconfig：npm 11 不再把 `--userconfig=` 当作独立覆盖项。
-$auditConfig = Join-Path ([IO.Path]::GetTempPath()) 'dsm-audit-empty.npmrc'
-if (-not (Test-Path $auditConfig)) { New-Item -ItemType File -Path $auditConfig | Out-Null }
-$previousUserConfig = $env:npm_config_userconfig
-$env:npm_config_userconfig = $auditConfig
-try {
-    Invoke-Check '生产依赖安全审计' 'npm' @('audit', '--package-lock-only', '--ignore-scripts', '--omit=dev')
-}
-finally {
-    if ($previousUserConfig) { $env:npm_config_userconfig = $previousUserConfig }
-    else { Remove-Item Env:npm_config_userconfig -ErrorAction SilentlyContinue }
-}
+# 由独立脚本执行：npm 会把 project-scoped 配置传给子进程，机器级 allow-scripts
+# 会让 `npm audit` 报 EALLOWSCRIPTS（环境问题，不是依赖问题）。
+Invoke-Check '生产依赖安全审计' 'node' @('scripts/audit-dependencies.mjs')
 
 Write-Host '全部通过。' -ForegroundColor Green
