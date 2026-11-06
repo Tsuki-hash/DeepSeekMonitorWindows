@@ -9,6 +9,7 @@
 
 use crate::credentials;
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use std::{
     fs,
     path::PathBuf,
@@ -90,16 +91,8 @@ pub fn edit_config(
 ) -> Result<StoredConfig, String> {
     let _guard = lock_config_io();
     let mut config = read_stored_config_unlocked()?;
-    let old_key = config.api_key.clone();
-    let old_token = config.usage_token.clone();
     f(&mut config)?;
     write_stored_config_unlocked(&config)?;
-    if config.api_key != old_key {
-        API_KEY_COMMIT_REVISION.store(revision(), Ordering::SeqCst);
-    }
-    if config.usage_token != old_token {
-        USAGE_TOKEN_COMMIT_REVISION.store(revision(), Ordering::SeqCst);
-    }
     stamp_snapshot(&mut config);
     Ok(config)
 }
@@ -159,15 +152,8 @@ pub fn edit_validated_credential(
         ValidatedCredential::ApiKey => config.api_key = Some(value),
         ValidatedCredential::UsageToken => config.usage_token = Some(value),
     }
-    write_stored_config_unlocked(&config)?;
-    credential_counter(kind).fetch_add(1, Ordering::SeqCst);
-    let committed_revision = match kind {
-        ValidatedCredential::ApiKey => &API_KEY_COMMIT_REVISION,
-        ValidatedCredential::UsageToken => &USAGE_TOKEN_COMMIT_REVISION,
-    };
-    committed_revision.store(revision(), Ordering::SeqCst);
+    write_stored_config_commit(&config, Some(kind))?;
     stamp_snapshot(&mut config);
-    changed().notify_one();
     Ok(config)
 }
 pub fn revision() -> u64 {
@@ -200,7 +186,7 @@ pub fn default_refresh_interval_seconds() -> u64 {
     DEFAULT_REFRESH_INTERVAL_SECONDS
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct StoredConfig {
     #[serde(skip)]
     pub config_revision: u64,
@@ -210,6 +196,8 @@ pub struct StoredConfig {
     pub usage_token_revision: u64,
     #[serde(skip)]
     pub config_warnings: Vec<String>,
+    #[serde(skip)]
+    pub config_read_error: Option<String>,
     // 放在首位，便于人工查看 config.json 时一眼看到格式版本
     #[serde(default)]
     pub version: u32,
@@ -245,13 +233,14 @@ impl StoredConfig {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub config_revision: u64,
     pub api_key_revision: u64,
     pub usage_token_revision: u64,
     pub config_warnings: Vec<String>,
+    pub config_read_error: Option<String>,
     pub api_key_configured: bool,
     pub api_key_preview: Option<String>,
     pub usage_token_configured: bool,
@@ -287,74 +276,155 @@ pub fn read_stored_config() -> Result<StoredConfig, String> {
     read_stored_config_unlocked()
 }
 
-fn read_stored_config_unlocked() -> Result<StoredConfig, String> {
-    let path = config_path()?;
-    if !path.exists() {
-        let mut config = StoredConfig::with_defaults();
-        stamp_snapshot(&mut config);
-        return Ok(config);
+/// The tracker stores semantic values only in process memory. It is never serialized,
+/// logged, or sent to the webview. Ciphertext randomness/schema migration do not
+/// represent account changes. Presence and unreadability do represent new snapshots.
+struct ObservedConfig {
+    path: PathBuf,
+    present: bool,
+    config: StoredConfig,
+}
+fn observed_config() -> &'static Mutex<Option<ObservedConfig>> {
+    static OBSERVED: OnceLock<Mutex<Option<ObservedConfig>>> = OnceLock::new();
+    OBSERVED.get_or_init(|| Mutex::new(None))
+}
+static CONFIG_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+pub fn install_change_listener(app: tauri::AppHandle) {
+    let _ = CONFIG_APP.set(app);
+}
+fn publish_snapshot(config: &StoredConfig) {
+    changed().notify_one();
+    if let (Some(app), Ok(public)) = (CONFIG_APP.get(), to_app_config(config.clone())) {
+        let _ = app.emit("credential-config-changed", public);
     }
-
-    let raw = fs::read(&path).map_err(|_| "无法读取配置文件，原文件未改动".to_string())?;
-    // 不记录 serde 原始错误：类型错误等诊断可能包含输入中的凭据值。
+}
+fn semantic_config(config: &StoredConfig) -> StoredConfig {
+    let mut semantic = config.clone();
+    semantic.version = 0;
+    semantic.config_revision = 0;
+    semantic.api_key_revision = 0;
+    semantic.usage_token_revision = 0;
+    for field in [&mut semantic.api_key, &mut semantic.usage_token] {
+        if field.as_deref() == Some("") {
+            *field = None;
+        }
+    }
+    semantic
+}
+/// Called only while config_io_lock is held, for reads and successful writes alike.
+fn observe_snapshot(
+    config: &mut StoredConfig,
+    present: bool,
+    force_commit: bool,
+    validated: Option<ValidatedCredential>,
+) {
+    let Ok(path) = config_path() else { return };
+    let semantic = semantic_config(config);
+    let mut observed = observed_config().lock().unwrap_or_else(|e| e.into_inner());
+    let previous = observed.as_ref().filter(|previous| previous.path == path);
+    let changed = previous.is_some_and(|previous| {
+        previous.present != present || previous.config != semantic
+    });
+    if changed || force_commit {
+        let next = CONFIG_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+        if previous.is_some_and(|previous| previous.config.api_key != semantic.api_key)
+            || matches!(validated, Some(ValidatedCredential::ApiKey))
+        {
+            API_KEY_COMMIT_REVISION.store(next, Ordering::SeqCst);
+        }
+        if previous.is_some_and(|previous| previous.config.usage_token != semantic.usage_token)
+            || matches!(validated, Some(ValidatedCredential::UsageToken))
+        {
+            USAGE_TOKEN_COMMIT_REVISION.store(next, Ordering::SeqCst);
+        }
+    }
+    if let Some(kind) = validated {
+        credential_counter(kind).fetch_add(1, Ordering::SeqCst);
+    }
+    *observed = Some(ObservedConfig { path, present, config: semantic });
+    drop(observed);
+    stamp_snapshot(config);
+    if changed || force_commit {
+        publish_snapshot(config);
+    }
+}
+fn unavailable_snapshot(error: String) -> StoredConfig {
+    let mut config = StoredConfig::with_defaults();
+    config.config_warnings.push(error.clone());
+    config.config_read_error = Some(error);
+    observe_snapshot(&mut config, true, false, None);
+    config
+}
+/// UI reads return an explicitly untrusted, versioned snapshot on disk failure.
+/// Mutation and account-request reads still return Err and never overwrite recovery material.
+pub fn read_app_config() -> Result<AppConfig, String> {
+    let _guard = lock_config_io();
+    let config = match read_effective_config_unlocked() {
+        Ok(config) => config,
+        Err(error) => unavailable_snapshot(error),
+    };
+    to_app_config(config)
+}
+fn read_stored_config_unlocked() -> Result<StoredConfig, String> {
+    match read_effective_config_unlocked() {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            unavailable_snapshot(error.clone());
+            Err(error)
+        }
+    }
+}
+fn read_effective_config_unlocked() -> Result<StoredConfig, String> {
+    let path = config_path()?;
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut config = StoredConfig::with_defaults();
+            observe_snapshot(&mut config, false, false, None);
+            return Ok(config);
+        }
+        Err(_) => return Err("无法读取配置文件，原文件未改动".to_string()),
+    };
+    // Never expose parser diagnostics, raw data, or decrypt diagnostics.
     const INVALID_CONFIG: &str = "配置文件损坏或编码无效，原文件已保留，未生成备份或重置。请安全修复或移走 config.json 后重试；历史备份不会自动清理。";
-    // serde 的未知字段跳过路径不负责校验全部字符串，先校验整份 UTF-8。
     let text = std::str::from_utf8(&raw).map_err(|_| INVALID_CONFIG.to_string())?;
     let mut config: StoredConfig =
         serde_json::from_str(text).map_err(|_| INVALID_CONFIG.to_string())?;
     config.refresh_interval_seconds =
         normalize_refresh_interval_seconds(config.refresh_interval_seconds);
-
-    let needs_migration = decrypt_credentials(&mut config);
+    let needs_migration = decrypt_credentials(&mut config)?;
     if needs_migration {
-        // 明文凭据已还原到内存，此处回写即完成「读取时自动加密」。
-        // 已持有 config_io_lock，必须走 unlocked 写，避免自锁。
-        if let Err(error) = write_stored_config_unlocked(&config) {
-            log::warn!("凭据加密迁移回写失败（本次读取不受影响）：{error}");
-            config
-                .config_warnings
-                .push("旧配置凭据尚未成功加密，请检查 Windows 加密服务并重新保存".into());
+        // Migration changes the disk representation, not semantic identity. Publish
+        // exactly once below, including independently changed Key/Token generations.
+        if write_stored_config_with(&config, encrypt_credentials).is_err() {
+            config.config_warnings.push(
+                "旧配置凭据尚未成功加密，请检查 Windows 加密服务并重新保存".into(),
+            );
         }
     }
-
-    stamp_snapshot(&mut config);
+    observe_snapshot(&mut config, true, false, None);
     Ok(config)
 }
 
-/// 原地解密配置里的凭据字段。返回是否需要回写迁移。
-///
-/// 三类输入的区别要分清：
-/// - **密文**：正常路径，解出来替换掉字段值；
-/// - **明文**（迁移期的旧文件、或用户手工编辑）：原样保留，标记需要迁移；
-/// - **密文但解不开**（异机拷贝、DPAPI 密钥丢失）：置空并告警。保留一个解不开的
-///   字符串没有意义——后续每次请求都会失败，不如让界面回到「未配置」提示用户重填。
-fn decrypt_credentials(config: &mut StoredConfig) -> bool {
+/// A transient/foreign DPAPI failure must not become a writable empty credential.
+/// Fail the whole read before migration so mixed plaintext + unreadable ciphertext
+/// also preserves the original file byte for byte.
+fn decrypt_credentials(config: &mut StoredConfig) -> Result<bool, String> {
     let mut migrated = false;
     for field in [&mut config.api_key, &mut config.usage_token] {
-        let Some(stored) = field.as_ref() else {
-            continue;
-        };
+        let Some(stored) = field.as_ref() else { continue };
         if stored.is_empty() || !credentials::is_ciphertext(stored) {
-            // 非空明文 → 迁移期格式，需要回写加密
-            if !stored.is_empty() {
-                migrated = true;
-            }
+            migrated |= !stored.is_empty();
             continue;
         }
         match credentials::decrypt(stored) {
             Some(Ok(plain)) => *field = Some(plain),
-            Some(Err(error)) => {
-                log::warn!("凭据解密失败，已清空该字段等待用户重填：{error}");
-                *field = None;
-                config
-                    .config_warnings
-                    .push("本机无法解密旧凭据，请重新填写".into());
-            }
-            // is_ciphertext 为真时 decrypt 必然返回 Some
-            None => *field = None,
+            _ => return Err(
+                "本机暂时无法解密配置凭据，已停止使用旧账户数据且保留原文件。请恢复本机加密服务，或安全修复或移走 config.json 后重试。".into(),
+            ),
         }
     }
-    migrated
+    Ok(migrated)
 }
 
 /// 原地加密配置里的凭据字段。已是密文的跳过，避免重复加密。
@@ -401,11 +471,23 @@ pub fn normalize_refresh_interval_seconds(value: u64) -> u64 {
 /// 调用方无需各自维护，也就不会出现「某个命令写出的文件是明文没加密」这种不一致。
 pub fn write_stored_config(config: &StoredConfig) -> Result<(), String> {
     let _guard = lock_config_io();
+    // Even a direct writer must not replace unreadable recovery material.
+    read_stored_config_unlocked()?;
     write_stored_config_unlocked(config)
 }
 
 fn write_stored_config_unlocked(config: &StoredConfig) -> Result<(), String> {
-    write_stored_config_with(config, encrypt_credentials)
+    write_stored_config_commit(config, None)
+}
+fn write_stored_config_commit(
+    config: &StoredConfig,
+    validated: Option<ValidatedCredential>,
+) -> Result<(), String> {
+    write_stored_config_with(config, encrypt_credentials)?;
+    let mut committed = config.clone();
+    committed.config_read_error = None;
+    observe_snapshot(&mut committed, true, true, validated);
+    Ok(())
 }
 
 fn write_stored_config_with(
@@ -430,8 +512,6 @@ fn write_stored_config_with(
         let _ = fs::remove_file(&temp_path);
         error.to_string()
     })?;
-    CONFIG_REVISION.fetch_add(1, Ordering::SeqCst);
-    changed().notify_one();
     Ok(())
 }
 
@@ -474,6 +554,7 @@ pub fn to_app_config(config: StoredConfig) -> Result<AppConfig, String> {
         api_key_revision: config.api_key_revision,
         usage_token_revision: config.usage_token_revision,
         config_warnings: config.config_warnings,
+        config_read_error: config.config_read_error,
         api_key_configured: api_key_preview.is_some(),
         api_key_preview,
         usage_token_configured,
@@ -626,6 +707,7 @@ mod tests {
             always_on_top: false,
             shortcut_enabled: false,
             alerts: Default::default(),
+            ..StoredConfig::with_defaults()
         };
         write_stored_config(&config).unwrap();
 
@@ -663,6 +745,7 @@ mod tests {
                 monthly_budget_cny: 123.45,
                 ..Default::default()
             },
+            ..StoredConfig::with_defaults()
         };
         write_stored_config(&config).unwrap();
         let reread = read_stored_config().unwrap();
@@ -778,33 +861,112 @@ mod tests {
     }
 
     #[test]
-    fn 解不开的密文_凭据置空_其余字段保留() {
-        if !require_windows_encryption() {
-            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
-            return;
-        }
-        // Windows 上加密必须真的可用：失败即失败，不静默跳过。
-        assert!(
-            credentials::encrypt("probe").is_some(),
-            "Windows 上 DPAPI 不可用，落盘加密无法工作"
-        );
-        // 模拟「config.json 从另一台机器拷贝过来」：密文格式正确但本机 DPAPI 解不开。
-        // 期望：凭据字段清空（让界面回到「未配置」提示重填），
-        // 但刷新间隔等非凭据设置必须原样保留。
+    fn 解不开的密文_撤销信任并保全原件_禁止偏好写覆盖() {
         let _dir = TempConfigDir::new("m1_foreign");
         let path = config_path().unwrap();
-        // 构造一段前缀正确、base64 合法、但不是 DPAPI 密文的内容——
-        // 直接模拟异机凭据即可，不必真去另一台机器上加密。
-        fs::write(
-            &path,
-            r#"{"version":1,"api_key":"DSM1:AAAAAAAAAAAAAAAAAAAAAA==","refresh_interval_seconds":1800,"autostart":true}"#,
-        )
-        .unwrap();
+        let original = br#"{"version":1,"api_key":"DSM1:AAAAAAAAAAAAAAAAAAAAAA==","usage_token":"SYNTHETIC_LEGACY_TOKEN","refresh_interval_seconds":1800,"autostart":true}"#;
+        fs::write(&path, original).unwrap();
+        assert!(read_stored_config().is_err());
+        let public = read_app_config().unwrap();
+        assert!(!public.api_key_configured && !public.usage_token_configured);
+        assert!(public.config_read_error.is_some());
+        assert!(!serde_json::to_string(&public).unwrap().contains("SYNTHETIC"));
+        assert!(edit_config(|_| panic!("unreadable credentials must block writes")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
 
-        let config = read_stored_config().unwrap();
-        assert_eq!(config.api_key, None, "解不开的凭据应被清空");
-        assert_eq!(config.refresh_interval_seconds, 1800, "非凭据设置应保留");
-        assert!(config.autostart, "非凭据设置应保留");
+    fn write_synthetic_plaintext(key: &str, token: &str, interval: u64) {
+        fs::write(config_path().unwrap(), serde_json::to_vec(&serde_json::json!({
+            "api_key": key,
+            "usage_token": token,
+            "refresh_interval_seconds": interval,
+        })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn n09_first_read_initializes_then_disk_removal_revokes_both_credentials() {
+        let _dir = TempConfigDir::new("n09_missing");
+        write_synthetic_plaintext("SYNTHETIC_KEY_A", "SYNTHETIC_TOKEN_A", 300);
+        let before = revision();
+        let first = read_stored_config().unwrap();
+        assert_eq!(first.config_revision, before, "initial migration is not a new identity");
+        fs::remove_file(config_path().unwrap()).unwrap();
+        let missing = read_stored_config().unwrap();
+        assert!(missing.config_revision > first.config_revision);
+        assert!(missing.api_key_revision > first.api_key_revision);
+        assert!(missing.usage_token_revision > first.usage_token_revision);
+        assert!(missing.api_key.is_none() && missing.usage_token.is_none());
+        assert_eq!(read_stored_config().unwrap().config_revision, missing.config_revision);
+    }
+
+    #[test]
+    fn n09_same_preview_different_key_and_preference_write_preserve_independent_versions() {
+        let _dir = TempConfigDir::new("n09_identity");
+        write_synthetic_plaintext("sk-sameAAAA-tail", "SYNTHETIC_TOKEN", 60);
+        let first = read_stored_config().unwrap();
+        write_synthetic_plaintext("sk-sameBBBB-tail", "SYNTHETIC_TOKEN", 60);
+        // edit_config must observe the external account change before the preference write.
+        let changed = edit_config(|config| {
+            config.refresh_interval_seconds = 300;
+            Ok(())
+        });
+        // Non-Windows cannot securely write these synthetic credentials. The read
+        // observation must nevertheless have advanced, without overwriting the file.
+        if cfg!(windows) {
+            assert!(changed.is_ok());
+        } else {
+            assert!(changed.is_err());
+        }
+        let second = read_stored_config().unwrap();
+        assert_eq!(api_key_preview(first.api_key.as_deref().unwrap()),
+                   api_key_preview(second.api_key.as_deref().unwrap()));
+        assert!(second.api_key_revision > first.api_key_revision);
+        assert_eq!(second.usage_token_revision, first.usage_token_revision);
+        assert!(second.config_revision > first.config_revision);
+        assert_eq!(to_app_config(first.clone()).unwrap().config_revision, first.config_revision);
+    }
+
+    #[test]
+    fn n09_invalid_disk_revokes_then_recovery_gets_fresh_credential_versions() {
+        let _dir = TempConfigDir::new("n09_recovery");
+        write_synthetic_plaintext("SYNTHETIC_KEY", "SYNTHETIC_TOKEN", 60);
+        let first = read_stored_config().unwrap();
+        let corrupt = br#"{"api_key":"SYNTHETIC_RECOVERY_SECRET",!}"#;
+        fs::write(config_path().unwrap(), corrupt).unwrap();
+        let revoked = read_app_config().unwrap();
+        assert!(revoked.config_read_error.is_some());
+        assert!(!revoked.api_key_configured && !revoked.usage_token_configured);
+        assert!(revoked.api_key_revision > first.api_key_revision);
+        assert!(revoked.usage_token_revision > first.usage_token_revision);
+        assert_eq!(read_app_config().unwrap().config_revision, revoked.config_revision);
+        assert!(edit_config(|_| panic!("corrupt source must not be overwritten")).is_err());
+        assert_eq!(fs::read(config_path().unwrap()).unwrap(), corrupt);
+        write_synthetic_plaintext("SYNTHETIC_KEY", "SYNTHETIC_TOKEN", 60);
+        let recovered = read_app_config().unwrap();
+        assert!(recovered.config_read_error.is_none());
+        assert!(recovered.api_key_revision > revoked.api_key_revision);
+        assert!(recovered.usage_token_revision > revoked.usage_token_revision);
+        assert!(!serde_json::to_string(&revoked).unwrap().contains("SYNTHETIC"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n09_same_secret_reencrypted_ciphertext_is_not_an_account_change() {
+        let _dir = TempConfigDir::new("n09_dpapi_identity");
+        let secret = "SYNTHETIC_SAME_SECRET";
+        let write_cipher = || {
+            let encrypted = credentials::encrypt(secret).expect("Windows DPAPI must be available");
+            fs::write(config_path().unwrap(), serde_json::to_vec(&serde_json::json!({
+                "version": 1, "api_key": encrypted,
+            })).unwrap()).unwrap();
+        };
+        write_cipher();
+        let first = read_stored_config().unwrap();
+        write_cipher();
+        let second = read_stored_config().unwrap();
+        assert_eq!(second.config_revision, first.config_revision);
+        assert_eq!(second.api_key_revision, first.api_key_revision);
+        assert_eq!(second.usage_token_revision, first.usage_token_revision);
     }
 
     #[test]

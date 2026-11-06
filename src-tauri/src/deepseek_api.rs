@@ -1721,56 +1721,7 @@ mod tests {
         );
     }
 
-    // ---------- 第八轮复评 R05/R09/R10 ----------
-
-    #[test]
-    fn r05_镜像client不再被静默丢弃且与原生会话隔离() {
-        // 固定引擎的 Claude 解析器会把 cc-mirror 的 variant 作为独立 client 输出。
-        let amount: AmountResp = serde_json::from_str(
-            r#"{"data":{"biz_data":{
-                "total":[
-                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}
-                ],
-                "days":[]
-            }}}"#,
-        )
-        .unwrap();
-        let cost: CostResp = serde_json::from_str(
-            r#"{"data":{"biz_data":[{
-                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
-                "days":[]
-            }]}}"#,
-        )
-        .unwrap();
-        let report: serde_json::Value = serde_json::from_str(
-            r#"{"entries":[
-                {"client":"claude","sessionId":"s1","model":"deepseek-flash","input":100,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0},
-                {"client":"claude-mirror","sessionId":"s1","model":"deepseek-flash","input":65,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}
-            ],"workspaces":[],"sessions":[]}"#,
-        )
-        .unwrap();
-        let snapshot = crate::local_usage::normalize_report(&report, 1000).unwrap();
-        // 镜像条目必须保留（旧实现被 CLIENTS 严格过滤丢弃）。
-        assert_eq!(snapshot.rows.len(), 2, "镜像 client 不得被静默丢弃");
-        assert!(
-            snapshot.rows.iter().any(|row| row.tool == "claude"),
-            "镜像归类到 claude 槽位"
-        );
-        // 同名 sessionId 的镜像与原生必须是两条独立行（不能合并）。
-        let ids: std::collections::HashSet<_> =
-            snapshot.rows.iter().map(|row| row.id.clone()).collect();
-        assert_eq!(ids.len(), 2, "原生与镜像的同名会话必须隔离");
-        // 不支持的 client 仍被忽略（不被误当镜像）。
-        let unknown: serde_json::Value = serde_json::from_str(
-            r#"{"entries":[{"client":"codex","sessionId":"s9","model":"m","input":10,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}],"workspaces":[],"sessions":[]}"#,
-        )
-        .unwrap();
-        assert!(crate::local_usage::normalize_report(&unknown, 2000)
-            .unwrap()
-            .rows
-            .is_empty());
-        let _ = build_usage_result(&amount, &cost);
-    }
+    // ---------- 第八轮复评 R09/R10 ----------
 
     #[test]
     fn r09_有数量但无任何费用值为未知_显式零仍为零() {

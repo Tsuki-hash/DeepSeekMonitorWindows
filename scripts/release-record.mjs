@@ -4,9 +4,8 @@
 // 背景（评审 P2）：README 明确不再启用 Actions，本地 verify 是唯一门禁，但
 // pre-push 可以被跳过，运行结果也没有留档。
 //
-// 复评 R12：记录只跑普通 cargo test，没有集成与依赖审计，于是「门禁全部通过」
-// 与 verify 实际覆盖不一致。这里改为复用**同一份门禁清单**，逐项记录
-// PASS/FAIL/NOT RUN，并在发布阶段要求没有 NOT RUN。
+// 与 verify 使用同一份 DeepSeek 门禁清单，逐项记录 PASS/FAIL/NOT RUN。
+// Agent 引擎与工具目录探针随功能移除，不执行，也不计作 PASS。
 //
 // 复评 R13：测试计数正则被模板字符串吃掉了反斜杠，且 Rust 的
 // `191 passed; 0 failed; 4 ignored` 与 Node 的 `pass 123` 格式不同。
@@ -40,7 +39,7 @@ const installer = option("installer");
  * 旧实现对每条命令都设 `shell: process.platform === "win32"`，Node 会把
  * args 用空格直接拼成一条 cmd 命令串 —— TEMP 含空格（`C:\Users\Jane Doe\...`）
  * 时，`--log-file C:\Users\Jane Doe\AppData\Local\Temp\...json` 会被拆成两个
- * 参数，子脚本写到错误位置、外层再报集成日志缺失，合法环境被误阻断。
+ * 参数，子脚本写到错误位置、外层再报门禁日志缺失，合法环境被误阻断。
  * 现在：
  * - `node` 用 `process.execPath` 直接启动，不经 shell；
  * - `git` / `cargo` / `rustc` 直接启动可执行文件；
@@ -148,69 +147,13 @@ const version = JSON.parse(
   readFileSync(join(root, "package.json"), "utf8"),
 ).version;
 
-// 复评 T09：集成子用例的底层日志文件（集成入口写入，随后嵌入本记录）。
-// 没有它，外层只能看到汇总表，无法核验每个用例是否真的执行。
+// Rust 门禁保留完整结构化证据；缺失或不可解析的日志必须阻断发布。
 const rustLogFile = join(
   tmpdir(),
   `dsm-rust-log-${process.pid}-${Date.now()}.json`,
 );
-const integrationLogFile = join(
-  tmpdir(),
-  `dsm-integration-log-${process.pid}-${Date.now()}.json`,
-);
 
-/**
- * 唯一门禁清单：与 `scripts/verify.ps1` 保持一致（复评 R12）。
- *
- * `releaseCritical: true` 表示发版必须真实执行并通过；`NOT RUN` 不放行。
- */
-/**
- * 复评 Q09：从集成入口的结构化日志合计测试计数。
- *
- * 集成 stdout 含四条 `test result:` 行（每子用例一条），
- * `testCounts` 的 exec 只取首个匹配会得到 tests=1、首过后败时 failed=0。
- * 这里按子用例 verdict 分别累计：PASS 计 passed，FAIL 计 failed，
- * NOT RUN / ERROR 不计入执行数（它们确实没跑或结论未知）。
- */
-let integrationResults = [];
-let integrationPreflight = [];
-let integrationLoaded = false;
-/** 复评 Q09/第五轮：加载结构化集成日志（preflight + 逐用例 verdict）；失败返回 false。 */
-function loadIntegrationResults() {
-  if (integrationLoaded) return true;
-  if (!existsSync(integrationLogFile)) return false;
-  try {
-    const parsed = JSON.parse(readFileSync(integrationLogFile, "utf8"));
-    integrationResults = Array.isArray(parsed.results) ? parsed.results : [];
-    integrationPreflight = Array.isArray(parsed.preflight)
-      ? parsed.preflight
-      : [];
-    integrationLoaded = true;
-    return true;
-  } catch {
-    return false;
-  }
-}
-const integrationCounts = () => {
-  const totals = { passed: 0, failed: 0, ignored: 0, tests: 0 };
-  let known = false;
-  for (const item of integrationResults) {
-    if (item.verdict === "PASS" || item.verdict === "FAIL") {
-      known = true;
-      const counts = testCounts(`${item.stdout ?? ""}\n${item.stderr ?? ""}`);
-      totals.passed += counts.passed ?? 0;
-      totals.failed += counts.failed ?? 0;
-      totals.ignored += counts.ignored ?? 0;
-      totals.tests += counts.tests ?? counts.passed ?? 0;
-    }
-    // NOT RUN / ERROR：没有可合计的执行数，但结论本身是明确的
-    // （覆盖不足或工具失败），整体仍按「已知」处理而不是解析失败。
-    if (item.verdict === "NOT RUN" || item.verdict === "ERROR") known = true;
-  }
-  if (!known) return { ...totals, parseable: false };
-  return { ...totals, parseable: true };
-};
-
+/** DeepSeek 门禁清单须与 scripts/verify.ps1 保持一致。 */
 const checks = [
   ["版本一致性", "node", ["scripts/check-version.mjs"], true],
   ["前端测试", "npm", ["test"], true],
@@ -250,23 +193,13 @@ const checks = [
     ["scripts/run-rust-tests.mjs", "--log-file", rustLogFile],
     true,
   ],
-  // 复评 R12：集成与依赖审计也必须进入记录，否则发布结论覆盖不全。
-  // 复评 T09：把集成入口自己的逐用例日志落盘，再嵌入发布记录，
-  // 否则外层只能看到汇总表，无法核验每个用例是否真的执行。
-  [
-    "引擎集成测试",
-    "node",
-    ["scripts/run-integration-tests.mjs", "--log-file", integrationLogFile],
-    true,
-  ],
   ["依赖审计", "node", ["scripts/audit-dependencies.mjs"], true],
 ];
 
 /** NOT RUN 是独立结论；成功退出也不能掩盖缺失场景。 */
 const classify = (label, result) => {
-  if (result.error || result.signal) return "FAIL";
-  if ((label.includes("集成") || label === "cargo test") && result.code === 2)
-    return "NOT RUN";
+  if (result.error || result.signal) return "ERROR";
+  if (label === "cargo test" && result.code === 2) return "NOT RUN";
   if (!result.ok) return "FAIL";
   if (hasNotRun(`${result.stdout}\n${result.stderr}`)) return "NOT RUN";
   return "PASS";
@@ -359,14 +292,12 @@ for (const [label, command, commandArgs] of checks) {
   const rustLog =
     label === "cargo test" ? readRustGateLog(rustLogFile, result.code) : null;
   const verdict =
-    label === "cargo test" && !rustLog ? "FAIL" : classify(label, result);
+    label === "cargo test"
+      ? (rustLog?.verdict ?? "ERROR")
+      : classify(label, result);
   checkResults.push({ label, command, commandArgs, result, verdict });
-  if (verdict === "FAIL") failures.push(label);
+  if (verdict === "FAIL" || verdict === "ERROR") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
-  // 复评 Q09：集成入口的 stdout 含多条 `test result:` 行（每子用例一条），
-  // exec 只取首个会得到 tests=1。集成项改用结构化子用例日志合计。
-  // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机；
-  // 日志缺失时按「不可解析」呈现，证据链失败在循环后统一并入 failures。
   const unknownCounts = {
     passed: null,
     failed: null,
@@ -377,13 +308,9 @@ for (const [label, command, commandArgs] of checks) {
   const counts =
     label === "cargo test"
       ? (rustLog?.rust.counts ?? unknownCounts)
-      : label.includes("集成")
-        ? loadIntegrationResults()
-          ? integrationCounts()
-          : unknownCounts
-        : verdict === "NOT RUN"
-          ? unknownCounts
-          : testCounts(`${result.stdout}\n${result.stderr}`);
+      : verdict === "NOT RUN"
+        ? unknownCounts
+        : testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
     `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
@@ -391,17 +318,9 @@ for (const [label, command, commandArgs] of checks) {
 
 lines.push("");
 lines.push(
-  `门禁汇总：${["PASS", "FAIL", "NOT RUN"].map((verdict) => `${verdict}=${checkResults.filter((item) => item.verdict === verdict).length}`).join("；")}。NOT RUN 不计通过。`,
+  `门禁汇总：${["PASS", "FAIL", "NOT RUN", "ERROR"].map((verdict) => `${verdict}=${checkResults.filter((item) => item.verdict === verdict).length}`).join("；")}。NOT RUN 不计通过。`,
 );
 
-// 复评 Q09：集成检查执行过，但结构化日志丢失/不可解析，属于证据链失败，
-// 必须阻断放行 —— 否则「子用例是否真实执行」无法核验。
-if (
-  checkResults.some((item) => item.label === "引擎集成测试") &&
-  !loadIntegrationResults()
-) {
-  failures.push("引擎集成子用例日志");
-}
 lines.push("");
 lines.push("### 完整输出");
 lines.push("");
@@ -423,69 +342,6 @@ for (const { label, command, commandArgs, result, verdict } of checkResults) {
   lines.push("```");
   lines.push("");
   lines.push("</details>");
-  lines.push("");
-}
-
-// 复评 T09/第五轮 Q09：把集成前置调用与逐用例日志嵌入发布记录 ——
-// PASS/FAIL/NOT RUN/ERROR 都可核验执行数与真实命令；嵌入失败必须阻断
-// （failures 已在门禁循环后并入，这里只负责正文自洽）。
-if (loadIntegrationResults()) {
-  lines.push("## 引擎集成子用例日志");
-  lines.push("");
-  for (const item of integrationResults) {
-    lines.push(
-      `<details><summary>${item.fullName} — ${item.verdict ?? "无结论"}${
-        item.code != null ? `（退出码 ${item.code}）` : ""
-      }</summary>`,
-    );
-    lines.push("");
-    lines.push("```text");
-    lines.push(
-      `[command] ${item.command ?? "(未运行)"} ${(item.args ?? []).join(" ")}`,
-    );
-    lines.push((item.stdout || "(stdout 为空)").trim());
-    lines.push("");
-    lines.push("[stderr]");
-    lines.push((item.stderr || "(stderr 为空)").trim());
-    if (item.error) {
-      lines.push("");
-      lines.push(`[spawn error] ${item.error.name}: ${item.error.message}`);
-    }
-    lines.push("```");
-    lines.push("");
-    lines.push("</details>");
-    lines.push("");
-  }
-  if (integrationPreflight.length) {
-    lines.push("### 集成前置调用（探针/枚举）");
-    lines.push("");
-    for (const item of integrationPreflight) {
-      lines.push(
-        `<details><summary>${item.fullName ?? "(未命名)"}（退出码 ${item.code}）</summary>`,
-      );
-      lines.push("");
-      lines.push("```text");
-      lines.push(
-        `[command] ${item.command} ${(item.args ?? []).join(" ")}（cwd: ${item.cwd ?? "未记录"}）`,
-      );
-      lines.push((item.stdout || "(stdout 为空)").trim());
-      lines.push("");
-      lines.push("[stderr]");
-      lines.push((item.stderr || "(stderr 为空)").trim());
-      if (item.error) {
-        lines.push("");
-        lines.push(`[spawn error] ${item.error.name}: ${item.error.message}`);
-      }
-      lines.push("```");
-      lines.push("");
-      lines.push("</details>");
-      lines.push("");
-    }
-  }
-} else if (checkResults.some((item) => item.label === "引擎集成测试")) {
-  lines.push("## 引擎集成子用例日志");
-  lines.push("");
-  lines.push("⚠ 集成日志丢失或不可解析：无法核验子用例是否真实执行。");
   lines.push("");
 }
 
@@ -540,10 +396,19 @@ if (installer) {
   );
 }
 lines.push("");
+lines.push("## 验收范围");
+lines.push("");
+lines.push(
+  "- 本次范围仅含 DeepSeek 账户余额、消费与用量、历史、提醒及桌面集成。",
+);
+lines.push(
+  "- 多工具 Agent 统计已移除：引擎集成、WSL/SQLite 工具扫描与目录链接能力探针不再执行，不计为 PASS 或 NOT RUN。",
+);
+lines.push("");
 lines.push("## 未覆盖项（需真机验收）");
 lines.push("");
 lines.push(
-  "- Windows 安装升级、托盘交互、全局快捷键、通知可见性、WebView2 行为、DPI/文本缩放、WSL 与 SQLite 竞争、真实安装包内的检查更新。",
+  "- Windows 安装升级、托盘交互、全局快捷键、通知可见性、WebView2 行为、DPI/文本缩放、升级后旧数据保留、真实安装包内的检查更新。",
 );
 lines.push(
   "- 本次未做 CPU/内存/启动耗时采样，性能结论只基于代码结构，不含实测数值。",
@@ -554,7 +419,7 @@ lines.push("## 结论");
 lines.push("");
 if (failures.length) {
   lines.push(
-    `❌ FAIL：${failures.join("、")} 失败。本次记录不能作为放行证据。`,
+    `❌ FAIL：${failures.join("、")} 失败或证据不可用。本次记录不能作为放行证据。`,
   );
 } else if (notRun.length) {
   lines.push(
@@ -575,12 +440,9 @@ if (out) {
 } else {
   console.log(text);
 }
-// 复评 T09：临时集成日志用完即删，清理失败不影响结论。
+// 只删除本次运行自己创建的临时门禁日志，不涉及用户配置、缓存或历史。
 try {
   if (existsSync(rustLogFile)) rmSync(rustLogFile, { force: true });
-  if (existsSync(integrationLogFile)) {
-    rmSync(integrationLogFile, { force: true });
-  }
 } catch {
   /* 清理失败不影响结论 */
 }

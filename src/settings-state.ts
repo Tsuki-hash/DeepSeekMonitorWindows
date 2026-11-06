@@ -6,7 +6,10 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { currencySymbol } from "./format";
-import type { AppConfig, SavedApiKey } from "./types";
+import type {
+  AppConfig, SavedApiKey, UsageSyncStatus, UsageSyncStarted, UsageTokenCaptured,
+} from "./types";
+import { newUsageSyncRequest, UsageSyncOwner } from "./usage-sync-owner";
 import { errorMessage } from "./error-state";
 import type { LeaveBlocker } from "./leave-guard";
 import { CredentialDraft } from "./credential-draft";
@@ -148,20 +151,18 @@ export function useSettingsState(): SettingsState {
   // 无缓存时用 `null` 表示**未知**，控件据此禁用而不是猜测默认值。
   const initial = getCommittedConfig();
   const [refresh, setRefresh] = React.useState<number | null>(
-    initial ? initial.refreshIntervalSeconds || 60 : null,
+    initial && !initial.configReadError ? initial.refreshIntervalSeconds || 60 : null,
   );
   const [autoRefresh, setAutoRefresh] = React.useState<boolean | null>(
-    initial ? initial.autoRefreshEnabled : null,
+    initial && !initial.configReadError ? initial.autoRefreshEnabled : null,
   );
   const [autostart, setAutostart] = React.useState<boolean | null>(
-    initial ? initial.autostart : null,
+    initial && !initial.configReadError ? initial.autostart : null,
   );
   const [usageStatus, setUsageStatus] = React.useState("");
   const [usageSyncing, setUsageSyncing] = React.useState(false);
   const syncRequestId = React.useRef(0);
-  const syncCredentialRevision = React.useRef(
-    getCommittedConfig()?.usageTokenRevision ?? -1,
-  );
+  const syncOwner = React.useRef(new UsageSyncOwner());
   const [showManualPaste, setShowManualPaste] = React.useState(false);
   // 空串表示「版本未知」。刻意不写死一个兜底版本号：那个数字会随着发版过期，
   // 显示出来反而是错的信息，不如显示「—」。
@@ -177,19 +178,20 @@ export function useSettingsState(): SettingsState {
     const syncFromCommitted = (next: AppConfig) => {
       if (!current()) return;
       setConfig(next);
-      setRefresh(next.refreshIntervalSeconds || 60);
-      setAutoRefresh(next.autoRefreshEnabled);
-      setAutostart(next.autostart);
+      setRefresh(next.configReadError ? null : next.refreshIntervalSeconds || 60);
+      setAutoRefresh(next.configReadError ? null : next.autoRefreshEnabled);
+      setAutostart(next.configReadError ? null : next.autostart);
       setStatus(
-        next.apiKeyConfigured
+        next.configReadError ?? (next.apiKeyConfigured
           ? next.apiKeyPreview
             ? `已配置 ${next.apiKeyPreview}`
             : "API Key 已配置"
-          : "未配置 API Key",
+          : "未配置 API Key"),
       );
-      setUsageStatus(
-        next.usageTokenConfigured ? "用量 Token 已配置" : "未配置用量 Token",
-      );
+      if (!syncOwner.current.requestId || syncOwner.current.ended || next.configReadError)
+        setUsageStatus(
+          next.configReadError ?? (next.usageTokenConfigured ? "用量 Token 已配置" : "未配置用量 Token"),
+        );
     };
     const unsubscribe = subscribeCommittedConfig(() => {
       const committed = getCommittedConfig();
@@ -207,7 +209,8 @@ export function useSettingsState(): SettingsState {
           if (committed) syncFromCommitted(committed);
           return;
         }
-        syncFromCommitted(nextConfig);
+        const committed = getCommittedConfig();
+        if (committed) syncFromCommitted(committed);
       })
       .catch((error) => {
         if (!current()) return;
@@ -235,44 +238,59 @@ export function useSettingsState(): SettingsState {
 
   React.useEffect(() => {
     const current = capturePage();
-    const unlistenPromise = listen<AppConfig>(
-      "usage-token-captured",
-      (event) => {
-        // Persisted state belongs to the application, even if this page just left.
-        setCommittedConfig(event.payload);
-        if (
-          !current() ||
-          !isCurrentCredential(event.payload, "usageToken") ||
-          event.payload.usageTokenRevision <= syncCredentialRevision.current
-        )
-          return;
-        syncCredentialRevision.current = event.payload.usageTokenRevision;
+    let eventRevision = 0;
+    const requests = [
+      listen<UsageSyncStatus>("usage-sync-started", ({ payload }) => {
+        eventRevision += 1;
+        if (!current() || !syncOwner.current.accept(payload)) return;
+        setUsageSyncing(payload.active && payload.kind === "web");
+      }),
+      listen<UsageTokenCaptured>("usage-token-captured", ({ payload }) => {
+        eventRevision += 1;
+        // Persisted credentials still belong to the app, regardless of page/session.
+        setCommittedConfig(payload.config);
+        if (!current() || !syncOwner.current.accept(payload)) return;
         syncRequestId.current += 1;
         setUsageSyncing(false);
-      },
-    );
+        const committed = getCommittedConfig();
+        setUsageStatus(committed?.configReadError ?? (
+          committed?.usageTokenConfigured ? "用量 Token 已配置" : "未配置用量 Token"
+        ));
+      }),
+      listen<UsageSyncStatus>("usage-sync-ended", ({ payload }) => {
+        eventRevision += 1;
+        if (!current() || !syncOwner.current.accept(payload)) return;
+        syncRequestId.current += 1;
+        setUsageSyncing(false);
+        if (payload.kind === "web") {
+          setUsageStatus("未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。");
+          setShowManualPaste(true);
+        }
+      }),
+    ];
+    // Subscribe first, then restore backend state on remount. A local action or
+    // accepted terminal event supersedes this read, just like config reads.
+    const startedAt = syncRequestId.current;
+    void Promise.all(requests)
+      .then(async () => {
+        while (current() && startedAt === syncRequestId.current) {
+          const eventsAtStart = eventRevision;
+          const snapshot = await invoke<UsageSyncStatus>("get_usage_sync_status");
+          if (!current() || startedAt !== syncRequestId.current) return;
+          // A terminal event can arrive before a remounted page knows its owner.
+          // Re-read instead of resurrecting the pre-event active snapshot.
+          if (eventsAtStart !== eventRevision) continue;
+          syncOwner.current.restore(snapshot);
+          setUsageSyncing(snapshot.active && snapshot.kind === "web");
+          if (snapshot.active && snapshot.kind === "web")
+            setUsageStatus("等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。");
+          return;
+        }
+      })
+      .catch(() => undefined);
     return () => {
-      void unlistenPromise
-        .then((unlisten) => unlisten())
-        .catch(() => undefined);
-    };
-  }, [capturePage]);
-
-  React.useEffect(() => {
-    const current = capturePage();
-    const unlistenPromise = listen("usage-sync-ended", () => {
-      if (!current()) return;
-      syncRequestId.current += 1;
-      setUsageSyncing(false);
-      setUsageStatus(
-        "未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。",
-      );
-      setShowManualPaste(true);
-    });
-    return () => {
-      void unlistenPromise
-        .then((unlisten) => unlisten())
-        .catch(() => undefined);
+      for (const request of requests)
+        void request.then((unlisten) => unlisten()).catch(() => undefined);
     };
   }, [capturePage]);
 
@@ -378,25 +396,22 @@ export function useSettingsState(): SettingsState {
   const startUsageSync = React.useCallback(() => {
     const current = capturePage();
     if (!current()) return;
-    syncCredentialRevision.current =
-      getCommittedConfig()?.usageTokenRevision ?? -1;
-    const requestId = ++syncRequestId.current;
+    const requestId = newUsageSyncRequest();
+    syncOwner.current.begin(requestId);
+    const sequence = ++syncRequestId.current;
     setUsageSyncing(true);
     setUsageStatus("正在打开登录窗口…");
-    void invoke<boolean>("start_usage_sync")
-      .then((synced) => {
-        if (!current() || requestId !== syncRequestId.current) return;
-        if (!synced) {
-          setUsageStatus(
-            "等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。",
-          );
-        } else {
-          setUsageSyncing(false);
-        }
-        // synced=true 时由 usage-token-captured 事件刷新数据并更新状态
+    void invoke<UsageSyncStarted>("start_usage_sync", { requestId })
+      .then((result) => {
+        if (!current() || sequence !== syncRequestId.current ||
+            !syncOwner.current.accept(result)) return;
+        setUsageSyncing(result.active && !result.synced);
+        if (result.active && !result.synced)
+          setUsageStatus("等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。");
       })
       .catch((error) => {
-        if (!current() || requestId !== syncRequestId.current) return;
+        if (!current() || sequence !== syncRequestId.current ||
+            !syncOwner.current.finish(requestId)) return;
         setUsageSyncing(false);
         setUsageStatus(errorMessage(error));
       });
@@ -404,17 +419,44 @@ export function useSettingsState(): SettingsState {
 
   const cancelUsageSync = React.useCallback(() => {
     const current = capturePage();
-    if (!current()) return;
-    syncRequestId.current += 1;
-    void invoke("cancel_usage_sync")
-      .then(() => {
-        if (!current()) return;
-        setUsageSyncing(false);
-        setUsageStatus("已取消同步，原 Token 未更改");
-      })
-      .catch((error) => {
-        if (current()) setUsageStatus(errorMessage(error));
-      });
+    const owner = syncOwner.current;
+    const requestId = owner.requestId;
+    if (!current() || !requestId) return;
+    ++syncRequestId.current; // Invalidate the old start response immediately.
+    void invoke<UsageSyncStatus | null>("cancel_usage_sync", {
+      requestId, generation: owner.generation,
+    }).then(async (ended) => {
+      if (!current() || !syncOwner.current.owns(requestId)) return;
+      if (!ended) {
+        // The request may already have captured a Token. A no-op is not a
+        // cancellation receipt and cannot promise that the old Token is unchanged.
+        const startedAt = getCommitRevision();
+        const [snapshot, latestConfig] = await Promise.all([
+          invoke<UsageSyncStatus>("get_usage_sync_status"),
+          invoke<AppConfig>("get_app_config"),
+        ]);
+        applyReadConfig(latestConfig, startedAt);
+        if (!current() || !syncOwner.current.owns(requestId)) return;
+        syncOwner.current.restore(snapshot);
+        setUsageSyncing(snapshot.active && snapshot.kind === "web");
+        if (snapshot.active && snapshot.kind === "web") {
+          setUsageStatus("等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。");
+        } else {
+          const committed = getCommittedConfig();
+          setUsageStatus(committed?.configReadError ?? (
+            committed?.usageTokenConfigured ? "用量 Token 已配置" : "未配置用量 Token"
+          ));
+        }
+        return;
+      }
+      if (!syncOwner.current.accept(ended)) return;
+      syncOwner.current.finish(requestId);
+      setUsageSyncing(false);
+      setUsageStatus("已取消同步，原 Token 未更改");
+    }).catch((error) => {
+      if (current() && syncOwner.current.owns(requestId))
+        setUsageStatus(errorMessage(error));
+    });
   }, [capturePage]);
   const tokenSaves = React.useRef(new Map<number, Promise<boolean>>());
   const saveTokenSnapshot = React.useCallback(
@@ -429,23 +471,31 @@ export function useSettingsState(): SettingsState {
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
         isCurrentUsageTokenOperation(operation);
+      const requestId = newUsageSyncRequest();
+      syncOwner.current.begin(requestId);
+      syncRequestId.current += 1;
+      setUsageSyncing(false);
       const saving = (async () => {
         setBusy(true);
         setUsageStatus("正在验证候选 Token…");
         try {
           const nextConfig = await invoke<AppConfig>("save_usage_token", {
             usageToken: submitted.value,
+            requestId,
           });
           setCommittedConfig(nextConfig);
           if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
             return false;
           commitUsageToken(submitted.revision);
-          setUsageStatus("验证通过并已保存");
+          if (syncOwner.current.owns(requestId))
+            setUsageStatus("验证通过并已保存");
           return true;
         } catch (error) {
-          if (current()) setUsageStatus(errorMessage(error));
+          if (current() && syncOwner.current.owns(requestId))
+            setUsageStatus(errorMessage(error));
           return false;
         } finally {
+          syncOwner.current.finish(requestId);
           if (current()) setBusy(false);
         }
       })().finally(() => tokenSaves.current.delete(submitted.revision));
@@ -461,6 +511,9 @@ export function useSettingsState(): SettingsState {
 
   const clearUsageToken = React.useCallback(() => {
     if (!lifecycle.current.active) return;
+    syncRequestId.current += 1;
+    syncOwner.current.invalidate();
+    setUsageSyncing(false);
     const revision = tokenDraft.current.revision;
     const generation = lifecycle.current.generation;
     const operation = beginUsageTokenOperation();
@@ -475,8 +528,8 @@ export function useSettingsState(): SettingsState {
         if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
           return;
         commitUsageToken(revision);
-        setUsageStatus("已清除用量 Token");
-        setUsageSyncing(false);
+        if (syncOwner.current.requestId === null)
+          setUsageStatus("已清除用量 Token");
       })
       .catch((error) => {
         if (current()) setUsageStatus(errorMessage(error));
@@ -495,6 +548,9 @@ export function useSettingsState(): SettingsState {
   } | null>(null);
   const forgetUsageSession = React.useCallback(() => {
     if (!lifecycle.current.active || forgetOwner.current) return;
+    syncRequestId.current += 1;
+    syncOwner.current.invalidate();
+    setUsageSyncing(false);
     const revision = tokenDraft.current.revision;
     const generation = lifecycle.current.generation;
     const owner = { operation: beginUsageTokenOperation(), consumed: false };
@@ -517,10 +573,10 @@ export function useSettingsState(): SettingsState {
           return;
         owner.consumed = true;
         commitUsageToken(revision);
-        setUsageSyncing(false);
-        setUsageStatus(
-          "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
-        );
+        if (syncOwner.current.requestId === null)
+          setUsageStatus(
+            "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
+          );
       })
       .catch((error) => {
         if (current()) setUsageStatus(errorMessage(error));
@@ -540,17 +596,8 @@ export function useSettingsState(): SettingsState {
   }, [tokenDraft, commitUsageToken]);
 
   React.useEffect(() => {
-    const current = capturePage();
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
       setCommittedConfig(event.payload);
-      if (
-        current() &&
-        isCurrentCredential(event.payload, "usageToken") &&
-        event.payload.usageTokenRevision > syncCredentialRevision.current
-      ) {
-        syncCredentialRevision.current = event.payload.usageTokenRevision;
-        setUsageSyncing(false);
-      }
     });
     return () => {
       void cleared.then((unlisten) => unlisten()).catch(() => undefined);
@@ -616,7 +663,6 @@ export function useSettingsState(): SettingsState {
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, refresh: "" }));
-      const previous = refresh;
       setRefresh(seconds);
       void invoke<AppConfig>("save_refresh_interval", {
         refreshIntervalSeconds: seconds,
@@ -624,17 +670,13 @@ export function useSettingsState(): SettingsState {
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
           if (!current()) return;
-          const committed = getCommittedConfig()!;
-          setRefresh(committed.refreshIntervalSeconds || 60);
+          const committed = getCommittedConfig();
+          setRefresh(committed && !committed.configReadError ? committed.refreshIntervalSeconds || 60 : null);
         })
         .catch((error) => {
           if (!current()) return;
-          // 复评 N12：只有可信旧值才回滚（配置未知时控件已禁用）。
-          if (previous !== null) {
-            setRefresh(
-              getCommittedConfig()?.refreshIntervalSeconds ?? previous,
-            );
-          }
+          const committed = getCommittedConfig();
+          setRefresh(committed && !committed.configReadError ? committed.refreshIntervalSeconds || 60 : null);
           setSettingErrors((previous) => ({
             ...previous,
             refresh: errorMessage(error),
@@ -645,7 +687,7 @@ export function useSettingsState(): SettingsState {
           if (current()) setBusy(false);
         });
     },
-    [refresh, capturePage],
+    [capturePage],
   );
 
   const saveAutoRefreshEnabled = React.useCallback(
@@ -655,7 +697,6 @@ export function useSettingsState(): SettingsState {
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, autoRefresh: "" }));
-      const previous = autoRefresh;
       setAutoRefresh(enabled);
       void invoke<AppConfig>("save_auto_refresh_enabled", {
         autoRefreshEnabled: enabled,
@@ -663,18 +704,13 @@ export function useSettingsState(): SettingsState {
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
           if (!current()) return;
-          const committed = getCommittedConfig()!;
-          setAutoRefresh(committed.autoRefreshEnabled);
+          const committed = getCommittedConfig();
+          setAutoRefresh(committed && !committed.configReadError ? committed.autoRefreshEnabled : null);
         })
         .catch((error) => {
           if (!current()) return;
-          // 复评 N12：配置未知时控件已禁用、不会走到这里；回滚只在有
-          // 可信旧值时进行，不用 null 覆盖真实值。
-          if (previous !== null) {
-            setAutoRefresh(
-              getCommittedConfig()?.autoRefreshEnabled ?? previous,
-            );
-          }
+          const committed = getCommittedConfig();
+          setAutoRefresh(committed && !committed.configReadError ? committed.autoRefreshEnabled : null);
           setSettingErrors((previous) => ({
             ...previous,
             autoRefresh: errorMessage(error),
@@ -685,7 +721,7 @@ export function useSettingsState(): SettingsState {
           if (current()) setBusy(false);
         });
     },
-    [autoRefresh, capturePage],
+    [capturePage],
   );
 
   const saveAutostart = React.useCallback(
@@ -695,18 +731,18 @@ export function useSettingsState(): SettingsState {
       preferenceBusy.current = true;
       setBusy(true);
       setSettingErrors((previous) => ({ ...previous, autostart: "" }));
-      const previous = autostart;
       setAutostart(enabled);
       void invoke<AppConfig>("save_autostart", { autostart: enabled })
         .then((nextConfig) => {
           setCommittedConfig(nextConfig);
-          if (current()) setAutostart(getCommittedConfig()!.autostart);
+          if (!current()) return;
+          const committed = getCommittedConfig();
+          setAutostart(committed && !committed.configReadError ? committed.autostart : null);
         })
         .catch((error) => {
           if (!current()) return;
-          // 复评 N12：只有可信旧值才回滚。
-          if (previous !== null)
-            setAutostart(getCommittedConfig()?.autostart ?? previous);
+          const committed = getCommittedConfig();
+          setAutostart(committed && !committed.configReadError ? committed.autostart : null);
           setSettingErrors((previous) => ({
             ...previous,
             autostart: errorMessage(error),
@@ -717,7 +753,7 @@ export function useSettingsState(): SettingsState {
           if (current()) setBusy(false);
         });
     },
-    [autostart, capturePage],
+    [capturePage],
   );
 
   return {

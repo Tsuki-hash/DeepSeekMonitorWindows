@@ -1,6 +1,23 @@
 //! 同步会话的线性化点：取消与凭据提交共用一把锁。
 use std::sync::Mutex;
 
+#[derive(Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageSyncKind {
+    #[default]
+    Web,
+    Manual,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSyncStatus {
+    pub generation: u64,
+    pub request_id: Option<String>,
+    pub active: bool,
+    pub kind: UsageSyncKind,
+}
+
 #[derive(Default)]
 pub struct SyncSession(Mutex<SessionState>);
 
@@ -13,9 +30,77 @@ struct SessionState {
     generation: u64,
     active: bool,
     clearing: bool,
+    request_id: Option<String>,
+    kind: UsageSyncKind,
+    cancelled_requests: std::collections::HashSet<String>,
+}
+
+impl SessionState {
+    fn status(&self) -> UsageSyncStatus {
+        UsageSyncStatus {
+            generation: self.generation,
+            request_id: self.request_id.clone(),
+            active: self.active,
+            kind: self.kind,
+        }
+    }
 }
 
 impl SyncSession {
+    /// Replace the old login and close its window under the same lock. A slow
+    /// caller cannot close a newer generation's window after begin returns.
+    pub fn begin_usage(
+        &self,
+        request_id: String,
+        kind: UsageSyncKind,
+        close_previous: impl FnOnce(),
+    ) -> Result<UsageSyncStatus, String> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.clearing {
+            return Err("网页登录数据正在清理，请稍后再试".into());
+        }
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err("无效的同步请求标识".into());
+        }
+        if state.cancelled_requests.contains(&request_id) {
+            return Err("同步已取消或已被新的操作替代".into());
+        }
+        state.generation += 1;
+        state.active = true;
+        state.request_id = Some(request_id);
+        state.kind = kind;
+        close_previous();
+        Ok(state.status())
+    }
+
+    pub fn status(&self) -> UsageSyncStatus {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).status()
+    }
+
+    /// Cancellation owns a particular request even before start's slow response.
+    /// A stale cancel is a no-op, never a cancellation of the latest generation.
+    pub fn cancel_usage(
+        &self,
+        request_id: &str,
+        generation: Option<u64>,
+        close_current: impl FnOnce(),
+    ) -> Option<UsageSyncStatus> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !request_id.is_empty() && request_id.len() <= 128 {
+            // Cancellation can reach IPC before a queued start is polled.
+            state.cancelled_requests.insert(request_id.to_string());
+        }
+        if !state.active
+            || state.request_id.as_deref() != Some(request_id)
+            || generation.is_some_and(|generation| generation != state.generation)
+        {
+            return None;
+        }
+        state.active = false;
+        close_current();
+        Some(state.status())
+    }
+
     pub fn begin(&self) -> Result<u64, String> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.clearing {
@@ -96,6 +181,32 @@ impl SyncSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n10_manual_failure_ends_only_its_generation_and_preserves_newer_login() {
+        let session = SyncSession::default();
+        let web = session.begin_usage("web-one".into(), UsageSyncKind::Web, || ()).unwrap();
+        let manual = session.begin_usage("manual-two".into(), UsageSyncKind::Manual, || ()).unwrap();
+        assert!(!session.is_current(web.generation));
+        session.commit(manual.generation, || Ok(())).unwrap();
+        assert!(!session.status().active);
+        let latest = session.begin_usage("web-three".into(), UsageSyncKind::Web, || ()).unwrap();
+        assert!(session.commit::<()>(manual.generation, || panic!("old failure must not close new window")).is_err());
+        assert!(session.is_current(latest.generation));
+        assert!(session.cancel_usage("web-one", Some(web.generation), || panic!("stale cancel")).is_none());
+        assert!(session.is_current(latest.generation));
+    }
+
+    #[test]
+    fn n10_cancel_before_start_rejects_the_queued_request() {
+        let session = SyncSession::default();
+        assert!(session.cancel_usage("queued", None, || panic!("no window yet")).is_none());
+        assert!(session.begin_usage("queued".into(), UsageSyncKind::Web, || panic!("cancelled start")).is_err());
+        let next = session.begin_usage("next".into(), UsageSyncKind::Web, || ()).unwrap();
+        assert!(session.cancel_usage("next", Some(next.generation + 1), || panic!("wrong generation")).is_none());
+        assert!(session.is_current(next.generation));
+        assert!(!session.cancel_usage("next", Some(next.generation), || ()).unwrap().active);
+    }
 
     #[test]
     fn key清除拒绝迟到保存_新保存优先_不影响用量同步() {

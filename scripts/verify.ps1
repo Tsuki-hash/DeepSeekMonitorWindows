@@ -41,44 +41,16 @@ Invoke-Check 'cargo fmt' 'cargo' @('fmt', '--manifest-path', 'src-tauri/Cargo.to
 
 Invoke-Check 'cargo clippy' 'cargo' @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
 
-# 与发行记录共用能力探针、显式成功输出和结构化结论。关键能力缺失必须非零。
-Invoke-Check 'cargo test（含链接能力探针）' 'node' @('scripts/run-rust-tests.mjs') -ScenarioGate
+# 与发行记录共用真实执行数与结构化结论，缺失或未执行场景必须非零。
+Invoke-Check 'cargo test' 'node' @('scripts/run-rust-tests.mjs') -ScenarioGate
 
-# 复评 F20/T02：ignored 集成测试默认不跑，不能把「跳过」当成「通过」。
-# 集成入口退出码：0=全部执行且通过，1=有用例失败，2=存在 NOT RUN，
-# 3=配置或 fixture 错误，4=工具执行错误（结论未知）。
-# NOT RUN 不阻断普通开发门禁，但最终结论必须是「不完整」，不得使用「全部通过」。
-Write-Host '==> 引擎集成测试（显式 ignored）' -ForegroundColor Cyan
-& node @('scripts/run-integration-tests.mjs')
-$integrationExit = $LASTEXITCODE
-$gateIncomplete = $false
-if ($integrationExit -eq 0) {
-    Write-Host '集成测试通过。' -ForegroundColor Green
-}
-elseif ($integrationExit -eq 2) {
-    Write-Host '集成测试未完整运行：存在 NOT RUN 项。' -ForegroundColor Yellow
-    Write-Host '   本次门禁不包含完整引擎集成证据；发版前必须补齐，不能记为通过。' -ForegroundColor Yellow
-    $gateIncomplete = $true
-}
-elseif ($integrationExit -eq 3) {
-    throw '集成测试配置或 fixture 错误（退出码 3）：请先修正 fixture，不能当作产品失败或通过。'
-}
-elseif ($integrationExit -eq 4) {
-    throw '集成测试工具执行错误（退出码 4）：结论未知，不能当作通过。'
-}
-else {
-    throw "引擎集成测试失败（退出码 $integrationExit）"
-}
+# Agent 统计已移除：引擎集成和工具目录链接探针不再属于产品验收范围，
+# 不执行它们，也不把已移除的场景计为 PASS。
+Write-Host '已移除的 Agent 引擎集成与工具目录探针不计入本次门禁。' -ForegroundColor Cyan
 
 # 复评 F19：依赖告警纳入门禁（开发依赖曾出现 high）。
 # 由独立脚本执行：npm 会把 project-scoped 配置传给子进程，机器级 allow-scripts
 # 会让 `npm audit` 报 EALLOWSCRIPTS（环境问题，不是依赖问题）。
 Invoke-Check '生产依赖安全审计' 'node' @('scripts/audit-dependencies.mjs')
 
-# 复评 T02：有 NOT RUN 时最终措辞必须是「不完整」，
-# 不得让「全部通过」盖过缺失的集成证据。
-if ($gateIncomplete) {
-    Write-Host '门禁不完整：存在 NOT RUN 的集成用例（详见上方黄色提示）。' -ForegroundColor Yellow
-} else {
-    Write-Host '全部通过。' -ForegroundColor Green
-}
+Write-Host 'DeepSeek 源码门禁全部通过；安装升级与真机使用仍需验收。' -ForegroundColor Green

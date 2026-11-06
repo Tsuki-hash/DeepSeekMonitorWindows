@@ -394,7 +394,7 @@ export function AlertSettings({
       <details className="alert-explanation">
         <summary>提醒说明</summary>
         <p className="muted">
-          只用成功且有效的最新查询触发提醒；失败时逐步退避至30分钟，凭据失效暂停该项。预算按平台东八区自然月费用，不计本地Agent用量，也不会阻止消费。
+          只用成功且有效的最新查询触发提醒；失败时逐步退避至30分钟，凭据失效暂停该项。预算按 DeepSeek 平台东八区自然月费用判断，提醒不会阻止消费。
         </p>
         <p className="muted">
           余额Key与用量Token的账户尚未自动匹配，两项独立判断。Windows通知显示由系统设置控制；测试通知不受本应用夜间时段限制，至少间隔60秒。

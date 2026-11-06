@@ -2,14 +2,13 @@ import React from "react";
 import { applyStoredGlass } from "./components/GlassSettings";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useLocalSettingsRefresh } from "./local-settings-sync";
-import type { LocalUsageStatus } from "./local-usage";
 import type {
   AppConfig,
   BalanceData,
   LoadState,
   ModelName,
   UsageResult,
+  UsageTokenCaptured,
   ViewName,
 } from "./types";
 import { nextLoadStateAfterError, todayStr } from "./format";
@@ -33,7 +32,6 @@ import { DashboardPanel } from "./components/DashboardPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelDetailPanel } from "./components/ModelDetailPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
-import { LocalUsagePanel } from "./components/LocalUsagePanel";
 import { TrayBalancePublisher } from "./tray-balance";
 import { OnboardingPanel } from "./components/OnboardingPanel";
 import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
@@ -311,7 +309,7 @@ function App() {
     refreshAll();
   }, [refreshAll]);
 
-  // 首次使用分流（评审 P2）：只在三个任务都未完成时出现，任一完成即收起。
+  // 首次配置入口：余额与平台用量都未配置时出现，任一完成即收起。
   const [onboardingDismissed, setOnboardingDismissed] = React.useState(false);
   const [configSnapshot, setConfigSnapshot] = React.useState<{
     apiKeyConfigured: boolean;
@@ -437,53 +435,6 @@ function App() {
     void reloadConfig();
   }, [reloadConfig]);
 
-  // 本地统计是否开启（复评 R09）：引导卡与历史页都要用真实状态。
-  // 原实现只在启动时读一次，用户在同会话里启停本地采集后引导仍显示旧状态。
-  // 现在封装成可重读函数，并在进入首页/Agent 页时刷新（开关就在这些页面上）。
-  const [localEnabled, setLocalEnabled] = React.useState(false);
-  const [localStatusLoaded, setLocalStatusLoaded] = React.useState(false);
-  const localStatusOwner = React.useRef({
-    active: true,
-    sequence: 0,
-    generation: 0,
-  });
-  const reloadLocalStatus = React.useCallback((generation?: number) => {
-    const owner = localStatusOwner.current;
-    owner.generation = Math.max(owner.generation, generation ?? 0);
-    const sequence = ++owner.sequence;
-    return invoke<LocalUsageStatus>("get_local_usage")
-      .then((status) => {
-        if (
-          !owner.active ||
-          sequence !== owner.sequence ||
-          (status.generation != null && status.generation < owner.generation)
-        )
-          return null;
-        owner.generation = Math.max(owner.generation, status.generation ?? 0);
-        setLocalEnabled(status.enabled === true);
-        setLocalStatusLoaded(true);
-        return status.enabled === true;
-      })
-      .catch(() => {
-        if (owner.active && sequence === owner.sequence)
-          setLocalStatusLoaded(true);
-        return null;
-      });
-  }, []);
-  React.useEffect(() => {
-    const owner = localStatusOwner.current;
-    owner.active = true;
-    return () => {
-      owner.active = false;
-      owner.sequence++;
-    };
-  }, []);
-  useLocalSettingsRefresh(reloadLocalStatus);
-  // 每次回到首页或 Agent 页都重新读取：这两个页面可能刚改过开关。
-  React.useEffect(() => {
-    if (view === "dashboard" || view === "local") void reloadLocalStatus();
-  }, [reloadLocalStatus, view]);
-
   // 面板是否可见。窗口隐藏不会卸载 WebView，所以自动刷新定时器必须靠这个状态显式暂停，
   // 否则面板整天收在托盘里也会按时打接口。该状态由 Rust 侧在显隐时发的事件驱动
   // （见 lib.rs 的 EVENT_MAIN_WINDOW_SHOWN / EVENT_MAIN_WINDOW_HIDDEN），
@@ -556,14 +507,11 @@ function App() {
   }, [mode]);
 
   // 配置尚未读取完成时不展示引导，避免把老用户当新手（复评 F12）。
-  // 复评 R09：加载完成条件必须覆盖所依赖的状态，否则启动瞬间可能用默认值判断。
-  const configLoaded = configSnapshot !== null && localStatusLoaded;
   const showOnboarding =
-    configLoaded &&
+    configSnapshot !== null &&
     shouldShowOnboarding({
       apiKeyConfigured: configSnapshot.apiKeyConfigured,
       usageTokenConfigured: configSnapshot.usageTokenConfigured,
-      localEnabled,
       dismissed: onboardingDismissed,
     });
 
@@ -678,7 +626,9 @@ function App() {
     const acceptConfig = (event: { payload: AppConfig }) => {
       setCommittedConfig(event.payload);
     };
-    const captured = listen<AppConfig>("usage-token-captured", acceptConfig);
+    const captured = listen<UsageTokenCaptured>("usage-token-captured", ({ payload }) => {
+      setCommittedConfig(payload.config);
+    });
     const cleared = listen<AppConfig>("usage-token-cleared", acceptConfig);
     const changed = listen<AppConfig>(
       "credential-config-changed",
@@ -748,7 +698,7 @@ function App() {
     <div
       ref={stageRef}
       data-panel-mode={mode}
-      className={`stage mode-${mode} ${["dashboard", "local", "history"].includes(view) ? "with-navigation" : ""}`}
+      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""}`}
     >
       {view === "dashboard" && (
         <>
@@ -760,14 +710,14 @@ function App() {
                     apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
                     usageTokenConfigured:
                       configSnapshot?.usageTokenConfigured ?? false,
-                    localEnabled,
                     dismissed: onboardingDismissed,
                   })}
                   onChoose={(task) => {
                     setOnboardingDismissed(true);
-                    setSettingsTarget(null);
-                    // 平台用量与余额都在设置页配置；本地统计在 Agent 页开启。
-                    setView(task === "local" ? "local" : "settings");
+                    setSettingsTarget(
+                      task === "platform" ? "usageToken" : null,
+                    );
+                    setView("settings");
                   }}
                   onDismiss={() => setOnboardingDismissed(true)}
                 />
@@ -852,20 +802,12 @@ function App() {
           }}
         />
       )}
-      {view === "local" && (
-        <LocalUsagePanel
-          onBack={() => navigate(() => setView("dashboard"))}
-          onRegisterLeaveBlocker={registerLeaveBlocker}
-          onRequestLeave={(action) => navigate(action)}
-        />
-      )}
       {leavePrompt}
-      {["dashboard", "local", "history"].includes(view) && (
+      {["dashboard", "history"].includes(view) && (
         <nav className="primary-navigation" aria-label="主导航">
           {(
             [
               ["dashboard", "账户"],
-              ["local", "Agent"],
               ["history", "历史"],
             ] as const
           ).map(([target, label]) => (

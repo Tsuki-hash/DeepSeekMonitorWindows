@@ -40,12 +40,10 @@ const dateLabel = (date: string, from: string, to: string) =>
 
 export function HistoryPanel({
   onBack,
-  onLocalUsage,
   onConfigureUsage,
   usageTokenConfigured = true,
 }: {
   onBack: () => void;
-  onLocalUsage?: () => void;
   /** 直接打开并定位到用量 Token 设置（复评 F10：不能只回首页）。 */
   onConfigureUsage?: () => void;
   /** 真实配置状态：区分「首次配置」与「凭据失效」，不能默认当成失效。 */
@@ -428,11 +426,6 @@ export function HistoryPanel({
         </p>
       )}
       <div className="history-scroll">
-        {onLocalUsage && (
-          <button className="local-entry" onClick={onLocalUsage}>
-            项目与会话<span>本机 Agent 用量 ›</span>
-          </button>
-        )}
         <label className="history-filter">
           模型
           <select

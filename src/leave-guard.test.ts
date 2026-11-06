@@ -10,7 +10,7 @@ import type { LeaveBlocker } from "./leave-guard.ts";
 
 const make = (over: Partial<LeaveBlocker> = {}): LeaveBlocker => ({
   dirty: true,
-  subject: "采集目录",
+  subject: "提醒设置",
   save: async () => true,
   discard: () => undefined,
   ...over,
@@ -291,7 +291,7 @@ test("Q04：无待决意图时 decide 忽略_取消幂等", () => {
 // ---------- 第六轮复评 R01：跨出口共享同一决策会话 ----------
 
 test("R01：局部出口保存中_全局新意图后取消_局部旧保存完成不得导航", async () => {
-  // 复评 R01 的跨出口场景：局部出口（采集页返回）与全局出口（底部导航）
+  // 跨出口场景：局部出口（设置页返回）与全局出口（托盘退出）
   // 必须共享同一决策会话 —— 只有一份 runner、一份 pending intent。
   // 旧实现两处各建 runner，取消全局不会撤销局部在途保存的导航。
   let resolveSave: (value: boolean) => void = () => undefined;
@@ -300,11 +300,11 @@ test("R01：局部出口保存中_全局新意图后取消_局部旧保存完成
   });
   const { runner, submits } = harness(blocker);
   const navigated: string[] = [];
-  // 局部出口：采集页「返回上一级」。
-  runner.requestIntent(() => navigated.push("local-back"));
+  // 局部出口：设置页「返回主面板」。
+  runner.requestIntent(() => navigated.push("settings-back"));
   runner.decide("save"); // 局部保存开始（延迟）
-  // 全局出口：底部「历史」形成新的 pending intent。
-  runner.requestIntent(() => navigated.push("global-history"));
+  // 全局出口：托盘「退出」形成新的 pending intent。
+  runner.requestIntent(() => navigated.push("global-quit"));
   // 用户在唯一的提示中点「留在此页」。
   runner.cancel();
   resolveSave(true); // 局部旧保存迟到成功
@@ -352,13 +352,13 @@ test("R01：跨出口始终只有一个待决意图_保存完成后只执行最�
   });
   const { runner } = harness(blocker);
   const navigated: string[] = [];
-  runner.requestIntent(() => navigated.push("local-back"));
-  runner.requestIntent(() => navigated.push("global-history"));
+  runner.requestIntent(() => navigated.push("settings-back"));
+  runner.requestIntent(() => navigated.push("global-quit"));
   runner.decide("save");
   assert.equal(saveCalls, 1, "只发起一次保存");
   resolveSave(true);
   await tick();
-  assert.deepEqual(navigated, ["global-history"], "只执行最新的出口意图");
+  assert.deepEqual(navigated, ["global-quit"], "只执行最新的出口意图");
 });
 
 test("R07: latest current draft is checked even after old save reports success", async () => {

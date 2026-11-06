@@ -1,17 +1,15 @@
 // 首次使用的任务分流。
 //
-// 评审 P2：新用户面对一个需要 Key + 网页登录 Token + 本地采集三层配置的应用，
-// 容易不知道「现在能做什么」。这里给三张轻量入口卡，按**目标**分流，
+// API Key 与网页登录 Token 用途不同。这里给两张轻量入口卡，按**目标**分流，
 // 而不是一个强制读完所有配置的向导。
 //
 // 只做纯计算：哪些任务已完成、当前该推荐哪个。
 
-export type OnboardingTask = "balance" | "platform" | "local";
+export type OnboardingTask = "balance" | "platform";
 
 export type OnboardingState = {
   apiKeyConfigured: boolean;
   usageTokenConfigured: boolean;
-  localEnabled: boolean;
   /** 用户是否已经主动选择过入口（避免反复弹出）。 */
   dismissed: boolean;
 };
@@ -45,15 +43,6 @@ export function onboardingTasks(state: OnboardingState): OnboardingTaskInfo[] {
       requirement: "同步用量 Token",
       done: state.usageTokenConfigured,
       sensitive: true,
-    },
-    {
-      task: "local",
-      title: "本地 Agent",
-      summary:
-        "读取本机六款工具的用量记录，无需 DeepSeek 登录。可能包含估算，不是账户账单。",
-      requirement: "开启本地统计",
-      done: state.localEnabled,
-      sensitive: false,
     },
   ];
 }

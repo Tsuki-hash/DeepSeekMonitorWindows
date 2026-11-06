@@ -7,7 +7,7 @@ import React from "react";
  * 这里把它收敛成一个紧凑的、可读屏的行，放在数字正上方。
  */
 export type SourceTrust = {
-  /** 数据来源，例如「平台用量」「本地 Agent」。 */
+  /** 数据来源，例如「DeepSeek 平台用量」。 */
   source: string;
   /** 统计期间，例如「2026-11 · 北京时间」。 */
   period: string;

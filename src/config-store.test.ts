@@ -201,3 +201,35 @@ test("N05: a later balance observation supersedes the older verification receipt
   assert.equal(getValidatedBalance()?.revision, newer.apiKeyRevision);
   setCommittedConfig(null);
 });
+
+test("N09: equal revision with different contents is a contract error, never a second page snapshot", () => {
+  setCommittedConfig(null);
+  const saved = config({ apiKeyConfigured: true });
+  setCommittedConfig(saved);
+  const conflicting = { ...saved, apiKeyConfigured: false };
+  assert.throws(() => applyReadConfig(conflicting, getCommitRevision()), "same-version contents must agree");
+  assert.throws(() => setCommittedConfig(conflicting), "same-version contents must agree");
+  assert.equal(getCommittedConfig(), saved);
+  assert.equal(applyReadConfig({ ...saved }, getCommitRevision()), true);
+  assert.equal(getCommittedConfig(), saved);
+  setCommittedConfig(null);
+});
+
+test("N09: versioned unavailable disk snapshot revokes credentials and rejects old events", () => {
+  setCommittedConfig(null);
+  const saved = config({ apiKeyConfigured: true, usageTokenConfigured: true });
+  setCommittedConfig(saved);
+  const oldRead = getCommitRevision();
+  const revoked = config({ configReadError: "Synthetic unreadable config" });
+  setCommittedConfig(revoked);
+  assert.equal(getCommittedConfig(), revoked);
+  assert.equal(isCurrentCredential(saved, "apiKey"), false);
+  assert.equal(isCurrentCredential(saved, "usageToken"), false);
+  assert.equal(setCommittedConfig(saved), false);
+  assert.equal(applyReadConfig(saved, oldRead), false);
+  const restored = config({ apiKeyConfigured: true, usageTokenConfigured: true });
+  setCommittedConfig(restored);
+  assert.equal(setCommittedConfig(revoked), false);
+  assert.equal(getCommittedConfig(), restored);
+  setCommittedConfig(null);
+});

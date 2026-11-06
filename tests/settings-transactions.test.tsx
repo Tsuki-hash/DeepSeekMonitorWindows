@@ -14,10 +14,6 @@ import { HistoryPanel } from "../src/components/HistoryPanel";
 import { ModelDetailPanel } from "../src/components/ModelDetailPanel";
 import { historyCache } from "../src/history-cache";
 import { useLeaveGuard } from "../src/leave-guard";
-import { LocalSourceSettings } from "../src/components/LocalSourceSettings";
-import { LocalBackgroundSettings } from "../src/components/LocalBackgroundSettings";
-import { LocalArchiveCapture } from "../src/components/LocalArchiveCapture";
-import { LocalUsagePanel } from "../src/components/LocalUsagePanel";
 
 // Synthetic values only. No credentials are written to storage, fixtures, or logs.
 // The renderer honors the StrictMode wrapper but does not replay StrictEffects.
@@ -66,6 +62,13 @@ g.__settingsListeners = new Map();
 let calls = [];
 let handlers = {};
 let fixtureRevision = 0;
+let fixtureSyncGeneration = 0;
+const syncStatus = (requestId = null, active = false, kind = "web") => ({
+  generation: ++fixtureSyncGeneration, requestId, active, kind,
+});
+const capturedPayload = (config, status = syncStatus("old-captured")) => ({
+  ...status, active: false, config,
+});
 const baseConfig = (over = {}) => ({
   configRevision: ++fixtureRevision,
   apiKeyRevision: fixtureRevision,
@@ -111,6 +114,10 @@ g.__settingsIpc = async (command, args) => {
   switch (command) {
     case "get_app_config":
       return { ...config };
+    case "get_usage_sync_status":
+      return syncStatus();
+    case "start_usage_sync":
+      return { ...syncStatus(args.requestId, true), synced: false };
     case "save_api_key":
       config = baseConfig();
       return { config, balance };
@@ -121,31 +128,6 @@ g.__settingsIpc = async (command, args) => {
       return balance;
     case "fetch_usage":
       return { models: [], rawModels: [], days: [], monthCost: 0 };
-    case "get_local_usage":
-      return { enabled: false, snapshot: null, busy: false, lastError: null };
-    case "get_local_sources":
-      return { includeDefault: true, homes: [] };
-    case "get_local_background":
-      return {
-        enabled: false,
-        effective: false,
-        state: "disabled",
-        watchedRoots: 0,
-        lastAttempt: null,
-        lastSuccess: null,
-        error: null,
-        watchWarning: null,
-      };
-    case "get_local_retention_enabled":
-      return false;
-    case "get_local_retention_capacity":
-      return {
-        entries: 0,
-        maxEntries: 128,
-        bytes: 0,
-        maxBytes: 8388608,
-        remainingEntries: 128,
-      };
     case "is_main_window_visible":
       return true;
     case "begin_tray_balance_session":
@@ -899,10 +881,10 @@ scenario(
     await mount(<Probe />, concurrent);
     await act(async () => state.setUsageToken("TOKEN_C"));
     const captured = nextCredentialConfig("usageToken", true);
-    await emit("usage-token-captured", captured);
+    await emit("usage-token-captured", capturedPayload(captured));
     await finish(pending, cleared);
     await emit("usage-token-cleared", cleared);
-    await emit("usage-token-captured", captured);
+    await emit("usage-token-captured", capturedPayload(captured));
     assert.equal(getCommittedConfig(), captured);
     assert.equal(state.usageToken, "TOKEN_C");
     assert.equal(state.config.usageTokenConfigured, true);
@@ -1104,331 +1086,96 @@ scenario(
   async (concurrent) => {
     await mount(<Probe />, concurrent);
     const captured = nextCredentialConfig("usageToken", true);
-    await emit("usage-token-captured", captured);
+    await emit("usage-token-captured", capturedPayload(captured));
     const pending = deferred();
     handlers.start_usage_sync = () => pending.promise;
     await act(async () => state.startUsageSync());
-    await emit("usage-token-captured", captured);
+    await emit("usage-token-captured", capturedPayload(captured));
     assert.equal(state.usageSyncing, true);
-    await finish(pending, false);
+    await finish(pending, {
+      ...syncStatus(submitted("start_usage_sync").at(-1).args.requestId, true),
+      synced: false,
+    });
     assert.equal(state.usageSyncing, true);
   },
 );
 
-// N04: native settings work can complete after IPC timeout. Events invalidate
-// reads; they never certify a save, own a draft, or resurrect a stopped scan.
-const localCheckbox = (label) =>
-  renderer.root
-    .findAllByType("label")
-    .find((node) => textOf(node).includes(label))
-    .findByType("input");
-const checked = async (label, value) => {
-  await act(async () =>
-    localCheckbox(label).props.onChange({ target: { checked: value } }),
+// DeepSeek-only scope: navigation and configuration must never initialize the
+// removed local collection, retention or cleanup paths, including legacy events.
+const assertNoLocalIpc = () => {
+  assert.deepEqual(
+    calls.filter(({ command }) => /local_|retention|archive/.test(command)),
+    [],
   );
-  await flush();
+  assert.equal(
+    (g.__settingsListeners.get("local-settings-changed") ?? new Set()).size,
+    0,
+  );
 };
 
 scenario(
-  "N04: source events update baseline without erasing timeout-era draft",
+  "DeepSeek-only: account, history, settings and tray close remain available",
   async (concurrent) => {
-    let sources = { includeDefault: true, homes: [] };
-    handlers.get_local_sources = () => sources;
+    await mount(<App />, concurrent);
+    assert.equal(panel("dashboard"), 1);
+    assert.equal(panel("onboarding"), 0);
+    const navigation = renderer.root.findByProps({ "aria-label": "主导航" });
+    assert.deepEqual(
+      navigation
+        .findAllByType("button")
+        .filter((node) => !node.props["aria-label"])
+        .map(textOf),
+      ["账户", "历史"],
+    );
+    assert.ok(submitted("fetch_balance").length > 0);
+    assert.ok(submitted("fetch_usage").length > 0);
+    assert.ok(submitted("update_tray_balance").length > 0);
+    await click(button("历史"));
+    assert.equal(panel("history"), 1);
+    assert.equal(button("历史").props["aria-current"], "page");
+    assert.equal(textOf(renderer.toJSON()).includes("项目与会话"), false);
+    await click(button("账户"));
+    assert.equal(panel("dashboard"), 1);
+    await click(input("设置"));
+    assert.equal(panel("settings"), 1);
+    assert.ok(submitted("get_desktop_options").length > 0);
+    assert.ok(submitted("get_alert_status").length > 0);
+    await click(input("返回主面板"));
+    await emit("local-settings-changed", 1);
+    await click(input("关闭"));
+    assert.equal(submitted("hide_main_window").length, 1);
+    assertNoLocalIpc();
+  },
+);
+
+scenario(
+  "DeepSeek-only: first configuration waits only for account config and opens platform settings",
+  async (concurrent) => {
+    config = baseConfig({
+      apiKeyConfigured: false,
+      usageTokenConfigured: false,
+    });
     const pending = deferred();
-    handlers.save_local_sources = () => pending.promise;
-    let save, result;
-    let saved = 0;
-    await mount(
-      <LocalSourceSettings
-        onSaved={() => saved++}
-        onSaveRequested={(fn) => {
-          save = fn;
-        }}
-      />,
-      concurrent,
-    );
-    await change("额外主目录", "D:\\AgentA");
-    await act(async () => {
-      result = save();
-    });
-    await act(async () =>
-      pending.reject(new Error("Synthetic settings timeout")),
-    );
-    await flush();
-    assert.equal(await result, false);
-    await change("额外主目录", "D:\\AgentB");
-    sources = { includeDefault: true, homes: ["D:\\AgentA"] };
-    await emit("local-settings-changed", 1);
-    assert.equal(input("额外主目录").props.value, "D:\\AgentB");
-    assert.equal(button("保存目录").props.disabled, false);
-    assert.equal(saved, 0);
-    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), false);
+    handlers.get_app_config = () => pending.promise;
+    await mount(<App />, concurrent);
+    assert.equal(panel("onboarding"), 0);
+    await finish(pending, config);
+    assert.equal(panel("onboarding"), 1);
+    const tasks = renderer.root.findAllByProps({ className: "onboarding-task" });
+    assert.equal(tasks.length, 2);
+    assert.ok(tasks.some((node) => textOf(node).includes("只看余额")));
+    await click(tasks.find((node) => textOf(node).includes("平台消费与历史")));
+    assert.equal(panel("settings"), 1);
+    await drainFrames();
+    assert.ok(focus.includes("usage-target"));
+    await click(input("返回主面板"));
+    assert.equal(panel("onboarding"), 0);
+    assertNoLocalIpc();
   },
 );
 
 scenario(
-  "N04: source save cannot certify B/ABA edits while its response is pending",
-  async (concurrent) => {
-    let sources = { includeDefault: true, homes: [] };
-    handlers.get_local_sources = () => sources;
-    const pending = deferred();
-    handlers.save_local_sources = () => pending.promise;
-    let save, result;
-    let saved = 0;
-    await mount(
-      <LocalSourceSettings
-        onSaved={() => saved++}
-        onSaveRequested={(fn) => {
-          save = fn;
-        }}
-      />,
-      concurrent,
-    );
-    await change("额外主目录", "D:\\AgentA");
-    await act(async () => {
-      result = save();
-    });
-    await change("额外主目录", "D:\\AgentB");
-    await change("额外主目录", "D:\\AgentA");
-    sources = { includeDefault: true, homes: ["D:\\AgentA"] };
-    await emit("local-settings-changed", 1);
-    await finish(pending, sources);
-    assert.equal(await result, false);
-    assert.equal(saved, 0);
-    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), false);
-  },
-);
-
-scenario(
-  "N04: newest source read wins; duplicate or old events do not loop",
-  async (concurrent) => {
-    await mount(<LocalSourceSettings onSaved={noop} />, concurrent);
-    const older = deferred(),
-      newer = deferred();
-    let count = 0;
-    handlers.get_local_sources = () =>
-      ++count === 1 ? older.promise : newer.promise;
-    await emit("local-settings-changed", 2);
-    await emit("local-settings-changed", 3);
-    await finish(newer, { includeDefault: true, homes: ["D:\\Newest"] });
-    await finish(older, { includeDefault: true, homes: ["D:\\Older"] });
-    assert.equal(input("额外主目录").props.value, "D:\\Newest");
-    await emit("local-settings-changed", 3);
-    await emit("local-settings-changed", 2);
-    await emit("local-settings-changed", "invalid");
-    assert.equal(count, 2);
-    await act(async () => renderer.unmount());
-    renderer = null;
-    await emit("local-settings-changed", 4);
-    assert.equal(count, 2);
-  },
-);
-
-scenario(
-  "N04: confirmed source save keeps its success state without remount",
-  async (concurrent) => {
-    let sources = { includeDefault: true, homes: [] };
-    handlers.get_local_sources = () => sources;
-    handlers.save_local_sources = ({ options }) => {
-      sources = options;
-      return sources;
-    };
-    let save, result;
-    let saved = 0;
-    await mount(
-      <LocalSourceSettings
-        onSaved={() => saved++}
-        onSaveRequested={(fn) => {
-          save = fn;
-        }}
-      />,
-      concurrent,
-    );
-    await change("额外主目录", "D:\\AgentA");
-    await act(async () => {
-      result = save();
-    });
-    await flush();
-    assert.equal(await result, true);
-    assert.equal(saved, 1);
-    assert.equal(textOf(renderer.toJSON()).includes("目录已保存"), true);
-    assert.equal(input("额外主目录").props.value, "D:\\AgentA");
-  },
-);
-
-scenario(
-  "N04: retention late completion converges and refreshes N05 capacity without success toast",
-  async (concurrent) => {
-    let enabled = false;
-    handlers.get_local_retention_enabled = () => enabled;
-    handlers.set_local_retention_enabled = () =>
-      Promise.reject(new Error("Synthetic retention timeout"));
-    await mount(
-      <LocalArchiveCapture
-        collectedAt={null}
-        scope={{ kind: "all" }}
-        disabled
-        onOpen={noop}
-      />,
-      concurrent,
-    );
-    await checked("自动留存已读取会话", true);
-    const reads = submitted("get_local_retention_capacity").length;
-    enabled = true;
-    await emit("local-settings-changed", 1);
-    assert.equal(localCheckbox("自动留存已读取会话").props.checked, true);
-    assert.equal(localCheckbox("自动留存已读取会话").props.disabled, false);
-    assert.ok(submitted("get_local_retention_capacity").length > reads);
-    assert.equal(
-      textOf(renderer.toJSON()).includes("已开启，下次成功采集时自动留存"),
-      false,
-    );
-  },
-);
-
-scenario(
-  "N04: failed background stop converges and offers false-only persistence retry",
-  async (concurrent) => {
-    let enabled = true;
-    handlers.get_local_background = () => ({
-      enabled,
-      effective: enabled,
-      state: "watching",
-      watchedRoots: 1,
-    });
-    handlers.set_local_background = () => {
-      enabled = false;
-      return Promise.reject(new Error("Synthetic stop persistence failure"));
-    };
-    await mount(
-      <LocalBackgroundSettings localEnabled onMode={noop} />,
-      concurrent,
-    );
-    await checked("收起后继续采集", false);
-    assert.equal(localCheckbox("收起后继续采集").props.checked, false);
-    assert.equal(
-      textOf(renderer.toJSON()).includes("后台采集已关闭，已有留存保留"),
-      false,
-    );
-    await click(button("重新保存后台关闭状态"));
-    assert.equal(submitted("set_local_background").at(-1).args.enabled, false);
-  },
-);
-
-scenario(
-  "N04: failed stop rejects an old scan and never requires enabling to retry",
-  async (concurrent) => {
-    let status = {
-      enabled: true,
-      snapshot: null,
-      generation: 1,
-      busy: false,
-      settingsPending: false,
-      lastError: null,
-    };
-    handlers.get_local_usage = () => status;
-    const scan = deferred();
-    handlers.scan_local_usage = () => scan.promise;
-    handlers.set_local_usage_enabled = () => {
-      status = {
-        ...status,
-        enabled: false,
-        generation: 2,
-        lastError: "Synthetic stop persistence failure",
-      };
-      return Promise.reject(new Error(status.lastError));
-    };
-    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
-    await click(button("关闭本地统计"));
-    assert.ok(button("开启本地统计"));
-    await finish(scan, {
-      rows: [],
-      collectedAt: Date.now(),
-      engineVersion: "synthetic",
-      period: "month",
-    });
-    assert.equal(
-      renderer.root.findByType(LocalArchiveCapture).props.collectedAt,
-      null,
-    );
-    await click(button("重新保存关闭状态"));
-    assert.equal(
-      submitted("set_local_usage_enabled").at(-1).args.enabled,
-      false,
-    );
-  },
-);
-
-scenario(
-  "N04: pending enable converges on completion and ignores older generation",
-  async (concurrent) => {
-    let status = {
-      enabled: false,
-      snapshot: null,
-      generation: 1,
-      busy: false,
-      settingsPending: false,
-    };
-    handlers.get_local_usage = () => status;
-    handlers.is_main_window_visible = () => false;
-    handlers.set_local_usage_enabled = () => {
-      status = { ...status, generation: 2, busy: true, settingsPending: true };
-      return Promise.reject(new Error("Synthetic enable timeout"));
-    };
-    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
-    await click(button("开启本地统计"));
-    assert.equal(button("设置处理中…").props.disabled, true);
-    status = { ...status, enabled: true, busy: false, settingsPending: false };
-    await emit("local-settings-changed", 2);
-    assert.ok(button("关闭本地统计"));
-    status = { ...status, enabled: false, generation: 1 };
-    await emit("local-settings-changed", 3);
-    assert.ok(button("关闭本地统计"));
-    assert.equal(button("开启本地统计"), undefined);
-  },
-);
-
-scenario(
-  "N04: pending stop survives remount and retries false without a fresh error",
-  async (concurrent) => {
-    handlers.get_local_usage = () => ({
-      enabled: false,
-      snapshot: null,
-      generation: 3,
-      busy: false,
-      settingsPending: false,
-      stopSavePending: true,
-      lastError: null,
-    });
-    handlers.set_local_usage_enabled = () => ({ enabled: false });
-    await mount(<LocalUsagePanel onBack={noop} />, concurrent);
-    assert.ok(button("重新保存关闭状态"));
-    await click(button("重新保存关闭状态"));
-    assert.equal(
-      submitted("set_local_usage_enabled").at(-1).args.enabled,
-      false,
-    );
-    await act(async () => renderer.unmount());
-    renderer = null;
-    handlers.get_local_background = () => ({
-      enabled: false,
-      effective: false,
-      stopSavePending: true,
-      state: "disabled",
-      watchedRoots: 0,
-    });
-    handlers.set_local_background = () => ({ enabled: false });
-    await mount(
-      <LocalBackgroundSettings localEnabled={false} onMode={noop} />,
-      concurrent,
-    );
-    await click(button("重新保存后台关闭状态"));
-    assert.equal(submitted("set_local_background").at(-1).args.enabled, false);
-  },
-);
-
-scenario(
-  "N04: App completion refresh cannot be overwritten by an older local read",
+  "DeepSeek-only: dismissing first configuration leaves the account panel usable",
   async (concurrent) => {
     config = baseConfig({
       apiKeyConfigured: false,
@@ -1436,16 +1183,163 @@ scenario(
     });
     await mount(<App />, concurrent);
     assert.equal(panel("onboarding"), 1);
-    const older = deferred(),
-      newer = deferred();
-    let count = 0;
-    handlers.get_local_usage = () =>
-      ++count === 1 ? older.promise : newer.promise;
-    await emit("local-settings-changed", 1);
-    await emit("local-settings-changed", 2);
-    await finish(newer, { enabled: true, snapshot: null, generation: 2 });
+    await click(button("我已了解，先不配置"));
+    assert.equal(panel("dashboard"), 1);
     assert.equal(panel("onboarding"), 0);
-    await finish(older, { enabled: false, snapshot: null, generation: 1 });
+    await click(button("历史"));
+    await click(button("账户"));
     assert.equal(panel("onboarding"), 0);
+    assertNoLocalIpc();
   },
 );
+
+
+scenario("N09: settings only displays the accepted snapshot on an equal-version conflict", async (concurrent) => {
+  const trusted = config;
+  setCommittedConfig(trusted);
+  handlers.get_app_config = () => ({ ...trusted, apiKeyConfigured: false });
+  await mount(<Probe />, concurrent);
+  assert.equal(getCommittedConfig(), trusted);
+  assert.equal(state.config, trusted);
+  assert.match(state.status, /配置版本/);
+});
+
+scenario("N09: unavailable disk snapshot clears dashboard data and disables settings preferences", async (concurrent) => {
+  await mount(<App />, concurrent);
+  const unavailable = baseConfig({
+    apiKeyConfigured: false, apiKeyPreview: null, usageTokenConfigured: false,
+    configReadError: "Synthetic unreadable configuration",
+  });
+  config = unavailable;
+  await emit("credential-config-changed", unavailable);
+  assert.equal(dashboard().balance, null);
+  assert.equal(dashboard().usage, null);
+  assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+  await act(async () => renderer.unmount());
+  renderer = null;
+  await mount(<Probe />, concurrent);
+  assert.equal(state.refresh, null);
+  assert.equal(state.autoRefresh, null);
+  assert.equal(state.autostart, null);
+  assert.equal(state.config, unavailable);
+});
+
+scenario("N10: manual failure stops old web progress immediately and ignores its late start", async (concurrent) => {
+  const web = deferred();
+  const manualSave = deferred();
+  handlers.start_usage_sync = () => web.promise;
+  handlers.save_usage_token = () => manualSave.promise;
+  await mount(<Probe />, concurrent);
+  await act(async () => state.startUsageSync());
+  const oldRequest = submitted("start_usage_sync").at(-1).args.requestId;
+  await act(async () => state.setUsageToken("SYNTHETIC_INVALID_TOKEN"));
+  let saving;
+  await act(async () => { saving = state.saveUsageToken(); });
+  assert.equal(state.usageSyncing, false);
+  await finish(web, { ...syncStatus(oldRequest, true), synced: false });
+  assert.equal(state.usageSyncing, false);
+  await act(async () => manualSave.reject(new Error("Synthetic verification failed")));
+  assert.equal(await saving, false);
+  assert.equal(state.busy, false);
+  assert.equal(state.usageSyncing, false);
+  assert.equal(state.config.usageTokenConfigured, true);
+  assert.equal(state.usageToken, "SYNTHETIC_INVALID_TOKEN");
+});
+
+scenario("N10: first delayed capture and ended events cannot stop a new session after remount", async (concurrent) => {
+  await mount(<Probe />, concurrent);
+  await act(async () => state.startUsageSync());
+  const firstRequest = submitted("start_usage_sync").at(-1).args.requestId;
+  const oldSession = syncStatus(firstRequest, false);
+  await act(async () => renderer.unmount());
+  renderer = null;
+  await mount(<Probe />, concurrent);
+  await act(async () => state.startUsageSync());
+  const waitingStatus = state.usageStatus;
+  const captured = nextCredentialConfig("usageToken", true);
+  await emit("usage-token-captured", capturedPayload(captured, oldSession));
+  await emit("usage-sync-ended", oldSession);
+  assert.equal(getCommittedConfig(), captured);
+  assert.equal(state.usageSyncing, true);
+  assert.equal(state.usageStatus, waitingStatus);
+});
+
+scenario("N10: old manual failure and old cancel reply leave newer web progress intact", async (concurrent) => {
+  const pending = deferred();
+  handlers.save_usage_token = () => pending.promise;
+  await mount(<Probe />, concurrent);
+  await act(async () => state.setUsageToken("SYNTHETIC_TOKEN"));
+  let saving;
+  await act(async () => { saving = state.saveUsageToken(); });
+  const manualRequest = submitted("save_usage_token").at(-1).args.requestId;
+  await act(async () => state.startUsageSync());
+  await emit("usage-sync-ended", syncStatus(manualRequest, false, "manual"));
+  await act(async () => pending.reject(new Error("Synthetic old failure")));
+  assert.equal(await saving, false);
+  assert.equal(state.usageSyncing, true);
+  const cancel = deferred();
+  handlers.cancel_usage_sync = () => cancel.promise;
+  await act(async () => state.cancelUsageSync());
+  const cancelled = submitted("cancel_usage_sync").at(-1).args;
+  await act(async () => state.startUsageSync());
+  await finish(cancel, { ...cancelled, active: false, kind: "web" });
+  assert.equal(state.usageSyncing, true);
+});
+
+scenario("N10: cancel no-op after capture re-reads saved state instead of claiming old Token unchanged", async (concurrent) => {
+  await mount(<Probe />, concurrent);
+  await act(async () => state.startUsageSync());
+  const request = submitted("start_usage_sync").at(-1).args.requestId;
+  const saved = nextCredentialConfig("usageToken", true);
+  config = saved;
+  handlers.cancel_usage_sync = () => null;
+  handlers.get_usage_sync_status = () => syncStatus(request, false);
+  await act(async () => state.cancelUsageSync());
+  await flush();
+  assert.deepEqual(getCommittedConfig(), saved);
+  assert.equal(state.usageSyncing, false);
+  assert.doesNotMatch(state.usageStatus, /原 Token 未更改|已取消/);
+});
+
+scenario("N10: remount status read crossing terminal event re-reads instead of reviving login", async (concurrent) => {
+  const reading = deferred();
+  const first = syncStatus("previous-page", true);
+  const terminal = { ...first, active: false };
+  let reads = 0;
+  handlers.get_usage_sync_status = () => ++reads === 1 ? reading.promise : terminal;
+  await mount(<Probe />, concurrent);
+  await emit("usage-sync-ended", terminal);
+  await finish(reading, first);
+  assert.equal(reads, 2);
+  assert.equal(state.usageSyncing, false);
+});
+
+
+for (const [command, action, value, field] of [
+  ["save_refresh_interval", "saveRefreshInterval", 300, "refresh"],
+  ["save_auto_refresh_enabled", "saveAutoRefreshEnabled", true, "autoRefresh"],
+  ["save_autostart", "saveAutostart", true, "autostart"],
+]) {
+  for (const succeeds of [false, true]) {
+    scenario(`N09: late ${command} ${succeeds ? "success" : "failure"} cannot re-enable untrusted controls`, async (concurrent) => {
+      const pending = deferred();
+      handlers[command] = () => pending.promise;
+      await mount(<Probe />, concurrent);
+      const oldSuccess = baseConfig();
+      await act(async () => state[action](value));
+      const unavailable = baseConfig({
+        apiKeyConfigured: false, apiKeyPreview: null, usageTokenConfigured: false,
+        configReadError: "Synthetic unreadable configuration",
+      });
+      await act(async () => setCommittedConfig(unavailable));
+      assert.equal(state[field], null);
+      if (succeeds) await finish(pending, oldSuccess);
+      else await act(async () => pending.reject(new Error("Synthetic disk failure")));
+      await flush();
+      assert.equal(state.refresh, null);
+      assert.equal(state.autoRefresh, null);
+      assert.equal(state.autostart, null);
+      assert.equal(getCommittedConfig(), unavailable);
+    });
+  }
+}

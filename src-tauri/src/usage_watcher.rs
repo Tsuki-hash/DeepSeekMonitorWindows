@@ -240,11 +240,16 @@ pub(crate) async fn verify_token_with_probes(token: &str) -> Result<(), String> 
 ///
 /// 成功路径不用它：成功由 `capture_usage_token` 自己提交并关窗。
 pub(crate) fn end_sync_session(app: &tauri::AppHandle, generation: u64) {
+    let mut status = app.state::<SyncSession>().status();
+    if status.generation != generation {
+        return;
+    }
+    status.active = false;
     let _ = app.state::<SyncSession>().commit(generation, || {
         if let Some(login) = app.get_webview_window("login-sync") {
             let _ = login.close();
         }
-        let _ = app.emit("usage-sync-ended", ());
+        let _ = app.emit("usage-sync-ended", &status);
         Ok(())
     });
 }
@@ -259,6 +264,11 @@ pub(crate) fn capture_usage_token(
     if value.is_empty() {
         return Err("用量 Token 为空".to_string());
     }
+    let mut status = app.state::<SyncSession>().status();
+    if status.generation != generation {
+        return Err("同步已取消或已被新的操作替代".into());
+    }
+    status.active = false;
     app.state::<SyncSession>().commit(generation, || {
         let app_config = to_app_config(crate::config::edit_validated_credential(
             crate::config::ValidatedCredential::UsageToken,
@@ -271,7 +281,16 @@ pub(crate) fn capture_usage_token(
             let _ = window.close();
         }
 
-        let _ = app.emit("usage-token-captured", &app_config);
+        #[derive(Clone, serde::Serialize)]
+        struct Captured<'a> {
+            #[serde(flatten)]
+            status: &'a crate::sync_session::UsageSyncStatus,
+            config: &'a AppConfig,
+        }
+        let _ = app.emit("usage-token-captured", Captured {
+            status: &status,
+            config: &app_config,
+        });
         Ok(app_config)
     })
 }

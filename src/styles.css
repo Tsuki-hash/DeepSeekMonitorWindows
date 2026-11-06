@@ -488,216 +488,6 @@ button {
   color: var(--brand-ink);
 }
 
-.local-entry {
-  display: flex;
-  justify-content: space-between;
-  width: 100%;
-  border: 0;
-  background: transparent;
-  color: var(--text-strong);
-  padding: 0 0 11px;
-  font-size: 12px;
-  cursor: pointer;
-}
-.local-entry span {
-  color: var(--brand-ink);
-  font-size: 10px;
-}
-.local-welcome {
-  margin: 4px 0 16px;
-  padding: 22px 18px;
-  color: var(--text-muted);
-}
-.local-welcome > svg {
-  color: var(--brand-ink);
-}
-.local-welcome h2 {
-  color: var(--text-strong);
-  font-size: 17px;
-  margin: 13px 0 10px;
-}
-.local-welcome p {
-  font-size: 12px;
-  line-height: 1.7;
-  margin: 10px 0;
-}
-.local-welcome button {
-  margin-top: 10px;
-}
-.local-group-list {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 8px;
-  margin-top: 12px;
-}
-.local-group {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 13px 11px;
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-  text-align: left;
-  font: inherit;
-  cursor: pointer;
-}
-.local-group-icon {
-  color: var(--brand-ink);
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-}
-.local-group-copy {
-  min-width: 0;
-  flex: 1;
-}
-.local-group-copy strong {
-  display: block;
-  font-size: 12px;
-  color: var(--text-strong);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.local-group-copy small {
-  display: block;
-  font-size: 10px;
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  margin-top: 5px;
-}
-.local-group b {
-  font-size: 13px;
-  color: var(--brand-ink);
-  flex-shrink: 0;
-  font-variant-numeric: tabular-nums;
-}
-.local-metrics .local-rate {
-  font-size: 17px;
-  margin-top: 12px;
-}
-.local-session-id,
-.local-path {
-  font-size: 11px;
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-  margin: 12px 0;
-}
-.local-path {
-  margin-top: -6px;
-  font-size: 10px;
-}
-.local-model-name {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-strong);
-  overflow-wrap: anywhere;
-}
-.local-model-speed {
-  margin: 10px 0 0;
-  font-size: 10px;
-  color: var(--text-muted);
-}
-.local-usage-panel .history-breakdown {
-  grid-template-columns: 1fr;
-}
-.local-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--hairline);
-  color: var(--text-muted);
-  font-size: 10px;
-}
-.local-footer button {
-  font-size: 10px;
-  padding: 6px 9px;
-}
-.local-explanation {
-  margin-bottom: 0;
-}
-.local-export-option {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 10px 0;
-}
-.local-export-option input {
-  accent-color: var(--brand-ink);
-}
-.local-source-settings .toggle-row {
-  display: flex;
-  justify-content: space-between;
-  margin: 10px 0;
-}
-.local-source-settings .toggle-row i {
-  flex: 0 0 44px;
-}
-.local-source-label {
-  display: block;
-  margin-top: 12px;
-  color: var(--text-muted);
-  font-size: 11px;
-}
-.local-source-label textarea,
-.local-source-label input,
-.local-source-label select {
-  display: block;
-  width: 100%;
-  margin-top: 6px;
-  padding: 9px 10px;
-  resize: vertical;
-  border: 1px solid var(--input-border);
-  border-radius: 8px;
-  background: var(--input-bg);
-  color: var(--input-text);
-  font: inherit;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-.local-tool-paths {
-  margin: 12px 0;
-}
-.local-tool-path {
-  padding: 0 0 12px;
-  border-bottom: 1px solid var(--divider);
-  margin-bottom: 12px;
-}
-.local-tool-path .secondary {
-  margin-top: 8px;
-}
-.local-quality-counts {
-  display: grid;
-  gap: 8px;
-  margin: 12px 0;
-}
-.local-quality-counts > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-.local-quality-counts span {
-  min-width: 0;
-}
-.local-quality-counts strong {
-  flex-shrink: 0;
-  color: var(--text);
-}
-.local-quality-note {
-  color: var(--text);
-}
-.local-row-quality {
-  font-size: 10px;
-  color: var(--text-muted);
-  line-height: 1.6;
-  margin: 6px 0 10px;
-}
-
 .history-panel {
   display: flex;
   flex-direction: column;
@@ -2512,37 +2302,6 @@ button:disabled:hover {
   display: none;
 }
 
-.local-archive-row .local-quality-counts span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.local-archive-row .local-quality-counts strong {
-  flex-shrink: 0;
-}
-.local-archive-panel .history-models {
-  grid-template-columns: minmax(0, 1fr);
-}
-.local-archive-row {
-  min-width: 0;
-  font-size: 11px;
-}
-.local-archive-row h2 {
-  margin: 0 0 6px;
-  font-size: 13px;
-  color: var(--text-strong);
-}
-.local-archive-row .local-model-name {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.local-archive-row summary {
-  color: var(--text-muted);
-}
-.local-archive-row summary::after {
-  content: none;
-}
 /* Primary destinations stay visible; their space is reserved, never overlaid. */
 .stage.with-navigation {
   grid-template-rows: minmax(0, 1fr) 48px;
@@ -2581,8 +2340,7 @@ button:disabled:hover {
   color: var(--brand-ink);
   background: var(--flash-bg);
 }
-.primary-navigation button:hover,
-.local-workspace-nav button:hover {
+.primary-navigation button:hover {
   background: var(--control-hover);
 }
 .with-navigation > .dashboard-panel {
@@ -2595,70 +2353,6 @@ button:disabled:hover {
 }
 .with-navigation > .dashboard-panel .chart-card {
   min-height: 156px;
-}
-.local-workspace-nav {
-  display: flex;
-  gap: 6px;
-  border-bottom: 1px solid var(--hairline);
-}
-.local-workspace-nav button {
-  min-height: 40px;
-  padding: 0 10px;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 12px;
-  cursor: pointer;
-}
-.local-workspace-nav button:first-child {
-  margin-right: auto;
-}
-.local-workspace-nav button[aria-pressed="true"] {
-  border-bottom-color: var(--brand);
-  color: var(--brand-ink);
-  font-weight: 700;
-}
-.local-section-note {
-  margin: 4px 0 14px;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.6;
-}
-.local-usage-panel .history-header p {
-  font-size: 11px;
-}
-.local-usage-panel .history-metrics {
-  margin-bottom: 14px;
-}
-.local-usage-panel .local-group {
-  box-shadow: none;
-  border-radius: 12px;
-  padding: 13px 10px;
-}
-.local-usage-panel .local-group-copy small {
-  font-size: 11px;
-}
-.local-usage-panel .local-group b {
-  font-variant-numeric: tabular-nums;
-}
-.local-usage-panel .local-group::after {
-  content: "›";
-  color: var(--text-muted);
-}
-.local-welcome {
-  margin-top: 12px;
-  padding: 24px 18px;
-}
-.local-welcome h2 {
-  font-size: 18px;
-}
-.local-welcome .primary {
-  min-height: 40px;
-  margin-top: 12px;
-}
-.local-stop {
-  margin: 12px 0;
 }
 /* Reserve room for navigation without squeezing the chart or reducing text. */
 .with-navigation .balance-card {
@@ -2688,69 +2382,6 @@ button:disabled:hover {
 }
 .with-navigation .dashboard-panel .panel-header {
   padding-top: 16px;
-}
-
-.local-usage-panel .history-header h1 {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.local-usage-panel .history-icon-button {
-  flex-shrink: 0;
-}
-.local-empty {
-  padding: 20px 14px;
-  margin: 8px 0 14px;
-  border: 1px dashed var(--card-border);
-  border-radius: 14px;
-  color: var(--text-muted);
-}
-.local-empty > svg {
-  color: var(--brand-ink);
-}
-.local-empty h2 {
-  font-size: 15px;
-  color: var(--text-strong);
-  margin: 10px 0 6px;
-}
-.local-empty p {
-  font-size: 12px;
-  line-height: 1.7;
-  margin: 0 0 12px;
-}
-.local-empty button {
-  min-height: 36px;
-}
-.local-scope-card {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 14px;
-  margin: 2px 0 14px;
-  border: 1px solid var(--card-border);
-  border-radius: 12px;
-  background: var(--card-bottom);
-}
-.local-scope-card span,
-.local-scope-card small {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.local-scope-card strong {
-  font-size: 13px;
-  overflow-wrap: anywhere;
-  color: var(--text-strong);
-}
-.local-usage-panel .history-icon-button {
-  width: 34px;
-  height: 34px;
-}
-.local-group:hover {
-  border-color: var(--card-hover-border);
-  background: var(--card-bottom);
-}
-.local-group:active {
-  background: var(--control-bg);
 }
 
 .history-trend-reading {
@@ -2887,7 +2518,7 @@ button:disabled:hover {
   }
 }
 
-/* 首次使用入口卡：三张轻量任务卡，不占满屏、不阻塞主面板读数。 */
+/* 首次使用入口卡：两张 DeepSeek 配置卡，不占满屏、不阻塞主面板读数。 */
 .onboarding-panel {
   margin-bottom: 10px;
 }
@@ -2956,29 +2587,6 @@ button:disabled:hover {
   border-radius: 50%;
 }
 
-/* 本机数据管理清单：每项一行，标签与数值分开，说明用更小的字。 */
-.local-data-list {
-  display: grid;
-  gap: 8px;
-  margin: 8px 0;
-  padding: 0;
-  list-style: none;
-}
-.local-data-list li {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 2px 8px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--line);
-  font-size: 12px;
-}
-.local-data-list small {
-  grid-column: 1 / -1;
-  color: var(--text-faint);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
 /* 首页内部滚动区（复评 F04）：引导卡与数据同处一列，避免 stage 多出第三个网格子项。
    面板本身不再裁掉底部内容，导航行高度保持 48px 不变。 */
 .dashboard-scroll {
@@ -3018,14 +2626,12 @@ button:disabled:hover {
 .stage.mode-expanded .primary-navigation {
   width: min(720px, 100vw);
 }
-/* 展开后历史与 Agent 的分组列表可排成两列，减少长页面滚动。 */
-.stage.mode-expanded .local-group-list,
+/* 展开后历史模型列表可排成两列，减少长页面滚动。 */
 .stage.mode-expanded .history-models {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 /* 小工作区：宽度不足时退回单列，避免内容被压扁。 */
 @media (max-width: 560px) {
-  .stage.mode-expanded .local-group-list,
   .stage.mode-expanded .history-models {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -3065,15 +2671,4 @@ button:disabled:hover {
 }
 .leave-guard p {
   margin: 0 0 8px;
-}
-
-/* N06: source identity must stay visible when labels are long or cards narrow. */
-.local-usage-panel .local-identity-label,
-.local-archive-panel .local-identity-label {
-  min-width: 0;
-  max-width: 100%;
-  white-space: normal;
-  overflow: visible;
-  overflow-wrap: anywhere;
-  text-overflow: clip;
 }

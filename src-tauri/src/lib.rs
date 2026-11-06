@@ -9,12 +9,6 @@ pub mod deepseek_api;
 pub mod desktop;
 pub mod error;
 pub mod http;
-pub mod local_archive;
-pub mod local_background;
-pub mod local_overlap;
-pub mod local_retention;
-pub mod local_sources;
-pub mod local_usage;
 pub mod sync_script;
 pub mod sync_session;
 pub mod token_sync;
@@ -24,7 +18,6 @@ pub mod usage;
 pub mod usage_history;
 pub mod usage_watcher;
 pub mod window_pos;
-pub mod zcode_usage;
 
 #[cfg(test)]
 mod test_support;
@@ -48,8 +41,6 @@ pub fn run() {
         }))
         .manage(sync_session::SyncSession::default())
         .manage(sync_session::ApiKeySession::default())
-        .manage(local_usage::LocalCollector::default())
-        .manage(local_background::Runtime::default())
         .manage(desktop::DesktopState::default())
         .manage(update_check::UpdateCache::default())
         .manage(alerts::AlertRuntime::default())
@@ -87,28 +78,6 @@ pub fn run() {
             commands::get_alert_status,
             commands::save_alert_options,
             commands::test_alert_notification,
-            commands::get_local_usage,
-            commands::set_local_usage_enabled,
-            commands::scan_local_usage,
-            commands::get_local_background,
-            commands::set_local_background,
-            commands::save_local_archive,
-            commands::list_local_archives,
-            commands::read_local_archive,
-            commands::delete_local_archive,
-            commands::clear_local_archives,
-            commands::get_local_data_overview,
-            commands::clear_local_engine_cache,
-            commands::get_local_retention_enabled,
-            commands::set_local_retention_enabled,
-            commands::get_local_retention_capacity,
-            commands::list_local_retention,
-            commands::read_local_retention,
-            commands::delete_local_retention,
-            commands::clear_local_retention,
-            commands::get_local_sources,
-            commands::save_local_sources,
-            commands::list_running_wsl,
             commands::save_api_key,
             commands::clear_api_key,
             commands::save_refresh_interval,
@@ -119,11 +88,13 @@ pub fn run() {
             commands::clear_usage_token,
             commands::fetch_usage,
             commands::start_usage_sync,
+            commands::get_usage_sync_status,
             commands::cancel_usage_sync,
             commands::forget_usage_session,
             commands::usage_token_captured
         ])
         .setup(|app| {
+            config::install_change_listener(app.handle().clone());
             // 日志在 debug 与 release 都要注册。代码里的 log::warn!（未知模型名、
             // 未归类 token 类型、配置损坏、同步失败原因）在用户机器上必须真正落盘，
             // 否则排障只能靠复现。默认 target 含 LogDir，落盘位置为 app_log_dir()，
@@ -148,7 +119,8 @@ pub fn run() {
             tray::build_tray(app)?;
             desktop::restore(app.handle());
             alerts::start(app.handle().clone());
-            local_background::start(app.handle().clone());
+            // Agent 统计已移除。旧的独立配置、归档、留存与引擎缓存保留原样，
+            // 不读取、不迁移、不清理，也不再启动任何工具目录扫描。
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -18,13 +18,11 @@
     "format": "prettier --write .",
     "verify": "pwsh -NoProfile -File scripts/verify.ps1",
     "check:version": "node scripts/check-version.mjs",
-    "local-usage:prepare": "node scripts/prepare-local-usage.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "release:record": "node scripts/release-record.mjs",
-    "test:integration": "node scripts/run-integration-tests.mjs",
     "test:components": "node scripts/test-settings-components.mjs"
   },
   "dependencies": {

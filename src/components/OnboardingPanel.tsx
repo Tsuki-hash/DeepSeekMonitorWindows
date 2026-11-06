@@ -1,21 +1,14 @@
 import React from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  CreditCard,
-  Folder,
-  LineChart,
-} from "lucide-react";
+import { ArrowRight, CheckCircle2, CreditCard, LineChart } from "lucide-react";
 import type { OnboardingTask, OnboardingTaskInfo } from "../onboarding";
 
 const icons = {
   balance: CreditCard,
   platform: LineChart,
-  local: Folder,
 } as const;
 
 /**
- * 首次使用的三张入口卡。
+ * 首次使用的两张 DeepSeek 配置入口卡。
  *
  * 评审 P2：不是强制向导，而是「选一个目标开始」。每张卡只说明该任务的最小条件，
  * 已完成的任务标勾，敏感会话（平台用量）在进入前先说明会过期。
@@ -33,7 +26,7 @@ export function OnboardingPanel({
     <article className="card onboarding-panel" data-testid="onboarding-panel">
       <h2>先选一个目标</h2>
       <p className="muted">
-        三种数据来源彼此独立，可以只用其中一种。不需要全部配置完才能开始。
+        余额与平台用量独立配置，可以只用其中一种。不需要全部配置完才能开始。
       </p>
       <div className="onboarding-tasks">
         {tasks.map((task) => {

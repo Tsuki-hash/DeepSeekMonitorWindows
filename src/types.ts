@@ -1,7 +1,6 @@
 import type { UsageDay } from "./format";
 
-export type ViewName =
-  "dashboard" | "settings" | "detail" | "history" | "local";
+export type ViewName = "dashboard" | "settings" | "detail" | "history";
 export type ModelName = "flash" | "pro" | "other";
 export type AppConfig = {
   /** Non-secret process-local backend commit versions, captured with this snapshot. */
@@ -9,6 +8,8 @@ export type AppConfig = {
   apiKeyRevision: number;
   usageTokenRevision: number;
   configWarnings?: string[];
+  /** Untrusted disk state: account data is revoked and preference writes are disabled. */
+  configReadError?: string | null;
   apiKeyConfigured: boolean;
   apiKeyPreview: string | null;
   usageTokenConfigured: boolean;
@@ -63,3 +64,13 @@ export type RawModelUsage = {
   otherTokens: number | null;
   cost: number | null;
 };
+
+/** Independent login lifecycle identity; never inferred from credential versions. */
+export type UsageSyncStatus = {
+  generation: number;
+  requestId: string | null;
+  active: boolean;
+  kind: "web" | "manual";
+};
+export type UsageSyncStarted = UsageSyncStatus & { synced: boolean };
+export type UsageTokenCaptured = UsageSyncStatus & { config: AppConfig };

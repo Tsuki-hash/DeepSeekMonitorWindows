@@ -1,19 +1,9 @@
 #!/usr/bin/env node
-// Shared Rust gate for verify/release. Capability probes are separate from libtest:
-// a missing prerequisite is NOT RUN, never a successful test assertion.
+// Shared DeepSeek Rust gate for verify/release. Removed Agent directory/link
+// capabilities are no longer prerequisites and are never reported as passing.
 import { spawnSync } from "node:child_process";
-import {
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -44,58 +34,7 @@ function parseCounts(output) {
   };
 }
 
-function probeLinks() {
-  let dir;
-  const results = [];
-  const kinds =
-    process.platform === "win32"
-      ? ["file", "dir", "junction"]
-      : ["file", "dir"];
-  try {
-    dir = mkdtempSync(join(tmpdir(), "dsm-link-probe-"));
-    const targetFile = join(dir, "target.txt");
-    const targetDir = join(dir, "target-dir");
-    writeFileSync(targetFile, "dsm-link-probe");
-    mkdirSync(targetDir);
-    for (const kind of kinds) {
-      try {
-        const target = kind === "file" ? targetFile : targetDir;
-        const link = join(dir, `link-${kind}`);
-        symlinkSync(target, link, kind);
-        if (
-          !lstatSync(link).isSymbolicLink() ||
-          realpathSync(link) !== realpathSync(target)
-        ) {
-          throw new Error("link did not resolve to the probe target");
-        }
-        if (
-          kind === "file" &&
-          readFileSync(link, "utf8") !== "dsm-link-probe"
-        ) {
-          throw new Error("file link was not readable");
-        }
-        results.push({ id: kind, verdict: "PASS" });
-      } catch (error) {
-        results.push({ id: kind, verdict: "NOT RUN", reason: String(error) });
-      }
-    }
-  } catch (error) {
-    for (const kind of kinds)
-      results.push({ id: kind, verdict: "NOT RUN", reason: String(error) });
-  } finally {
-    if (dir) {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch (error) {
-        results.push({ id: "cleanup", verdict: "FAIL", reason: String(error) });
-      }
-    }
-  }
-  return results;
-}
-
 export function runRustGate() {
-  const capabilities = probeLinks();
   const result = spawnSync("cargo", cargoArgs, {
     cwd: root,
     encoding: "utf8",
@@ -106,18 +45,14 @@ export function runRustGate() {
   const stderr = String(result.stderr ?? "");
   const output = `${stdout}\n${stderr}`;
   const markers = hasNotRun(output);
-  const missingCapability = capabilities.some(
-    (item) => item.verdict === "NOT RUN",
-  );
-  // Missing prerequisites or legacy early-return markers make claimed pass counts untrustworthy.
-  // Preserve raw output, but do not promote its libtest PASS count to evidence.
-  const counts = markers || missingCapability ? null : parseCounts(output);
+  // Explicitly missing scenarios invalidate the claimed libtest pass count.
+  const counts = markers ? null : parseCounts(output);
   const verdict =
     result.error || result.signal || result.status === null
       ? "ERROR"
       : result.status !== 0
         ? "FAIL"
-        : markers || missingCapability
+        : markers
           ? "NOT RUN"
           : !counts ||
               counts.tests === 0 ||
@@ -125,54 +60,37 @@ export function runRustGate() {
               counts.failed > 0
             ? "ERROR"
             : "PASS";
-  const rust = {
-    command: "cargo",
-    args: cargoArgs,
-    code: result.status,
-    signal: result.signal ?? null,
-    error: result.error ? String(result.error) : null,
-    stdout,
-    stderr,
-    verdict,
-    counts,
-  };
-  const all = [...capabilities.map((item) => item.verdict), verdict];
-  const overall = all.includes("ERROR")
-    ? "ERROR"
-    : all.includes("FAIL")
-      ? "FAIL"
-      : all.includes("NOT RUN")
-        ? "NOT RUN"
-        : "PASS";
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    scope: "deepseek-account",
     platform: process.platform,
-    capabilities,
-    rust,
-    verdict: overall,
+    rust: {
+      command: "cargo",
+      args: cargoArgs,
+      code: result.status,
+      signal: result.signal ?? null,
+      error: result.error ? String(result.error) : null,
+      stdout,
+      stderr,
+      verdict,
+      counts,
+    },
+    verdict,
   };
 }
 
-// The release record must fail closed if its structured evidence is absent,
-// malformed, or disagrees with the child process exit status.
+// Fail closed on absent/malformed evidence, stale Agent-era logs, or mismatched
+// exit status. A successful command with no executed assertions is not a pass.
 export function readRustGateLog(path, code) {
   try {
     const log = JSON.parse(readFileSync(path, "utf8"));
     const expected = { PASS: 0, FAIL: 1, "NOT RUN": 2, ERROR: 4 };
-    if (log.schemaVersion !== 1 || expected[log.verdict] !== code) return null;
-    const kinds =
-      log.platform === "win32" ? ["file", "dir", "junction"] : ["file", "dir"];
-    if (!Array.isArray(log.capabilities) || !log.rust) return null;
     if (
-      !kinds.every(
-        (id) => log.capabilities.filter((item) => item.id === id).length === 1,
-      )
-    )
-      return null;
-    if (
-      !log.capabilities.every((item) =>
-        ["PASS", "FAIL", "NOT RUN"].includes(item.verdict),
-      )
+      log.schemaVersion !== 2 ||
+      log.scope !== "deepseek-account" ||
+      expected[log.verdict] !== code ||
+      !log.rust ||
+      log.verdict !== log.rust.verdict
     )
       return null;
     const rust = log.rust;
@@ -187,6 +105,7 @@ export function readRustGateLog(path, code) {
       return null;
     if (rust.counts !== null) {
       if (
+        !rust.counts ||
         !["passed", "failed", "ignored", "tests"].every(
           (key) =>
             Number.isSafeInteger(rust.counts[key]) && rust.counts[key] >= 0,
@@ -205,15 +124,7 @@ export function readRustGateLog(path, code) {
     )
       return null;
     if (rust.verdict === "NOT RUN" && rust.counts !== null) return null;
-    const all = [...log.capabilities.map((item) => item.verdict), rust.verdict];
-    const verdict = all.includes("ERROR")
-      ? "ERROR"
-      : all.includes("FAIL")
-        ? "FAIL"
-        : all.includes("NOT RUN")
-          ? "NOT RUN"
-          : "PASS";
-    return verdict === log.verdict ? log : null;
+    return log;
   } catch {
     return null;
   }
@@ -233,10 +144,6 @@ if (
   console.log(
     `Rust gate platform: ${log.platform} (Windows-only assertions require Windows)`,
   );
-  for (const item of log.capabilities)
-    console.log(
-      `${item.verdict}: link capability ${item.id}${item.reason ? `: ${item.reason}` : ""}`,
-    );
   process.stdout.write(log.rust.stdout);
   process.stderr.write(log.rust.stderr);
   if (log.rust.error) console.error(log.rust.error);

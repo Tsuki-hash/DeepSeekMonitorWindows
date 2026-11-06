@@ -35,11 +35,27 @@ export const subscribeCommittedConfig = (listener: () => void) => {
   };
 };
 
+// Equal versions are idempotent only when every public field is equal. Never let
+// a caller display a different snapshot that the shared store did not accept.
+function requireSameSnapshot(left: AppConfig, right: AppConfig) {
+  const fields = (config: AppConfig) => [
+    config.configRevision, config.apiKeyRevision, config.usageTokenRevision,
+    config.configWarnings ?? [], config.configReadError ?? null,
+    config.apiKeyConfigured, config.apiKeyPreview, config.usageTokenConfigured,
+    config.refreshIntervalSeconds, config.autoRefreshEnabled,
+    config.autostart, config.configPath,
+  ];
+  if (JSON.stringify(fields(left)) !== JSON.stringify(fields(right)))
+    throw new Error("配置版本与快照内容不一致，请重新读取配置");
+}
+
 /** Accept only a newer whole backend snapshot. Equal events/responses are idempotent. */
 export const setCommittedConfig = (
   config: AppConfig | null,
   balance?: BalanceData,
 ): boolean => {
+  if (config && current && config.configRevision === current.configRevision)
+    requireSameSnapshot(config, current);
   const newer =
     !config || !current || config.configRevision > current.configRevision;
   // A later preference/Token commit may have arrived first. Its whole snapshot
@@ -73,8 +89,10 @@ export const applyReadConfig = (
   if (startedAt !== commitRevision) return false;
   if (config && current && config.configRevision < current.configRevision)
     return false;
-  if (config && current && config.configRevision === current.configRevision)
+  if (config && current && config.configRevision === current.configRevision) {
+    requireSameSnapshot(config, current);
     return true;
+  }
   current = config;
   if (!config || validatedBalance?.revision !== config.apiKeyRevision)
     validatedBalance = null;
