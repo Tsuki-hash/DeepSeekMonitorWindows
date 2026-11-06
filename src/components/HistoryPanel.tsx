@@ -2,6 +2,7 @@ import React from "react";
 import { HistoryTrend } from "./HistoryTrend";
 import { ArrowLeft, Download, RefreshCw } from "lucide-react";
 import { todayStr, fmtTokensShort, fmtMoneyDisplay, mmdd } from "../format";
+import { historyDateLabel } from "../history-date-label";
 import { updateTime, snapshotAge } from "../data-display";
 import { fetchMonthUsage } from "../usage-api";
 import { historyCache } from "../history-cache";
@@ -32,16 +33,9 @@ const valueText = (value: number | null, metric: "totalTokens" | "cost") =>
       ? fmtMoneyDisplay(value)
       : fmtTokensShort(value);
 
-/**
- * 日期显示：跨年范围用完整日期，单年内仍用 `9/11` 短格式。
- *
- * 评审 P2：全部历史用 `mmdd` 会让不同年份的同月日显示成同一个「1/1」，
- * 原始数据与导出都保留完整日期，缺口只在展示。
- */
-const historyDateLabel = (date: string, from: string, to: string) => {
-  const spansYears = from.slice(0, 4) !== to.slice(0, 4);
-  return spansYears ? date : mmdd(date);
-};
+// 日期显示规则在 history-date-label（纯函数，可单测）。
+const dateLabel = (date: string, from: string, to: string) =>
+  historyDateLabel(date, from, to, mmdd);
 
 export function HistoryPanel({
   onBack,
@@ -513,11 +507,7 @@ export function HistoryPanel({
                 monthly={range === "all"}
                 metric={metric}
                 dateLabel={(value) =>
-                  historyDateLabel(
-                    value,
-                    snapshot.window.from,
-                    snapshot.window.to,
-                  )
+                  dateLabel(value, snapshot.window.from, snapshot.window.to)
                 }
               />
             </article>
@@ -587,7 +577,7 @@ export function HistoryPanel({
                   {rows.map((row) => (
                     <tr key={`${row.date}-${row.model.model}`}>
                       <td>
-                        {historyDateLabel(
+                        {dateLabel(
                           row.date,
                           snapshot.window.from,
                           snapshot.window.to,
