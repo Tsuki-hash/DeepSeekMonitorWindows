@@ -17,7 +17,8 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -112,6 +113,13 @@ const version = JSON.parse(
   readFileSync(join(root, "package.json"), "utf8"),
 ).version;
 
+// 复评 T09：集成子用例的底层日志文件（集成入口写入，随后嵌入本记录）。
+// 没有它，外层只能看到汇总表，无法核验每个用例是否真的执行。
+const integrationLogFile = join(
+  tmpdir(),
+  `dsm-integration-log-${process.pid}-${Date.now()}.json`,
+);
+
 /**
  * 唯一门禁清单：与 `scripts/verify.ps1` 保持一致（复评 R12）。
  *
@@ -150,7 +158,14 @@ const checks = [
     true,
   ],
   // 复评 R12：集成与依赖审计也必须进入记录，否则发布结论覆盖不全。
-  ["引擎集成测试", "node", ["scripts/run-integration-tests.mjs"], true],
+  // 复评 T09：把集成入口自己的逐用例日志落盘，再嵌入发布记录，
+  // 否则外层只能看到汇总表，无法核验每个用例是否真的执行。
+  [
+    "引擎集成测试",
+    "node",
+    ["scripts/run-integration-tests.mjs", "--log-file", integrationLogFile],
+    true,
+  ],
   ["依赖审计", "node", ["scripts/audit-dependencies.mjs"], true],
 ];
 
@@ -224,13 +239,15 @@ lines.push("### 完整输出");
 lines.push("");
 lines.push("> 审计需要原始 stdout/stderr，不截断；成功命令的 stderr 也保留。");
 lines.push("");
-for (const { label, result, verdict } of checkResults) {
+for (const { label, command, commandArgs, result, verdict } of checkResults) {
   lines.push(
     `<details><summary>${label} — ${verdict}（退出码 ${result.code}）</summary>`,
   );
   lines.push("");
   lines.push("```text");
-  lines.push(`[command] ${result.command ?? ""}`);
+  // 复评 T09：command/commandArgs 在外层解构对象上，不在 result 里；
+  // 记录必须能重建真实调用（可重放）。
+  lines.push(`[command] ${command} ${commandArgs.join(" ")}（cwd: ${root}）`);
   lines.push((result.stdout || "(stdout 为空)").trim());
   lines.push("");
   lines.push("[stderr]");
@@ -241,6 +258,34 @@ for (const { label, result, verdict } of checkResults) {
   lines.push("");
 }
 
+// 复评 T09：把集成子用例日志嵌入发布记录 —— PASS/FAIL/NOT RUN 都可核验执行数。
+if (existsSync(integrationLogFile)) {
+  try {
+    const integration = JSON.parse(readFileSync(integrationLogFile, "utf8"));
+    lines.push("## 引擎集成子用例日志");
+    lines.push("");
+    for (const item of integration.results ?? []) {
+      lines.push(
+        `<details><summary>${item.fullName}（退出码 ${item.code}）</summary>`,
+      );
+      lines.push("");
+      lines.push("```text");
+      lines.push(`[command] ${item.command} ${(item.args ?? []).join(" ")}`);
+      lines.push((item.stdout || "(stdout 为空)").trim());
+      lines.push("");
+      lines.push("[stderr]");
+      lines.push((item.stderr || "(stderr 为空)").trim());
+      lines.push("```");
+      lines.push("");
+      lines.push("</details>");
+      lines.push("");
+    }
+  } catch (error) {
+    lines.push(
+      `⚠ 引擎集成子用例日志无法读取：${error.message}。外层输出仍保留在上方。`,
+    );
+  }
+}
 lines.push("## 安装包");
 lines.push("");
 let installerStatus = "missing";
@@ -296,6 +341,15 @@ if (out) {
 } else {
   console.log(text);
 }
+// 复评 T09：临时集成日志用完即删，清理失败不影响结论。
+try {
+  if (existsSync(integrationLogFile)) {
+    rmSync(integrationLogFile, { force: true });
+  }
+} catch {
+  /* 清理失败不影响结论 */
+}
+
 // 失败必须传播到退出码；NOT RUN 在发版语境下同样不放行。
 if (failures.length) {
   console.error(`失败项：${failures.join("、")}`);

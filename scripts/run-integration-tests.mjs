@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 // 显式运行被 #[ignore] 标记的引擎集成测试。
 //
-// 复评 F20：`cargo test --lib` 默认跳过 4 项集成测试，把 ignored 当成通过是假绿灯。
+// 复评 F20/R15：`cargo test --lib` 默认跳过 4 项集成测试；只写已实测验证的格式，
+// 覆盖不足的用例明确 NOT RUN，不伪造、不冒充通过。
 //
-// 复评 R15：原入口只接受外部目录，`SECOND_HOME` 缺省时退化成同一目录，
-// 「双主目录」用例要求两个不同来源，去重后必然只剩一份；注释声称生成 fixture
-// 但实际没有生成。
+// 复评 T01：cargo test --exact 需要**全限定名**（如 `local_usage::tests::xxx`）。
+// 传裸函数名会 `running 0 tests` 并以退出码 0 结束 —— 原脚本仅凭退出码判 PASS，
+// 于是零执行也被当成通过。现在：先用 `--list` 枚举真实全名并要求唯一匹配，
+// 再逐项校验「实际执行数恰好 1 且 failed=0」，零执行一律 NOT RUN。
 //
-// 复评 R15（本版）：三项 local_usage 集成用例都要求**六款工具**的合成记录，
-// 而各工具的真实格式差异很大（OpenCode 用 storage/message、DSH 用 zstd 压缩的
-// jsonl.v4、Hermes/OpenClaw 依赖自有存储）。本脚本只保证已实测验证的格式，
-// 其余**明确声明未覆盖**，逐用例给出 PASS / FAIL / NOT RUN，绝不把
-// 「fixture 不够」记成「产品回归」或「通过」。
+// 复评 T02：分类顺序是 FAIL 优先 —— `0 passed; 1 failed` 是真实失败，
+// 不得因出现 "0 passed" 被归为 NOT RUN。工具本身没跑起来（cargo 缺失等）是 ERROR。
+//
+// 复评 T09：每个子用例都保留完整命令、参数、退出码与 stdout/stderr，
+// 可用 `--log-file <path>` 落盘，供发布记录重建真实调用。
+//
+// 复评 T10：合成记录的时间戳从**执行时钟**生成（当月 15 日中午），
+// 不再写死 2026-11-01；探针与用例查询同月，跨月不会无产品变更地失败。
 //
 // 退出码：0 全部 PASS / 1 有用例 FAIL / 2 有用例 NOT RUN / 3 配置或 fixture 错误
+//        4 工具执行错误（cargo 缺失、编译失败等，结论未知）
 
 import { spawnSync } from "node:child_process";
 import {
@@ -29,18 +35,14 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const keep = process.argv.includes("--keep");
+const logArgIndex = process.argv.indexOf("--log-file");
+const logFile = logArgIndex >= 0 ? process.argv[logArgIndex + 1] : undefined;
 const engine = join(root, "src-tauri/resources/local-usage/tokscale.exe");
 
-/**
- * 已用固定引擎实测验证可解析的工具与格式。
- *
- * 只有 Claude Code 的 `<home>/.claude/projects/<project>/<session>.jsonl`
- * 被确认能产出 input=100 / cacheRead=10 / output=20 的记录。
- * 其余工具的写入格式未经验证，写「看起来像」的数据只会让用例失败并误导排查。
- */
+/** 已用固定引擎实测验证可解析的工具与格式。 */
 const VERIFIED_TOOLS = ["claude"];
 
-/** 需要六款工具完整 fixture 的用例：在只覆盖 Claude 时必然 NOT RUN。 */
+/** 需要六款工具完整 fixture 的用例：只覆盖 Claude 时必然 NOT RUN。 */
 const FULL_MATRIX_TESTS = [
   "五工具单路径真实引擎与部分失败",
   "双主目录真实引擎合并_部分失败不当零",
@@ -49,13 +51,25 @@ const FULL_MATRIX_TESTS = [
 
 const TOKENS = { input: 100, cacheRead: 10, output: 20 };
 
+/**
+ * 合成记录时间戳（复评 T10）：直接取**当前时刻**。
+ *
+ * 引擎的 `--month` 语义是「当月至今」（实测：未来日期会被排除），
+ * 所以时间戳必须既在当月、又不晚于现在 —— 只有「现在」永远满足。
+ * 写死日期（如 2026-11-01）会在跨月后无产品变更地失败。
+ * 每次调用 cargo 前都会重写 fixture，月界跨越也以当前时钟为准。
+ */
+function fixtureTimestamp() {
+  return new Date().toISOString();
+}
+
 /** Claude Code 的 JSONL 行格式（已实测）。 */
-function claudeLine({ sessionId, cwd, timestamp, id }) {
+function claudeLine({ sessionId, cwd, id }) {
   return JSON.stringify({
     type: "assistant",
     sessionId,
     cwd,
-    timestamp,
+    timestamp: fixtureTimestamp(),
     message: {
       id,
       model: "deepseek-flash",
@@ -78,7 +92,6 @@ function buildHome(dir, tag) {
     claudeLine({
       sessionId: `session-${tag}`,
       cwd: project,
-      timestamp: "2026-11-01T10:00:00Z",
       id: `msg-${tag}`,
     }) + "\n",
   );
@@ -93,6 +106,12 @@ function buildHome(dir, tag) {
   }
   return dir;
 }
+
+const cargoEnv = () => ({
+  ...process.env,
+  DSM_TEST_LOCAL_USAGE_HOME: fixture.home,
+  DSM_TEST_LOCAL_USAGE_SECOND_HOME: fixture.second,
+});
 
 /** 用引擎解析一次，返回记录数；失败返回 null。 */
 function probeEngine(home) {
@@ -126,6 +145,33 @@ function probeEngine(home) {
   } catch {
     return null;
   }
+}
+
+/** 复评 T01：枚举 ignored 用例的**全限定名**。 */
+function listIgnoredTests() {
+  const result = spawnSync(
+    "cargo",
+    [
+      "test",
+      "--manifest-path",
+      "src-tauri/Cargo.toml",
+      "--lib",
+      "--",
+      "--ignored",
+      "--list",
+    ],
+    { cwd: root, encoding: "utf8", shell: process.platform === "win32" },
+  );
+  if (result.status !== 0) {
+    return { error: `cargo --list 退出码 ${result.status}` };
+  }
+  // 形如 `local_usage::tests::名称: test`
+  const names = String(result.stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.endsWith(": test"))
+    .map((line) => line.slice(0, -": test".length));
+  return { names };
 }
 
 const externalHome = process.env.DSM_TEST_LOCAL_USAGE_HOME;
@@ -176,8 +222,9 @@ if (!existsSync(engine)) {
   process.exit(2);
 }
 
-if (!fullMatrix) {
-  // 校验 fixture 与当前引擎格式仍匹配：格式漂移要报 FIXTURE 错误而非产品回归。
+// 复评 T10：无论哪种模式，先确认 fixture 里有**当月**数据可被引擎解析。
+// 探针失败是配置/格式问题（退出码 3），不是产品回归，也不会伪装成通过。
+{
   const rows = probeEngine(fixture.home);
   if (rows == null) {
     console.error("fixture 错误：引擎无法解析生成的合成目录。");
@@ -197,98 +244,192 @@ if (!fullMatrix) {
   console.log(`fixture 校验通过：单目录解析 ${rows} 条记录。`);
 }
 
-/**
- * 逐用例运行：只跑能判定的用例，其余明确 NOT RUN。
- *
- * `cargo test --lib -- --ignored --exact <name>` 用于单个用例；
- * 只覆盖 Claude 时，六工具矩阵用例不可能通过，直接归为 NOT RUN。
- */
-const runTest = (name) => {
-  const result = spawnSync(
-    "cargo",
-    [
-      "test",
-      "--manifest-path",
-      "src-tauri/Cargo.toml",
-      "--lib",
-      "--",
-      "--ignored",
-      "--exact",
-      name,
-      "--nocapture",
-    ],
-    {
-      cwd: root,
-      encoding: "utf8",
-      shell: process.platform === "win32",
-      maxBuffer: 32 * 1024 * 1024,
-      env: {
-        ...process.env,
-        DSM_TEST_LOCAL_USAGE_HOME: fixture.home,
-        DSM_TEST_LOCAL_USAGE_SECOND_HOME: fixture.second,
-      },
-    },
-  );
+/** 复评 T01：解析 `test result:` 行，得到实际执行数与失败数。 */
+function parseResultLine(text) {
+  // 例：test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 195 filtered out
+  const match =
+    /test result:\s*\w+\.?\s*(\d+) passed;\s*(\d+) failed;\s*(\d+) ignored/.exec(
+      text,
+    );
+  if (!match) return null;
   return {
-    code: typeof result.status === "number" ? result.status : 1,
-    stdout: String(result.stdout ?? ""),
-    stderr: String(result.stderr ?? ""),
+    passed: Number(match[1]),
+    failed: Number(match[2]),
+    ignored: Number(match[3]),
   };
-};
+}
 
-const results = [];
-const allTests = [
+const logs = [];
+
+/**
+ * 运行单个用例并按证据分类。
+ *
+ * 复评 T01/T02：PASS 要求「实际执行数恰好 1、failed=0、退出码 0」；
+ * 失败优先于 NOT RUN；工具没跑起来是 ERROR。
+ */
+function runTest(fullName) {
+  const args = [
+    "test",
+    "--manifest-path",
+    "src-tauri/Cargo.toml",
+    "--lib",
+    "--",
+    "--ignored",
+    "--exact",
+    fullName,
+    "--nocapture",
+  ];
+  const result = spawnSync("cargo", args, {
+    cwd: root,
+    encoding: "utf8",
+    shell: process.platform === "win32",
+    maxBuffer: 32 * 1024 * 1024,
+    env: cargoEnv(),
+  });
+  const code = typeof result.status === "number" ? result.status : 1;
+  const stdout = String(result.stdout ?? "");
+  const stderr = String(result.stderr ?? "");
+  const entry = {
+    fullName,
+    command: "cargo",
+    args,
+    cwd: root,
+    code,
+    stdout,
+    stderr,
+  };
+  logs.push(entry);
+
+  // 工具执行错误：cargo 没跑起来或编译失败，结论未知（复评 T02）。
+  if (code !== 0 && code !== 101) {
+    return { ...entry, verdict: "ERROR", reason: `cargo 退出码 ${code}` };
+  }
+  const counts = parseResultLine(stdout);
+  if (!counts) {
+    // 没有可解析的结果行：既不能算 PASS 也不能算 FAIL。
+    return {
+      ...entry,
+      verdict: "ERROR",
+      reason: "无法从输出解析 test result 行",
+    };
+  }
+  const executed = counts.passed + counts.failed;
+  // 复评 T02：失败优先判定 —— `0 passed; 1 failed` 是真实回归。
+  if (counts.failed > 0 || (code === 101 && executed > 0)) {
+    return { ...entry, verdict: "FAIL", reason: `${counts.failed} failed` };
+  }
+  // 复评 T01：零执行（如用例名不匹配）不能 PASS。
+  if (executed === 0) {
+    return { ...entry, verdict: "NOT RUN", reason: "实际执行 0 个测试" };
+  }
+  if (executed > 1) {
+    return {
+      ...entry,
+      verdict: "ERROR",
+      reason: `筛选匹配到 ${executed} 个测试，结果有歧义`,
+    };
+  }
+  if (code !== 0) {
+    return { ...entry, verdict: "FAIL", reason: `退出码 ${code}` };
+  }
+  return { ...entry, verdict: "PASS" };
+}
+
+// 复评 T01：先把期望用例名解析成全限定名，要求唯一匹配。
+const listed = listIgnoredTests();
+if (listed.error) {
+  console.error(`工具执行错误：${listed.error}`);
+  if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+  process.exit(4);
+}
+const expectedNames = [
   ...FULL_MATRIX_TESTS,
   "pinned_engine_and_adapter_known_counts_match",
 ];
-for (const name of allTests) {
-  const needsFullMatrix = FULL_MATRIX_TESTS.includes(name);
+const resolved = [];
+for (const name of expectedNames) {
+  const matches = (listed.names ?? []).filter(
+    (full) => full === name || full.endsWith(`::${name}`),
+  );
+  if (matches.length !== 1) {
+    // 名字对不上是脚本/上游漂移，不是产品回归：明确 CONFIG 错误。
+    console.error(
+      `配置错误：用例「${name}」匹配到 ${matches.length} 个测试（期望 1）。请核对脚本中的用例名。`,
+    );
+    if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+    process.exit(3);
+  }
+  resolved.push({ shortName: name, fullName: matches[0] });
+}
+
+const results = [];
+for (const { shortName, fullName } of resolved) {
+  const needsFullMatrix = FULL_MATRIX_TESTS.includes(shortName);
   if (needsFullMatrix && !fullMatrix) {
     results.push({
-      name,
+      fullName,
       verdict: "NOT RUN",
       reason: `fixture 只覆盖 ${VERIFIED_TOOLS.join("、")}，该用例需要六款工具`,
     });
     continue;
   }
-  const outcome = runTest(name);
-  if (outcome.code === 0) {
-    results.push({ name, verdict: "PASS" });
-  } else if (
-    outcome.code === 101 &&
-    /no tests matched|0 passed|0 filtered/i.test(
-      outcome.stdout + outcome.stderr,
-    )
-  ) {
-    // 用例名不匹配（上游改名）与真实失败要分开。
-    results.push({ name, verdict: "NOT RUN", reason: "用例名未匹配" });
-  } else {
-    results.push({ name, verdict: "FAIL", reason: `退出码 ${outcome.code}` });
-    process.stderr.write(outcome.stdout);
-    process.stderr.write(outcome.stderr);
-  }
+  results.push(runTest(fullName));
 }
 
+// 复评 T09：无论结论如何都输出完整结果表与底层日志。
 console.log("");
 console.log("| 用例 | 结论 | 说明 |");
 console.log("| - | - | - |");
 for (const item of results) {
-  console.log(`| ${item.name} | ${item.verdict} | ${item.reason ?? "-"} |`);
+  console.log(`| ${item.fullName} | ${item.verdict} | ${item.reason ?? "-"} |`);
+}
+console.log("");
+for (const item of results) {
+  if (item.verdict === "NOT RUN" && !item.command) continue; // 未运行的用例没有日志
+  console.log(
+    `=== ${item.fullName}（${item.verdict}，退出码 ${item.code}）===`,
+  );
+  console.log(`[command] ${item.command} ${item.args.join(" ")}`);
+  console.log("[stdout]");
+  console.log(item.stdout.trim() || "(stdout 为空)");
+  console.log("[stderr]");
+  console.log(item.stderr.trim() || "(stderr 为空)");
+  console.log("");
+}
+
+if (logFile) {
+  writeFileSync(
+    resolve(logFile),
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        fixture: { home: fixture.home, second: fixture.second },
+        results: logs,
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(`已写入集成日志：${resolve(logFile)}`);
 }
 
 if (keep && cleanup) console.log(`已保留 fixture：${cleanup}`);
 else if (cleanup) rmSync(cleanup, { recursive: true, force: true });
 
+const errors = results.filter((item) => item.verdict === "ERROR");
 const failed = results.filter((item) => item.verdict === "FAIL");
 const notRun = results.filter((item) => item.verdict === "NOT RUN");
-if (failed.length) {
+if (errors.length) {
+  console.error(`\n工具执行错误 ${errors.length} 项：结论未知，不能算通过。`);
+  process.exitCode = 4;
+} else if (failed.length) {
   console.error(
     `\n集成测试失败 ${failed.length} 项：不能把 ignored 项当作通过。`,
   );
   process.exitCode = 1;
 } else if (notRun.length) {
   console.error(
-    `\n集成测试未完整运行：${notRun.length} 项 NOT RUN（fixture 覆盖不足）。发版前必须补齐。`,
+    `\n集成测试未完整运行：${notRun.length} 项 NOT RUN。发版前必须补齐。`,
   );
   process.exitCode = 2;
 } else {
