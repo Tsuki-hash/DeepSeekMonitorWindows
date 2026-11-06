@@ -493,9 +493,10 @@ function SettingsPanel({
           <p>开启后，每次登录 Windows 时自动启动 DeepSeek Monitor。</p>
           <Toggle
             label="登录时自动启动"
-            checked={autostart}
+            // 复评 N12：配置未知时禁用，不展示猜测的默认值。
+            checked={autostart ?? false}
             onChange={saveAutostart}
-            disabled={busy}
+            disabled={busy || autostart === null}
           />
           {settingErrors.autostart && (
             <p className="muted" role="alert">
@@ -508,13 +509,19 @@ function SettingsPanel({
           <p>开启后，按设定周期自动从 DeepSeek API 拉取最新数据。</p>
           <Toggle
             label="启用自动刷新"
-            checked={autoRefresh}
+            // 复评 N12：配置未知时禁用，避免用默认值无意改变 App 调度。
+            checked={autoRefresh ?? false}
             onChange={saveAutoRefreshEnabled}
-            disabled={busy}
+            disabled={busy || autoRefresh === null}
           />
           {settingErrors.autoRefresh && (
             <p className="muted" role="alert">
               {settingErrors.autoRefresh}
+            </p>
+          )}
+          {autoRefresh === null && (
+            <p className="muted" role="status">
+              尚未取得可信的自动刷新配置，开关已禁用
             </p>
           )}
           {autoRefresh && (

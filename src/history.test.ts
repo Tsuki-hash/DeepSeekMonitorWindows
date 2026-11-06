@@ -490,3 +490,28 @@ test("R17：跨模型 Token 合计溢出返回 null，金额保留小数", () =>
   // 空数组未知。
   assert.equal(safeKnownSum([], "totalTokens"), null);
 });
+
+// ---------- 第九轮复评 N16：极端金额累计溢出 ----------
+
+test("N16：金额累计溢出为未知，且不会把 1e308+1e308 当正常金额", () => {
+  const model = (cost: number) => ({
+    model: "deepseek-flash",
+    groupKey: "flash",
+    totalTokens: 0,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: 0,
+    otherTokens: 0,
+    cost,
+  });
+  const summed = safeKnownSum([model(1e308), model(1e308)], "cost");
+  assert.equal(
+    summed,
+    null,
+    "1e308 + 1e308 溢出为 Infinity，必须返回未知而不是 Infinity",
+  );
+  // 正常小数仍可用。
+  const ok = safeKnownSum([model(0.1), model(0.2)], "cost");
+  assert.ok(ok != null && Math.abs(ok - 0.3) < 1e-9);
+});

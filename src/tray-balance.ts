@@ -14,6 +14,9 @@ export class TrayBalancePublisher {
   private active = true;
   private starting = false;
   private session: number | null = null;
+  /** 复评 N13：发布失败后的有界退避状态与唯一待重试 timer。 */
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryDelay = 0;
   private revision = 0;
   private latest: TrayBalance | null = null;
   constructor(transport: Transport) {
@@ -48,13 +51,38 @@ export class TrayBalancePublisher {
   }
   stop() {
     this.active = false;
+    // 复评 N13：销毁时取消待重试，不留 timer。
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
   }
   private publish() {
     if (!this.active || this.session === null || !this.latest) return;
+    // 复评 N13：发布失败必须**重试**。旧实现 `.catch(() => undefined)` 直接吞掉
+    // 失败：原生 set_text/tooltip 一次失败后，若凭据已清除又没有新变化，
+    // 托盘会长期停留在旧金额且没有任何补救。
+    // 这里用单飞 + 有界退避 + 最新代际：成功才结束，失败按 1/2/4/8/16 秒
+    //（上限 30 秒）重试；期间有更新的发布则用最新值重试，旧值不覆盖新值。
+    const revision = this.revision;
     void this.transport("update_tray_balance", {
       session: this.session,
-      revision: this.revision,
+      revision,
       ...this.latest,
-    }).catch(() => undefined);
+    })
+      .then(() => {
+        if (revision === this.revision) this.retryDelay = 0;
+      })
+      .catch(() => this.scheduleRetry());
+  }
+  private scheduleRetry() {
+    if (!this.active || this.retryTimer !== null) return;
+    // 有界退避：1s 起，逐次翻倍，上限 30s。持续失败只保留一个 timer。
+    this.retryDelay =
+      this.retryDelay === 0 ? 1000 : Math.min(this.retryDelay * 2, 30_000);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.publish();
+    }, this.retryDelay);
   }
 }

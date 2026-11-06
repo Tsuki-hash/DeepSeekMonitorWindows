@@ -182,6 +182,9 @@ export function safeKnownSum(
     const value = model[field]!;
     if (!Number.isFinite(value)) return null;
     sum += value;
+    // 复评 N16：**累计值**也必须每步检查 —— 金额 1e308 + 1e308 会得到
+    // Infinity，旧实现只校验各输入有限，会把溢出当成正常金额展示。
+    if (!Number.isFinite(sum)) return null;
     if (field !== "cost" && (!Number.isSafeInteger(sum) || sum < 0))
       return null;
   }

@@ -30,6 +30,8 @@ export function localExport(
       sourceId: row.sourceId || "native",
       sourceLabel: row.sourceLabel || "本机",
       tool: row.tool,
+      // 复评 N01：导出保留 client 身份，避免镜像与原生会话在导出中不可区分。
+      clientId: row.clientId || row.tool,
       sessionId: row.sessionId,
       model: row.model,
       ...localEvidence(row),
@@ -85,6 +87,7 @@ export function localExport(
     "sourceId",
     "sourceLabel",
     "tool",
+    "clientId",
     "sessionId",
     "model",
     "tokenAccuracy",

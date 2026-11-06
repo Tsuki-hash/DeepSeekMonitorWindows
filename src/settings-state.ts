@@ -62,9 +62,10 @@ export type SettingsState = {
   setApiKey: (value: string) => void;
   usageToken: string;
   setUsageToken: (value: string) => void;
-  refresh: number;
-  autoRefresh: boolean;
-  autostart: boolean;
+  // 复评 N12：`null` 表示**尚未取得可信配置**（控件应禁用，不猜默认值）。
+  refresh: number | null;
+  autoRefresh: boolean | null;
+  autostart: boolean | null;
   usageStatus: string;
   settingErrors: Partial<
     Record<"refresh" | "autoRefresh" | "autostart", string>
@@ -113,9 +114,21 @@ export function useSettingsState(handlers: {
   const [settingErrors, setSettingErrors] = React.useState<
     SettingsState["settingErrors"]
   >({});
-  const [refresh, setRefresh] = React.useState(60);
-  const [autoRefresh, setAutoRefresh] = React.useState(false);
-  const [autostart, setAutostart] = React.useState(false);
+  // 复评 N12：控件初值必须从**已提交快照**派生，而不是写死默认值。
+  // 旧实现只让 `config` 从缓存初始化，refresh/autoRefresh/autostart 仍从
+  // 60/false/false 起步 —— 重挂载后即使已有已提交的 1800/true/true，
+  // 控件也显示默认值且可操作（读失败时更会误导用户以为设置被重置）。
+  // 无缓存时用 `null` 表示**未知**，控件据此禁用而不是猜测默认值。
+  const initial = getCommittedConfig();
+  const [refresh, setRefresh] = React.useState<number | null>(
+    initial ? initial.refreshIntervalSeconds || 60 : null,
+  );
+  const [autoRefresh, setAutoRefresh] = React.useState<boolean | null>(
+    initial ? initial.autoRefreshEnabled : null,
+  );
+  const [autostart, setAutostart] = React.useState<boolean | null>(
+    initial ? initial.autostart : null,
+  );
   const [usageToken, setUsageToken] = React.useState("");
   const [usageStatus, setUsageStatus] = React.useState("");
   const [usageSyncing, setUsageSyncing] = React.useState(false);
@@ -258,12 +271,16 @@ export function useSettingsState(handlers: {
 
   const clearApiKey = React.useCallback(() => {
     const operation = beginApiKeyOperation();
+    // 复评 N11：记录清除开始时的草稿值 —— 清除成功返回时若无条件 `setApiKey("")`
+    // 会把用户在清除期间新输入的值抹掉（实跑已复现）。只在草稿未变时清空，
+    // 否则保留新输入并提示尚未保存。
+    const draftAtStart = apiKey;
     setBusy(true);
     void invoke<AppConfig>("clear_api_key")
       .then((nextConfig) => {
         if (!isCurrentApiKeyOperation(operation)) return;
         setCommittedConfig(nextConfig);
-        setApiKey("");
+        setApiKey((current) => (current === draftAtStart ? "" : current));
         setStatus("已清除 API Key");
         onBalanceCleared();
       })
@@ -272,7 +289,7 @@ export function useSettingsState(handlers: {
         setStatus(errorMessage(error));
       })
       .finally(() => setBusy(false));
-  }, [onBalanceCleared]);
+  }, [onBalanceCleared, apiKey]);
 
   const pasteUsageToken = React.useCallback(async () => {
     try {
@@ -337,11 +354,13 @@ export function useSettingsState(handlers: {
   }, [usageToken]);
 
   const clearUsageToken = React.useCallback(() => {
+    // 复评 N11：与 clearApiKey 同一规则（保留清除期间的新输入）。
+    const draftAtStart = usageToken;
     setBusy(true);
     void invoke<AppConfig>("clear_usage_token")
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
-        setUsageToken("");
+        setUsageToken((current) => (current === draftAtStart ? "" : current));
         setUsageStatus("已清除用量 Token");
         setUsageSyncing(false);
         onUsageCleared();
@@ -350,7 +369,7 @@ export function useSettingsState(handlers: {
         setUsageStatus(errorMessage(error));
       })
       .finally(() => setBusy(false));
-  }, [onUsageCleared]);
+  }, [onUsageCleared, usageToken]);
 
   const forgetUsageSession = React.useCallback(() => {
     setBusy(true);
@@ -399,8 +418,11 @@ export function useSettingsState(handlers: {
           onRefreshIntervalChanged(nextConfig.refreshIntervalSeconds || 60);
         })
         .catch((error) => {
-          setRefresh(previous);
-          onRefreshIntervalChanged(previous);
+          // 复评 N12：只有可信旧值才回滚（配置未知时控件已禁用）。
+          if (previous !== null) {
+            setRefresh(previous);
+            onRefreshIntervalChanged(previous);
+          }
           setSettingErrors((previous) => ({
             ...previous,
             refresh: errorMessage(error),
@@ -432,8 +454,12 @@ export function useSettingsState(handlers: {
           onAutoRefreshChanged(nextConfig.autoRefreshEnabled);
         })
         .catch((error) => {
-          setAutoRefresh(previous);
-          onAutoRefreshChanged(previous);
+          // 复评 N12：配置未知时控件已禁用、不会走到这里；回滚只在有
+          // 可信旧值时进行，不用 null 覆盖真实值。
+          if (previous !== null) {
+            setAutoRefresh(previous);
+            onAutoRefreshChanged(previous);
+          }
           setSettingErrors((previous) => ({
             ...previous,
             autoRefresh: errorMessage(error),
@@ -461,7 +487,8 @@ export function useSettingsState(handlers: {
           setAutostart(nextConfig.autostart);
         })
         .catch((error) => {
-          setAutostart(previous);
+          // 复评 N12：只有可信旧值才回滚。
+          if (previous !== null) setAutostart(previous);
           setSettingErrors((previous) => ({
             ...previous,
             autostart: errorMessage(error),

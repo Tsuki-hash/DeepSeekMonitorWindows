@@ -631,6 +631,16 @@ export function LocalUsagePanel({
               stale={Boolean(error)}
             />
           )}
+          {enabled && snapshot && snapshot.qualityWarnings?.length ? (
+            // 复评 N03：已知重叠等**质量证据**与「读取是否完整」分开显示 ——
+            // complete 仍为 true，但去重可信度下降，用户不该把重复合计
+            // 当成准确值。这里只展示脱敏 code 的可读说明，不含路径。
+            <p className="data-error" role="alert">
+              {snapshot.qualityWarnings.includes("overlap_partial")
+                ? "部分来源范围重叠：重叠部分的用量可能被重复计入，不能当作去重后的合计"
+                : `数据质量提示：${snapshot.qualityWarnings.join("、")}`}
+            </p>
+          ) : null}
           {enabled && (
             <details className="history-details local-export">
               <summary>

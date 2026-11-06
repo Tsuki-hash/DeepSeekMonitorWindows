@@ -13,6 +13,8 @@ export type LocalRow = {
   sourceLabel?: string;
   id: string;
   tool: string;
+  /** 复评 N01：稳定 client 身份；旧数据缺省时回填 tool。 */
+  clientId?: string;
   sessionId: string;
   projectKey: string | null;
   projectPath: string | null;
@@ -44,6 +46,8 @@ export type LocalSnapshot = {
     state: string;
     message: string | null;
   }[];
+  /** 复评 N03：质量证据（脱敏 code），与 complete 分开。 */
+  qualityWarnings?: string[];
 };
 export type LocalUsageStatus = {
   enabled: boolean;
@@ -102,7 +106,10 @@ export function localProjects(rows: LocalRow[]): LocalGroup[] {
 export function localSessions(rows: LocalRow[]): LocalGroup[] {
   const groups = new Map<string, LocalGroup>();
   for (const row of rows) {
-    const key = `${row.sourceId || "native"}\0${row.tool}\0${row.sessionId}`;
+    // 复评 N01：会话身份必须含 client —— 原生 Claude 与 mirror 可能有
+    // 同名 sessionId，只按 tool 分组会把它们合并成一个会话。
+    const client = row.clientId || row.tool;
+    const key = `${row.sourceId || "native"}\0${row.tool}\0${client}\0${row.sessionId}`;
     if (!groups.has(key))
       groups.set(key, {
         key,
