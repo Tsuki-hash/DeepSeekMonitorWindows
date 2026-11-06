@@ -53,20 +53,48 @@ function audit(extraArgs) {
     const stdout = String(result.stdout ?? "");
     const stderr = String(result.stderr ?? "");
     const code = typeof result.status === "number" ? result.status : 1;
+    const signal = result.signal ?? null;
+    const spawnError = result.error ? String(result.error) : null;
 
-    // npm audit 的退出码语义：0 = 无漏洞；1 = 有漏洞；其他 = 执行失败。
-    // 但「其他」也可能被 npm 用作 1，所以还要看输出能否解析出计数。
-    const found = /found\s+(\d+)\s+vulnerabilit/.exec(stdout);
-    const zero = /found\s+0\s+vulnerabilit/.test(stdout);
-
-    if (zero) {
-      return { state: "clean", code, stdout, stderr };
+    // 复评 F13：**先看进程状态**，再看文本。旧实现只正则匹配 stdout ——
+    // 一个「打印 found 0 vulnerabilities 但退出 42 / 被信号中止 / spawn 出错」
+    // 的子进程会被判成 clean，生产门禁静默放行；而 stderr 也因 `print()`
+    // 二选一而丢失，诊断无从查起。
+    // 现在：
+    // 1. 有 spawn 错误 / 信号 / 非 0/1 退出码 → error（结论未知）；
+    // 2. 退出码 1 是 npm audit 的**合法**「发现漏洞」结果；
+    // 3. 退出码 0 才可能是 clean，且必须文本确认零告警；
+    // 4. 无法解析任何结论 → error。
+    const toolFailure =
+      spawnError != null ||
+      signal != null ||
+      code === null ||
+      (code !== 0 && code !== 1);
+    if (toolFailure) {
+      return { state: "error", code, stdout, stderr, signal, spawnError };
     }
-    if (found) {
-      return { state: "findings", code, stdout, stderr };
+    // 合法 findings：exit 1 且输出里有非零计数（不要求 `found` 前缀 ——
+    // 新版 npm 会输出 `1 high severity vulnerability`）。
+    const zero = /found\s+0\s+vulnerabilit/i.test(stdout);
+    const nonZero =
+      /found\s+[1-9]\d*\s+vulnerabilit/i.test(stdout) ||
+      /(?:^|\n)\s*(\d+)\s+[a-z]+\s+severity\s+vulnerabilit/i.test(stdout) ||
+      // `1 high severity vulnerability` 这类不带 "found" 的汇总行。
+      /(?:^|\n)\s*[1-9]\d*\s+[a-z]+\s+vulnerabilit/i.test(stdout);
+    if (code === 1) {
+      // npm audit 用 exit 1 表示「有漏洞」；文本没给计数也算 findings
+      // （结论方向已由退出码确定），但要保留原始输出供复核。
+      return { state: "findings", code, stdout, stderr, signal, spawnError };
+    }
+    if (code === 0 && zero && !nonZero) {
+      return { state: "clean", code, stdout, stderr, signal, spawnError };
+    }
+    if (code === 0 && nonZero) {
+      // 退出码说没问题、文本说有漏洞：自相矛盾，不能判 clean。
+      return { state: "error", code, stdout, stderr, signal, spawnError };
     }
     // 没有任何可解析结论：审计没跑成功（网络、配置、工具错误）。
-    return { state: "error", code, stdout, stderr };
+    return { state: "error", code, stdout, stderr, signal, spawnError };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -75,8 +103,17 @@ function audit(extraArgs) {
 const print = (label, result) => {
   console.log("");
   console.log(`${label}：${result.state.toUpperCase()}`);
-  const body = result.stdout.trim() || result.stderr.trim() || "(无输出)";
-  console.log(body);
+  // 复评 F13：两个流都要保留 —— 成功命令也可能向 stderr 写警告，
+  // 失败时的诊断往往只在 stderr。旧实现 stdout 有内容就不输出 stderr。
+  if (result.stdout.trim()) console.log(result.stdout.trimEnd());
+  if (result.stderr.trim()) {
+    console.log("[stderr]");
+    console.log(result.stderr.trimEnd());
+  }
+  if (result.signal) console.log(`[signal] ${result.signal}`);
+  if (result.spawnError) console.log(`[spawn error] ${result.spawnError}`);
+  console.log(`[exit] ${result.code}`);
+  if (!result.stdout.trim() && !result.stderr.trim()) console.log("(无输出)");
 };
 
 const production = audit(["--omit=dev"]);

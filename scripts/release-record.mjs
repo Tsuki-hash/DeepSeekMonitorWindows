@@ -32,14 +32,34 @@ const option = (name) => {
 const out = option("out");
 const installer = option("installer");
 
-/** 运行一条命令，始终记录 stdout 与 stderr（复评 R14）。 */
+/**
+ * 运行一条命令，始终记录 stdout 与 stderr（复评 R14）。
+ *
+ * 复评 F12：**只有**确实需要 `.cmd` 包装的命令才启用 shell。
+ * 旧实现对每条命令都设 `shell: process.platform === "win32"`，Node 会把
+ * args 用空格直接拼成一条 cmd 命令串 —— TEMP 含空格（`C:\Users\Jane Doe\...`）
+ * 时，`--log-file C:\Users\Jane Doe\AppData\Local\Temp\...json` 会被拆成两个
+ * 参数，子脚本写到错误位置、外层再报集成日志缺失，合法环境被误阻断。
+ * 现在：
+ * - `node` 用 `process.execPath` 直接启动，不经 shell；
+ * - `git` / `cargo` / `rustc` 直接启动可执行文件；
+ * - 只有 npm / npx 这类 `.cmd` 包装脚本走 shell（它们的参数是固定短选项，
+ *   不含路径），且路径参数一律走 `node` 直启分支。
+ */
+const needsShell = (command) => {
+  if (process.platform !== "win32") return false;
+  return command === "npm" || command === "npx";
+};
+
+const resolveCommand = (command) =>
+  command === "node" ? process.execPath : command;
+
 const run = (command, commandArgs) => {
   const started = Date.now();
-  const result = spawnSync(command, commandArgs, {
+  const result = spawnSync(resolveCommand(command), commandArgs, {
     cwd: root,
     encoding: "utf8",
-    // Windows 上 npm/npx 是 .cmd 包装脚本，需要 shell 解析。
-    shell: process.platform === "win32",
+    shell: needsShell(command),
     maxBuffer: 32 * 1024 * 1024,
   });
   return {
@@ -50,6 +70,9 @@ const run = (command, commandArgs) => {
     stderr:
       String(result.stderr ?? "") + (result.error ? String(result.error) : ""),
     seconds: (Date.now() - started) / 1000,
+    // 复评 F13 的同类要求：进程状态与 spawn 错误必须保留，不能只看 stdout。
+    signal: result.signal ?? null,
+    error: result.error ? String(result.error) : null,
   };
 };
 
