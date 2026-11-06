@@ -157,6 +157,8 @@ export class LeaveDecisionRunner {
   private decisions = new LeaveDecisions();
   private active: { ticket: LeaveTicket; intent: () => void } | null = null;
   private pending: (() => void) | null = null;
+  /** 当前是否处于提交中（跨出口只有一份状态，避免重复的 false 抖动）。 */
+  private submitting = false;
   private readonly getBlocker: () => LeaveBlocker | null;
   private readonly onSubmitting: (value: boolean) => void;
   private readonly onIntentCleared: () => void;
@@ -184,7 +186,10 @@ export class LeaveDecisionRunner {
     this.pending = null;
     if (had) {
       this.onIntentCleared();
-      this.onSubmitting(false);
+      if (this.submitting) {
+        this.submitting = false;
+        this.onSubmitting(false);
+      }
     }
   }
 
@@ -209,7 +214,11 @@ export class LeaveDecisionRunner {
       : null;
     const ticket = this.decisions.begin();
     this.active = { ticket, intent };
-    this.onSubmitting(true);
+    // 跨出口共享同一份「提交中」状态：新决策接管在途保存时不再重复发 true。
+    if (!this.submitting) {
+      this.submitting = true;
+      this.onSubmitting(true);
+    }
     void resolveLeave(wrapped, decision, intent, () =>
       this.decisions.isCurrent(ticket),
     ).then((left) => {
@@ -217,8 +226,13 @@ export class LeaveDecisionRunner {
         // 被取代/取消的旧决策：只清理自身。若已有更新决策在途，
         // 提交状态归它管，这里不得触碰。
         if (!this.active) {
-          this.onSubmitting(false);
-          // 旧保存成功且有待决意图：草稿前提已消失，直接执行最新意图。
+          if (this.submitting) {
+            this.submitting = false;
+            this.onSubmitting(false);
+          }
+          // 旧保存成功且**最新意图尚未开始新决策**：草稿前提已消失，
+          // 直接执行最新意图。若新决策已在途（active != null），由新决策
+          // 自己决定，旧完成不得再执行/清除其意图。
           if (saved === true && this.pending) {
             const next = this.pending;
             this.pending = null;
@@ -230,6 +244,7 @@ export class LeaveDecisionRunner {
       }
       this.decisions.finish(ticket);
       this.active = null;
+      this.submitting = false;
       this.onSubmitting(false);
       if (left) {
         this.pending = null;

@@ -95,8 +95,10 @@ export function AlertSettings({
       if (control.current.active && sequence === control.current.sequence) {
         accept(value, true);
         setMessage("提醒设置已保存");
+        return true;
       }
-      return true;
+      // 组件已卸载或更新操作已取代当前保存：不算当前设置实例的成功。
+      return false;
     } catch (failure) {
       if (control.current.active && sequence === control.current.sequence) {
         setError(errorMessage(failure));
@@ -104,7 +106,9 @@ export function AlertSettings({
       }
       return false;
     } finally {
-      if (control.current.active) setBusy(false);
+      // R01：旧保存迟到时不得解除新保存的 busy。
+      if (control.current.active && sequence === control.current.sequence)
+        setBusy(false);
     }
   };
   // 第五轮复评 N04：未保存的提醒草稿注册为 App 级离开拦截 ——

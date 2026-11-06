@@ -13,6 +13,11 @@ import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
 } from "./api-key-operation";
+import {
+  getCommittedConfig,
+  setCommittedConfig,
+  subscribeCommittedConfig,
+} from "./config-store";
 
 function useSettingsActions(handlers: {
   onUsageLoaded: (usage: UsageResult) => void;
@@ -97,7 +102,9 @@ export function useSettingsState(handlers: {
   } = handlers;
 
   const [apiKey, setApiKey] = React.useState("");
-  const [config, setConfig] = React.useState<AppConfig | null>(null);
+  const [config, setConfig] = React.useState<AppConfig | null>(
+    getCommittedConfig,
+  );
   const [status, setStatus] = React.useState("正在读取本地配置");
   const [busy, setBusy] = React.useState(false);
   const preferenceBusy = React.useRef(false);
@@ -119,9 +126,13 @@ export function useSettingsState(handlers: {
     config?.configPath ?? "%APPDATA%\\DeepSeekMonitorWindows\\config.json";
 
   React.useEffect(() => {
+    const unsubscribe = subscribeCommittedConfig(() => {
+      const committed = getCommittedConfig();
+      if (committed) setConfig(committed);
+    });
     void invoke<AppConfig>("get_app_config")
       .then((nextConfig) => {
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setRefresh(nextConfig.refreshIntervalSeconds || 60);
         setAutoRefresh(nextConfig.autoRefreshEnabled);
         setAutostart(nextConfig.autostart);
@@ -147,6 +158,7 @@ export function useSettingsState(handlers: {
         }
         setStatus(errorMessage(error));
       });
+    return unsubscribe;
   }, []);
 
   React.useEffect(() => {
@@ -167,7 +179,7 @@ export function useSettingsState(handlers: {
       "usage-token-captured",
       (event) => {
         syncRequestId.current += 1;
-        setConfig(event.payload);
+        setCommittedConfig(event.payload);
         setUsageSyncing(false);
         void refreshUsageAfterToken("已通过网页登录自动同步用量 Token");
       },
@@ -208,7 +220,7 @@ export function useSettingsState(handlers: {
     void invoke<SavedApiKey>("save_api_key", { apiKey })
       .then(({ config: nextConfig, balance }) => {
         if (!isCurrentApiKeyOperation(operation)) return;
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setApiKey("");
         onBalanceLoaded(balance);
         const symbol = currencySymbol(balance.currency);
@@ -229,7 +241,7 @@ export function useSettingsState(handlers: {
     void invoke<AppConfig>("clear_api_key")
       .then((nextConfig) => {
         if (!isCurrentApiKeyOperation(operation)) return;
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setApiKey("");
         setStatus("已清除 API Key");
         onBalanceCleared();
@@ -289,7 +301,7 @@ export function useSettingsState(handlers: {
     setUsageStatus("正在验证候选 Token…");
     void invoke<AppConfig>("save_usage_token", { usageToken })
       .then((nextConfig) => {
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setUsageToken("");
         setUsageStatus("验证通过并已保存，正在刷新用量…");
       })
@@ -305,7 +317,7 @@ export function useSettingsState(handlers: {
     setBusy(true);
     void invoke<AppConfig>("clear_usage_token")
       .then((nextConfig) => {
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setUsageToken("");
         setUsageStatus("已清除用量 Token");
         setUsageSyncing(false);
@@ -322,7 +334,7 @@ export function useSettingsState(handlers: {
     setUsageStatus("正在清除应用内的网页登录数据…");
     void invoke<AppConfig>("forget_usage_session")
       .then((nextConfig) => {
-        setConfig(nextConfig);
+        setCommittedConfig(nextConfig);
         setUsageToken("");
         setUsageSyncing(false);
         onUsageCleared();
@@ -336,7 +348,7 @@ export function useSettingsState(handlers: {
 
   React.useEffect(() => {
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
-      setConfig(event.payload);
+      setCommittedConfig(event.payload);
       setUsageToken("");
       setUsageSyncing(false);
       onUsageCleared();
@@ -359,7 +371,7 @@ export function useSettingsState(handlers: {
         refreshIntervalSeconds: seconds,
       })
         .then((nextConfig) => {
-          setConfig(nextConfig);
+          setCommittedConfig(nextConfig);
           setRefresh(nextConfig.refreshIntervalSeconds || 60);
           onRefreshIntervalChanged(nextConfig.refreshIntervalSeconds || 60);
         })
@@ -392,7 +404,7 @@ export function useSettingsState(handlers: {
         autoRefreshEnabled: enabled,
       })
         .then((nextConfig) => {
-          setConfig(nextConfig);
+          setCommittedConfig(nextConfig);
           setAutoRefresh(nextConfig.autoRefreshEnabled);
           onAutoRefreshChanged(nextConfig.autoRefreshEnabled);
         })
@@ -422,7 +434,7 @@ export function useSettingsState(handlers: {
       setAutostart(enabled);
       void invoke<AppConfig>("save_autostart", { autostart: enabled })
         .then((nextConfig) => {
-          setConfig(nextConfig);
+          setCommittedConfig(nextConfig);
           setAutostart(nextConfig.autostart);
         })
         .catch((error) => {

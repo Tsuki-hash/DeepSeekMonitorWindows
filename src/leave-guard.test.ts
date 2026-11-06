@@ -287,3 +287,76 @@ test("Q04：无待决意图时 decide 忽略_取消幂等", () => {
   assert.deepEqual(submits, []);
   assert.equal(clears(), 0);
 });
+
+// ---------- 第六轮复评 R01：跨出口共享同一决策会话 ----------
+
+test("R01：局部出口保存中_全局新意图后取消_局部旧保存完成不得导航", async () => {
+  // 复评 R01 的跨出口场景：局部出口（采集页返回）与全局出口（底部导航）
+  // 必须共享同一决策会话 —— 只有一份 runner、一份 pending intent。
+  // 旧实现两处各建 runner，取消全局不会撤销局部在途保存的导航。
+  let resolveSave: (value: boolean) => void = () => undefined;
+  const blocker = make({
+    save: () => new Promise<boolean>((done) => (resolveSave = done)),
+  });
+  const { runner, submits } = harness(blocker);
+  const navigated: string[] = [];
+  // 局部出口：采集页「返回上一级」。
+  runner.requestIntent(() => navigated.push("local-back"));
+  runner.decide("save"); // 局部保存开始（延迟）
+  // 全局出口：底部「历史」形成新的 pending intent。
+  runner.requestIntent(() => navigated.push("global-history"));
+  // 用户在唯一的提示中点「留在此页」。
+  runner.cancel();
+  resolveSave(true); // 局部旧保存迟到成功
+  await tick();
+  assert.deepEqual(navigated, [], "取消后任何出口都不得导航");
+  assert.deepEqual(submits, [true, false], "提交状态最终解除");
+});
+
+test("R01：旧保存完成不得消费新决策已在途的意图", async () => {
+  // A 保存 → 新意图 B 并开始保存 → A 迟到成功：B 的决策仍在途，
+  // 旧完成不得直接执行 B（否则会绕过 B 自己的 save/cancel 语义）。
+  const resolvers: Array<(value: boolean) => void> = [];
+  const blocker = make({
+    save: () =>
+      new Promise<boolean>((done) => {
+        resolvers.push(done);
+      }),
+  });
+  const { runner, submits } = harness(blocker);
+  const navigated: string[] = [];
+  runner.requestIntent(() => navigated.push("A"));
+  runner.decide("save");
+  runner.requestIntent(() => navigated.push("B"));
+  runner.decide("save"); // B 的保存开始
+  resolvers[0](true); // A 迟到成功
+  await tick();
+  assert.deepEqual(navigated, [], "B 决策在途时旧完成不得导航");
+  assert.deepEqual(submits, [true], "B 仍处于提交中（接管不重复发 true）");
+  resolvers[1](true);
+  await tick();
+  assert.deepEqual(navigated, ["B"], "B 自己的决策完成后才导航");
+  assert.deepEqual(submits, [true, false]);
+});
+
+test("R01：跨出口始终只有一个待决意图_保存完成后只执行最新一次", async () => {
+  // 局部出口与全局出口向同一会话请求意图：后一个取代前一个，
+  // 只有一份 pending，保存完成后只执行最新意图一次。
+  let saveCalls = 0;
+  let resolveSave: (value: boolean) => void = () => undefined;
+  const blocker = make({
+    save: () => {
+      saveCalls += 1;
+      return new Promise<boolean>((done) => (resolveSave = done));
+    },
+  });
+  const { runner } = harness(blocker);
+  const navigated: string[] = [];
+  runner.requestIntent(() => navigated.push("local-back"));
+  runner.requestIntent(() => navigated.push("global-history"));
+  runner.decide("save");
+  assert.equal(saveCalls, 1, "只发起一次保存");
+  resolveSave(true);
+  await tick();
+  assert.deepEqual(navigated, ["global-history"], "只执行最新的出口意图");
+});

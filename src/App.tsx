@@ -42,6 +42,7 @@ import { attemptLeave, useLeaveGuard } from "./leave-guard";
 import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
 import { LeavePromptDialog } from "./components/LeavePromptDialog";
+import { setCommittedConfig } from "./config-store";
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
@@ -310,6 +311,9 @@ function App() {
   const reloadConfig = React.useCallback(() => {
     return invoke<AppConfig>("get_app_config")
       .then((config) => {
+        // 复评 R10：已提交配置写入共享 store，跨设置页卸载/重挂载的
+        // 当前实例据此收敛，而不是各自停留在旧快照。
+        setCommittedConfig(config);
         setRefreshIntervalSeconds(config.refreshIntervalSeconds || 60);
         setAutoRefreshEnabled(config.autoRefreshEnabled);
         setConfigSnapshot({
@@ -823,6 +827,7 @@ function App() {
         <LocalUsagePanel
           onBack={() => navigate(() => setView("dashboard"))}
           onRegisterLeaveBlocker={registerLeaveBlocker}
+          onRequestLeave={(action) => navigate(action)}
         />
       )}
       {leavePrompt}
