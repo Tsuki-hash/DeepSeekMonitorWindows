@@ -232,6 +232,87 @@ function scenario(name, body) {
 }
 
 scenario(
+  "R17: invalid balance refresh keeps the last trusted amount and timestamp until recovery",
+  async (concurrent) => {
+    const originalNow = Date.now;
+    let now = 1_793_900_000_000;
+    Date.now = () => now;
+    try {
+      const trusted = {
+        ...balance,
+        totalBalance: "12.34",
+        toppedUpBalance: "12.34",
+      };
+      handlers.fetch_balance = () => trusted;
+      await mount(<App />, concurrent);
+      const acceptedConfig = getCommittedConfig();
+      const successfulAt = dashboard().balanceUpdatedAt;
+      assert.equal(dashboard().balanceState, "ok");
+      assert.deepEqual(dashboard().balance, trusted);
+      assert.equal(successfulAt, now);
+      assert.equal(dashboard().balanceError, "");
+      assert.equal(
+        submitted("update_tray_balance").at(-1)?.args.total,
+        "12.34",
+      );
+      assert.equal(submitted("update_tray_balance").at(-1)?.args.stale, false);
+
+      now += 60_000;
+      const invalidData = {
+        code: "invalid_data",
+        message: "synthetic invalid balance payload",
+        retryable: false,
+      };
+      handlers.fetch_balance = () => Promise.reject(invalidData);
+      const beforeFailure = submitted("fetch_balance").length;
+      await click(input("刷新"));
+      assert.equal(submitted("fetch_balance").length, beforeFailure + 1);
+      // The retained-data UI uses ok + error; stale belongs to the tray payload,
+      // not LoadState. A failed response must not replace the successful time.
+      assert.equal(dashboard().balanceState, "ok");
+      assert.deepEqual(dashboard().balance, trusted);
+      assert.equal(dashboard().balanceUpdatedAt, successfulAt);
+      assert.equal(dashboard().balanceError, invalidData.message);
+      assert.ok(text().includes("12.34"));
+      assert.ok(text().includes("更新失败"));
+      assert.equal(
+        submitted("update_tray_balance").at(-1)?.args.total,
+        "12.34",
+      );
+      assert.equal(
+        submitted("update_tray_balance").at(-1)?.args.currency,
+        "CNY",
+      );
+      assert.equal(submitted("update_tray_balance").at(-1)?.args.stale, true);
+      assert.equal(getCommittedConfig(), acceptedConfig);
+
+      now += 60_000;
+      const recovered = {
+        ...trusted,
+        totalBalance: "23.45",
+        toppedUpBalance: "23.45",
+      };
+      handlers.fetch_balance = () => recovered;
+      await click(input("刷新"));
+      assert.equal(dashboard().balanceState, "ok");
+      assert.deepEqual(dashboard().balance, recovered);
+      assert.equal(dashboard().balanceUpdatedAt, now);
+      assert.notEqual(dashboard().balanceUpdatedAt, successfulAt);
+      assert.equal(dashboard().balanceError, "");
+      assert.equal(text().includes("更新失败"), false);
+      assert.equal(
+        submitted("update_tray_balance").at(-1)?.args.total,
+        "23.45",
+      );
+      assert.equal(submitted("update_tray_balance").at(-1)?.args.stale, false);
+      assert.equal(getCommittedConfig(), acceptedConfig);
+    } finally {
+      Date.now = originalNow;
+    }
+  },
+);
+
+scenario(
   "R14-03: unreadable config owns both channels and recovers to trusted empty",
   async (concurrent) => {
     const pendingBalance = deferred(),

@@ -23,6 +23,8 @@ import type { LeaveBlocker } from "./leave-guard";
 import { CredentialDraft } from "./credential-draft";
 import type { CredentialSnapshot } from "./credential-draft";
 import { ApiKeyFeedback } from "./api-key-feedback";
+import { UsageTokenFeedback } from "./usage-token-feedback";
+import type { UsageTokenFeedbackOwner } from "./usage-token-feedback";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -127,14 +129,18 @@ export function useSettingsState(): SettingsState {
   const {
     draft: tokenDraft,
     value: usageToken,
-    edit: setUsageToken,
-    clear: discardUsageToken,
+    edit: editUsageToken,
+    clear: clearUsageTokenDraft,
     commit: commitUsageToken,
   } = useCredentialDraft(lifecycle);
+  const tokenFeedback = React.useRef(
+    new UsageTokenFeedback(getCommittedConfig()),
+  );
   React.useLayoutEffect(() => {
     const owner = lifecycle.current;
     const key = keyDraft.current;
     const token = tokenDraft.current;
+    const feedback = tokenFeedback.current;
     owner.active = true;
     owner.generation += 1;
     return () => {
@@ -143,6 +149,7 @@ export function useSettingsState(): SettingsState {
       // Clear memory synchronously, before child cleanup or stale callbacks.
       key.clear();
       token.clear();
+      feedback.edit();
     };
   }, [keyDraft, tokenDraft]);
   const capturePage = React.useCallback(() => {
@@ -192,10 +199,32 @@ export function useSettingsState(): SettingsState {
   const [autostart, setAutostart] = React.useState<boolean | null>(
     initial && !initial.configReadError ? initial.autostart : null,
   );
-  const [usageStatus, setUsageStatus] = React.useState("");
+  const [usageStatus, setUsageStatus] = React.useState(
+    () => tokenFeedback.current.status,
+  );
+  const setUsageToken = React.useCallback(
+    (value: string) => {
+      if (!lifecycle.current.active) return;
+      editUsageToken(value);
+      tokenFeedback.current.edit();
+      setUsageStatus(tokenFeedback.current.status);
+    },
+    [editUsageToken],
+  );
+  const discardUsageToken = React.useCallback(() => {
+    if (!lifecycle.current.active) return;
+    clearUsageTokenDraft();
+    tokenFeedback.current.edit();
+    setUsageStatus(tokenFeedback.current.status);
+  }, [clearUsageTokenDraft]);
   const [usageSyncing, setUsageSyncing] = React.useState(false);
   const syncRequestId = React.useRef(0);
   const syncOwner = React.useRef(new UsageSyncOwner());
+  const syncFeedbackOwner = React.useRef<{
+    requestId: string;
+    feedback: UsageTokenFeedbackOwner;
+    suppressEndedFeedback?: boolean;
+  } | null>(null);
   const [showManualPaste, setShowManualPaste] = React.useState(false);
   // 空串表示「版本未知」。刻意不写死一个兜底版本号：那个数字会随着发版过期，
   // 显示出来反而是错的信息，不如显示「—」。
@@ -218,17 +247,8 @@ export function useSettingsState(): SettingsState {
       setAutostart(next.configReadError ? null : next.autostart);
       keyFeedback.current.observe(next);
       setStatus(keyFeedback.current.status);
-      if (
-        !syncOwner.current.requestId ||
-        syncOwner.current.ended ||
-        next.configReadError
-      )
-        setUsageStatus(
-          next.configReadError ??
-            (next.usageTokenConfigured
-              ? "用量 Token 已配置"
-              : "未配置用量 Token"),
-        );
+      tokenFeedback.current.observe(next, !syncOwner.current.ended);
+      setUsageStatus(tokenFeedback.current.status);
     };
     const unsubscribe = subscribeCommittedConfig(() => {
       const committed = getCommittedConfig();
@@ -313,23 +333,43 @@ export function useSettingsState(): SettingsState {
         if (!current() || !syncOwner.current.accept(payload)) return;
         syncRequestId.current += 1;
         setUsageSyncing(false);
-        const committed = getCommittedConfig();
-        setUsageStatus(
-          committed?.configReadError ??
-            (committed?.usageTokenConfigured
-              ? "用量 Token 已配置"
-              : "未配置用量 Token"),
-        );
+        const owner = syncFeedbackOwner.current;
+        if (owner?.requestId === payload.requestId) {
+          owner.suppressEndedFeedback = true;
+          tokenFeedback.current.update(
+            owner.feedback,
+            tokenDraft.current.revision,
+            null,
+            true,
+            "sync",
+          );
+        }
+        setUsageStatus(tokenFeedback.current.status);
       }),
       listen<UsageSyncStatus>("usage-sync-ended", ({ payload }) => {
         eventRevision += 1;
         if (!current() || !syncOwner.current.accept(payload)) return;
-        syncRequestId.current += 1;
         setUsageSyncing(false);
+        const owner = syncFeedbackOwner.current;
+        // Event delivery may trail the cancel receipt or a successful capture.
+        // Duplicate terminal events do not replace feedback or cancel its read.
+        if (
+          payload.kind === "web" &&
+          owner?.requestId === payload.requestId &&
+          owner.suppressEndedFeedback
+        )
+          return;
+        syncRequestId.current += 1;
         if (payload.kind === "web") {
-          setUsageStatus(
-            "未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。",
-          );
+          if (owner?.requestId === payload.requestId)
+            tokenFeedback.current.update(
+              owner.feedback,
+              tokenDraft.current.revision,
+              "未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。",
+              true,
+              "sync",
+            );
+          setUsageStatus(tokenFeedback.current.status);
           setShowManualPaste(true);
         }
       }),
@@ -337,6 +377,7 @@ export function useSettingsState(): SettingsState {
     // Subscribe first, then restore backend state on remount. A local action or
     // accepted terminal event supersedes this read, just like config reads.
     const startedAt = syncRequestId.current;
+    const feedback = tokenFeedback.current.capture(tokenDraft.current.revision);
     void Promise.all(requests)
       .then(async () => {
         while (current() && startedAt === syncRequestId.current) {
@@ -350,10 +391,24 @@ export function useSettingsState(): SettingsState {
           if (eventsAtStart !== eventRevision) continue;
           syncOwner.current.restore(snapshot);
           setUsageSyncing(snapshot.active && snapshot.kind === "web");
-          if (snapshot.active && snapshot.kind === "web")
-            setUsageStatus(
+          if (
+            snapshot.active &&
+            snapshot.kind === "web" &&
+            snapshot.requestId
+          ) {
+            syncFeedbackOwner.current = {
+              requestId: snapshot.requestId,
+              feedback,
+            };
+            tokenFeedback.current.update(
+              feedback,
+              tokenDraft.current.revision,
               "等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。",
+              true,
+              "sync",
             );
+            setUsageStatus(tokenFeedback.current.status);
+          }
           return;
         }
       })
@@ -362,7 +417,7 @@ export function useSettingsState(): SettingsState {
       for (const request of requests)
         void request.then((unlisten) => unlisten()).catch(() => undefined);
     };
-  }, [capturePage]);
+  }, [capturePage, tokenDraft]);
 
   const pasteApiKey = React.useCallback(async () => {
     const current = capturePage();
@@ -511,24 +566,49 @@ export function useSettingsState(): SettingsState {
   const pasteUsageToken = React.useCallback(async () => {
     const current = capturePage();
     if (!current()) return;
+    const owner = tokenFeedback.current.begin(
+      tokenDraft.current.revision,
+      "正在读取剪贴板…",
+    );
+    setUsageStatus(tokenFeedback.current.status);
     try {
       const text = await navigator.clipboard.readText();
-      if (!current()) return;
-      setUsageToken(text.trim());
-      setUsageStatus("已从剪贴板读取");
+      if (
+        !current() ||
+        !tokenFeedback.current.ownsIntent(owner, tokenDraft.current.revision)
+      )
+        return;
+      editUsageToken(text.trim());
+      tokenFeedback.current.begin(
+        tokenDraft.current.revision,
+        "已从剪贴板读取",
+      );
+      setUsageStatus(tokenFeedback.current.status);
     } catch {
-      if (current()) setUsageStatus("剪贴板读取失败");
+      if (!current()) return;
+      tokenFeedback.current.update(
+        owner,
+        tokenDraft.current.revision,
+        "剪贴板读取失败",
+      );
+      setUsageStatus(tokenFeedback.current.status);
     }
-  }, [setUsageToken, capturePage]);
+  }, [editUsageToken, tokenDraft, capturePage]);
 
   const startUsageSync = React.useCallback(() => {
     const current = capturePage();
     if (!current()) return;
     const requestId = newUsageSyncRequest();
     syncOwner.current.begin(requestId);
+    const feedback = tokenFeedback.current.begin(
+      tokenDraft.current.revision,
+      "正在打开登录窗口…",
+      "sync",
+    );
+    syncFeedbackOwner.current = { requestId, feedback };
     const sequence = ++syncRequestId.current;
     setUsageSyncing(true);
-    setUsageStatus("正在打开登录窗口…");
+    setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
       .start(requestId, (supersededRequestIds) =>
         invoke<UsageSyncStarted>("start_usage_sync", {
@@ -536,7 +616,7 @@ export function useSettingsState(): SettingsState {
           supersededRequestIds,
         }),
       )
-      .then((result) => {
+      .then(async (result) => {
         if (
           !current() ||
           sequence !== syncRequestId.current ||
@@ -544,10 +624,47 @@ export function useSettingsState(): SettingsState {
         )
           return;
         setUsageSyncing(result.active && !result.synced);
-        if (result.active && !result.synced)
-          setUsageStatus(
+        if (result.active && !result.synced) {
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
             "等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。",
+            true,
+            "sync",
           );
+          setUsageStatus(tokenFeedback.current.status);
+        } else if (result.synced) {
+          syncOwner.current.finish(requestId);
+          if (syncFeedbackOwner.current?.feedback === feedback)
+            syncFeedbackOwner.current.suppressEndedFeedback = true;
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            "同步完成，正在读取配置…",
+            true,
+            "sync",
+          );
+          setUsageStatus(tokenFeedback.current.status);
+          // A cached-session success may arrive without its capture event.
+          // Re-read only; never start another login or restore a credential.
+          const startedAt = getCommitRevision();
+          const latest = await invoke<AppConfig>("get_app_config");
+          applyReadConfig(latest, startedAt);
+          if (
+            !current() ||
+            sequence !== syncRequestId.current ||
+            !syncOwner.current.owns(requestId)
+          )
+            return;
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            null,
+            true,
+            "sync",
+          );
+          setUsageStatus(tokenFeedback.current.status);
+        }
       })
       .catch((error) => {
         if (
@@ -557,9 +674,16 @@ export function useSettingsState(): SettingsState {
         )
           return;
         setUsageSyncing(false);
-        setUsageStatus(errorMessage(error));
+        tokenFeedback.current.update(
+          feedback,
+          tokenDraft.current.revision,
+          errorMessage(error),
+          true,
+          "sync",
+        );
+        setUsageStatus(tokenFeedback.current.status);
       });
-  }, [capturePage]);
+  }, [capturePage, tokenDraft]);
 
   const cancelUsageSync = React.useCallback(() => {
     const current = capturePage();
@@ -567,6 +691,17 @@ export function useSettingsState(): SettingsState {
     const requestId = owner.requestId;
     if (!current() || !requestId) return;
     ++syncRequestId.current; // Invalidate the old start response immediately.
+    const feedback = tokenFeedback.current.begin(
+      tokenDraft.current.revision,
+      "正在取消同步…",
+      "sync",
+    );
+    syncFeedbackOwner.current = {
+      requestId,
+      feedback,
+      suppressEndedFeedback: true,
+    };
+    setUsageStatus(tokenFeedback.current.status);
     void invoke<UsageSyncStatus | null>("cancel_usage_sync", {
       requestId,
       generation: owner.generation,
@@ -586,37 +721,82 @@ export function useSettingsState(): SettingsState {
           syncOwner.current.restore(snapshot);
           setUsageSyncing(snapshot.active && snapshot.kind === "web");
           if (snapshot.active && snapshot.kind === "web") {
-            setUsageStatus(
+            if (syncFeedbackOwner.current?.feedback === feedback)
+              syncFeedbackOwner.current.suppressEndedFeedback = false;
+            tokenFeedback.current.update(
+              feedback,
+              tokenDraft.current.revision,
               "等待网页登录，完成后将自动校验并同步。关闭登录窗口可结束等待。",
+              true,
+              "sync",
             );
           } else {
-            const committed = getCommittedConfig();
-            setUsageStatus(
-              committed?.configReadError ??
-                (committed?.usageTokenConfigured
-                  ? "用量 Token 已配置"
-                  : "未配置用量 Token"),
+            tokenFeedback.current.update(
+              feedback,
+              tokenDraft.current.revision,
+              null,
+              true,
+              "sync",
             );
           }
+          setUsageStatus(tokenFeedback.current.status);
           return;
         }
         if (!syncOwner.current.accept(ended)) return;
         syncOwner.current.finish(requestId);
         setUsageSyncing(false);
-        setUsageStatus("已取消同步，原 Token 未更改");
+        tokenFeedback.current.update(
+          feedback,
+          tokenDraft.current.revision,
+          "已取消同步，原 Token 未更改",
+          true,
+          "sync",
+        );
+        setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (current() && syncOwner.current.owns(requestId))
-          setUsageStatus(errorMessage(error));
+        if (current() && syncOwner.current.owns(requestId)) {
+          if (syncFeedbackOwner.current?.feedback === feedback)
+            syncFeedbackOwner.current.suppressEndedFeedback = false;
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            errorMessage(error),
+            true,
+            "sync",
+          );
+          setUsageStatus(tokenFeedback.current.status);
+        }
       });
-  }, [capturePage]);
-  const tokenSaves = React.useRef(new Map<number, Promise<boolean>>());
+  }, [capturePage, tokenDraft]);
+  const tokenSaves = React.useRef(
+    new Map<
+      number,
+      {
+        promise: Promise<boolean>;
+        owner: { feedback: UsageTokenFeedbackOwner };
+        current: () => boolean;
+        requestId: string;
+      }
+    >(),
+  );
   const saveTokenSnapshot = React.useCallback(
     (submitted: CredentialSnapshot): Promise<boolean> => {
-      const pending = tokenSaves.current.get(submitted.revision);
-      if (pending) return pending;
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
+      const feedback =
+        submitted.revision === tokenDraft.current.revision
+          ? tokenFeedback.current.begin(
+              submitted.revision,
+              "正在验证候选 Token…",
+            )
+          : tokenFeedback.current.capture(submitted.revision);
+      const pending = tokenSaves.current.get(submitted.revision);
+      if (pending?.current() && syncOwner.current.owns(pending.requestId)) {
+        pending.owner.feedback = feedback;
+        setUsageStatus(tokenFeedback.current.status);
+        return pending.promise;
+      }
       const generation = lifecycle.current.generation;
       const operation = beginUsageTokenOperation();
       const current = () =>
@@ -625,11 +805,13 @@ export function useSettingsState(): SettingsState {
         isCurrentUsageTokenOperation(operation);
       const requestId = newUsageSyncRequest();
       syncOwner.current.begin(requestId);
+      syncFeedbackOwner.current = null;
       syncRequestId.current += 1;
       setUsageSyncing(false);
+      const owner = { feedback };
       const saving = (async () => {
         setBusy(true);
-        setUsageStatus("正在验证候选 Token…");
+        setUsageStatus(tokenFeedback.current.status);
         try {
           const nextConfig = await usageSyncRequests.start(
             requestId,
@@ -643,23 +825,44 @@ export function useSettingsState(): SettingsState {
           setCommittedConfig(nextConfig);
           if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
             return false;
-          commitUsageToken(submitted.revision);
-          if (syncOwner.current.owns(requestId))
-            setUsageStatus("验证通过并已保存");
+          const ownsReceipt =
+            syncOwner.current.owns(requestId) &&
+            tokenFeedback.current.update(
+              owner.feedback,
+              tokenDraft.current.revision,
+              "验证通过并已保存",
+              true,
+            );
+          if (ownsReceipt) commitUsageToken(submitted.revision);
+          setUsageStatus(tokenFeedback.current.status);
           return true;
         } catch (error) {
-          if (current() && syncOwner.current.owns(requestId))
-            setUsageStatus(errorMessage(error));
+          if (current() && syncOwner.current.owns(requestId)) {
+            tokenFeedback.current.update(
+              owner.feedback,
+              tokenDraft.current.revision,
+              errorMessage(error),
+            );
+            setUsageStatus(tokenFeedback.current.status);
+          }
           return false;
         } finally {
           syncOwner.current.finish(requestId);
           if (current()) setBusy(false);
         }
-      })().finally(() => tokenSaves.current.delete(submitted.revision));
-      tokenSaves.current.set(submitted.revision, saving);
+      })().finally(() => {
+        if (tokenSaves.current.get(submitted.revision)?.owner === owner)
+          tokenSaves.current.delete(submitted.revision);
+      });
+      tokenSaves.current.set(submitted.revision, {
+        promise: saving,
+        owner,
+        current,
+        requestId,
+      });
       return saving;
     },
-    [commitUsageToken],
+    [commitUsageToken, tokenDraft],
   );
   const saveUsageToken = React.useCallback(
     () => saveTokenSnapshot(tokenDraft.current.snapshot()),
@@ -670,8 +873,13 @@ export function useSettingsState(): SettingsState {
     if (!lifecycle.current.active) return;
     syncRequestId.current += 1;
     syncOwner.current.invalidate();
+    syncFeedbackOwner.current = null;
     setUsageSyncing(false);
     const revision = tokenDraft.current.revision;
+    const feedback = tokenFeedback.current.begin(
+      revision,
+      "正在清除用量 Token…",
+    );
     const generation = lifecycle.current.generation;
     const operation = beginUsageTokenOperation();
     const current = () =>
@@ -679,6 +887,7 @@ export function useSettingsState(): SettingsState {
       lifecycle.current.generation === generation &&
       isCurrentUsageTokenOperation(operation);
     setBusy(true);
+    setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
       .clear((cancelledRequestIds) =>
         invoke<AppConfig>("clear_usage_token", { cancelledRequestIds }),
@@ -687,12 +896,26 @@ export function useSettingsState(): SettingsState {
         setCommittedConfig(nextConfig);
         if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
           return;
-        commitUsageToken(revision);
-        if (syncOwner.current.requestId === null)
-          setUsageStatus("已清除用量 Token");
+        const ownsReceipt =
+          syncOwner.current.requestId === null &&
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            "已清除用量 Token",
+            true,
+          );
+        if (ownsReceipt) commitUsageToken(revision);
+        setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (current()) setUsageStatus(errorMessage(error));
+        if (current()) {
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            errorMessage(error),
+          );
+          setUsageStatus(tokenFeedback.current.status);
+        }
       })
       .finally(() => {
         if (current()) setBusy(false);
@@ -710,8 +933,13 @@ export function useSettingsState(): SettingsState {
     if (!lifecycle.current.active || forgetOwner.current) return;
     syncRequestId.current += 1;
     syncOwner.current.invalidate();
+    syncFeedbackOwner.current = null;
     setUsageSyncing(false);
     const revision = tokenDraft.current.revision;
+    const feedback = tokenFeedback.current.begin(
+      revision,
+      "正在清除应用内的网页登录数据…",
+    );
     const generation = lifecycle.current.generation;
     const owner = { operation: beginUsageTokenOperation(), consumed: false };
     forgetOwner.current = owner;
@@ -721,7 +949,7 @@ export function useSettingsState(): SettingsState {
       forgetOwner.current === owner &&
       isCurrentUsageTokenOperation(owner.operation);
     setBusy(true);
-    setUsageStatus("正在清除应用内的网页登录数据…");
+    setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
       .clear((cancelledRequestIds) =>
         invoke<AppConfig>("forget_usage_session", { cancelledRequestIds }),
@@ -735,14 +963,29 @@ export function useSettingsState(): SettingsState {
         )
           return;
         owner.consumed = true;
-        commitUsageToken(revision);
-        if (syncOwner.current.requestId === null)
-          setUsageStatus(
+        const ownsReceipt =
+          syncOwner.current.requestId === null &&
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
             "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
+            true,
           );
+        if (ownsReceipt) commitUsageToken(revision);
+        setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (current()) setUsageStatus(errorMessage(error));
+        if (current()) {
+          tokenFeedback.current.update(
+            feedback,
+            tokenDraft.current.revision,
+            errorMessage(error),
+            // Forget may clear the Token before browser-data deletion fails.
+            // Report that current operation failure across its partial commit.
+            true,
+          );
+          setUsageStatus(tokenFeedback.current.status);
+        }
       })
       .finally(() => {
         if (forgetOwner.current !== owner) return;

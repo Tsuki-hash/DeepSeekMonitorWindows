@@ -628,6 +628,57 @@ mod api_key_ownership_tests {
         }
     }
 
+    #[test]
+    fn r17_invalid_balance_response_preserves_the_saved_key_and_revisions() {
+        let dir = TempConfigDir::new("r17-invalid-balance");
+        edit_validated_credential(ValidatedCredential::ApiKey, "SYNTHETIC_K0".into()).unwrap();
+        edit_validated_credential(ValidatedCredential::UsageToken, "SYNTHETIC_TOKEN".into())
+            .unwrap();
+        let original = std::fs::read(dir.join("config.json")).unwrap();
+        let config = read_stored_config().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (index, (currency, total)) in [
+            ("CNY", ""),
+            ("CNY", "NaN"),
+            ("CNY", "Infinity"),
+            ("CNY", "1e16"),
+            ("EUR", "0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = serde_json::json!({
+                "is_available": true,
+                "balance_infos": [{
+                    "currency": currency, "total_balance": total,
+                    "granted_balance": "0", "topped_up_balance": "0"
+                }]
+            })
+            .to_string();
+            let session = ApiKeySession::default();
+            let error = runtime
+                .block_on(save_api_key_owned(
+                    &session,
+                    "SYNTHETIC_K1".into(),
+                    format!("r17-invalid-balance-{index}"),
+                    &[],
+                    |_| async move { crate::deepseek_api::parse_balance_json(&body) },
+                ))
+                .err()
+                .expect("invalid data must not commit a new key");
+            assert_eq!(error.code, "invalid_data");
+            assert_eq!(error.credential, Some("api_key"));
+            assert!(!error.retryable);
+            assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), original);
+            let stored = read_stored_config().unwrap();
+            assert_eq!(stored.api_key.as_deref(), Some("SYNTHETIC_K0"));
+            assert_eq!(stored.usage_token.as_deref(), Some("SYNTHETIC_TOKEN"));
+            assert_eq!(stored.config_revision, config.config_revision);
+            assert_eq!(stored.api_key_revision, config.api_key_revision);
+            assert_eq!(stored.usage_token_revision, config.usage_token_revision);
+        }
+    }
+
     // These tests use the production command helper and actual encrypted config
     // writes in an isolated directory. HTTP is synthetic; no window is launched.
     #[test]

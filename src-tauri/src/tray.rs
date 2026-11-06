@@ -88,15 +88,8 @@ pub fn balance_caption(
     let Some(total) = total else {
         return Ok("余额：尚未取得".into());
     };
-    let value = total.parse::<f64>().map_err(|_| "余额格式不可用")?;
-    if !value.is_finite() || value.abs() > 1e15 {
-        return Err("余额格式不可用".into());
-    }
-    let unit = match currency {
-        Some("CNY") => "¥",
-        Some("USD") => "$",
-        _ => return Err("余额币种不可用".into()),
-    };
+    let value = crate::deepseek_api::validate_balance_amount(total)?;
+    let unit = crate::deepseek_api::balance_currency_symbol(currency.ok_or("余额币种不可用")?)?;
     Ok(format!(
         "余额：{unit}{value:.2} · {}",
         if stale { "旧数据" } else { "最近成功" }
@@ -147,6 +140,85 @@ fn last_tray_rect() -> Option<TrayRect> {
     tray_rect_store().lock().ok().and_then(|slot| *slot)
 }
 
+#[derive(Clone, Copy)]
+enum MainWindowPlacement {
+    SavedPosition(i32, i32),
+    NearTray(f64, f64),
+}
+
+/// 两个唤窗入口共用目标工作区、DPI 边距与完整矩形边界。
+/// 只改变定位策略：有效记录保留原位置，fallback 才贴靠托盘。
+fn main_window_geometry(
+    area: window_pos::WorkArea,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    placement: MainWindowPlacement,
+) -> (u32, u32, i32, i32) {
+    let margin = (12.0 * scale_factor).round() as i32;
+    let (width, height) = window_pos::clamp_size_into_area(area, width, height, margin);
+    let (x, y) = match placement {
+        MainWindowPlacement::SavedPosition(x, y) => (x, y),
+        MainWindowPlacement::NearTray(anchor_x, anchor_y) => window_pos::panel_origin(
+            area,
+            width as i32,
+            height as i32,
+            margin,
+            anchor_x,
+            anchor_y,
+        ),
+    };
+    let (x, y) = window_pos::clamp_origin_into_area(area, width as i32, height as i32, x, y);
+    (width, height, x, y)
+}
+
+fn apply_main_window_geometry(
+    window: &WebviewWindow,
+    current_size: tauri::PhysicalSize<u32>,
+    (width, height, x, y): (u32, u32, i32, i32),
+) -> tauri::Result<()> {
+    if width != current_size.width || height != current_size.height {
+        // 主面板无系统装饰，物理客户区尺寸与 outer_size 一致。
+        window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+            width, height,
+        )))?;
+    }
+    window.set_position(Position::Physical(PhysicalPosition::new(x, y)))
+}
+
+fn position_main_window_in_work_area(
+    window: &WebviewWindow,
+    monitor: &tauri::Monitor,
+    placement: MainWindowPlacement,
+) -> tauri::Result<()> {
+    let work_area = monitor.work_area();
+    let area = window_pos::WorkArea {
+        x: work_area.position.x,
+        y: work_area.position.y,
+        width: work_area.size.width as i32,
+        height: work_area.size.height as i32,
+    };
+    let scale_factor = monitor.scale_factor();
+    let size = window.outer_size()?;
+    let geometry = main_window_geometry(area, size.width, size.height, scale_factor, placement);
+    apply_main_window_geometry(window, size, geometry)?;
+
+    // 跨屏定位可能触发 DPI 尺寸调整。读取实际尺寸后再约束一次，不能让系统
+    // 在首次缩小之后又把窗口放大到工作区外；第二次定位仍在同一目标工作区。
+    let actual_size = window.outer_size()?;
+    if actual_size.width != geometry.0 || actual_size.height != geometry.1 {
+        let geometry = main_window_geometry(
+            area,
+            actual_size.width,
+            actual_size.height,
+            scale_factor,
+            placement,
+        );
+        apply_main_window_geometry(window, actual_size, geometry)?;
+    }
+    Ok(())
+}
+
 fn position_near_tray(window: &WebviewWindow) -> tauri::Result<()> {
     // 定位锚点优先取托盘图标中心；托盘事件还没发生过（例如从菜单项「显示主面板」
     // 唤出）时退回光标位置。按锚点最近的工作区边贴靠（几何在 window_pos）。
@@ -166,26 +238,11 @@ fn position_near_tray(window: &WebviewWindow) -> tauri::Result<()> {
         .or(window.primary_monitor()?)
         .ok_or(tauri::Error::WindowNotFound)?;
 
-    let work_area = monitor.work_area();
-    let scale_factor = monitor.scale_factor();
-    let size = window.outer_size()?;
-    let margin = (12.0 * scale_factor).round() as i32;
-    let area = window_pos::WorkArea {
-        x: work_area.position.x,
-        y: work_area.position.y,
-        width: work_area.size.width as i32,
-        height: work_area.size.height as i32,
-    };
-    let (x, y) = window_pos::panel_origin(
-        area,
-        size.width as i32,
-        size.height as i32,
-        margin,
-        anchor.0,
-        anchor.1,
-    );
-
-    window.set_position(Position::Physical(PhysicalPosition::new(x, y)))
+    position_main_window_in_work_area(
+        window,
+        &monitor,
+        MainWindowPlacement::NearTray(anchor.0, anchor.1),
+    )
 }
 
 /// 把主面板当前物理位置写入配置（隐藏到托盘与退出时调用），供下次唤出/启动时
@@ -219,31 +276,9 @@ pub(crate) fn restore_saved_position(window: &WebviewWindow) -> bool {
     let Ok(Some(monitor)) = window.monitor_from_point(x as f64, y as f64) else {
         return false;
     };
-    // 复评 R08：恢复到更小工作区时先缩小真实外部尺寸，再夹取位置；
-    // 只移动旧尺寸无法保证完整矩形可见。
-    let area = monitor.work_area();
-    let size = window.outer_size().unwrap_or_default();
-    let work_area = crate::window_pos::WorkArea {
-        x: area.position.x,
-        y: area.position.y,
-        width: area.size.width as i32,
-        height: area.size.height as i32,
-    };
-    let (width, height, clamped_x, clamped_y) =
-        crate::window_pos::clamp_window_into_area(work_area, size.width, size.height, x, y, 12);
-    if (width != size.width || height != size.height)
-        && window
-            .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
-                width, height,
-            )))
-            .is_err()
-    {
-        return false;
-    }
-    window
-        .set_position(Position::Physical(PhysicalPosition::new(
-            clamped_x, clamped_y,
-        )))
+    // 复评 R08/R17：有效记录与托盘 fallback 都先缩尺寸，再夹完整矩形；
+    // 读尺寸失败不再用 0×0 冒充窗口尺寸。
+    position_main_window_in_work_area(window, &monitor, MainWindowPlacement::SavedPosition(x, y))
         .is_ok()
 }
 
@@ -359,6 +394,10 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     tray_builder.build(app)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tray_placement_tests.rs"]
+mod placement_tests;
 
 #[cfg(test)]
 mod overview_tests {
@@ -505,5 +544,31 @@ mod overview_tests {
         );
         assert!(balance_caption(Some("SECRET"), Some("CNY"), false).is_err());
         assert!(balance_caption(Some("NaN"), Some("CNY"), false).is_err());
+    }
+
+    #[test]
+    fn r17_托盘沿用余额统一值域_真零负数与科学计数法可用() {
+        for amount in ["", " ", "NaN", "inf", "1e999", "1e-999", "1000000000000001"] {
+            assert!(balance_caption(Some(amount), Some("CNY"), false).is_err());
+        }
+        for currency in [None, Some(""), Some("JPY")] {
+            assert!(balance_caption(Some("0"), currency, false).is_err());
+        }
+        assert_eq!(
+            balance_caption(Some("0"), Some("CNY"), false).unwrap(),
+            "余额：¥0.00 · 最近成功"
+        );
+        assert_eq!(
+            balance_caption(Some("-1.25"), Some("USD"), false).unwrap(),
+            "余额：$-1.25 · 最近成功"
+        );
+        assert_eq!(
+            balance_caption(Some("1e2"), Some("CNY"), false).unwrap(),
+            "余额：¥100.00 · 最近成功"
+        );
+        assert_eq!(
+            balance_caption(None, None, false).unwrap(),
+            "余额：尚未取得"
+        );
     }
 }

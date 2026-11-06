@@ -426,15 +426,18 @@ pub fn test_notification(app: &tauri::AppHandle) -> Result<(), String> {
     .ok_or_else(|| "设置已改变，请重试".into())
 }
 fn balance_sample(data: deepseek_api::BalanceResult, options: &AlertOptions) -> (String, bool) {
+    // 与 HTTP 入口、托盘共用值域，不把未知币种误报为合法 USD 的提醒限制。
+    if deepseek_api::balance_currency_symbol(&data.currency).is_err() {
+        return ("invalid_data".into(), false);
+    }
+    let Ok(value) = deepseek_api::validate_balance_amount(&data.total_balance) else {
+        return ("invalid_data".into(), false);
+    };
     if data.currency != "CNY" {
+        // USD 余额仍可展示，但人民币提醒不能直接与美元比较。
         return ("unsupported".into(), false);
     }
-    match data.total_balance.parse::<f64>() {
-        Ok(value) if value.is_finite() && value.abs() <= 1e12 => {
-            ("ok".into(), value <= options.low_balance_cny)
-        }
-        _ => ("invalid_data".into(), false),
-    }
+    ("ok".into(), value <= options.low_balance_cny)
 }
 fn budget_sample(data: deepseek_api::UsageResult, options: &AlertOptions) -> (String, bool) {
     // 费用缺失（None）不能用于预算判定：宁可「待核对」，也不把缺失当成零消费。
@@ -1182,6 +1185,63 @@ mod tests {
         assert!(!balance_sample(balance("CNY", "NaN"), &Default::default()).1);
         assert!(!balance_sample(balance("USD", "0"), &Default::default()).1);
     }
+    #[test]
+    fn r17_balance_parser_failure_never_enters_notification_evaluation() {
+        for (currency, total) in [
+            ("CNY", ""),
+            ("CNY", "NaN"),
+            ("CNY", "Infinity"),
+            ("CNY", "1e16"),
+            ("CNY", "1e-9999"),
+            ("EUR", "0"),
+        ] {
+            let body = serde_json::json!({
+                "is_available": true,
+                "balance_infos": [{
+                    "currency": currency, "total_balance": total,
+                    "granted_balance": "0", "topped_up_balance": "0"
+                }]
+            });
+            assert_eq!(
+                outcome(
+                    Some(deepseek_api::parse_balance_json(&body.to_string())),
+                    |_| panic!("invalid response must not reach notification evaluation")
+                ),
+                Some(("invalid_data".into(), false))
+            );
+        }
+    }
+
+    #[test]
+    fn r17_balance_valid_values_keep_cny_threshold_and_usd_unsupported_semantics() {
+        for (currency, total, code, trigger) in [
+            ("CNY", "0", "ok", true),
+            ("CNY", "-12.34", "ok", true),
+            ("CNY", "10.00", "ok", true),
+            ("CNY", "10.01", "ok", false),
+            ("CNY", "1e15", "ok", false),
+            ("CNY", "-1e15", "ok", true),
+            ("USD", "0", "unsupported", false),
+            ("USD", "-12.34", "unsupported", false),
+        ] {
+            let body = serde_json::json!({
+                "is_available": false,
+                "balance_infos": [{
+                    "currency": currency, "total_balance": total,
+                    "granted_balance": "0", "topped_up_balance": total
+                }]
+            });
+            assert_eq!(
+                outcome(
+                    Some(deepseek_api::parse_balance_json(&body.to_string())),
+                    |data| balance_sample(data, &Default::default())
+                ),
+                Some((code.into(), trigger)),
+                "{currency} {total}"
+            );
+        }
+    }
+
     #[test]
     fn 预算待核对或无效数字不能触发_阈值包含等号() {
         let data = |cost: Option<f64>, warnings| deepseek_api::UsageResult {

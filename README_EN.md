@@ -143,7 +143,7 @@ When reporting issues, include the version, reproduction steps, expected result 
 
 ## Development and acceptance
 
-The source requires Node.js 22.6+, npm, Rust 1.88+, Windows MSVC and Visual Studio Build Tools 2022 with Desktop development with C++. These are commands for local execution, **not evidence that they were run or passed for this change**:
+The source requires Node.js 22.13 or later within 22.x, or 24 and later, npm, Rust 1.88+, Windows MSVC and Visual Studio Build Tools 2022 with Desktop development with C++. These are commands for local execution, **not evidence that they were run or passed for this change**:
 
 ```powershell
 npm ci

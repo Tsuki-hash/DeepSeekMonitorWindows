@@ -13,7 +13,8 @@ import {
   historyWindow,
   historyDates,
   historyExport,
-  sumModels,
+  returnedHistoryModels,
+  retainHistoryWindow,
   safeKnownSum,
   isUnusedHistoryModel,
 } from "../history";
@@ -42,12 +43,15 @@ export function HistoryPanel({
   onBack,
   onConfigureUsage,
   usageTokenConfigured = true,
+  windowVisible = true,
 }: {
   onBack: () => void;
   /** 直接打开并定位到用量 Token 设置（复评 F10：不能只回首页）。 */
   onConfigureUsage?: () => void;
   /** 真实配置状态：区分「首次配置」与「凭据失效」，不能默认当成失效。 */
   usageTokenConfigured?: boolean;
+  /** Native tray visibility; a hidden WebView remains mounted. */
+  windowVisible?: boolean;
 }) {
   const [range, setRange] = React.useState<HistoryRange>("month");
   const [selectedMonth, setSelectedMonth] = React.useState(
@@ -73,10 +77,14 @@ export function HistoryPanel({
     historyCache.subscribe,
     historyCache.epoch,
   );
-  React.useEffect(() => {
-    snapshotRef.current = snapshot;
-  }, [snapshot]);
+  // The display clock may invalidate the date label, never the request identity.
   const date = todayStr();
+  const visibleRef = React.useRef(windowVisible);
+  visibleRef.current = windowVisible;
+  const configuredRef = React.useRef(usageTokenConfigured);
+  configuredRef.current = usageTokenConfigured;
+  const requestInProgress = React.useRef(false);
+  const needsInitialQuery = React.useRef(true);
   const sequence = React.useRef({ value: 0 });
   // 全部历史分批加载（评审 P2）：先查最近一批，明确「还有更早月份未加载」，
   // 不把未加载误当成「平台没有记录」。`loadedFrom` 记录已请求到的最早月份。
@@ -101,11 +109,35 @@ export function HistoryPanel({
       monthsOnly: string[] | null = null,
       older = false,
     ) => {
+      // Date ticks and hidden windows cannot initiate a query. An explicit
+      // refresh/show reads the current date, rather than a captured render date.
+      if (!visibleRef.current) return;
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
-      const window = historyWindow(range, date, selectedMonth);
+      const window = historyWindow(range, todayStr(), selectedMonth);
+      const requestedScope: HistoryScope = {
+        range,
+        from: window.from,
+        to: window.to,
+        epoch: requestedEpoch,
+      };
+      const previousScope = previousScopeRef.current;
+      const sameSelection =
+        previousScope?.epoch === requestedEpoch &&
+        previousScope.range === range &&
+        (range !== "custom" ||
+          previousScope.from.slice(0, 7) === selectedMonth);
+      const canRetain =
+        sameSelection &&
+        snapshotRef.current != null &&
+        snapshotEpoch.current === requestedEpoch;
+      // A rolling date window is not a new user selection or account. Rebase
+      // the same account's source months, without changing their as-of dates.
+      const retained = canRetain
+        ? retainHistoryWindow(snapshotRef.current!, window)
+        : null;
       // 三种模式：
-      // - 默认：`all` 只请求最近一批；其他区间请求整个窗口。
+      // - 默认：`all` 首次请求最近一批，刷新保留并覆盖已加载范围。
       // - `monthsOnly`：只重试失败月份（保留其他成功月份）。
       // - `older=true`：把已加载范围再往前扩一批。
       let targets: string[];
@@ -117,20 +149,25 @@ export function HistoryPanel({
           ? window.months
               .filter((month) => alreadyLoaded != null && month < alreadyLoaded)
               .slice(-BATCH_MONTHS)
-          : window.months.slice(-BATCH_MONTHS);
+          : alreadyLoaded == null
+            ? window.months.slice(-BATCH_MONTHS)
+            : window.months.filter((month) => month >= alreadyLoaded);
       } else {
         targets = window.months;
       }
       // 本次请求之前已成功取得的月份：重试与继续加载都要保留它们。
-      const previousMonths = snapshotRef.current?.months ?? [];
+      const previousMonths = retained?.months ?? [];
       // 复评 R05：失败月份跨批次持久，只有本次成功才清除。
-      const previousFailed = failedRef.current;
+      const previousFailed = sameSelection
+        ? failedRef.current.filter((month) => window.months.includes(month))
+        : [];
       const attempted: string[] = [];
       const successful: HistorySnapshot["months"] = [];
       const failedMonths: string[] = [];
       // 复评 R04：所有写状态的地方都必须先确认「这次请求仍然有效」。
       // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
       const stillOwner = () =>
+        visibleRef.current &&
         id === sequence.current.value &&
         requestedEpoch === historyCache.epoch() &&
         scopeEpoch.current === requestedScope.epoch;
@@ -139,7 +176,7 @@ export function HistoryPanel({
       const commit = (stopText?: string) => {
         const merged = mergeHistoryMonths({
           scope: requestedScope,
-          previousScope: previousScopeRef.current,
+          previousScope: sameSelection ? requestedScope : null,
           windowMonths: window.months,
           planned: targets,
           attempted,
@@ -157,20 +194,28 @@ export function HistoryPanel({
         }
         if (successful.length || previousMonths.length) {
           snapshotEpoch.current = requestedEpoch;
-          setSnapshot(
-            buildHistory(
-              window,
-              merged.months,
-              merged.failedMonths,
-              merged.unloaded,
-            ),
+          // A rolling window can have unqueried months above the old loaded
+          // range (e.g. "load older" after a month boundary). Do not rely on
+          // the merge helper's older-only, contiguous-range approximation.
+          const accounted = new Set([
+            ...merged.months.map((month) => month.month),
+            ...merged.failedMonths,
+          ]);
+          const next = buildHistory(
+            window,
+            merged.months,
+            merged.failedMonths,
+            window.months.filter((month) => !accounted.has(month)),
           );
+          snapshotRef.current = next;
+          setSnapshot(next);
           // 复评 T03：快照、作用域身份与失败集合必须**同一次提交**。
           // 原实现只在整批结束或分类错误终止时记录 scope，首次批次中途停止
           // （停止查询/新请求使 sequence 失效）后 scope 仍为 null，
           // 继续加载时同身份月份被合并器的防线拒绝继承，用户已看到的月份静默消失。
-          previousScopeRef.current = requestedScope;
         }
+        // Failed-only batches also own a scope, even without a usable snapshot.
+        previousScopeRef.current = requestedScope;
         setFailed(merged.failedMonths);
         failedRef.current = merged.failedMonths;
         if (stopText) {
@@ -180,15 +225,15 @@ export function HistoryPanel({
           setError(
             `${merged.failedMonths.length}个月份未取得，未返回日期标为未知。`,
           );
+        } else {
+          // A retry may clear the final failure after earlier commits in the
+          // same batch showed partial recovery. Clear that intermediate status.
+          setRecovery(null);
+          setError("");
         }
       };
-      // 记录本次作用域：后续合并据此判断能否继承旧结果。
-      const requestedScope: HistoryScope = {
-        range,
-        from: window.from,
-        to: window.to,
-        epoch: scopeEpoch.current,
-      };
+      needsInitialQuery.current = false;
+      requestInProgress.current = true;
       setBusy(true);
       setError("");
       setRecovery(null);
@@ -202,6 +247,9 @@ export function HistoryPanel({
           successful.push(
             await historyCache.get(
               month,
+              // A registered cache request is already in flight and can be
+              // shared by a new valid consumer (including effect replay).
+              // Page ownership guards the loop/commit, not this shared loader.
               () => fetchMonthUsage(number, year),
               force,
             ),
@@ -213,7 +261,7 @@ export function HistoryPanel({
           const outcome = historyFailureOutcome(
             classified,
             [...failedMonths, month],
-            usageTokenConfigured,
+            configuredRef.current,
           );
           failedMonths.push(month);
           // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
@@ -221,6 +269,7 @@ export function HistoryPanel({
             setProgress({ done: attempted.length, total: targets.length });
             setError(outcome.text);
             commit(outcome.recovery);
+            requestInProgress.current = false;
             setBusy(false);
             return;
           }
@@ -229,46 +278,139 @@ export function HistoryPanel({
         setProgress({ done: attempted.length, total: targets.length });
         commit();
       }
+      if (!stillOwner()) return;
       commit();
+      requestInProgress.current = false;
       setBusy(false);
     },
-    [range, date, selectedMonth, usageTokenConfigured],
+    [range, selectedMonth],
   );
   React.useEffect(() => {
+    // Only an actual range/month selection or credential epoch clears data.
+    // A display clock tick must not discard loaded batches or model filters.
+    sequence.current.value++;
+    requestInProgress.current = false;
+    needsInitialQuery.current = true;
+    snapshotEpoch.current = -1;
     setSnapshot(null);
     setSelected("");
+    setBusy(false);
+    setError("");
+    setRecovery(null);
+    setFailed([]);
+    setExportStatus("");
     loadedFrom.current = null;
     // 复评 R02：切范围时必须同步清空快照与继承来源，否则 request 会读到旧月份。
     snapshotRef.current = null;
     previousScopeRef.current = null;
     failedRef.current = [];
-    void request();
+    if (visibleRef.current) void request();
     const owner = sequence.current;
     return () => {
       owner.value++;
     };
   }, [request, epoch]);
+  const previousVisible = React.useRef(windowVisible);
   React.useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 60000);
-    return () => window.clearInterval(timer);
+    const wasVisible = previousVisible.current;
+    previousVisible.current = windowVisible;
+    if (!windowVisible) {
+      sequence.current.value++;
+      if (requestInProgress.current) {
+        requestInProgress.current = false;
+        setBusy(false);
+        setError(
+          "窗口已隐藏，后续月份查询已停止；已取得记录保留，可重新查询或继续加载。",
+        );
+      }
+      return;
+    }
+    if (wasVisible) return;
+    setClock(Date.now());
+    const retained = snapshotRef.current;
+    const nextWindow = historyWindow(range, todayStr(), selectedMonth);
+    // Showing the native window is an explicit refresh opportunity, matching
+    // App's tray contract. A fixed historical month has no new date window.
+    if (needsInitialQuery.current || !retained) {
+      void request();
+    } else if (
+      retained.window.from !== nextWindow.from ||
+      retained.window.to !== nextWindow.to
+    ) {
+      // Catch up only the former open month and newly entered months. Earlier
+      // all-history batches stay intact and are not fetched again on every show.
+      // Force the former open month too: its last-day cache may still be warm.
+      const changedMonths = nextWindow.months.filter(
+        (month) => month >= retained.window.to.slice(0, 7),
+      );
+      void request(
+        true,
+        changedMonths.length ? changedMonths : nextWindow.months.slice(-1),
+      );
+    }
+  }, [windowVisible, range, selectedMonth, request]);
+  React.useEffect(() => {
+    const tick = () => setClock(Date.now());
+    const timer = window.setInterval(tick, 60000);
+    // Browser wake-up only updates labels. Native show above owns any query.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
-  const summaryModels = snapshot
-    ? sumModels(
-        range === "30days"
-          ? snapshot.rows.map((row) => row.model)
-          : snapshot.months.flatMap((month) => month.usage.rawModels ?? []),
-      )
-    : [];
+  const currentWindow = historyWindow(range, date, selectedMonth);
+  const windowOutdated = Boolean(
+    snapshot &&
+    (snapshot.window.from !== currentWindow.from ||
+      snapshot.window.to !== currentWindow.to),
+  );
+  const earlierUnloaded =
+    snapshot?.unloadedMonths.filter(
+      (month) => loadedFrom.current != null && month < loadedFrom.current,
+    ) ?? [];
+  const pendingLoadedMonths =
+    snapshot?.unloadedMonths.filter(
+      (month) => loadedFrom.current != null && month >= loadedFrom.current,
+    ) ?? [];
+  const summaryModels = snapshot ? returnedHistoryModels(snapshot) : [];
   const knownNames = new Set(summaryModels.map((model) => model.model));
-  const dailyOnly =
-    snapshot && range !== "30days"
-      ? sumModels(snapshot.rows.map((row) => row.model)).filter(
-          (model) => !knownNames.has(model.model),
-        )
-      : [];
-  const allModels = [...summaryModels, ...dailyOnly];
+  // Source-only models remain selectable, but absent day fields remain unknown.
+  // Never borrow a full source month's totals for a returned-day aggregate.
+  const sourceOnly = snapshot
+    ? [
+        ...new Map(
+          snapshot.months
+            .flatMap((month) => month.usage.rawModels ?? [])
+            .filter((model) => !knownNames.has(model.model))
+            .map(
+              (model) =>
+                [
+                  model.model,
+                  {
+                    ...model,
+                    totalTokens: null,
+                    requestCount: null,
+                    cacheHitTokens: null,
+                    cacheMissTokens: null,
+                    responseTokens: null,
+                    otherTokens: null,
+                    cost: null,
+                  },
+                ] as const,
+            ),
+        ).values(),
+      ]
+    : [];
+  const allModels = [...summaryModels, ...sourceOnly];
   const models = selected
+    ? summaryModels.filter((model) => model.model === selected)
+    : summaryModels;
+  const displayedModels = selected
     ? allModels.filter((model) => model.model === selected)
     : allModels;
   const unusedModels = new Set(
@@ -284,7 +426,7 @@ export function HistoryPanel({
       )
       .map((model) => model.model),
   );
-  const visibleModels = models.filter(
+  const visibleModels = displayedModels.filter(
     (model) => showUnused || selected || !unusedModels.has(model.model),
   );
   const rows =
@@ -295,10 +437,9 @@ export function HistoryPanel({
       ? snapshot.window.months.map((month) => ({
           date: `${month}-01`,
           value: knownSum(
-            (
-              snapshot.months.find((item) => item.month === month)?.usage
-                .rawModels ?? []
-            ).filter((model) => !selected || model.model === selected),
+            returnedHistoryModels(snapshot, month).filter(
+              (model) => !selected || model.model === selected,
+            ),
             metric,
           ),
         }))
@@ -318,7 +459,7 @@ export function HistoryPanel({
       snapshot?.months.flatMap((month) => month.usage.warnings ?? []) ?? [],
     ),
   ];
-  const stale = Boolean(error && snapshot);
+  const stale = Boolean(error && snapshot) || windowOutdated;
   const fetchedAt = snapshot?.months.length
     ? Math.min(...snapshot.months.map((month) => month.fetchedAt))
     : null;
@@ -414,7 +555,7 @@ export function HistoryPanel({
           {snapshot?.unloadedMonths.length
             ? ` · 还有 ${snapshot.unloadedMonths.length} 个月未加载`
             : ""}
-          {snapshot?.unloadedMonths.length ? (
+          {earlierUnloaded.length > 0 ? (
             <button
               className="link-button"
               disabled={busy}
@@ -423,6 +564,15 @@ export function HistoryPanel({
               继续加载更早月份 ›
             </button>
           ) : null}
+          {pendingLoadedMonths.length > 0 && (
+            <button
+              className="link-button"
+              disabled={busy}
+              onClick={() => void request(true, pendingLoadedMonths)}
+            >
+              补查未加载月份（{pendingLoadedMonths.length}）
+            </button>
+          )}
         </p>
       )}
       <div className="history-scroll">
@@ -443,16 +593,33 @@ export function HistoryPanel({
         </label>
         <div className="history-metrics">
           <article className="card">
-            <span>已返回 Tokens</span>
+            <span>已返回日记录 Tokens</span>
             <strong>
               {valueText(knownSum(models, "totalTokens"), "totalTokens")}
             </strong>
           </article>
           <article className="card">
-            <span>已返回费用</span>
+            <span>已返回日记录费用</span>
             <strong>{valueText(knownSum(models, "cost"), "cost")}</strong>
           </article>
         </div>
+        {snapshot && (
+          <p className="history-message">
+            当前记录：{snapshot.window.from} 至 {snapshot.window.to}。
+            {snapshot.missingDates.length ||
+            snapshot.unloadedMonths.length ||
+            snapshot.failedMonths.length
+              ? ` 覆盖不完整：${snapshot.missingDates.length} 日未返回、${snapshot.unloadedMonths.length} 个月未加载、${snapshot.failedMonths.length} 个月查询失败。小计不代表完整区间用量。`
+              : " 汇总只包含已返回日记录。"}
+          </p>
+        )}
+        {windowOutdated && snapshot && (
+          <p className="history-message warning" role="status">
+            记账日期已变化，当前仍为 {snapshot.window.from} 至{" "}
+            {snapshot.window.to}
+            的已查询记录。重新查询或重新显示窗口时更新，已加载范围与模型筛选保留。
+          </p>
+        )}
         {error && (
           <p className="history-message warning" role="alert">
             {error}
@@ -500,6 +667,7 @@ export function HistoryPanel({
               className="history-cancel"
               onClick={() => {
                 sequence.current.value++;
+                requestInProgress.current = false;
                 setBusy(false);
                 setError("查询已停止；未加载月份标为未知，可重新查询。");
               }}
@@ -512,7 +680,7 @@ export function HistoryPanel({
           <>
             <article className="card history-chart">
               <div className="history-chart-title">
-                <h2>{range === "all" ? "每月趋势" : "每日趋势"}</h2>
+                <h2>{range === "all" ? "每月已返回日记录合计" : "每日趋势"}</h2>
                 <div role="group" aria-label="趋势指标">
                   <button
                     aria-pressed={metric === "totalTokens"}
@@ -619,6 +787,39 @@ export function HistoryPanel({
               </table>
             </details>
             <details className="history-details">
+              <summary>平台原始月汇总 · 独立来源口径</summary>
+              <p>
+                以下保留平台月接口原值，可能包含未返回每日明细的用量，不能当作上方已返回日合计。
+                当前月仅截至来源查询日；JSON 将这些值单列为
+                sourceMonthlySnapshots。
+              </p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>来源月份 / 模型</th>
+                    <th>原始月 Tokens</th>
+                    <th>原始月费用</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshot.months.flatMap((month) =>
+                    (month.usage.rawModels ?? [])
+                      .filter((model) => !selected || model.model === selected)
+                      .map((model) => (
+                        <tr key={`${month.month}-${model.model}`}>
+                          <td>
+                            {month.month}
+                            <span title={model.model}>{model.model}</span>
+                          </td>
+                          <td>{valueText(model.totalTokens, "totalTokens")}</td>
+                          <td>{valueText(model.cost, "cost")}</td>
+                        </tr>
+                      )),
+                  )}
+                </tbody>
+              </table>
+            </details>
+            <details className="history-details">
               <summary>
                 数据来源与状态
                 {snapshot.failedMonths.length ||
@@ -640,7 +841,9 @@ export function HistoryPanel({
               <p>
                 {snapshot.window.from} 至 {snapshot.window.to}；
                 {snapshot.missingDates.length}
-                个日期未返回模型明细，不代表零用量。近30天汇总只覆盖已返回记录。
+                个日期未返回模型明细，不代表零用量。所有区间的顶部、模型汇总与趋势均只合计
+                已返回日记录，与 CSV 日记录及 JSON monthly
+                同源；未返回、未加载不补零。
               </p>
               {legacy && (
                 <p>当前响应缺少新版原始模型明细，请使用最新桌面程序。</p>
@@ -662,7 +865,7 @@ export function HistoryPanel({
           CSV
         </button>
         <button
-          title="导出每日记录及所查询月份的完整汇总"
+          title="导出已返回日记录、同源区间月合计及独立的原始月来源"
           disabled={!snapshot || busy || legacy}
           onClick={() => download("json")}
         >

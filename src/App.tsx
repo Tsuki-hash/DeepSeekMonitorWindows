@@ -891,6 +891,7 @@ function App() {
       )}
       {view === "history" && (
         <HistoryPanel
+          windowVisible={windowVisible}
           onBack={() => navigate(() => setView("dashboard"))}
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
           onConfigureUsage={() => {

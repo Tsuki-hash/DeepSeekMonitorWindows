@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   historyWindow,
   buildHistory,
+  retainHistoryWindow,
+  returnedHistoryModels,
   historyExport,
   sumModels,
   safeKnownSum,
@@ -597,4 +599,182 @@ test("T10：未记录 sourceAsOfDate 时不过滤（兼容旧夹具）", () => {
     [],
   );
   assert.equal(snapshot.rows.length, 1, "无 sourceAsOfDate 时不做额外过滤");
+});
+
+// ---------- Round 17: one returned-day basis for every history range ----------
+
+for (const range of ["month", "previous", "30days", "custom", "all"] as const) {
+  test(`R17: ${range} totals and exported monthly records share the returned-day basis`, () => {
+    const window = historyWindow(range, "2026-11-04", "2026-10");
+    const source = ["2026-10", "2026-11"]
+      .filter((month) => window.months.includes(month))
+      .map((month) => ({
+        month,
+        fetchedAt: 0,
+        sourceAsOfDate: "2026-11-04",
+        usage: {
+          ...usage(),
+          rawModels: [
+            usageModel(900, 90),
+            {
+              ...usageModel(800, 80),
+              model: "second-model",
+            },
+            { ...usageModel(700, 70), model: "source-only-model" },
+          ],
+          days: [
+            {
+              date: `${month}-${month === "2026-10" ? "31" : "04"}`,
+              rawModels: [
+                usageModel(10, 1),
+                {
+                  ...usageModel(20, null),
+                  model: "second-model",
+                },
+              ],
+            },
+          ],
+        } as UsageResult,
+      }));
+    const snapshot = buildHistory(
+      window,
+      source,
+      [],
+      window.months.filter(
+        (month) => !source.some((item) => item.month === month),
+      ),
+    );
+    const page = returnedHistoryModels(snapshot);
+    const exported = historyExport(snapshot, 0);
+    const json = JSON.parse(exported.json);
+    assert.equal(safeKnownSum(page, "totalTokens"), source.length * 30);
+    assert.equal(safeKnownSum(page, "cost"), null);
+    assert.equal(
+      page.some((item) => item.model === "source-only-model"),
+      false,
+    );
+    assert.equal(json.aggregationBasis, "returned-daily-records");
+    assert.equal(
+      safeKnownSum(
+        json.monthly.flatMap(
+          (item: { models: RawModelUsage[] }) => item.models,
+        ),
+        "totalTokens",
+      ),
+      safeKnownSum(page, "totalTokens"),
+    );
+    assert.equal(safeKnownSum(json.daily, "cost"), null);
+    for (const item of json.monthly) {
+      assert.equal(
+        item.coveredDates,
+        1,
+        "multiple models are one returned date",
+      );
+      assert.equal(item.models.length, 2);
+      assert.equal(item.aggregationBasis, "returned-daily-records");
+      assert.equal(item.models[1].cost, null);
+      assert.ok(item.missingDates.length > 0, "partial days remain explicit");
+    }
+    for (const item of json.sourceMonthlySnapshots) {
+      assert.equal(item.models[0].totalTokens, 900);
+      assert.equal(item.models[1].cost, 80);
+      assert.equal(item.models[2].model, "source-only-model");
+      assert.equal(item.sourceAsOfDate, "2026-11-04");
+    }
+    const csv = exported.csv
+      .trim()
+      .split("\r\n")
+      .slice(1)
+      .map((line) => line.slice(1, -1).split('","'));
+    const returned = csv.filter((row) => row[11] === "returned");
+    assert.equal(
+      returned.reduce((total, row) => total + Number(row[3]), 0),
+      source.length * 30,
+    );
+    assert.ok(
+      returned.some((row) => row[9] === ""),
+      "unknown costs stay blank",
+    );
+    const missing = csv.filter((row) => row[11] === "not-returned");
+    assert.ok(missing.length > 0);
+    assert.ok(
+      missing.every((row) => row.slice(3, 10).every((cell) => cell === "")),
+    );
+  });
+}
+
+test("R17: a source-only month has no invented returned zero or daily total", () => {
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-11-04"),
+    [usageMonth("2026-11", 900, [])],
+    [],
+  );
+  assert.deepEqual(returnedHistoryModels(snapshot), []);
+  assert.equal(
+    safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+    null,
+  );
+  const json = JSON.parse(historyExport(snapshot, 0).json);
+  assert.deepEqual(json.monthly[0].models, []);
+  assert.equal(json.sourceMonthlySnapshots[0].models[0].totalTokens, 900);
+  assert.equal(json.missingDates.length, 4);
+});
+
+test("R17: advancing an all-history window retains batches, failures and source dates", () => {
+  const window = historyWindow("all", "2026-10-31");
+  const source = [
+    usageMonth("2024-11", 10, [["2024-11-01", 10]]),
+    {
+      ...usageMonth("2026-10", 20, [["2026-10-31", 20]]),
+      sourceAsOfDate: "2026-10-31",
+    },
+  ];
+  const snapshot = buildHistory(
+    window,
+    source,
+    ["2025-04"],
+    window.months.slice(0, 58),
+  );
+  const next = retainHistoryWindow(
+    snapshot,
+    historyWindow("all", "2026-11-01"),
+  );
+  assert.deepEqual(next.months, source);
+  assert.deepEqual(next.failedMonths, ["2025-04"]);
+  assert.ok(next.unloadedMonths.includes("2026-11"));
+  assert.equal(next.missingDates.includes("2026-11-01"), false);
+  assert.equal(next.months[1].sourceAsOfDate, "2026-10-31");
+  assert.equal(
+    snapshot.window.to,
+    "2026-10-31",
+    "retention does not mutate the old snapshot",
+  );
+});
+
+test("R17: rolling-window retention clips days and does not promote future placeholders", () => {
+  const source = {
+    ...usageMonth("2026-10", 90, [
+      ["2026-10-04", 10],
+      ["2026-10-05", 20],
+      ["2026-10-06", 0],
+    ]),
+    sourceAsOfDate: "2026-10-05",
+  };
+  const snapshot = buildHistory(
+    historyWindow("month", "2026-10-05"),
+    [source],
+    [],
+  );
+  const next = retainHistoryWindow(
+    snapshot,
+    historyWindow("month", "2026-10-06"),
+  );
+  assert.equal(next.rows.length, 2);
+  assert.ok(next.missingDates.includes("2026-10-06"));
+  const clipped = retainHistoryWindow(snapshot, {
+    from: "2026-10-05",
+    to: "2026-10-06",
+    months: ["2026-10"],
+  });
+  assert.equal(safeKnownSum(returnedHistoryModels(clipped), "totalTokens"), 20);
 });

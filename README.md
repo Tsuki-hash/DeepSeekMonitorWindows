@@ -143,7 +143,7 @@ API Key 和用量 Token 保存在：
 
 ## 开发与验收
 
-源码工具链要求 Node.js 22.6+、npm、Rust 1.88+、Windows MSVC 与 Visual Studio Build Tools 2022 的 C++ 桌面开发组件。以下为供本机执行的命令，**不是本轮已执行或通过的记录**：
+源码工具链要求 Node.js 22.13 及以上的 22.x，或 24 及以上版本、npm、Rust 1.88+、Windows MSVC 与 Visual Studio Build Tools 2022 的 C++ 桌面开发组件。以下为供本机执行的命令，**不是本轮已执行或通过的记录**：
 
 ```powershell
 npm ci

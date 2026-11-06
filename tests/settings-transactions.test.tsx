@@ -2059,3 +2059,621 @@ scenario(
     assert.equal(input("API Key").props.value, "SYNTHETIC_K1");
   },
 );
+
+// R17: deferred clipboard and IPC results intentionally resolve out of order.
+// These are regression definitions, not Windows clipboard/WebView2 evidence.
+const withTokenClipboard = async (readText, body) => {
+  const descriptor = Object.getOwnPropertyDescriptor(g, "navigator");
+  Object.defineProperty(g, "navigator", {
+    configurable: true,
+    value: { clipboard: { readText } },
+  });
+  try {
+    await body();
+  } finally {
+    if (descriptor) Object.defineProperty(g, "navigator", descriptor);
+    else delete g.navigator;
+  }
+};
+const beginTokenPaste = async () => {
+  await act(async () => {
+    state.pasteUsageToken();
+  });
+};
+
+for (const clipboardFails of [false, true]) {
+  scenario(
+    `R17: late clipboard ${clipboardFails ? "failure" : "success"} cannot overwrite typed or ABA Token edits`,
+    async (concurrent) => {
+      const clipboard = deferred();
+      await withTokenClipboard(
+        () => clipboard.promise,
+        async () => {
+          await mount(<Probe />, concurrent);
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+          await beginTokenPaste();
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+          const displayed = state.usageStatus;
+          await act(async () => {
+            if (clipboardFails)
+              clipboard.reject(new Error("Synthetic clipboard failure"));
+            else clipboard.resolve("SYNTHETIC_OLD_CLIPBOARD_TOKEN");
+          });
+          await flush();
+          assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+          assert.equal(state.usageStatus, displayed);
+          assert.equal(submitted("save_usage_token").length, 0);
+        },
+      );
+    },
+  );
+}
+
+for (const olderFails of [false, true]) {
+  scenario(
+    `R17: later Token paste owns feedback when older clipboard ${olderFails ? "rejects" : "resolves"} last`,
+    async (concurrent) => {
+      const older = deferred();
+      const newer = deferred();
+      let reads = 0;
+      await withTokenClipboard(
+        () => (++reads === 1 ? older.promise : newer.promise),
+        async () => {
+          await mount(<Probe />, concurrent);
+          await beginTokenPaste();
+          await beginTokenPaste();
+          await finish(newer, "  SYNTHETIC_NEW_CLIPBOARD_TOKEN  ");
+          assert.equal(state.usageToken, "SYNTHETIC_NEW_CLIPBOARD_TOKEN");
+          assert.equal(state.usageStatus, "已从剪贴板读取");
+          await act(async () => {
+            if (olderFails)
+              older.reject(new Error("Synthetic older clipboard failure"));
+            else older.resolve("SYNTHETIC_OLD_CLIPBOARD_TOKEN");
+          });
+          await flush();
+          assert.equal(state.usageToken, "SYNTHETIC_NEW_CLIPBOARD_TOKEN");
+          assert.equal(state.usageStatus, "已从剪贴板读取");
+        },
+      );
+    },
+  );
+}
+
+for (const [command, action] of [
+  ["clear_usage_token", "clearUsageToken"],
+  ["forget_usage_session", "forgetUsageSession"],
+]) {
+  for (const clipboardFirst of [false, true]) {
+    scenario(
+      `R17: ${command} revokes older clipboard before or after its receipt (${clipboardFirst})`,
+      async (concurrent) => {
+        const clipboard = deferred();
+        const clearing = deferred();
+        handlers[command] = () => clearing.promise;
+        await withTokenClipboard(
+          () => clipboard.promise,
+          async () => {
+            await mount(<Probe />, concurrent);
+            await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+            await beginTokenPaste();
+            await act(async () => state[action]());
+            const cleared = nextCredentialConfig("usageToken", false);
+            if (clipboardFirst) {
+              await finish(clipboard, "SYNTHETIC_OLD_CLIPBOARD_TOKEN");
+              assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+            }
+            await finish(clearing, cleared);
+            const displayed = state.usageStatus;
+            if (!clipboardFirst)
+              await finish(clipboard, "SYNTHETIC_OLD_CLIPBOARD_TOKEN");
+            assert.equal(state.usageToken, "");
+            assert.equal(state.usageStatus, displayed);
+            assert.match(displayed, /已清除/);
+            assert.equal(getCommittedConfig().usageTokenConfigured, false);
+            assert.equal(submitted("save_usage_token").length, 0);
+            assert.equal(submitted("start_usage_sync").length, 0);
+          },
+        );
+      },
+    );
+  }
+  scenario(
+    `R17: explicit paste after ${command} stays current across its older receipt`,
+    async (concurrent) => {
+      const clipboard = deferred();
+      const clearing = deferred();
+      handlers[command] = () => clearing.promise;
+      await withTokenClipboard(
+        () => clipboard.promise,
+        async () => {
+          await mount(<Probe />, concurrent);
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+          await act(async () => state[action]());
+          await beginTokenPaste();
+          await finish(clearing, nextCredentialConfig("usageToken", false));
+          await finish(clipboard, "SYNTHETIC_EXPLICIT_NEW_TOKEN");
+          assert.equal(state.usageToken, "SYNTHETIC_EXPLICIT_NEW_TOKEN");
+          assert.equal(state.usageStatus, "已从剪贴板读取");
+          assert.equal(getCommittedConfig().usageTokenConfigured, false);
+          assert.equal(submitted("save_usage_token").length, 0);
+        },
+      );
+    },
+  );
+}
+
+for (const succeeds of [false, true]) {
+  scenario(
+    `R17: Token save ${succeeds ? "success" : "failure"} belongs to submitted generation, not newer ABA draft`,
+    async (concurrent) => {
+      const saving = deferred();
+      handlers.save_usage_token = () => saving.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+      let result;
+      await act(async () => {
+        result = state.saveUsageToken();
+      });
+      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+      const displayed = state.usageStatus;
+      if (succeeds) {
+        const receipt = nextCredentialConfig("usageToken", true);
+        await finish(saving, receipt);
+        assert.equal(getCommittedConfig(), receipt);
+      } else {
+        await act(async () =>
+          saving.reject(new Error("Synthetic obsolete Token rejection")),
+        );
+      }
+      await flush();
+      assert.equal(await result, succeeds);
+      assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+      assert.equal(state.usageStatus, displayed);
+      assert.equal(state.busy, false);
+    },
+  );
+  scenario(
+    `R17: Token save revokes an older clipboard even when verification ${succeeds ? "succeeds" : "fails"}`,
+    async (concurrent) => {
+      const clipboard = deferred();
+      const saving = deferred();
+      handlers.save_usage_token = () => saving.promise;
+      await withTokenClipboard(
+        () => clipboard.promise,
+        async () => {
+          await mount(<Probe />, concurrent);
+          await act(async () =>
+            state.setUsageToken("SYNTHETIC_SUBMITTED_TOKEN"),
+          );
+          await beginTokenPaste();
+          let result;
+          await act(async () => {
+            result = state.saveUsageToken();
+          });
+          if (succeeds)
+            await finish(saving, nextCredentialConfig("usageToken", true));
+          else
+            await act(async () =>
+              saving.reject(new Error("Synthetic current Token rejection")),
+            );
+          const displayed = state.usageStatus;
+          await finish(clipboard, "SYNTHETIC_OBSOLETE_CLIPBOARD_TOKEN");
+          assert.equal(await result, succeeds);
+          assert.equal(
+            state.usageToken,
+            succeeds ? "" : "SYNTHETIC_SUBMITTED_TOKEN",
+          );
+          assert.equal(state.usageStatus, displayed);
+          assert.match(
+            displayed,
+            succeeds ? /验证通过/ : /Synthetic current Token rejection/,
+          );
+          assert.equal(submitted("save_usage_token").length, 1);
+        },
+      );
+    },
+  );
+}
+
+scenario(
+  "R17: Token success clears on edit while unrelated committed reads retain candidate rejection",
+  async (concurrent) => {
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+    await act(async () => state.saveUsageToken());
+    assert.equal(state.usageStatus, "验证通过并已保存");
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+    assert.doesNotMatch(state.usageStatus, /验证通过/);
+    handlers.save_usage_token = () =>
+      Promise.reject(new Error("Synthetic current Token rejection"));
+    await act(async () => state.saveUsageToken());
+    const before = getCommittedConfig();
+    config = {
+      ...before,
+      configRevision: ++fixtureRevision,
+      refreshIntervalSeconds: 1800,
+    };
+    await act(async () => setCommittedConfig(config));
+    assert.equal(state.refresh, 1800);
+    assert.equal(state.usageStatus, "Synthetic current Token rejection");
+    config = {
+      ...config,
+      configRevision: ++fixtureRevision,
+      apiKeyRevision: fixtureRevision,
+    };
+    await act(async () => applyReadConfig(config, getCommitRevision()));
+    assert.equal(state.usageStatus, "Synthetic current Token rejection");
+    assert.equal(state.usageToken, "SYNTHETIC_TOKEN_B");
+    config = nextCredentialConfig("usageToken", false);
+    await act(async () => setCommittedConfig(config));
+    assert.equal(state.usageStatus, "未配置用量 Token");
+    assert.equal(state.usageToken, "SYNTHETIC_TOKEN_B");
+  },
+);
+
+scenario(
+  "R17: early Token commit and later Key snapshot do not swallow the current save receipt",
+  async (concurrent) => {
+    const saving = deferred();
+    handlers.save_usage_token = () => saving.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+    let result;
+    await act(async () => {
+      result = state.saveUsageToken();
+    });
+    const receipt = nextCredentialConfig("usageToken", true);
+    await act(async () => setCommittedConfig(receipt));
+    config = {
+      ...receipt,
+      configRevision: ++fixtureRevision,
+      apiKeyRevision: fixtureRevision,
+    };
+    await act(async () => setCommittedConfig(config));
+    await finish(saving, receipt);
+    assert.equal(await result, true);
+    assert.equal(getCommittedConfig(), config);
+    assert.equal(state.usageStatus, "验证通过并已保存");
+    assert.equal(state.usageToken, "");
+  },
+);
+
+scenario(
+  "R17: late clipboard after discard and remount cannot restore credentials or cross page ownership",
+  async (concurrent) => {
+    const clipboard = deferred();
+    await withTokenClipboard(
+      () => clipboard.promise,
+      async () => {
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        await beginTokenPaste();
+        let blocker;
+        state.registerCredentialBlocker((value) => {
+          blocker = value;
+        });
+        await act(async () => blocker.discard());
+        assert.equal(state.usageToken, "");
+        await act(async () => renderer.unmount());
+        renderer = null;
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_NEW_PAGE_TOKEN"));
+        const displayed = state.usageStatus;
+        await finish(clipboard, "SYNTHETIC_OLD_PAGE_TOKEN");
+        assert.equal(state.usageToken, "SYNTHETIC_NEW_PAGE_TOKEN");
+        assert.equal(state.usageStatus, displayed);
+        assert.equal(submitted("save_usage_token").length, 0);
+      },
+    );
+  },
+);
+
+scenario(
+  "R17: editing a candidate retires web feedback without cancelling the owned login or its committed result",
+  async (concurrent) => {
+    let session;
+    handlers.start_usage_sync = (args) => {
+      session = syncStatus(args.requestId, true);
+      return { ...session, synced: false };
+    };
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    await act(async () => state.setUsageToken("SYNTHETIC_NEW_DRAFT_TOKEN"));
+    assert.equal(state.usageSyncing, true);
+    const captured = nextCredentialConfig("usageToken", true);
+    await emit("usage-token-captured", capturedPayload(captured, session));
+    assert.equal(getCommittedConfig(), captured);
+    assert.equal(state.usageSyncing, false);
+    assert.equal(state.usageToken, "SYNTHETIC_NEW_DRAFT_TOKEN");
+    assert.equal(submitted("cancel_usage_sync").length, 0);
+  },
+);
+
+scenario(
+  "R17: a repeated Token save reuses IPC but revokes the intervening clipboard intent",
+  async (concurrent) => {
+    const clipboard = deferred();
+    const saving = deferred();
+    handlers.save_usage_token = () => saving.promise;
+    await withTokenClipboard(
+      () => clipboard.promise,
+      async () => {
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        let first, repeated;
+        await act(async () => {
+          first = state.saveUsageToken();
+        });
+        await beginTokenPaste();
+        await act(async () => {
+          repeated = state.saveUsageToken();
+        });
+        assert.equal(first, repeated);
+        assert.equal(submitted("save_usage_token").length, 1);
+        await finish(saving, nextCredentialConfig("usageToken", true));
+        await finish(clipboard, "SYNTHETIC_OBSOLETE_CLIPBOARD_TOKEN");
+        assert.equal(await repeated, true);
+        assert.equal(state.usageToken, "");
+        assert.equal(state.usageStatus, "验证通过并已保存");
+      },
+    );
+  },
+);
+
+scenario(
+  "R17: an explicit new paste keeps its draft ownership across an older save receipt",
+  async (concurrent) => {
+    const clipboard = deferred();
+    const saving = deferred();
+    handlers.save_usage_token = () => saving.promise;
+    await withTokenClipboard(
+      () => clipboard.promise,
+      async () => {
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        let result;
+        await act(async () => {
+          result = state.saveUsageToken();
+        });
+        await beginTokenPaste();
+        await finish(saving, nextCredentialConfig("usageToken", true));
+        assert.equal(await result, true);
+        assert.doesNotMatch(state.usageStatus, /验证通过/);
+        await finish(clipboard, "SYNTHETIC_NEW_CLIPBOARD_TOKEN");
+        assert.equal(state.usageToken, "SYNTHETIC_NEW_CLIPBOARD_TOKEN");
+        assert.equal(state.usageStatus, "已从剪贴板读取");
+        assert.equal(submitted("save_usage_token").length, 1);
+      },
+    );
+  },
+);
+
+scenario(
+  "R17: first accepted configuration cannot erase a failed Token candidate",
+  async (concurrent) => {
+    const reading = deferred();
+    handlers.get_app_config = () => reading.promise;
+    handlers.save_usage_token = () =>
+      Promise.reject(new Error("Synthetic first Token rejection"));
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+    await act(async () => state.saveUsageToken());
+    assert.equal(getCommittedConfig(), null);
+    await finish(reading, config);
+    assert.equal(state.usageStatus, "Synthetic first Token rejection");
+    assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+  },
+);
+
+scenario(
+  "R17: discard invalidates an unresolved Token clipboard without requiring unmount",
+  async (concurrent) => {
+    const clipboard = deferred();
+    await withTokenClipboard(
+      () => clipboard.promise,
+      async () => {
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        await beginTokenPaste();
+        let blocker;
+        state.registerCredentialBlocker((value) => {
+          blocker = value;
+        });
+        await act(async () => blocker.discard());
+        const displayed = state.usageStatus;
+        await finish(clipboard, "SYNTHETIC_OBSOLETE_CLIPBOARD_TOKEN");
+        assert.equal(state.usageToken, "");
+        assert.equal(state.usageStatus, displayed);
+        assert.equal(blocker.dirty, false);
+      },
+    );
+  },
+);
+
+for (const [command, action] of [
+  ["save_usage_token", "saveUsageToken"],
+  ["clear_usage_token", "clearUsageToken"],
+  ["forget_usage_session", "forgetUsageSession"],
+]) {
+  scenario(
+    `R17: ${command} receipt cannot consume a draft under a newer root read error`,
+    async (concurrent) => {
+      const pending = deferred();
+      handlers[command] = () => pending.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+      await act(async () => {
+        state[action]();
+      });
+      const receipt = nextCredentialConfig(
+        "usageToken",
+        command === "save_usage_token",
+      );
+      const unavailable = {
+        ...receipt,
+        configRevision: ++fixtureRevision,
+        configReadError: "Synthetic root read error",
+      };
+      await act(async () => setCommittedConfig(unavailable));
+      await finish(pending, receipt);
+      assert.equal(getCommittedConfig(), unavailable);
+      assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+      assert.equal(state.usageStatus, "Synthetic root read error");
+      assert.equal(state.busy, false);
+    },
+  );
+}
+
+for (const editAfterClear of [false, true]) {
+  scenario(
+    `R17: forget reports partial browser-data failure only for its current intent (${editAfterClear})`,
+    async (concurrent) => {
+      const forgetting = deferred();
+      handlers.forget_usage_session = () => forgetting.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+      await act(async () => state.forgetUsageSession());
+      const cleared = nextCredentialConfig("usageToken", false);
+      await emit("usage-token-cleared", cleared);
+      if (editAfterClear)
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+      await act(async () =>
+        forgetting.reject(new Error("Synthetic browser-data deletion failure")),
+      );
+      await flush();
+      assert.equal(getCommittedConfig().usageTokenConfigured, false);
+      assert.equal(
+        state.usageToken,
+        editAfterClear ? "SYNTHETIC_TOKEN_B" : "SYNTHETIC_TOKEN_A",
+      );
+      assert.equal(
+        state.usageStatus,
+        editAfterClear
+          ? "未配置用量 Token"
+          : "Synthetic browser-data deletion failure",
+      );
+      assert.equal(state.busy, false);
+      assert.equal(submitted("save_usage_token").length, 0);
+    },
+  );
+}
+
+for (const eventFirst of [false, true]) {
+  scenario(
+    `R17: cancel receipt and terminal event preserve cancellation feedback in either delivery order (${eventFirst})`,
+    async (concurrent) => {
+      const cancelling = deferred();
+      let session;
+      handlers.start_usage_sync = (args) => {
+        session = syncStatus(args.requestId, true);
+        return { ...session, synced: false };
+      };
+      handlers.cancel_usage_sync = () => cancelling.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      await act(async () => state.cancelUsageSync());
+      const ended = { ...session, active: false };
+      if (eventFirst) await emit("usage-sync-ended", ended);
+      await finish(cancelling, ended);
+      if (!eventFirst) await emit("usage-sync-ended", ended);
+      assert.equal(state.usageSyncing, false);
+      assert.equal(state.usageStatus, "已取消同步，原 Token 未更改");
+      assert.equal(state.showManualPaste, false);
+    },
+  );
+}
+
+scenario(
+  "R17: explicit save after a failed clear never reuses the revoked same-draft request",
+  async (concurrent) => {
+    const oldSave = deferred();
+    const newSave = deferred();
+    let saves = 0;
+    handlers.save_usage_token = () =>
+      ++saves === 1 ? oldSave.promise : newSave.promise;
+    handlers.clear_usage_token = () =>
+      Promise.reject(new Error("Synthetic clear failure"));
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+    let oldResult, newResult;
+    await act(async () => {
+      oldResult = state.saveUsageToken();
+    });
+    const previous = submitted("save_usage_token").at(-1).args.requestId;
+    await act(async () => state.clearUsageToken());
+    await flush();
+    assert.equal(state.usageStatus, "Synthetic clear failure");
+    await act(async () => {
+      newResult = state.saveUsageToken();
+    });
+    assert.equal(submitted("save_usage_token").length, 2);
+    assert.ok(
+      submitted("save_usage_token")
+        .at(-1)
+        .args.supersededRequestIds.includes(previous),
+    );
+    await finish(newSave, nextCredentialConfig("usageToken", true));
+    assert.equal(await newResult, true);
+    await act(async () =>
+      oldSave.reject(new Error("Synthetic revoked old request")),
+    );
+    assert.equal(await oldResult, false);
+    assert.equal(state.usageToken, "");
+    assert.equal(state.usageStatus, "验证通过并已保存");
+  },
+);
+
+scenario(
+  "R17: response-only cached Token sync finishes feedback and re-reads configuration despite a duplicate ended event",
+  async (concurrent) => {
+    const reading = deferred();
+    let reads = 0;
+    handlers.get_app_config = () => (++reads === 1 ? config : reading.promise);
+    let terminal;
+    handlers.start_usage_sync = (args) => {
+      terminal = syncStatus(args.requestId, false);
+      return { ...terminal, synced: true };
+    };
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_LOCAL_DRAFT_TOKEN"));
+    await act(async () => state.startUsageSync());
+    assert.equal(reads, 2);
+    assert.equal(state.usageSyncing, false);
+    await emit("usage-sync-ended", terminal);
+    await finish(reading, config);
+    assert.equal(state.usageStatus, "用量 Token 已配置");
+    assert.equal(state.usageToken, "SYNTHETIC_LOCAL_DRAFT_TOKEN");
+    assert.equal(state.showManualPaste, false);
+    assert.equal(submitted("start_usage_sync").length, 1);
+    assert.equal(submitted("save_usage_token").length, 0);
+  },
+);
+
+scenario(
+  "R17: a cached-sync fallback read cannot restore Token state after a newer clear",
+  async (concurrent) => {
+    const reading = deferred();
+    let reads = 0;
+    handlers.get_app_config = () => (++reads === 1 ? config : reading.promise);
+    handlers.start_usage_sync = (args) => ({
+      ...syncStatus(args.requestId, false),
+      synced: true,
+    });
+    handlers.clear_usage_token = () =>
+      nextCredentialConfig("usageToken", false);
+    await mount(<Probe />, concurrent);
+    const stale = getCommittedConfig();
+    await act(async () => state.startUsageSync());
+    await act(async () => state.clearUsageToken());
+    await flush();
+    const cleared = getCommittedConfig();
+    await finish(reading, stale);
+    assert.equal(getCommittedConfig(), cleared);
+    assert.equal(state.config.usageTokenConfigured, false);
+    assert.equal(state.usageStatus, "已清除用量 Token");
+    assert.equal(submitted("start_usage_sync").length, 1);
+    assert.equal(submitted("save_usage_token").length, 0);
+  },
+);

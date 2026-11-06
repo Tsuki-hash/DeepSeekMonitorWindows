@@ -131,6 +131,40 @@ export function buildHistory(
   };
 }
 
+/**
+ * Advance only the displayed date window of an already account-checked snapshot.
+ * Callers must verify the credential epoch and selection before retaining it.
+ * Source request dates stay unchanged, so yesterday's future placeholders never
+ * become today's returned zeroes. Newly encountered months are still unloaded.
+ */
+export function retainHistoryWindow(
+  snapshot: HistorySnapshot,
+  window: HistoryWindow,
+): HistorySnapshot {
+  const monthSet = new Set(window.months);
+  const months = snapshot.months.filter((month) => monthSet.has(month.month));
+  const failed = snapshot.failedMonths.filter((month) => monthSet.has(month));
+  const attempted = new Set([...months.map((month) => month.month), ...failed]);
+  return buildHistory(
+    window,
+    months,
+    failed,
+    window.months.filter((month) => !attempted.has(month)),
+  );
+}
+
+/** One aggregation basis for page totals, monthly bars and JSON monthly rows. */
+export function returnedHistoryModels(
+  snapshot: HistorySnapshot,
+  month?: string,
+): RawModelUsage[] {
+  return sumModels(
+    snapshot.rows
+      .filter((row) => month == null || row.date.slice(0, 7) === month)
+      .map((row) => row.model),
+  );
+}
+
 const fields = [
   "totalTokens",
   "requestCount",
@@ -253,6 +287,7 @@ export function historyExport(
     currency: "CNY",
     accountScope: "current-local-usage-session",
     stale,
+    aggregationBasis: "returned-daily-records",
     from: snapshot.window.from,
     to: snapshot.window.to,
     failedMonths: snapshot.failedMonths,
@@ -279,6 +314,7 @@ export function historyExport(
       month: month.month,
       scope: "window",
       aggregationScope: "selected-window" as const,
+      aggregationBasis: "returned-daily-records" as const,
       // 复评 F06：窗口内该月的日期覆盖情况显式给出，缺失日期不折算成 0。
       // 复评 R11：覆盖天数必须是**唯一日期数** —— 旧实现用行数，
       // 一天两个模型会被算成 2 天，误导覆盖率。
@@ -290,7 +326,7 @@ export function historyExport(
       modelMappingVersion: month.usage.modelMappingVersion ?? null,
       fetchedAt: new Date(month.fetchedAt).toISOString(),
       warnings: month.usage.warnings ?? [],
-      models: sumModels(inWindow.map((row) => row.model)).map(cleanModel),
+      models: returnedHistoryModels(snapshot, month.month).map(cleanModel),
     };
   });
   const sourceMonthlySnapshots = snapshot.months.map((month) => ({
@@ -300,6 +336,7 @@ export function historyExport(
     fullMonthFrom: `${month.month}-01`,
     // 复评 R11：真实月末（闰二月 29、平月 28/30），不再固定 -31。
     fullMonthTo: monthEndDate(month.month),
+    sourceAsOfDate: month.sourceAsOfDate ?? month.usage.accountingDate ?? null,
     fetchedAt: new Date(month.fetchedAt).toISOString(),
     models: (month.usage.rawModels ?? []).map(cleanModel),
   }));

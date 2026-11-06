@@ -89,13 +89,50 @@ struct BalanceResponse {
     balance_infos: Vec<BalanceInfo>,
 }
 
-/// 纯解析：余额 JSON → 结构。供单测直接喂样本。
+/// 余额显示的防御上界，沿用托盘既有范围；不是 DeepSeek 的业务余额上限。
+/// 各入口使用同一范围，不能在首页成功后才被提醒或托盘拒绝。
+const MAX_DISPLAY_BALANCE: f64 = 1e15;
+
+/// 余额金额的共同值域。保留明确零、欠费负数及原有浮点数字语法；
+/// 不把空白、非有限值或下溢的非零数当成可展示的零余额。
+pub(crate) fn validate_balance_amount(raw: &str) -> Result<f64, String> {
+    let value = raw.parse::<f64>().map_err(|_| "余额金额不是有效数字")?;
+    if !value.is_finite() || value.abs() > MAX_DISPLAY_BALANCE {
+        return Err("余额金额超出可显示范围".into());
+    }
+    let mantissa = raw.split(['e', 'E']).next().unwrap_or(raw);
+    if value == 0.0 && mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
+        return Err("余额金额过小，不能可靠表示".into());
+    }
+    Ok(value)
+}
+
+/// 首页与托盘当前支持的账户币种。未知币种不能默认为人民币。
+pub(crate) fn balance_currency_symbol(currency: &str) -> Result<&'static str, String> {
+    match currency {
+        "CNY" => Ok("¥"),
+        "USD" => Ok("$"),
+        _ => Err("余额币种不可用".into()),
+    }
+}
+
+/// 纯解析：余额 JSON → 已校验结构。沿用首条账户余额语义，不跳过坏行找好行。
 fn parse_balance(data: BalanceResponse) -> Result<BalanceResult, String> {
     let info = data
         .balance_infos
         .into_iter()
         .next()
         .ok_or_else(|| "余额信息为空".to_string())?;
+    balance_currency_symbol(&info.currency)?;
+    for (field, value) in [
+        ("total_balance", &info.total_balance),
+        ("granted_balance", &info.granted_balance),
+        ("topped_up_balance", &info.topped_up_balance),
+    ] {
+        validate_balance_amount(value).map_err(|error| format!("{field}：{error}"))?;
+    }
+    // 账户不可用可能只是余额为零或欠费，不等于 API Key 失效。
+    // 金额保留原始精度文本，不补零、不取绝对值，也不擅自校正各余额分项。
     Ok(BalanceResult {
         is_available: data.is_available,
         currency: info.currency,
@@ -110,6 +147,14 @@ impl BalanceResponse {
     fn from_json(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|error| format!("解析余额数据失败：{error}"))
     }
+}
+
+/// 所有生产余额请求共用的 JSON 入口：结构或值域异常均为 InvalidData，
+/// 在产生 BalanceResult 前失败，调用者沿既有失败路径保留最后可信快照/凭据。
+pub(crate) fn parse_balance_json(text: &str) -> Result<BalanceResult, ApiError> {
+    BalanceResponse::from_json(text)
+        .and_then(parse_balance)
+        .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))
 }
 
 /// 实时查询 DeepSeek 账户余额。
@@ -141,9 +186,7 @@ pub async fn fetch_balance_with_key(api_key: &str) -> Result<BalanceResult, ApiE
     let text = read_bounded_body(response, MAX_RESPONSE_BYTES)
         .await
         .map_err(|error| body_error_to_api("读取余额响应失败", error))?;
-    let parsed = BalanceResponse::from_json(&text)
-        .map_err(|message| ApiError::new(ErrorKind::InvalidData, message))?;
-    parse_balance(parsed).map_err(|message| ApiError::new(ErrorKind::InvalidData, message))
+    parse_balance_json(&text)
 }
 
 /// 复评 N18：官方响应体的字节上限（16MiB，与采集输出同量级）。
@@ -2506,6 +2549,188 @@ mod tests {
         let raw = r#"{"is_available": true, "balance_infos": []}"#;
         let parsed = BalanceResponse::from_json(raw).unwrap();
         assert!(parse_balance(parsed).is_err());
+    }
+
+    fn r17_balance_body(currency: &str, total: &str) -> serde_json::Value {
+        serde_json::json!({
+            "is_available": true,
+            "balance_infos": [{
+                "currency": currency,
+                "total_balance": total,
+                "granted_balance": "0.00",
+                "topped_up_balance": total
+            }]
+        })
+    }
+
+    #[test]
+    fn r17_balance_rejects_invalid_totals_at_the_production_json_boundary() {
+        for total in [
+            "",
+            " ",
+            "\t\n",
+            "NaN",
+            "nan",
+            "+NaN",
+            "inf",
+            "-inf",
+            "Infinity",
+            "-Infinity",
+            "1e309",
+            "-1e309",
+            "1000000000000001",
+            "-1000000000000001",
+            "1e-9999",
+            "-1e-9999",
+            "12.34oops",
+            "0x10",
+            "1,000",
+            " 12.34 ",
+            "--1",
+        ] {
+            let mut body = r17_balance_body("CNY", total);
+            body["balance_infos"][0]["topped_up_balance"] = serde_json::json!("12.34");
+            let error = parse_balance_json(&body.to_string()).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidData, "{total:?}");
+            assert!(error.message.contains("total_balance"), "{total:?}");
+            let command: crate::error::CommandError = error.into();
+            assert_eq!(command.code, "invalid_data");
+            assert!(!command.retryable);
+        }
+    }
+
+    #[test]
+    fn r17_balance_keeps_zero_debt_supported_currencies_and_original_precision() {
+        for currency in ["CNY", "USD"] {
+            for total in [
+                "0",
+                "0.00",
+                "-0.00",
+                "+0",
+                "0e100",
+                "-0.000e-100",
+                "12.340000",
+                "-12.34",
+                "1.234e2",
+                "-1.234e2",
+                "1000000000001",
+                "-1000000000001",
+                "1e15",
+                "-1e15",
+            ] {
+                for available in [true, false] {
+                    let mut body = r17_balance_body(currency, total);
+                    body["is_available"] = serde_json::json!(available);
+                    let result = parse_balance_json(&body.to_string()).unwrap();
+                    assert_eq!(result.is_available, available);
+                    assert_eq!(result.currency, currency);
+                    assert_eq!(result.total_balance, total);
+                    assert_eq!(result.granted_balance, "0.00");
+                    assert_eq!(result.topped_up_balance, total);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r17_balance_unknown_or_missing_currency_is_not_assumed_cny() {
+        for currency in ["", " ", "EUR", "JPY", "cny", "usd", "CNY "] {
+            let body = r17_balance_body(currency, "12.34");
+            let error = parse_balance_json(&body.to_string()).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidData, "{currency:?}");
+        }
+        for value in [serde_json::Value::Null, serde_json::json!(123)] {
+            let mut body = r17_balance_body("CNY", "12.34");
+            body["balance_infos"][0]["currency"] = value;
+            assert_eq!(
+                parse_balance_json(&body.to_string()).unwrap_err().kind,
+                ErrorKind::InvalidData
+            );
+        }
+        let mut body = r17_balance_body("CNY", "12.34");
+        body["balance_infos"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("currency");
+        assert_eq!(
+            parse_balance_json(&body.to_string()).unwrap_err().kind,
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn r17_balance_all_amount_fields_require_explicit_valid_strings() {
+        for field in ["total_balance", "granted_balance", "topped_up_balance"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(0),
+                serde_json::json!(""),
+                serde_json::json!("NaN"),
+                serde_json::json!("Infinity"),
+                serde_json::json!("1e16"),
+                serde_json::json!("1e-9999"),
+            ] {
+                let mut body = r17_balance_body("CNY", "12.34");
+                body["balance_infos"][0][field] = value;
+                assert_eq!(
+                    parse_balance_json(&body.to_string()).unwrap_err().kind,
+                    ErrorKind::InvalidData,
+                    "{field}"
+                );
+            }
+            let mut body = r17_balance_body("CNY", "12.34");
+            body["balance_infos"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert_eq!(
+                parse_balance_json(&body.to_string()).unwrap_err().kind,
+                ErrorKind::InvalidData,
+                "missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn r17_balance_does_not_replace_a_bad_first_row_with_another_currency() {
+        let mut body = r17_balance_body("CNY", "12.34");
+        let usd = r17_balance_body("USD", "56.78")["balance_infos"][0].clone();
+        body["balance_infos"].as_array_mut().unwrap().push(usd);
+        let result = parse_balance_json(&body.to_string()).unwrap();
+        assert_eq!(result.currency, "CNY");
+        assert_eq!(result.total_balance, "12.34");
+        body["balance_infos"][0]["total_balance"] = serde_json::json!("NaN");
+        assert_eq!(
+            parse_balance_json(&body.to_string()).unwrap_err().kind,
+            ErrorKind::InvalidData
+        );
+        body["balance_infos"][0]["total_balance"] = serde_json::json!("12.34");
+        body["balance_infos"][0]["currency"] = serde_json::json!("EUR");
+        assert_eq!(
+            parse_balance_json(&body.to_string()).unwrap_err().kind,
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn r17_balance_invalid_structure_uses_the_same_invalid_data_classification() {
+        for body in [
+            "not json",
+            "{}",
+            r#"{"is_available":true,"balance_infos":[]}"#,
+            r#"{"is_available":true,"balance_infos":null}"#,
+        ] {
+            assert_eq!(
+                parse_balance_json(body).unwrap_err().kind,
+                ErrorKind::InvalidData
+            );
+        }
+        let mut body = r17_balance_body("CNY", "0");
+        body["is_available"] = serde_json::json!("false");
+        assert_eq!(
+            parse_balance_json(&body.to_string()).unwrap_err().kind,
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]
