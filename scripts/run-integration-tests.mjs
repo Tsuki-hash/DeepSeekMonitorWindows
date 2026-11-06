@@ -18,6 +18,14 @@
 // 复评 T10：合成记录的时间戳从**执行时钟**生成（当月 15 日中午），
 // 不再写死 2026-11-01；探针与用例查询同月，跨月不会无产品变更地失败。
 //
+// 第五轮复评 Q09：日志改为结构化契约 —— `preflight` 存探针/枚举等前置调用，
+// `results` 存逐用例结论（PASS/FAIL/NOT RUN/ERROR 全部落盘，含实际计数、
+// 命令、参数、cwd、退出码与两路输出）。发布记录只消费这个 schema，
+// 不再从裸调用流里猜结论。
+//
+// 第五轮复评 Q10：所有提前退出统一 flushLogs 落盘；spawn 启动错误保留
+// name/message/code；探针记录实际执行的 exe 路径与显式 cwd。
+//
 // 退出码：0 全部 PASS / 1 有用例 FAIL / 2 有用例 NOT RUN / 3 配置或 fixture 错误
 //        4 工具执行错误（cargo 缺失、编译失败等，结论未知）
 
@@ -38,6 +46,16 @@ const keep = process.argv.includes("--keep");
 const logArgIndex = process.argv.indexOf("--log-file");
 const logFile = logArgIndex >= 0 ? process.argv[logArgIndex + 1] : undefined;
 const engine = join(root, "src-tauri/resources/local-usage/tokscale.exe");
+
+/** 第五轮复评 Q10：保留 spawn 启动错误（ENOENT/ENOEXEC 等）的原始字段。 */
+function spawnError(error) {
+  if (!error) return null;
+  return {
+    name: error.name,
+    message: error.message,
+    code: typeof error.code === "string" ? error.code : undefined,
+  };
+}
 
 /** 已用固定引擎实测验证可解析的工具与格式。 */
 const VERIFIED_TOOLS = ["claude"];
@@ -129,6 +147,7 @@ function probeEngine(home) {
       home,
     ],
     {
+      cwd: root,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
       env: {
@@ -140,7 +159,8 @@ function probeEngine(home) {
   );
   const outcome = {
     fullName: "probeEngine（fixture 探针）",
-    command: "tokscale",
+    // 第五轮复评 Q10：记录实际执行的二进制路径与显式 cwd，保证日志可重放。
+    command: engine,
     args: [
       "--json",
       "--client",
@@ -156,6 +176,7 @@ function probeEngine(home) {
     code: typeof result.status === "number" ? result.status : 1,
     stdout: String(result.stdout ?? ""),
     stderr: String(result.stderr ?? ""),
+    error: spawnError(result.error),
   };
   // 复评 Q10：探针失败也要留下完整命令与两个流，供发布记录定位。
   recordLog(outcome);
@@ -183,7 +204,8 @@ function listIgnoredTests() {
     ],
     { cwd: root, encoding: "utf8", shell: process.platform === "win32" },
   );
-  // 复评 Q10：枚举失败（编译错误等）同样留下底层诊断。
+  // 复评 Q10/第五轮 Q10：枚举失败（编译错误、启动失败等）同样留下底层诊断，
+  // 且该失败路径的最终 exit(4) 前由调用方 flushLogs 落盘。
   recordLog({
     fullName: "listIgnoredTests（用例枚举）",
     command: "cargo",
@@ -200,6 +222,7 @@ function listIgnoredTests() {
     code: typeof result.status === "number" ? result.status : 1,
     stdout: String(result.stdout ?? ""),
     stderr: String(result.stderr ?? ""),
+    error: spawnError(result.error),
   });
   if (result.status !== 0) {
     return { error: `cargo --list 退出码 ${result.status}` };
@@ -213,27 +236,31 @@ function listIgnoredTests() {
   return { names };
 }
 
-// 复评 Q10：诊断日志从脚本一开始就存在 —— 探针/枚举等前置失败也要留下
+// 复评 Q10/第五轮 Q09：`logs` 只存前置调用（探针/枚举），逐用例结论在
+// `results` 数组里并随最终 JSON 一起落盘 —— 两个数组共同构成发布记录消费的
+// 结构化契约。诊断日志从脚本一开始就存在，探针/枚举等前置失败也要留下
 // 完整命令、退出码与两个流，否则发布记录无法定位 fixture/编译错误。
 const logs = [];
 
-/** 记录一次底层调用（含两个流），供 --log-file 与发布记录使用。 */
+/** 记录一次前置调用（含两个流），供 --log-file 与发布记录使用。 */
 function recordLog(entry) {
   logs.push(entry);
+}
+
+/** 前置失败时的落盘形状：此时还没有任何用例结论。 */
+function logPayload(resultsValue) {
+  return {
+    generatedAt: new Date().toISOString(),
+    preflight: logs,
+    results: resultsValue,
+  };
 }
 
 /** 把已记录的诊断写到 --log-file 指定的路径（若提供）。 */
 function flushLogs() {
   if (!logFile) return;
   try {
-    writeFileSync(
-      resolve(logFile),
-      JSON.stringify(
-        { generatedAt: new Date().toISOString(), results: logs },
-        null,
-        2,
-      ),
-    );
+    writeFileSync(resolve(logFile), JSON.stringify(logPayload([]), null, 2));
   } catch (error) {
     console.error(`诊断日志写入失败：${error.message}`);
   }
@@ -358,6 +385,8 @@ function runTest(fullName) {
   const code = typeof result.status === "number" ? result.status : 1;
   const stdout = String(result.stdout ?? "");
   const stderr = String(result.stderr ?? "");
+  // 第五轮复评 Q09：runTest 的原始调用不再混入前置日志；带 verdict 的完整
+  // 结构化结果由调用方放进 results，最终随 JSON 落盘。
   const entry = {
     fullName,
     command: "cargo",
@@ -366,8 +395,8 @@ function runTest(fullName) {
     code,
     stdout,
     stderr,
+    error: spawnError(result.error),
   };
-  logs.push(entry);
 
   // 工具执行错误：cargo 没跑起来或编译失败，结论未知（复评 T02）。
   if (code !== 0 && code !== 101) {
@@ -409,6 +438,8 @@ const listed = listIgnoredTests();
 if (listed.error) {
   console.error(`工具执行错误：${listed.error}`);
   if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+  // 第五轮复评 Q10：提前退出也要把前置诊断（含枚举失败详情）落盘。
+  flushLogs();
   process.exit(4);
 }
 const expectedNames = [
@@ -468,18 +499,9 @@ for (const item of results) {
 }
 
 if (logFile) {
-  writeFileSync(
-    resolve(logFile),
-    JSON.stringify(
-      {
-        generatedAt: new Date().toISOString(),
-        fixture: { home: fixture.home, second: fixture.second },
-        results: logs,
-      },
-      null,
-      2,
-    ),
-  );
+  // 第五轮复评 Q09：结构化契约 —— preflight 存前置调用，results 存逐用例
+  // 结论（含 NOT RUN/ERROR），发布记录据此合计计数并完整嵌入。
+  writeFileSync(resolve(logFile), JSON.stringify(logPayload(results), null, 2));
   console.log(`已写入集成日志：${resolve(logFile)}`);
 }
 

@@ -104,13 +104,13 @@ const formatCounts = (counts) => {
   return `tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
 };
 
-// 复评 Q08：git 读取失败不得被解读成「工作区干净」。
-// 返回 { value, ok, code, stderr }，调用方据此写 UNKNOWN 并阻断。
+// 复评 Q08：git 成败只按退出码判断 —— 干净 `status --porcelain` 的正确结果
+// 就是 exit 0 加空输出，不能把空输出当成失败。要求非空的字段由调用方另行校验。
 const git = (...commandArgs) => {
   const result = run("git", commandArgs);
   return {
     value: result.stdout.trim(),
-    ok: result.ok && result.stdout.trim().length > 0,
+    ok: result.ok,
     code: result.code,
     stderr: result.stderr,
     args: commandArgs,
@@ -145,13 +145,19 @@ const integrationLogFile = join(
  * NOT RUN / ERROR 不计入执行数（它们确实没跑或结论未知）。
  */
 let integrationResults = [];
-/** 复评 Q09：从集成日志加载结构化子用例结果；失败返回 false 并保持空。 */
+let integrationPreflight = [];
+let integrationLoaded = false;
+/** 复评 Q09/第五轮：加载结构化集成日志（preflight + 逐用例 verdict）；失败返回 false。 */
 function loadIntegrationResults() {
-  if (integrationResults.length) return true;
+  if (integrationLoaded) return true;
   if (!existsSync(integrationLogFile)) return false;
   try {
-    integrationResults =
-      JSON.parse(readFileSync(integrationLogFile, "utf8")).results ?? [];
+    const parsed = JSON.parse(readFileSync(integrationLogFile, "utf8"));
+    integrationResults = Array.isArray(parsed.results) ? parsed.results : [];
+    integrationPreflight = Array.isArray(parsed.preflight)
+      ? parsed.preflight
+      : [];
+    integrationLoaded = true;
     return true;
   } catch {
     return false;
@@ -169,9 +175,9 @@ const integrationCounts = () => {
       totals.ignored += counts.ignored ?? 0;
       totals.tests += counts.tests ?? counts.passed ?? 0;
     }
-    // NOT RUN / ERROR：没有可合计的执行数，但整体仍标记为已知
-    // （覆盖不足是明确结论，不是解析失败）。
-    if (item.verdict === "NOT RUN") known = true;
+    // NOT RUN / ERROR：没有可合计的执行数，但结论本身是明确的
+    // （覆盖不足或工具失败），整体仍按「已知」处理而不是解析失败。
+    if (item.verdict === "NOT RUN" || item.verdict === "ERROR") known = true;
   }
   if (!known) return { ...totals, parseable: false };
   return { ...totals, parseable: true };
@@ -246,18 +252,23 @@ const gitField = (label, ...commandArgs) => {
     lines.push(`  - stderr：${result.stderr.trim() || "(空)"}`);
     return null;
   }
+  // 复评 Q08：成功路径必须把元数据显式写进报告，不能只返回值丢掉。
+  lines.push(`- ${label}：\`${result.value}\``);
   return result.value;
 };
 const headSha = gitField("提交", "rev-parse", "HEAD");
 gitField("分支", "rev-parse", "--abbrev-ref", "HEAD");
 gitField("提交时间", "log", "-1", "--format=%cI");
-// 复评 Q08：`status --porcelain` 成功时**空输出才代表干净**；
-// 命令失败（exit 128 等）输出也是空，必须区分，不能推导成干净。
+// 复评 Q08：`status --porcelain` 成功时**空输出才代表干净**；命令失败
+// （exit 128 等）输出也是空，必须区分。脏工作区按发布策略直接阻断放行。
 const status = git("status", "--porcelain");
 if (status.ok) {
-  lines.push(
-    `- 工作区是否干净：${status.value === "" ? "是" : "否（存在未提交改动）"}`,
-  );
+  const dirty = status.value !== "";
+  lines.push(`- 工作区是否干净：${dirty ? "否（存在未提交改动）" : "是"}`);
+  if (dirty) {
+    lines.push(`  - 改动：${status.value.split("\n").slice(0, 20).join("；")}`);
+    gitFailures.push("工作区存在未提交改动");
+  }
 } else {
   gitFailures.push("工作区状态");
   lines.push("- 工作区是否干净：UNKNOWN（git status 执行失败）");
@@ -311,15 +322,27 @@ for (const [label, command, commandArgs] of checks) {
   checkResults.push({ label, command, commandArgs, result, verdict });
   if (verdict === "FAIL") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
-  // 复评 Q09：集成入口的 stdout 含四条 `test result:` 行（每子用例一条），
+  // 复评 Q09：集成入口的 stdout 含多条 `test result:` 行（每子用例一条），
   // exec 只取首个会得到 tests=1。集成项改用结构化子用例日志合计。
-  // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机。
+  // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机；
+  // 日志缺失时按「不可解析」呈现，证据链失败在循环后统一并入 failures。
   const counts = label.includes("集成")
-    ? loadIntegrationResults() && integrationCounts()
+    ? loadIntegrationResults()
+      ? integrationCounts()
+      : { passed: 0, failed: 0, ignored: 0, tests: 0, parseable: false }
     : testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
     `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
+}
+
+// 复评 Q09：集成检查执行过，但结构化日志丢失/不可解析，属于证据链失败，
+// 必须阻断放行 —— 否则「子用例是否真实执行」无法核验。
+if (
+  checkResults.some((item) => item.label === "引擎集成测试") &&
+  !loadIntegrationResults()
+) {
+  failures.push("引擎集成子用例日志");
 }
 lines.push("");
 lines.push("### 完整输出");
@@ -345,35 +368,100 @@ for (const { label, command, commandArgs, result, verdict } of checkResults) {
   lines.push("");
 }
 
-// 复评 T09：把集成子用例日志嵌入发布记录 —— PASS/FAIL/NOT RUN 都可核验执行数。
-if (existsSync(integrationLogFile)) {
-  try {
-    // 复评 Q09：结果已在门禁表格阶段加载，这里直接复用。
-    loadIntegrationResults();
-    lines.push("## 引擎集成子用例日志");
+// 复评 T09/第五轮 Q09：把集成前置调用与逐用例日志嵌入发布记录 ——
+// PASS/FAIL/NOT RUN/ERROR 都可核验执行数与真实命令；嵌入失败必须阻断
+// （failures 已在门禁循环后并入，这里只负责正文自洽）。
+if (loadIntegrationResults()) {
+  lines.push("## 引擎集成子用例日志");
+  lines.push("");
+  for (const item of integrationResults) {
+    lines.push(
+      `<details><summary>${item.fullName} — ${item.verdict ?? "无结论"}${
+        item.code != null ? `（退出码 ${item.code}）` : ""
+      }</summary>`,
+    );
     lines.push("");
-    for (const item of integration.results ?? []) {
+    lines.push("```text");
+    lines.push(
+      `[command] ${item.command ?? "(未运行)"} ${(item.args ?? []).join(" ")}`,
+    );
+    lines.push((item.stdout || "(stdout 为空)").trim());
+    lines.push("");
+    lines.push("[stderr]");
+    lines.push((item.stderr || "(stderr 为空)").trim());
+    if (item.error) {
+      lines.push("");
+      lines.push(`[spawn error] ${item.error.name}: ${item.error.message}`);
+    }
+    lines.push("```");
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
+  if (integrationPreflight.length) {
+    lines.push("### 集成前置调用（探针/枚举）");
+    lines.push("");
+    for (const item of integrationPreflight) {
       lines.push(
-        `<details><summary>${item.fullName}（退出码 ${item.code}）</summary>`,
+        `<details><summary>${item.fullName ?? "(未命名)"}（退出码 ${item.code}）</summary>`,
       );
       lines.push("");
       lines.push("```text");
-      lines.push(`[command] ${item.command} ${(item.args ?? []).join(" ")}`);
+      lines.push(
+        `[command] ${item.command} ${(item.args ?? []).join(" ")}（cwd: ${item.cwd ?? "未记录"}）`,
+      );
       lines.push((item.stdout || "(stdout 为空)").trim());
       lines.push("");
       lines.push("[stderr]");
       lines.push((item.stderr || "(stderr 为空)").trim());
+      if (item.error) {
+        lines.push("");
+        lines.push(`[spawn error] ${item.error.name}: ${item.error.message}`);
+      }
       lines.push("```");
       lines.push("");
       lines.push("</details>");
       lines.push("");
     }
-  } catch (error) {
-    lines.push(
-      `⚠ 引擎集成子用例日志无法读取：${error.message}。外层输出仍保留在上方。`,
-    );
+  }
+} else if (checkResults.some((item) => item.label === "引擎集成测试")) {
+  lines.push("## 引擎集成子用例日志");
+  lines.push("");
+  lines.push("⚠ 集成日志丢失或不可解析：无法核验子用例是否真实执行。");
+  lines.push("");
+}
+
+// 复评 Q08：记录生成**结束**时的源状态也要落盘并与开头核对 ——
+// 提交变化或出现新改动，这条记录就不能再绑定到开头记录的固定提交。
+lines.push("## 记录生成结束时的源状态");
+lines.push("");
+const tailSha = git("rev-parse", "HEAD");
+const tailStatus = git("status", "--porcelain");
+if (!tailSha.ok) {
+  failures.push("结束时的提交状态");
+  lines.push(`- 提交：UNKNOWN（git rev-parse HEAD 退出码 ${tailSha.code}）`);
+  lines.push(`  - stderr：${tailSha.stderr.trim() || "(空)"}`);
+} else {
+  lines.push(`- 提交：\`${tailSha.value}\``);
+  if (headSha && tailSha.value !== headSha) {
+    failures.push("记录期间提交发生变化");
+    lines.push(`  - ⚠ 与开头记录的提交 ${headSha} 不一致。`);
+  } else if (!headSha) {
+    failures.push("结束时的提交状态");
+    lines.push("  - ⚠ 开头未能记录提交，无法核对是否变化。");
   }
 }
+if (!tailStatus.ok) {
+  failures.push("结束时的工作区状态");
+  lines.push(`- 工作区：UNKNOWN（git status 退出码 ${tailStatus.code}）`);
+} else if (tailStatus.value !== "") {
+  failures.push("记录结束时存在未提交改动");
+  lines.push("- 工作区：否（记录结束时出现未提交改动）");
+} else {
+  lines.push("- 工作区：是");
+}
+lines.push("");
+
 lines.push("## 安装包");
 lines.push("");
 let installerStatus = "missing";
