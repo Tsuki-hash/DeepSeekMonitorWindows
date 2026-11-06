@@ -1468,7 +1468,8 @@ for (const concurrent of [false, true]) {
         const status = reading(view);
         assert.equal(status.props.role, "status");
         assert.equal(status.props["aria-live"], "polite");
-        assert.equal(status.props["aria-atomic"], true);
+        // ARIA 属性值是字符串；组件按规范传 "true"，断言布尔会永远失败。
+        assert.equal(status.props["aria-atomic"], "true");
         const expectedValues = ["¥1,234.567891", "¥0.00", "未取得（不代表零）"];
         for (const [index, expected] of expectedValues.entries()) {
           const target = button(view, days[index].date);
@@ -1477,7 +1478,7 @@ for (const concurrent of [false, true]) {
             `${days[index].date}：${expected}`,
           );
           assert.equal(target.props.type, "button");
-          assert.equal(target.findByType("i").props["aria-hidden"], true);
+          assert.equal(target.findByType("i").props["aria-hidden"], "true");
           await act(async () => target.props.onFocus());
           assert.equal(text(reading(view).findByType("strong")), expected);
         }

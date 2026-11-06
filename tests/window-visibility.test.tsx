@@ -292,6 +292,35 @@ async function acceptBoth(start = registrations.length - 2) {
     registrations[start + 1].accept();
   });
 }
+/**
+ * StrictMode 会挂载→卸载→重挂，每个方向可能留下多于一个 registration，
+ * 按索引取会拿到同名的两个 `main-window-shown`（实测 names 为
+ * shown,shown,hidden），于是 `Promise.all` 永远等不到 hidden，查询不触发。
+ * 按事件名取**最后一个**未完成的 registration 才是当前挂载的那一个。
+ */
+function pendingByName(name: string) {
+  for (let index = registrations.length - 1; index >= 0; index -= 1) {
+    const registration = registrations[index];
+    if (registration.name === name && !registration.settled) {
+      return registration;
+    }
+  }
+  return undefined;
+}
+/**
+ * 当前挂载对应的那一对注册（每个事件名取最后一次注册）。
+ * StrictMode 的双挂载会留下更早的注册，断言不能按数组长度或固定索引。
+ */
+function currentRegistrations() {
+  return visibilityNames
+    .map((name) => {
+      for (let index = registrations.length - 1; index >= 0; index -= 1) {
+        if (registrations[index].name === name) return registrations[index];
+      }
+      return undefined;
+    })
+    .filter((slot): slot is Registration => slot != null);
+}
 async function drainFrames() {
   await change(() => {
     for (const [frame, callback] of [...frames]) {
@@ -406,7 +435,9 @@ for (const visible of [false, true]) {
     scenario(`one listener (${first}): ${visible}`, async (concurrent) => {
       nativeVisible = !visible;
       await mount(concurrent);
-      await change(() => registrations[first].accept());
+      // 先只放行一个方向：shown 或 hidden（按事件名取，不按数组索引）。
+      const accepted = visibilityNames[first];
+      await change(() => pendingByName(accepted)?.accept());
       const before = fetchCalls;
       await change(() => nativeChange(visible));
       assert.equal(queryCalls, 0);
@@ -416,7 +447,8 @@ for (const visible of [false, true]) {
         "A partial subscription may not trigger a show refresh",
       );
       assert.equal(scheduled().length, 0);
-      await change(() => registrations[1 - first].accept());
+      // 放行另一个方向后，两路都就绪，才允许查询一次。
+      await change(() => pendingByName(visibilityNames[1 - first])?.accept());
       assert.equal(queryCalls, 1);
       await probeFocus(visible);
     });
@@ -426,8 +458,10 @@ for (const visible of [false, true]) {
     nativeVisible = !visible;
     await mount(concurrent);
     await change(() => {
-      registrations[0].accept();
-      registrations[1].accept();
+      // 同一轮里放行两路并立刻投递原生事件：查询还没返回，事件已到，
+      // 由 revision 保证结果不被旧查询覆盖。按事件名取当前挂载的注册。
+      pendingByName(visibilityNames[0])?.accept();
+      pendingByName(visibilityNames[1])?.accept();
       nativeChange(visible);
       assert.equal(queryCalls, 0);
     });
@@ -499,14 +533,16 @@ for (const firstResolved of [false, true]) {
     const name = `reject ${event}, peer ${readiness}: retry restores`;
     scenario(name, async (concurrent) => {
       await mount(concurrent);
-      const peer = registrations[1 - rejected];
-      if (firstResolved) await change(() => peer.accept());
-      await change(() => registrations[rejected].reject());
+      // StrictMode 重复注册：按事件名取当前挂载的那一对，避免索引错位。
+      const peer = pendingByName(visibilityNames[1 - rejected]);
+      const target = pendingByName(event);
+      if (firstResolved) await change(() => peer?.accept());
+      await change(() => target?.reject());
       assert.equal(queryCalls, 0);
       assert.equal(errorShown(), true);
       assert.equal(scheduled().length, 0);
-      if (!firstResolved) await change(() => peer.accept());
-      assert.equal(peer.released, 1);
+      if (!firstResolved) await change(() => peer?.accept());
+      assert.equal(peer?.released, 1);
       assert.deepEqual(listening(), [0, 0]);
       const before = fetchCalls;
       await change(() =>
@@ -537,8 +573,10 @@ scenario("query failure retains manual recovery", async (concurrent) => {
   await acceptBoth();
   assert.equal(errorShown(), true);
   assert.deepEqual(listening(), [0, 0]);
+  // 只核对当前挂载的那一对注册：StrictMode 会先挂载再重挂，
+  // 早先一轮的注册不属于本次生命周期。
   assert.deepEqual(
-    registrations.map((slot) => slot.released),
+    currentRegistrations().map((slot) => slot.released),
     [1, 1],
   );
   assert.equal(scheduled().length, 0);
@@ -602,7 +640,9 @@ for (const oldVisible of [false, true]) {
     query = () => oldRead.promise;
     await mount(concurrent);
     await acceptBoth();
-    const old = registrations.slice();
+    // 只取当前挂载的那一对：StrictMode 的双挂载会留下更早的注册，
+    // 把它们算进「旧生命周期」会让 released 计数与断言不符。
+    const old = currentRegistrations();
     await unmount();
     assert.deepEqual(
       old.map((slot) => slot.released),
@@ -625,8 +665,9 @@ for (const oldVisible of [false, true]) {
 
 scenario("unmount releases ready/late listeners", async (concurrent) => {
   await mount(concurrent);
-  await change(() => registrations[0].accept());
-  const old = registrations.slice();
+  // 只放行 shown 方向：本场景验证「一个已就绪、另一个迟到」的释放。
+  await change(() => pendingByName(visibilityNames[0])?.accept());
+  const old = currentRegistrations();
   await unmount();
   assert.equal(old[0].released, 1);
   await mount(concurrent);
@@ -906,9 +947,10 @@ for (const failure of ["shown", "hidden", "query"] as const) {
       await mount(concurrent);
       if (failure === "query") await acceptBoth();
       else {
+        // 按事件名选取：StrictMode 双挂载会让固定索引拿到错误方向。
         await change(() => {
-          registrations[failure === "shown" ? 0 : 1].reject();
-          registrations[failure === "shown" ? 1 : 0].accept();
+          pendingByName(visibilityNames[failure === "shown" ? 0 : 1])?.reject();
+          pendingByName(visibilityNames[failure === "shown" ? 1 : 0])?.accept();
         });
       }
       assert.equal(errorShown(), true);
@@ -921,7 +963,8 @@ for (const failure of ["shown", "hidden", "query"] as const) {
         nodeText(renderer.root.findByType(HistoryPanel)),
         /请先点击上方“重试窗口状态”/,
       );
-      const old = registrations.slice();
+      // 旧生命周期的注册：只取当前挂载那一对，StrictMode 残留不计入。
+      const old = currentRegistrations();
       query = async () => true;
       await retry();
       assert.equal(historyButton("重新查询历史").props.disabled, true);

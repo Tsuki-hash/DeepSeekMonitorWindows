@@ -119,7 +119,8 @@ for (const variant of ["summary", "detail"] as const) {
           assert.equal(button(view, date), retainedButton);
           assertActive(view, date);
           assert.equal(inspector(view).props["aria-live"], "polite");
-          assert.equal(inspector(view).props["aria-atomic"], true);
+          // ARIA 属性值是字符串；组件按规范传 "true"，断言布尔会永远失败。
+          assert.equal(inspector(view).props["aria-atomic"], "true");
           assert.doesNotMatch(
             button(view, "2026-11-01").parent.props.className,
             /\bhovered\b/,

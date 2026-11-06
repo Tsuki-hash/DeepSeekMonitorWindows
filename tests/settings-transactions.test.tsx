@@ -472,15 +472,20 @@ scenario(
       renderer.root.findByType(HistoryPanel).props.onBack(),
     );
     await flush();
-    await emit("quit-requested", null);
-    assert.equal(prompt(), 0);
-    assert.equal(submitted("confirm_quit").length, 1);
+    // 先验证重进设置：草稿已清空、不会重新提交旧值。
+    // 必须排在托盘退出之前 —— 退出请求会关闭交互闸门，之后 `setView`
+    // 按设计直接拒绝导航，此时再点「设置」不会进入设置页。
     await click(input("设置"));
     await manual();
     assert.equal(input("API Key").props.value, "");
     assert.equal(input("用量 Token").props.value, "");
     assert.equal(submitted("save_api_key").length, 0);
     assert.equal(submitted("save_usage_token").length, 0);
+    await click(input("返回主面板"));
+    await flush();
+    await emit("quit-requested", null);
+    assert.equal(prompt(), 0);
+    assert.equal(submitted("confirm_quit").length, 1);
   },
 );
 scenario(
@@ -983,7 +988,12 @@ scenario(
     await openSettings(concurrent);
     await manual();
     await change("用量 Token", "TOKEN_B");
+    // 保存进行中「放弃」按规范禁用（只能取消），所以这里先取消这次保存，
+    // 再放弃草稿并重新进入 —— 目标是验证「放弃后迟到的保存响应」不会
+    // 消耗新草稿，而不是验证保存中能否放弃。
     await leave();
+    await click(button("留在此页"));
+    await click(input("返回主面板"));
     await click(button("放弃修改并离开"));
     await click(input("设置"));
     await manual();

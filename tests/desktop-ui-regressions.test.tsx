@@ -1071,9 +1071,12 @@ for (const configured of [false, true]) {
         submitted("fetch_balance").length,
         beforeBalance + Number(configured),
       );
+      // 一次 `fetchCurrentUsage` 会发两次 `fetch_usage`：本月一次，
+      // 近 7 日图表需要时再补一次上月（见 usage-api.ts 的上月分支）。
+      // 恢复为已配置账户时因此是 +2，不是 +1。
       assert.equal(
         submitted("fetch_usage").length,
-        beforeUsage + Number(configured),
+        beforeUsage + (configured ? 2 : 0),
       );
       assert.equal(input("API Key").props.value, "SYNTHETIC_UNSAVED_KEY");
       assert.equal(input("用量 Token").props.value, "SYNTHETIC_UNSAVED_TOKEN");
