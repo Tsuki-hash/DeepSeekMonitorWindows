@@ -43,7 +43,6 @@ import { HistoryPanel } from "./components/HistoryPanel";
 import { TrayBalancePublisher } from "./tray-balance";
 import { OnboardingPanel } from "./components/OnboardingPanel";
 import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
-import { suggestedMode } from "./panel-mode";
 import { attemptLeave, useLeaveGuard } from "./leave-guard";
 import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
@@ -917,15 +916,9 @@ function App() {
     revision: channelRevision.usage,
   });
 
-  // 面板尺寸：完全由当前视图决定（账户页紧凑、历史页展开）。
-  // 手动切换按钮已移除 —— 它只服务历史页这一个场景，而视图本身已经
-  // 自动切换；保留手动状态反而会让历史页不再自动展开。
-  const mode = suggestedMode(view);
-  React.useEffect(() => {
-    void invoke("set_panel_mode", { mode }).catch(() => {
-      // 浏览器预览没有 Tauri IPC；尺寸切换失败不影响数据展示。
-    });
-  }, [mode]);
+  // 面板尺寸固定 356×600（托盘速览形态）。历史页不再自动放大：
+  // 切页时窗口突然变宽会打断视线，而历史内容在窄面板里纵向滚动即可读。
+  // 因此不再调用 `set_panel_mode`，窗口尺寸完全由 tauri.conf.json 决定。
 
   // 配置尚未读取完成时不展示引导，避免把老用户当新手（复评 F12）。
   const showOnboarding =
@@ -1207,8 +1200,7 @@ function App() {
     <QuitInteractionContext.Provider value={quitInteractionGate}>
       <div
         ref={stageRef}
-        data-panel-mode={mode}
-        className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${showRecovery ? "visibility-unavailable" : ""}`}
+        className={`stage ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${showRecovery ? "visibility-unavailable" : ""}`}
       >
         {showRecovery && (
           <div className="visibility-error">

@@ -570,8 +570,13 @@ button {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  scrollbar-width: thin;
+  /* 与首页一致：隐藏滚动条但保留滚动，避免窄面板里出现灰色粗条。 */
+  scrollbar-width: none;
   padding-right: 2px;
+}
+.history-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 .history-filter {
   display: flex;
@@ -1746,7 +1751,13 @@ button:disabled:hover {
   flex-direction: column;
   gap: 12px;
   overflow: auto;
-  scrollbar-width: thin;
+  /* 与首页/历史一致：隐藏滚动条但保留滚动。 */
+  scrollbar-width: none;
+}
+
+.detail-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .detail-scroll > * {
@@ -2709,39 +2720,6 @@ button:disabled:hover {
   padding-bottom: 0;
 }
 
-/* 阅读模式（复评 F11）：原生窗口放大后，布局必须跟着放宽，
-   否则窗口变大而内容仍被 356px 面板夹住，等于没有阅读区。
-   紧凑模式保持原来的 356×600。 */
-.stage.mode-expanded {
-  align-items: start center;
-}
-.stage.mode-expanded > .panel,
-.stage.mode-expanded > .settings-panel {
-  width: min(720px, 100vw);
-  height: min(712px, 100vh);
-}
-.stage.mode-expanded.with-navigation {
-  grid-template-rows: minmax(0, 1fr) 48px;
-  height: min(760px, 100vh);
-}
-.stage.mode-expanded.with-navigation > .panel {
-  width: min(720px, 100vw);
-  height: 100%;
-}
-.stage.mode-expanded .primary-navigation {
-  width: min(720px, 100vw);
-}
-/* 展开后历史模型列表可排成两列，减少长页面滚动。 */
-.stage.mode-expanded .history-models {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-/* 小工作区：宽度不足时退回单列，避免内容被压扁。 */
-@media (max-width: 560px) {
-  .stage.mode-expanded .history-models {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
 /* 可信状态的补充原因：说明「为什么不完整」，紧跟在摘要下方。 */
 .source-trust-reason {
   margin: 0;
@@ -2771,9 +2749,6 @@ button:disabled:hover {
   font-size: 12px;
   z-index: 20;
 }
-.stage.mode-expanded .leave-guard {
-  width: min(720px, 100vw);
-}
 .leave-guard p {
   margin: 0 0 8px;
 }
@@ -2791,9 +2766,6 @@ button:disabled:hover {
   width: min(356px, 100vw);
   max-height: 35vh;
   overflow-y: auto;
-}
-.stage.mode-expanded > .visibility-error {
-  width: min(720px, 100vw);
 }
 .stage.visibility-unavailable > .panel,
 .stage.visibility-unavailable > .settings-panel {

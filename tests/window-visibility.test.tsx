@@ -1387,7 +1387,7 @@ test("R29 native visibility error contract", () => {
   const source = readFileSync("src-tauri/src/commands.rs", "utf8");
   const command = source.slice(
     source.indexOf("pub(crate) fn is_main_window_visible"),
-    source.indexOf("/// 面板尺寸模式。"),
+    source.indexOf("pub(crate) fn get_app_config"),
   );
   assert.match(command, /-> Result<bool, String>/);
   assert.match(command, /require_main\(&window\)\?/);

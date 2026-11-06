@@ -83,7 +83,6 @@ pub fn run() {
             commands::get_pending_quit_intent,
             commands::acknowledge_quit_intent,
             commands::is_main_window_visible,
-            commands::set_panel_mode,
             commands::get_app_config,
             commands::get_diagnostics,
             commands::open_support_page,
