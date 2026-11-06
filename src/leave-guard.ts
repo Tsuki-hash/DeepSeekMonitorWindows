@@ -136,3 +136,113 @@ export async function resolveLeave(
   action();
   return true;
 }
+
+/**
+ * 跨出口一致的离开决策运行器（第五轮复评 Q04）。
+ *
+ * 一次决策 = 代际令牌 + 导航意图 + 提交中状态，三者同属一次决策：
+ *
+ * - 新导航意图（`requestIntent`）**立即取得所有权**：作废仍在途的旧决策。
+ *   旧保存的迟到完成只清理自身，不得导航、不得清除新意图、
+ *   不得解除新决策的提交状态。
+ * - 被取代的旧保存**成功**时，草稿已落定，最新意图的前提（有脏草稿）
+ *   已消失 —— 由运行器直接执行最新导航意图，不再多问一次。
+ *   保存失败则保留最新意图的提示，交回用户决定。
+ * - `cancel` 作废一切在途决策；连点/并发只认第一次（`decide` 在提交中忽略）。
+ *
+ * App 级出口与 LocalUsagePanel 局部出口共用本运行器，避免两处规则漂移。
+ * 构造不用参数属性（Node --experimental-strip-types 只支持可擦除语法）。
+ */
+export class LeaveDecisionRunner {
+  private decisions = new LeaveDecisions();
+  private active: { ticket: LeaveTicket; intent: () => void } | null = null;
+  private pending: (() => void) | null = null;
+  private readonly getBlocker: () => LeaveBlocker | null;
+  private readonly onSubmitting: (value: boolean) => void;
+  private readonly onIntentCleared: () => void;
+
+  constructor(
+    getBlocker: () => LeaveBlocker | null,
+    onSubmitting: (value: boolean) => void,
+    onIntentCleared: () => void,
+  ) {
+    this.getBlocker = getBlocker;
+    this.onSubmitting = onSubmitting;
+    this.onIntentCleared = onIntentCleared;
+  }
+
+  /** 新导航意图：作废在途旧决策并成为最新待决意图。 */
+  requestIntent(action: () => void): void {
+    this.supersede();
+    this.pending = action;
+  }
+
+  /** 用户取消：作废一切在途决策并清空待决意图（幂等）。 */
+  cancel(): void {
+    const had = this.active != null || this.pending != null;
+    this.supersede();
+    this.pending = null;
+    if (had) {
+      this.onIntentCleared();
+      this.onSubmitting(false);
+    }
+  }
+
+  /** 保存并离开 / 放弃并离开。提交中或无待决意图时忽略。 */
+  decide(decision: "save" | "discard"): void {
+    if (this.active) return; // 连点/并发只认第一次
+    const intent = this.pending;
+    if (!intent) return;
+    const blocker = this.getBlocker();
+    // 捕获保存结果：被取代的决策完成时，外部 dirty 状态可能还没
+    // 经 React effect 刷新，保存 Promise 的结果才是确定性依据。
+    let saved: boolean | null = decision === "discard" ? true : null;
+    const wrapped: LeaveBlocker | null = blocker
+      ? {
+          ...blocker,
+          save: async () => {
+            const ok = await blocker.save();
+            saved = ok;
+            return ok;
+          },
+        }
+      : null;
+    const ticket = this.decisions.begin();
+    this.active = { ticket, intent };
+    this.onSubmitting(true);
+    void resolveLeave(wrapped, decision, intent, () =>
+      this.decisions.isCurrent(ticket),
+    ).then((left) => {
+      if (!this.decisions.isCurrent(ticket)) {
+        // 被取代/取消的旧决策：只清理自身。若已有更新决策在途，
+        // 提交状态归它管，这里不得触碰。
+        if (!this.active) {
+          this.onSubmitting(false);
+          // 旧保存成功且有待决意图：草稿前提已消失，直接执行最新意图。
+          if (saved === true && this.pending) {
+            const next = this.pending;
+            this.pending = null;
+            this.onIntentCleared();
+            next();
+          }
+        }
+        return;
+      }
+      this.decisions.finish(ticket);
+      this.active = null;
+      this.onSubmitting(false);
+      if (left) {
+        this.pending = null;
+        this.onIntentCleared();
+      }
+    });
+  }
+
+  /** 作废当前在途决策（若有）。 */
+  private supersede(): void {
+    if (this.active) {
+      this.decisions.cancel(this.active.ticket);
+      this.active = null;
+    }
+  }
+}

@@ -98,7 +98,11 @@ export function LocalSourceSettings({
         setError(errorMessage(failure));
       return false;
     } finally {
-      if (owner.current.active) setBusy(false);
+      // 复评 Q04：只有**当前**序号的保存可以解除 busy ——
+      // 旧保存迟到结束时可能已有新保存（序号更新）在途，
+      // 新保存自己的 finally 负责解除。
+      if (owner.current.active && sequence === owner.current.sequence)
+        setBusy(false);
     }
   };
 
@@ -111,6 +115,8 @@ export function LocalSourceSettings({
   }, [onSaveRequested]);
   const listWsl = async () => {
     setBusy(true);
+    // 复评 Q04：listWsl 与 save 共享 busy，同样按序号防旧操作迟到解除。
+    const sequence = ++owner.current.sequence;
     setError("");
     setMessage("");
     setWsl(null);
@@ -120,7 +126,8 @@ export function LocalSourceSettings({
     } catch (failure) {
       if (owner.current.active) setError(errorMessage(failure));
     } finally {
-      if (owner.current.active) setBusy(false);
+      if (owner.current.active && sequence === owner.current.sequence)
+        setBusy(false);
     }
   };
   return (

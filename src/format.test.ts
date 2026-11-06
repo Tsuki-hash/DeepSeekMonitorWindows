@@ -121,7 +121,8 @@ test("todayStr：使用平台东八区记账日期", () => {
 });
 
 test("recentUsageDays：未获取日期为未知，已获取无用量日期为零", () => {
-  const result = recentUsageDays([], 7, [todayStr()]);
+  // 第五轮复评 N07：now 显式注入，期望以记账日定义，不依赖宿主时区。
+  const result = recentUsageDays([], 7, [businessDate(FIXED_NOW)], FIXED_NOW);
   assert.equal(result[6].unavailable, true);
   assert.equal(chartPointFromDay(result[6]).unavailable, true);
   assert.equal(result[5].unavailable, false);
@@ -162,19 +163,32 @@ test("previousMonth：跨年回退", () => {
 });
 
 // ---------- recentUsageDays ----------
+//
+// 第五轮复评 N07：产品按**东八区记账日**生成窗口，旧测试用宿主本地日构造
+// 「昨天/明天」，本地日 ≠ 记账日时假红（UTC−7 实测 161 项挂 2 项）。
+// 现在 now 显式注入，全部期望以记账日（UTC+8）定义，任何时区结果一致。
+// 固定时刻用 UTC 绝对时间表达：
+// - 2026-11-04T02:00:00Z → 北京 10:00，记账日 2026-11-04
+// - 2026-11-04T15:59:59Z → 记账日仍是 2026-11-04（北京 23:59:59）
+// - 2026-11-04T16:00:00Z → 记账日翻到 2026-11-05（北京次日零点）
+const FIXED_NOW = new Date("2026-11-04T02:00:00Z");
+const businessDate = (instant: Date) => accountingDateKey(instant);
+const businessShift = (base: Date, days: number) =>
+  accountingDateKey(new Date(base.getTime() + days * 86400_000));
 
 test("recentUsageDays：固定返回 7 天且按时间升序", () => {
-  const result = recentUsageDays([]);
+  const result = recentUsageDays([], 7, [], FIXED_NOW);
   assert.equal(result.length, 7);
   const dates = result.map((item) => item.date);
   assert.deepEqual(dates, [...dates].sort(), "应按日期升序排列");
-  assert.equal(dates[6], todayStr(), "最后一天必须是今天");
+  assert.equal(dates[6], businessDate(FIXED_NOW), "最后一天必须是记账日今天");
 });
 
 test("recentUsageDays：接口没返回的日期补零", () => {
-  const today = new Date();
-  const yesterday = dateKey(addDays(today, -1));
-  const result = recentUsageDays([day(yesterday, 1000)]);
+  const today = businessDate(FIXED_NOW);
+  const yesterday = businessShift(FIXED_NOW, -1);
+  const result = recentUsageDays([day(yesterday, 1000)], 7, [], FIXED_NOW);
+  assert.equal(result[6].date, today);
   const filled = result.find((item) => item.date === yesterday);
   assert.equal(filled?.totalTokens, 1000);
   // 其余 6 天必须是零值，而不是 undefined
@@ -187,17 +201,23 @@ test("recentUsageDays：接口没返回的日期补零", () => {
 });
 
 test("recentUsageDays：跨月窗口能正确回溯到上月", () => {
-  // 无论今天是几号，窗口起点都应是「今天减 6 天」——月初时必然落在上个月。
+  // 记账日 2026-04-01（北京 4 月 1 日 10 点）：窗口起点必然落在 3 月。
   // 这条是跨月补零逻辑的护栏：若改成「拿接口最后一天往前数」，这里会失败。
-  const result = recentUsageDays([]);
-  assert.equal(result[0].date, dateKey(addDays(new Date(), -6)));
+  const result = recentUsageDays([], 7, [], new Date("2026-04-01T02:00:00Z"));
+  assert.equal(result[0].date, "2026-03-26");
+  assert.equal(result[6].date, "2026-04-01");
   assert.equal(result[0].date < result[6].date, true, "窗口起点必须早于终点");
 });
 
 test("recentUsageDays：过滤掉未来日期的占位行", () => {
-  const tomorrow = dateKey(addDays(new Date(), 1));
-  const farFuture = dateKey(addDays(new Date(), 30));
-  const result = recentUsageDays([day(tomorrow, 999), day(farFuture, 888)]);
+  const tomorrow = businessShift(FIXED_NOW, 1);
+  const farFuture = businessShift(FIXED_NOW, 30);
+  const result = recentUsageDays(
+    [day(tomorrow, 999), day(farFuture, 888)],
+    7,
+    [],
+    FIXED_NOW,
+  );
   assert.equal(result.length, 7);
   assert.equal(
     result.some((item) => item.totalTokens === 999 || item.totalTokens === 888),
@@ -207,23 +227,67 @@ test("recentUsageDays：过滤掉未来日期的占位行", () => {
 });
 
 test("recentUsageDays：自定义窗口长度", () => {
-  assert.equal(recentUsageDays([], 1).length, 1);
-  assert.equal(recentUsageDays([], 30).length, 30);
-  assert.equal(recentUsageDays([], 30)[29].date, todayStr());
+  assert.equal(recentUsageDays([], 1, [], FIXED_NOW).length, 1);
+  assert.equal(recentUsageDays([], 30, [], FIXED_NOW).length, 30);
+  assert.equal(
+    recentUsageDays([], 30, [], FIXED_NOW)[29].date,
+    businessDate(FIXED_NOW),
+  );
 });
 
 test("recentUsageDays：同一天出现多条时取最后一条", () => {
   // Map 构造保证后者覆盖前者；这里锁定该行为，避免将来改成 reduce 时语义漂移
-  const today = todayStr();
-  const result = recentUsageDays([day(today, 100), day(today, 200)]);
+  const today = businessDate(FIXED_NOW);
+  const result = recentUsageDays(
+    [day(today, 100), day(today, 200)],
+    7,
+    [],
+    FIXED_NOW,
+  );
   assert.equal(result[6].totalTokens, 200);
 });
 
 test("recentUsageDays：不修改入参数组", () => {
   const input = [day("2026-09-01", 1)];
   const snapshot = JSON.stringify(input);
-  recentUsageDays(input);
+  recentUsageDays(input, 7, [], FIXED_NOW);
   assert.equal(JSON.stringify(input), snapshot);
+});
+
+test("recentUsageDays：UTC 15:59:59 与 16:00:00 的记账日翻转", () => {
+  // 北京时间零点 = UTC 16:00。翻转瞬间整个窗口必须整体前移一天；
+  // 期望是写死的绝对日期，宿主在任意时区（含夏令时）都必须一致。
+  const before = new Date("2026-11-04T15:59:59Z");
+  const after = new Date("2026-11-04T16:00:00Z");
+  assert.equal(accountingDateKey(before), "2026-11-04");
+  assert.equal(accountingDateKey(after), "2026-11-05");
+  assert.equal(recentUsageDays([], 7, [], before)[6].date, "2026-11-04");
+  assert.equal(recentUsageDays([], 7, [], after)[6].date, "2026-11-05");
+});
+
+test("recentUsageDays：月末、年末与闰日窗口", () => {
+  // 月末：记账日 2026-04-01 → 起点 2026-03-26（跨 3/4 月）
+  assert.equal(
+    recentUsageDays([], 7, [], new Date("2026-04-01T02:00:00Z"))[0].date,
+    "2026-03-26",
+  );
+  // 年末：记账日 2027-01-01 → 起点 2026-12-26（跨 2026/2027）
+  const newYear = recentUsageDays([], 7, [], new Date("2027-01-01T02:00:00Z"));
+  assert.equal(newYear[0].date, "2026-12-26");
+  assert.equal(newYear[6].date, "2027-01-01");
+  // 闰日：2028-02-29 当天，7 天窗口起点 2028-02-23
+  const leap = recentUsageDays([], 7, [], new Date("2028-02-29T02:00:00Z"));
+  assert.equal(leap[0].date, "2028-02-23");
+  assert.equal(leap[6].date, "2028-02-29");
+  // 闰日次日：起点回溯必须落在 2 月（2027 非闰年等价场景会错成 02-25）
+  const afterLeap = recentUsageDays(
+    [],
+    7,
+    [],
+    new Date("2028-03-01T02:00:00Z"),
+  );
+  assert.equal(afterLeap[0].date, "2028-02-24");
+  assert.equal(afterLeap[6].date, "2028-03-01");
 });
 
 // ---------- chartPointFromDay ----------

@@ -14,7 +14,7 @@ import { LocalBackgroundSettings } from "./LocalBackgroundSettings";
 import { LocalDataManagement } from "./LocalDataManagement";
 import { localPeriodKey } from "../local-archive";
 import { shouldBlockLeave } from "../draft-guard";
-import { LeaveDecisions, resolveLeave } from "../leave-guard";
+import { LeaveDecisionRunner } from "../leave-guard";
 import type { LeaveDecision } from "../leave-guard";
 import { LeavePromptDialog } from "./LeavePromptDialog";
 import {
@@ -73,6 +73,10 @@ export function LocalUsagePanel({
   const [includePaths, setIncludePaths] = React.useState(false);
   const [exportStatus, setExportStatus] = React.useState("");
   const [sourceRevision, setSourceRevision] = React.useState(0);
+  // 第五轮复评 N06：采集数据刷新（sourceRevision）与「放弃草稿后重挂载重置」
+  // 分开 —— 保存成功只递增 revision 触发重读，不再重挂载子组件，
+  // 成功提示与展开状态得以保留；只有明确放弃才重挂载。
+  const [settingsResetKey, setSettingsResetKey] = React.useState(0);
   const [archiveView, setArchiveView] = React.useState<
     "manual" | "retention" | null
   >(null);
@@ -248,71 +252,43 @@ export function LocalUsagePanel({
   );
   // 复评 T05：局部出口与全局共用同一决策控制器 —— 保存是异步的，
   // 途中取消后迟到的成功不得导航；连点只提交一次。
-  const leaveDecisions = React.useRef(new LeaveDecisions());
   const [leaveSubmitting, setLeaveSubmitting] = React.useState(false);
   const guarded = (action: () => void) => {
-    if (shouldBlockLeave(sourceDirty)) setPendingLeave(() => action);
-    else action();
+    if (shouldBlockLeave(sourceDirty)) {
+      // 复评 Q04：新导航意图立即取得所有权 —— 作废在途旧决策，
+      // 旧保存的迟到完成不得执行旧导航或清除这个新意图。
+      leaveRunner.current?.requestIntent(action);
+      setPendingLeave(() => action);
+    } else action();
   };
-  // 与 App 的 decideLeave 同构：保存/放弃/取消都经过代际令牌校验。
-  // 复评 Q04：决策所有权收敛在 `activeDecision` 一个 ref 里 ——
-  // 令牌、提交状态与导航意图同属一次决策；旧决策的迟到完成不允许
-  // 解除新决策的 submitting，新的导航意图也会先作废旧令牌。
-  const activeDecision = React.useRef<{
-    ticket: ReturnType<LeaveDecisions["begin"]>;
-    action: () => void;
-  } | null>(null);
-  const saveInFlight = React.useRef(false);
-  const decideLeave = (decision: LeaveDecision) => {
-    if (decision === "cancel") {
-      // 取消使当前令牌失效：只撤销导航，不声称能撤回已提交的保存。
-      if (activeDecision.current) {
-        leaveDecisions.current.cancel(activeDecision.current.ticket);
-        activeDecision.current = null;
-      }
-      setPendingLeave(null);
-      setLeaveSubmitting(false);
-      return;
-    }
-    if (saveInFlight.current) return; // 连点/并发只认第一次
-    const pending = pendingLeave;
-    if (!pending) return;
-    // 新导航意图明确取代旧决策：作废旧令牌，旧保存的迟到完成不再生效。
-    if (activeDecision.current) {
-      leaveDecisions.current.cancel(activeDecision.current.ticket);
-    }
-    const ticket = leaveDecisions.current.begin();
-    activeDecision.current = { ticket, action: pending };
-    saveInFlight.current = true;
-    setLeaveSubmitting(true);
-    void resolveLeave(
-      {
+  // 第五轮复评 Q04：决策所有权收敛到共享的 LeaveDecisionRunner，
+  // 与 App 级出口同一条规则（令牌、意图、提交状态同属一次决策）。
+  const leaveRunner = React.useRef<LeaveDecisionRunner | null>(null);
+  if (leaveRunner.current === null) {
+    leaveRunner.current = new LeaveDecisionRunner(
+      () => ({
         dirty: true,
         subject: "采集目录",
         save: async () => (await saveSourceRef.current?.()) ?? false,
         discard: () => {
           setSourceDirty(false);
           setSourceRevision((value) => value + 1);
+          setSettingsResetKey((value) => value + 1);
         },
-      },
-      decision,
-      pending,
-      () => leaveDecisions.current.isCurrent(ticket),
-    ).then((left) => {
-      saveInFlight.current = false;
-      // 复评 Q04：只有**当前**决策的完成可以更新 submitting 与导航。
-      const isCurrent =
-        activeDecision.current?.ticket === ticket &&
-        leaveDecisions.current.isCurrent(ticket);
-      if (!isCurrent) return;
-      leaveDecisions.current.finish(ticket);
-      activeDecision.current = null;
-      setLeaveSubmitting(false);
-      if (left) {
-        setSourceDirty(false);
-        setPendingLeave(null);
-      }
-    });
+      }),
+      setLeaveSubmitting,
+      () => setPendingLeave(null),
+    );
+  }
+  const decideLeave = (decision: LeaveDecision) => {
+    if (decision === "cancel") {
+      // 取消使当前令牌失效：只撤销导航，不声称能撤回已提交的保存。
+      leaveRunner.current?.cancel();
+      return;
+    }
+    if (!pendingLeave) return;
+    // 连点/并发只认第一次：运行器在提交中忽略后续 decide。
+    leaveRunner.current?.decide(decision);
   };
   // 把草稿状态登记到 App 级拦截器：底部主导航、返回按钮都走同一条出口。
   React.useEffect(() => {
@@ -324,10 +300,12 @@ export function LocalUsagePanel({
             save: async () => (await saveSourceRef.current?.()) ?? false,
             discard: () => {
               // 复评 R07：只清父级 dirty 不够 —— 子组件仍保留修改且不会重新上报。
-              // 递增 revision 并递增 key 让子组件**重新挂载**，从后端重读已保存值。
+              // 递增 resetKey 让子组件**重新挂载**，从后端重读已保存值；
+              // revision 同步递增触发采集状态重读。
               setSourceDirty(false);
               setPendingLeave(null);
               setSourceRevision((value) => value + 1);
+              setSettingsResetKey((value) => value + 1);
             },
           }
         : null,
@@ -638,7 +616,7 @@ export function LocalUsagePanel({
         )}
         <div hidden={workspace !== "settings"}>
           <LocalSourceSettings
-            key={`sources-${sourceRevision}`}
+            key={`sources-${settingsResetKey}`}
             onDirtyChanged={setSourceDirty}
             onSaveRequested={(save) => {
               saveSourceRef.current = save;

@@ -38,8 +38,8 @@ import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
 import { panelModeLabel, suggestedMode } from "./panel-mode";
 import type { PanelMode } from "./panel-mode";
 import { Maximize2, Minimize2 } from "lucide-react";
-import { attemptLeave, resolveLeave, useLeaveGuard } from "./leave-guard";
-import { LeaveDecisions } from "./leave-guard";
+import { attemptLeave, useLeaveGuard } from "./leave-guard";
+import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
 import { LeavePromptDialog } from "./components/LeavePromptDialog";
 
@@ -60,9 +60,17 @@ function App() {
     subject: string;
   } | null>(null);
   // 复评 R08：保存是异步的，用户可能在途中取消或连点。
-  // 用代际令牌确保只有最新决策能执行导航，且保存中禁用按钮。
-  const leaveDecisions = React.useRef(new LeaveDecisions());
+  // 第五轮复评 Q04：决策、导航意图与提交状态收敛到共享运行器 ——
+  // 新导航意图立即作废旧决策，旧保存的迟到完成只清理自身。
   const [leaveSubmitting, setLeaveSubmitting] = React.useState(false);
+  const leaveRunner = React.useRef<LeaveDecisionRunner | null>(null);
+  if (leaveRunner.current === null) {
+    leaveRunner.current = new LeaveDecisionRunner(
+      () => leaveBlocker.current,
+      setLeaveSubmitting,
+      () => setPendingLeave(null),
+    );
+  }
   const [model, setModel] = React.useState<ModelName>("flash");
 
   const [balance, setBalance] = React.useState<BalanceData | null>(null);
@@ -432,6 +440,9 @@ function App() {
   const navigate = React.useCallback(
     (action: () => void) => {
       if (attemptLeave(leaveBlocker.current, action) === "blocked") {
+        // 复评 Q04：新导航意图立即取得所有权 —— 作废在途旧决策，
+        // 旧保存的迟到完成不得执行旧导航或清除这个新意图。
+        leaveRunner.current?.requestIntent(action);
         setPendingLeave({
           action,
           subject: leaveBlocker.current?.subject ?? "当前设置",
@@ -443,27 +454,16 @@ function App() {
 
   const decideLeave = React.useCallback(
     (decision: LeaveDecision) => {
-      const pending = pendingLeave;
-      if (!pending) return;
+      if (!pendingLeave) return;
       if (decision === "cancel") {
         // 取消使当前令牌失效：保存途中迟到的成功也不得导航。
-        leaveDecisions.current.cancel(leaveDecisions.current.begin());
-        setPendingLeave(null);
-        setLeaveSubmitting(false);
+        leaveRunner.current?.cancel();
         return;
       }
-      if (leaveSubmitting) return; // 连点只认第一次
-      const ticket = leaveDecisions.current.begin();
-      setLeaveSubmitting(true);
-      void resolveLeave(leaveBlocker.current, decision, pending.action, () =>
-        leaveDecisions.current.isCurrent(ticket),
-      ).then((left) => {
-        leaveDecisions.current.finish(ticket);
-        setLeaveSubmitting(false);
-        if (left) setPendingLeave(null);
-      });
+      // 连点只认第一次：运行器在提交中忽略后续 decide。
+      leaveRunner.current?.decide(decision);
     },
-    [leaveBlocker, leaveSubmitting, pendingLeave],
+    [pendingLeave],
   );
 
   const hideWindow = React.useCallback(() => {
@@ -778,10 +778,15 @@ function App() {
           }}
           onRefreshIntervalChanged={setRefreshIntervalSeconds}
           onAutoRefreshChanged={setAutoRefreshEnabled}
-          onBack={() => {
-            setSettingsTarget(null);
-            setView("dashboard");
-          }}
+          // 第五轮复评 N04：提醒设置草稿注册进同一个 App 级离开拦截；
+          // 关闭设置页也走 navigate，脏草稿不再被静默丢弃。
+          onRegisterLeaveBlocker={registerLeaveBlocker}
+          onBack={() =>
+            navigate(() => {
+              setSettingsTarget(null);
+              setView("dashboard");
+            })
+          }
         />
       )}
       {view === "detail" && (

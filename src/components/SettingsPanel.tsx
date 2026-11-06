@@ -21,6 +21,7 @@ import { DesktopSettings } from "./DesktopSettings";
 import { AlertSettings } from "./AlertSettings";
 import { BrandIcon } from "./BrandIcon";
 import { SettingsSection, Toggle } from "./ui";
+import type { LeaveBlocker } from "../leave-guard";
 
 // 状态与动作在 useSettingsState（评审 F-09 拆分），本组件只负责视图与文案。
 function SettingsPanel({
@@ -37,6 +38,7 @@ function SettingsPanel({
   targetSection,
   onRetry,
   onBack,
+  onRegisterLeaveBlocker,
   onBalanceLoaded,
   onBalanceCleared,
   onUsageLoaded,
@@ -58,6 +60,8 @@ function SettingsPanel({
   targetSection?: "usageToken" | null;
   onRetry?: () => Promise<unknown>;
   onBack: () => void;
+  /** 第五轮复评 N04：提醒设置草稿经此登记为 App 级离开拦截。 */
+  onRegisterLeaveBlocker?: (blocker: LeaveBlocker | null) => void;
   onBalanceLoaded: (balance: BalanceData) => void;
   onBalanceCleared: () => void;
   onUsageLoaded: (usage: UsageResult) => void;
@@ -565,7 +569,7 @@ function SettingsPanel({
               {settingErrors.refresh}
             </p>
           )}
-          <AlertSettings />
+          <AlertSettings onRegisterLeaveBlocker={onRegisterLeaveBlocker} />
         </SettingsSection>
 
         <SettingsSection icon={<Info size={15} />} title="外观">

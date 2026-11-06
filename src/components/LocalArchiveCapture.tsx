@@ -38,6 +38,55 @@ export function LocalArchiveCapture({
     maxBytes: number;
     remainingEntries: number;
   } | null>(null);
+  // 第五轮复评 N05：容量只在挂载时读一次会长期过期 —— 持续采集改变留存
+  // 条数后仍显示旧余量。改为按需刷新并记录读取时间；读取失败保留上次
+  // 结果并明确标旧，不把失败伪装成最新值。
+  const [capacityReadAt, setCapacityReadAt] = React.useState<number | null>(
+    null,
+  );
+  const [capacityStale, setCapacityStale] = React.useState(false);
+  const [retentionOpen, setRetentionOpen] = React.useState(false);
+  // 容量读取独立的代际：与留存开关读写互不失效。
+  const capacityOwner = React.useRef({ active: true, sequence: 0 });
+  const refreshCapacity = React.useCallback(() => {
+    const state = capacityOwner.current;
+    const seq = ++state.sequence;
+    void invoke<{
+      entries: number;
+      maxEntries: number;
+      bytes: number;
+      maxBytes: number;
+      remainingEntries: number;
+    }>("get_local_retention_capacity")
+      .then((value) => {
+        if (state.active && seq === state.sequence) {
+          setCapacity(value);
+          setCapacityReadAt(Date.now());
+          setCapacityStale(false);
+        }
+      })
+      .catch(() => {
+        if (state.active && seq === state.sequence) setCapacityStale(true);
+      });
+  }, []);
+  React.useEffect(() => {
+    const state = capacityOwner.current;
+    state.active = true;
+    refreshCapacity();
+    return () => {
+      state.active = false;
+      state.sequence++;
+    };
+  }, [refreshCapacity]);
+  // 成功采集（collectedAt 变化）后留存可能新增记录：重读一次。
+  React.useEffect(() => {
+    if (collectedAt == null) return;
+    refreshCapacity();
+  }, [refreshCapacity, collectedAt]);
+  // 留存区默认隐藏但仍挂载：展开时重读，避免后台采集后的旧余量。
+  React.useEffect(() => {
+    if (retentionOpen) refreshCapacity();
+  }, [refreshCapacity, retentionOpen]);
   React.useEffect(() => {
     const state = retentionOwner.current;
     state.active = true;
@@ -53,17 +102,6 @@ export function LocalArchiveCapture({
         if (state.active && seq === state.sequence)
           setRetentionError(errorMessage(failure));
       });
-    void invoke<{
-      entries: number;
-      maxEntries: number;
-      bytes: number;
-      maxBytes: number;
-      remainingEntries: number;
-    }>("get_local_retention_capacity")
-      .then((value) => {
-        if (state.active && seq === state.sequence) setCapacity(value);
-      })
-      .catch(() => undefined);
     return () => {
       state.active = false;
       state.sequence++;
@@ -89,6 +127,8 @@ export function LocalArchiveCapture({
             ? "已开启，下次成功采集时自动留存"
             : "自动留存已关闭，已有记录保留",
         );
+        // 第五轮复评 N05：留存开关变更后重读容量，避免旧余量。
+        refreshCapacity();
       }
     } catch (failure) {
       if (
@@ -180,7 +220,10 @@ export function LocalArchiveCapture({
           {error}
         </p>
       )}
-      <details className="local-retention-settings">
+      <details
+        className="local-retention-settings"
+        onToggle={(event) => setRetentionOpen(event.currentTarget.open)}
+      >
         <summary>自动会话留存</summary>
         <label className="local-export-option">
           <input
@@ -208,6 +251,10 @@ export function LocalArchiveCapture({
             {capacity.remainingEntries === 0
               ? " · 已满：新会话将等待清理"
               : ` · 还可新增 ${capacity.remainingEntries} 条`}
+            {capacityReadAt != null &&
+              (capacityStale
+                ? ` · 最新读取失败，以下为 ${new Date(capacityReadAt).toLocaleTimeString()} 的结果`
+                : ` · 读取于 ${new Date(capacityReadAt).toLocaleTimeString()}`)}
           </p>
         )}
         <button

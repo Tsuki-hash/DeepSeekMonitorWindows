@@ -491,7 +491,10 @@ export function HistoryPanel({
               <button
                 className="secondary"
                 disabled={busy}
-                onClick={() => void request(false, failed)}
+                // 第五轮复评 N01：失败月份重试必须 force —— 否则 5 分钟 TTL 内
+                // 会直接命中旧成功缓存，不发出请求却把旧值当本次成功，
+                // 清掉 failed/error 表现成「已恢复」。
+                onClick={() => void request(true, failed)}
               >
                 只重试失败月份（{failed.length}）
               </button>

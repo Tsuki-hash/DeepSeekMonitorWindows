@@ -108,19 +108,23 @@ export const emptyUsageDay = (date: string): UsageDay => ({
  *    不过滤会让活跃度柱状图出现「未来几天有数据」的怪象；
  * 2. 按**东八区记账日期**逐天递减生成，而不是拿接口返回的最后一天往前数——跨月时
  *    上个月的日期必须能被正确补进窗口，否则月初打开面板会看到几根空柱。
+ *
+ * 第五轮复评 N07：`now` 可注入（默认真实时钟）。测试必须传固定时刻并以
+ * 记账日（UTC+8）定义期望，否则断言混用宿主本地日会在跨时区环境假红。
  */
 export const recentUsageDays = (
   days: UsageDay[],
   count = 7,
   unavailableDates: string[] = [],
+  now: Date = new Date(),
 ): UsageDay[] => {
-  const today = todayStr();
+  const today = accountingDateKey(now);
   const source = new Map(
     days.filter((day) => day.date <= today).map((day) => [day.date, day]),
   );
-  const now = new Date(`${today}T00:00:00Z`);
+  const anchor = new Date(`${today}T00:00:00Z`);
   return Array.from({ length: count }, (_, index) => {
-    const date = new Date(now.getTime() + (index - count + 1) * 86400_000)
+    const date = new Date(anchor.getTime() + (index - count + 1) * 86400_000)
       .toISOString()
       .slice(0, 10);
     return (

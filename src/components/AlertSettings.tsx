@@ -4,9 +4,15 @@ import { Toggle } from "./ui";
 import { errorMessage } from "../error-state";
 import { updateTime } from "../data-display";
 import { alertDraftAmounts, alertStateLabel } from "../alert-options";
+import type { LeaveBlocker } from "../leave-guard";
 import type { AlertOptions, AlertStatus } from "../alert-options";
 
-export function AlertSettings() {
+export function AlertSettings({
+  onRegisterLeaveBlocker,
+}: {
+  /** 第五轮复评 N04：把未保存草稿登记为 App 级离开拦截，退出前协商。 */
+  onRegisterLeaveBlocker?: (blocker: LeaveBlocker | null) => void;
+} = {}) {
   const [status, setStatus] = React.useState<AlertStatus | null>(null);
   const [draft, setDraft] = React.useState<AlertOptions | null>(null);
   const [low, setLow] = React.useState("");
@@ -60,8 +66,8 @@ export function AlertSettings() {
     (JSON.stringify(draft) !== JSON.stringify(status.options) ||
       low !== String(status.options.lowBalanceCny) ||
       budget !== String(status.options.monthlyBudgetCny));
-  const save = async () => {
-    if (!draft || !status) return;
+  const save = async (): Promise<boolean> => {
+    if (!draft || !status) return false;
     setError("");
     setMessage("");
     let options: AlertOptions;
@@ -78,7 +84,7 @@ export function AlertSettings() {
         throw new Error("请至少开启一种提醒");
     } catch (failure) {
       setError(errorMessage(failure));
-      return;
+      return false;
     }
     setBusy(true);
     const sequence = ++control.current.sequence;
@@ -90,15 +96,40 @@ export function AlertSettings() {
         accept(value, true);
         setMessage("提醒设置已保存");
       }
+      return true;
     } catch (failure) {
       if (control.current.active && sequence === control.current.sequence) {
         setError(errorMessage(failure));
         void reload();
       }
+      return false;
     } finally {
       if (control.current.active) setBusy(false);
     }
   };
+  // 第五轮复评 N04：未保存的提醒草稿注册为 App 级离开拦截 ——
+  // 关闭设置页/切页前经过三选一协商：保存并离开、放弃（恢复后端值）、取消。
+  // save 每次渲染都是新函数，用 ref 转发避免反复登记。
+  const saveRef = React.useRef(save);
+  saveRef.current = save;
+  React.useEffect(() => {
+    onRegisterLeaveBlocker?.(
+      dirty
+        ? {
+            dirty: true,
+            subject: "提醒设置",
+            save: async () => (await saveRef.current()) === true,
+            discard: () => {
+              // 放弃：草稿恢复为后端已保存值。
+              if (status) accept(status, true);
+              setMessage("");
+            },
+          }
+        : null,
+    );
+    return () => onRegisterLeaveBlocker?.(null);
+  }, [dirty, onRegisterLeaveBlocker, status, accept]);
+
   const test = async () => {
     setBusy(true);
     setError("");
