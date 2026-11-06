@@ -1,8 +1,12 @@
 # Changelog
 
-## 1.3.1 · 未发布 / 待验收
+## 1.3.1 · 2026-11-06
 
-以下说明当前候选源码中的功能与修复，不代表已发布安装包的行为。**当前候选尚无对应的编译、测试、安装包和 Windows 使用验收结果；此次文档更新也未执行这些操作。** 编译和使用测试由维护者在本机完成，结果须对应实际候选提交。历史版本或早期候选的结果不能代替本版本验收。
+已发布：[v1.3.1](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.1)，对应提交 `d7cb1aa`。安装包 `DeepSeekMonitorWindows_1.3.1_x64-setup.exe`，SHA-256 `6f973931854e8b5026ca3d80df93946b3af9c2705d7efcc470ce352a65f64b07`，**未做 Authenticode 签名**。
+
+本机验收结果：源码门禁在 Windows 上全部通过（前端单测与组件回归、lint、format、构建、`cargo fmt`、`cargo clippy -D warnings`，以及含 11 项必需 Windows 用例的 Rust 套件）；发布记录绑定上述提交并记录了安装包哈希。维护者在本机完成安装与使用验收，未报告问题。Windows checksum 与文件快照验收在发布记录中仍为 NOT RUN。
+
+以下条目描述该版本的行为。
 
 ### 使用体验与数据修复
 
@@ -30,9 +34,9 @@
 ### 升级与发布说明
 
 - 使用范围、凭据和导出说明见中英文 README；从旧版本升级前请阅读 [升级与旧数据说明](docs/UPGRADE_1.3.1.md)。
-- 本版本仍须完成 [本机验收清单](docs/ACCEPTANCE_1.3.1.md) 和 [发布门禁](docs/RELEASE_GATES_1.3.1.md)。源码检查、安装包静态检查和真实安装使用验收是不同环节，不能互相替代。
+- 验收清单见 [本机验收清单](docs/ACCEPTANCE_1.3.1.md)，门禁说明见 [发布门禁](docs/RELEASE_GATES_1.3.1.md)。源码检查、安装包静态检查和真实安装使用验收是不同环节，不能互相替代。
 - 保留 MIT 许可证及两代上游归属。
-- 下列工作仍待本机核验：编译与自动化门禁、全新安装／覆盖升级、真实 DeepSeek 账户登录与查询、旧文件保留与无访问、通知／托盘／快捷键，以及实际安装包内容和哈希。没有新截图或安装包可据此宣布发布。
+- 安装包未做 Authenticode 签名，Windows 会提示未知发布者。Windows checksum 与文件快照验收仍为 NOT RUN，其余真机项由维护者在本机确认。
 
 ## 历史记录
 

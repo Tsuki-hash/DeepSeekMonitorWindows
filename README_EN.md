@@ -17,20 +17,20 @@ DeepSeek balance and platform usage in the Windows system tray. Open a compact p
 
 **This is an unofficial project, not affiliated with DeepSeek.** Built for Windows 10 / 11 with Tauri 2, React 18 and Rust.
 
-## Status: 1.3.1 is unreleased and awaiting acceptance
+## Status: 1.3.1 is released
 
-Version 1.3.1 is under repair and review. The current source focuses on DeepSeek accounts, platform usage and history; multi-tool agent statistics have been removed. This README describes the current source, not features already available in published installers.
+Version 1.3.1 keeps DeepSeek account balance, platform usage and history, login sync, alerts and the tray; multi-tool agent statistics have been removed. Old agent data is neither deleted automatically nor read or scanned any more.
 
-The current candidate has no corresponding compilation, automated-test, installer or Windows acceptance results. This documentation update did not run any of those steps. The maintainer will compile and test locally. Previous-version test results do not establish that 1.3.1 passes. Use the actual assets and release notes on [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest) for published versions.
+Source gates pass on Windows, the release record binds commit `d7cb1aa` and records the installer hash, and the maintainer completed install and usage acceptance locally. The installer is **not Authenticode-signed**, so Windows shows an unknown-publisher prompt; Windows checksum and file-snapshot acceptance remain NOT RUN. Use the actual assets and release notes on [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.1).
 
 - [1.3.1 upgrade and old-data notes](docs/UPGRADE_1.3.1.md)
 - [1.3.1 local acceptance checklist](docs/ACCEPTANCE_1.3.1.md)
 - [1.3.1 release gates and evidence requirements](docs/RELEASE_GATES_1.3.1.md)
 - [Changelog](CHANGELOG.md)
 
-Old screenshots show removed controls and are no longer used in this README. New 1.3.1 screenshots will need to be captured after local acceptance.
+Old screenshots show removed controls and are no longer used in this README.
 
-### Main changes in the 1.3.1 source
+### Main changes in 1.3.1
 
 - Focus on DeepSeek balance, platform usage and history, with other tools' statistics removed. Existing files are not automatically deleted.
 - Improve unknown values, explicit zeroes and invalid-number handling in model details and charts. Invalid source dates have separate notices and export records, outside normal totals.

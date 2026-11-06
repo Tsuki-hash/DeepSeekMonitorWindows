@@ -17,20 +17,20 @@
 
 **本项目不是 DeepSeek 官方产品，与 DeepSeek 公司无关。** 面向 Windows 10 / 11，使用 Tauri 2、React 18 和 Rust。
 
-## 当前状态：1.3.1 未发布、未验收
+## 当前状态：1.3.1 已发布
 
-1.3.1 正在修复与评审，当前源码只保留 DeepSeek 账户、平台用量与历史功能，已移除多工具 Agent 统计。本说明描述当前源码，不代表现有发行包已包含这些改动。
+1.3.1 已发布，只保留 DeepSeek 账户余额、平台用量与历史、登录同步、提醒与托盘，已移除多工具 Agent 统计。旧 Agent 数据不会被自动删除，也不再被读取或扫描。
 
-当前候选源码尚无对应的编译、自动化测试、安装包及 Windows 使用验收结果；此次文档更新也未执行这些操作。编译与使用测试由维护者在本机完成。旧版本的测试记录不作为 1.3.1 的通过证据。下载请以 [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest) 实际附件和版本说明为准。
+源码门禁在 Windows 上全部通过，发布记录绑定提交 `d7cb1aa` 并记录了安装包哈希；维护者已在本机完成安装与使用验收。安装包**未做 Authenticode 签名**，Windows 会提示未知发布者；Windows checksum 与文件快照验收仍为 NOT RUN。下载请以 [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/tag/v1.3.1) 实际附件和版本说明为准。
 
 - [1.3.1 升级与旧数据说明](docs/UPGRADE_1.3.1.md)
 - [1.3.1 本机验收清单](docs/ACCEPTANCE_1.3.1.md)
 - [1.3.1 发布门禁与证据要求](docs/RELEASE_GATES_1.3.1.md)
 - [变更记录](CHANGELOG.md)
 
-旧截图包含已移除的入口，已从当前说明撤下；1.3.1 截图待本机验收后更新。
+旧截图包含已移除的入口，已从当前说明撤下。
 
-### 1.3.1 源码中的主要变化
+### 1.3.1 的主要变化
 
 - 专注 DeepSeek 余额、平台用量与历史，移除其他工具统计；旧文件不会自动删除。
 - 改善模型与图表的未知值、真实零和异常数值显示，历史异常日期单独提示并随导出保留，不混入正常合计。
