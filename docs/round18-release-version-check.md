@@ -1,8 +1,10 @@
-# 第 18 轮：安装包静态版本检查
+# 历史记录：第 18 轮安装包静态版本检查
 
-> 第 21 轮已进一步修复校验期间的并发替换：持有 Windows 本机 NTFS 拒写/拒删句柄，哈希、PE/仓库及 RT_VERSION 全部取同一字节快照；不再通过可能合并外部 MUI 的 FileVersionInfo 读取正式校验字段。新的限制、独立回归和未执行的 Windows 验收见 [同一文件快照回归说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)。下面提及 FileVersionInfo 的历史实现和人工观察步骤，不代表当前主流程仍使用该 API。
+> **阅读范围：** 本文保留早期实现背景、判定理由和待执行步骤，不是当前完整发布清单，也不是通过记录。1.3.1 仍未发布、未完成 Windows 验收。当前要求以 [发布门禁](RELEASE_GATES_1.3.1.md) 和 [本机验收清单](ACCEPTANCE_1.3.1.md) 为准：同一 PowerShell 7+ Core 进程的运行时证据，依次执行 `filename`、`pe-header`、`pe-version`、`pe-bytes`、`checksum-pure` 五组非零断言，唯一完整汇总及真实成功退出码。还须分别完成 Windows 文件快照、checksum 和真实安装使用验收，五组源码结果不能代替它们。
 
-> 第 24 轮同步说明：第 18 轮“末行报告纯函数回归 PASS”是旧输出约定，不能作为当前门禁通过证据。当前必须有同一进程的 PowerShell 运行时行、四组非零逐断言（含 `pe-bytes`）、唯一完整汇总和真实成功退出码。旧三组日志或单独的 PASS 文案均不够；原始门禁日志现一律保留、不自动删除。详见 [当前发布门禁](RELEASE_GATES_1.3.1.md)。
+> 历史补注（第 21 轮）：后续修复了校验期间的并发替换，持有 Windows 本机 NTFS 拒写/拒删句柄，哈希、PE/仓库及 RT_VERSION 全部取同一字节快照；不再通过可能合并外部 MUI 的 FileVersionInfo 读取正式校验字段。限制、独立回归和未执行的 Windows 验收见 [同一文件快照回归说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)。下面提及 FileVersionInfo 的历史实现和人工观察步骤，不代表当前主流程仍使用该 API。
+
+> 历史补注（第 24 轮）：当时的门禁已要求同一进程的 PowerShell 运行时行、四组非零逐断言（含 `pe-bytes`）、唯一完整汇总和真实成功退出码，并保留原始门禁日志、不自动删除。这描述的是当时的四组要求；后续已加入独立第五组 `checksum-pure`，四组不能满足当前门禁。第 18 轮的旧 PASS 文案同样不能作为当前证据。
 
 ## 修复范围与验收状态
 
@@ -10,7 +12,7 @@
 
 本次修改仅编写并静态审阅，**未运行回归脚本、发行校验、构建、安装包或应用**。下面的命令和预期结果供用户在 Windows 本机验收，不代表已有执行结果。
 
-## 判定规则
+## 第 18 轮的判定规则（历史实现）
 
 - 文件名版本改为完整 token 匹配。`1.3.10`、`11.3.1`、`1.3.1.0`、`1.3.1-beta` 和 `1.3.1+build` 都不能冒充源码 `1.3.1`。支持通常的下划线、空格和版本前连字符分隔；其他重命名形式可能 INCONCLUSIVE。
 - 文件名始终只是辅助证据。另行检查 DOS/PE/COFF、optional header 与 section table 的基本结构，然后调用 .NET `FileVersionInfo.GetVersionInfo` 读取真实文件的版本资源。只读，不加载、不执行、不解包安装程序。
@@ -21,17 +23,21 @@
 
 静态 PASS 只表示这些静态检查一致。版本资源可以被复制或修改，PE 结构检查不是完整 Windows 加载器验证，哈希也只表示与给定值一致。**文件名和 PE 元数据都不能证明安装包绑定当前提交，更不能代替安装后检查更新、托盘、通知、DPI、升级等验收。** 提交绑定仍须可信构建来源、对应发布产物和独立获取的哈希证据。
 
-## 独立回归脚本文本
+## 回归入口及当前阅读指引
 
-第 18 轮新增 `scripts/verify-release-version.static-tests.ps1` 时，通过 PowerShell AST 提取三个纯函数验证文件名边界、PE 结构内存 fixture 和版本字段 fixture。当前入口还强制运行 `pe-bytes` 第四组，仍不执行发行校验主流程或任何安装包。用户可自行运行：
+历史范围：第 18 轮新增 `scripts/verify-release-version.static-tests.ps1` 时，通过 PowerShell AST 提取三个纯函数验证文件名边界、PE 结构内存 fixture 和版本字段 fixture。
+
+当前入口另强制运行 `pe-bytes` 和 `checksum-pure`，共五组，仍不执行发行校验或 checksum 主流程，也不运行任何安装包。维护者可在获准执行时运行：
 
 ```powershell
 pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 ```
 
-当前预期：真实退出码为 0，有 `RELEASE_VERSION_RUNTIME`、四组非零 `RELEASE_VERSION_ASSERT` 及唯一完整的 `RELEASE_VERSION_SUMMARY`，计数和运行时来源一致。仅看到旧 PASS 字样或部分断言不能放行。即使这些要求满足，也不能证明真实 NSIS 产物的字段格式、Windows 文件锁或安装行为正确，仍需下一节及第 21 轮独立本机验收。
+当前预期：真实退出码为 0，有 `RELEASE_VERSION_RUNTIME`、上述五组按顺序执行的非零 `RELEASE_VERSION_ASSERT` 及唯一完整的 `RELEASE_VERSION_SUMMARY`，计数和运行时来源一致。`pe-bytes` 与 `checksum-pure` 必须在同一已报告进程中实际执行，父入口须校验各自的逐断言与末尾完成对象；仅有子脚本的原始成功文字不足以放行。旧三组／四组、旧 PASS 字样或部分断言都不能放行。即使满足，也不能证明真实 NSIS 产物、Windows 文件锁或安装行为正确，须继续完成当前发布门禁中的独立 Windows 验收。
 
-## Windows 本机发行验收
+## 第 18 轮的 Windows 待验步骤（历史参考）
+
+以下保留原场景与人工观察方法，不表示已经执行。`FileVersionInfo` 输出仅供辅助观察，可能受外部 MUI 影响，不是当前主流程的版本证据；当前主流程从受保护的同一文件字节快照解析 PE 版本。发布时请先按当前清单执行，不要仅完成这份历史步骤就宣布通过。
 
 1. 在当前源码树中使用真实待发布 NSIS 安装包，先只读观察资源。将示例路径替换为实际文件：
 

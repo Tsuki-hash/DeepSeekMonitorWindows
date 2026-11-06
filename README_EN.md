@@ -21,13 +21,22 @@ DeepSeek balance and platform usage in the Windows system tray. Open a compact p
 
 Version 1.3.1 is under repair and review. The current source focuses on DeepSeek accounts, platform usage and history; multi-tool agent statistics have been removed. This README describes the current source, not features already available in published installers.
 
-No compilation, test execution, installer build or Windows acceptance testing was performed for this refocus. The maintainer will compile and test locally. Previous-version test results do not establish that 1.3.1 passes. Use the actual assets and release notes on [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest) for published versions.
+The current candidate has no corresponding compilation, automated-test, installer or Windows acceptance results. This documentation update did not run any of those steps. The maintainer will compile and test locally. Previous-version test results do not establish that 1.3.1 passes. Use the actual assets and release notes on [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest) for published versions.
 
 - [1.3.1 upgrade and old-data notes](docs/UPGRADE_1.3.1.md)
 - [1.3.1 local acceptance checklist](docs/ACCEPTANCE_1.3.1.md)
+- [1.3.1 release gates and evidence requirements](docs/RELEASE_GATES_1.3.1.md)
 - [Changelog](CHANGELOG.md)
 
 Old screenshots show removed controls and are no longer used in this README. New 1.3.1 screenshots will need to be captured after local acceptance.
+
+### Main changes in the 1.3.1 source
+
+- Focus on DeepSeek balance, platform usage and history, with other tools' statistics removed. Existing files are not automatically deleted.
+- Improve unknown values, explicit zeroes and invalid-number handling in model details and charts. Invalid source dates have separate notices and export records, outside normal totals.
+- Keep stale data, failed months and unloaded months distinct after a history refresh fails. Changing pages does not establish that a query has recovered.
+- Improve web-login waiting, cancellation and retries, plus tray exit and unsaved-settings handling, so late responses do not override newer actions.
+- Improve keyboard navigation and focus restoration. These behaviors and actual Windows usability still await acceptance; see the [changelog](CHANGELOG.md) for details.
 
 ## Scope
 
@@ -45,7 +54,7 @@ The app no longer provides other tools' project/session statistics, directory sc
 | Account balance | Official public DeepSeek API: `https://api.deepseek.com/user/balance` | DeepSeek API key | Does not supply the account usage history used by this app |
 | Tokens, requests, spending and history | Internal platform web endpoints: `https://platform.deepseek.com/api/v0/usage/amount` and `/api/v0/usage/cost` | Platform web-session token | Not a stable public API; sessions expire and paths, fields or authentication may change |
 
-The API key and usage token **are not interchangeable**. Either feature can be configured independently. The app does not automatically verify that both credentials belong to the same account; check that yourself.
+The API key and usage token **are not interchangeable**, and neither can be automatically derived from the other. Either feature can be configured independently. The app does not automatically verify that both credentials belong to the same account; check that yourself.
 
 An official balance endpoint does not make the usage endpoints public APIs. Usage comes from platform responses, not other tools' local logs or estimates based on balance differences. The DeepSeek platform bill remains authoritative.
 
@@ -73,6 +82,8 @@ Web sign-in is not needed for balance queries.
 
 You can cancel while waiting. Canceling or closing the window should allow a new attempt. Tokens expire and must then be synchronized again. This flow uses only the DeepSeek platform session; it does not need credentials for other tools.
 
+While waiting, Settings continues checking the login state to handle missed notifications or failed reads. **同步已结束，当前配置已核对** means synchronization has ended and the current configuration was checked; it does not establish that this login succeeded. Unsaved manual token input is preserved. These checks stop when you leave Settings.
+
 As a fallback, expand **方式二：手动粘贴 token**. In the developer-tools Console of your signed-in `platform.deepseek.com` tab, inspect:
 
 ```js
@@ -97,9 +108,15 @@ Run this only on your own DeepSeek page. Paste the result into the app, not into
 
 Use **历史** to query this month, last month, the last 30 days, a selected month or all history. All-history queries load in batches and can be continued or stopped. Platform retention and availability are not guaranteed. Unloaded or missing months do not mean zero usage.
 
-Successful months should remain available after failures. Resolve authentication or rate-limit errors first; individual failed months can be retried with **只重试失败月份**. History caches are tied to the usage session. Changing or clearing the token must invalidate old caches and late responses so they cannot enter another account's view.
+Successful months should remain available after failures, marked as stale. Changing ranges or reopening History does not clear a failure; if the cached data was released, the result should be unknown rather than zero or recovered. Resolve authentication or rate-limit errors first; individual failed months can be retried with **只重试失败月份**. History caches are tied to the usage session. Changing or clearing the token must invalidate old caches and late responses so they cannot enter another account's view.
 
-CSV exports daily records inside the selected range. JSON range summaries use the same daily records; original full-month responses are kept separately as `sourceMonthlySnapshots`, with their coverage stated. Exports exclude API keys, session tokens and cookies, but still contain account spending information. Choose carefully where to store or share them.
+Normal daily records and JSON range summaries cover the selected dates. Full-month source model summaries are kept separately as `sourceMonthlySnapshots`, marked `full-source-month`. They may include contributions outside the range or from anomalous source records and must not be used as selected-range totals.
+
+Malformed dates, impossible calendar dates and dates outside the queried month are excluded from normal daily records, totals and covered-day counts. The page shows their count, original dates and reasons. They do not fill genuinely missing dates.
+
+- JSON preserves these records separately in `excludedDateRecords`, with `includedInTotals=false`. `monthly.excludedDateRecordCount` counts anomalous records, not days.
+- CSV uses `returned` for normal records and `not-returned` for missing dates. Anomalies use `excluded-invalid-date` or `excluded-outside-query-month`; their seven usage/cost numeric columns stay empty and original model values appear in `excluded_models`. Additional trailing columns record source months, source dates, reasons and warnings. Read columns by name and distinguish statuses instead of treating every row as normal usage.
+- Anomalous evidence comes from loaded source months, so its original date may fall outside the selected window. Keeping it does not include it in range totals. Exports exclude API keys, session tokens and cookies, but still contain account spending information. Choose carefully where to store or share them.
 
 ### Balance and budget reminders
 

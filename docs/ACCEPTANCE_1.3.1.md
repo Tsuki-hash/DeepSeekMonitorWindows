@@ -1,8 +1,19 @@
 # 1.3.1 本机验收清单
 
-**当前状态：未发布、未验收。本轮未编译或运行测试。** 以下全部是待执行项目，不是通过记录。编译与使用测试由维护者在本机完成；不得沿用旧版本或旧提交的结果作为本次证据。
+**当前状态：未发布、未验收。此次文档更新未编译或运行测试。** 以下全部是待执行项目，不是通过记录。编译与使用测试由维护者在本机完成；不得沿用旧版本或旧提交的结果作为本次证据。
 
 本清单针对 DeepSeek-only 版本。测试账号凭据仅在本机和对应 DeepSeek 服务使用，不粘贴到验收记录、截图或 Issue。旧数据边界可先用专门测试目录中的合成文件确认，避免对唯一副本进行破坏性操作。
+
+## 专项验收导航
+
+以下说明补充具体场景，均为待执行要求，不是通过证据。最终验收须针对同一个候选提交。
+
+- 历史：[失败状态与缓存](REVIEW29_HISTORY_CACHE_REGRESSIONS.md)、[异常日期与导出](REVIEW29_HISTORY_DATE_REGRESSIONS.md)。
+- 键盘与焦点：[提示框和峰谷说明](REVIEW31_PROMPT_BADGE_FOCUS_REGRESSIONS.md)。
+- 退出与未保存设置：[启动期间的托盘退出请求](REVIEW32_EARLY_QUIT_REGRESSIONS.md)、[退出期间编辑与异步保存](REVIEW32_QUIT_LOCK_REGRESSIONS.md)。
+- 退出通知恢复：[监听就绪后通知丢失的恢复](REVIEW33_QUIT_RECONCILIATION_REGRESSIONS.md)。
+- 登录等待与恢复：[网页登录等待与状态恢复](REVIEW34_USAGE_SYNC_RECONCILIATION.md)。
+- 发布：[当前五组源码门禁及 Windows 独立要求](RELEASE_GATES_1.3.1.md)。早期三组／四组说明只作历史参考，不能作为当前清单。
 
 ## 记录模板
 
@@ -26,8 +37,9 @@
 - [ ] 依赖审计结果被真实记录；网络错误或无法取得结果不是“无漏洞”。
 - [ ] 测试实际执行数大于零；没有把已移除的 Agent 测试、空集合或跳过计为通过。
 - [ ] 按 [发布门禁说明](RELEASE_GATES_1.3.1.md) 在 Windows 本机运行 Rust 门禁：11 项必需 Windows 测试全部真实完成，schema v3 的逐项覆盖、完成行和总数一致。非 Windows／中文跳过／缺必需项的注入均阻断放行。
-- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus、directed-settings-focus、window-visibility、pricing-period-badge 与 quit-request-lifecycle 十二套回归；directed-settings-focus 包含 R31 LeavePromptDialog 回归。焦点套件使用合成节点/事件和可控 RAF，不是真实 DOM 或原生焦点测试。非零计数不替代 Windows 原生窗口、布局和通知验收。
-- [ ] 按[第 31 轮提示与峰谷说明回归](REVIEW31_PROMPT_BADGE_FOCUS_REGRESSIONS.md) 验收提示初始 RAF 的同步撤销、安全取消归还与保存/放弃导航；打开峰谷说明后 Tab 到图表日期再按 Escape，图表处理的事件不能关闭说明或把焦点拉回峰谷按钮。另测外部未处理 Escape 关闭说明但保持当前焦点。
+- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus、directed-settings-focus、window-visibility、pricing-period-badge 与 quit-request-lifecycle 十二套回归；directed-settings-focus 包含 LeavePromptDialog 提示框回归。焦点套件使用合成节点/事件和可控 RAF，不是真实 DOM 或原生焦点测试。非零计数不替代 Windows 原生窗口、布局和通知验收。
+- [ ] 退出相关回归包含 `src/quit-intent.test.ts`、`src/quit-request.test.ts`、`src/quit-interaction.test.ts`、`src-tauri/src/quit_intent.rs` 及 `tests/quit-request-lifecycle.test.tsx`；登录恢复包含 `src/usage-sync-reconcile.test.ts` 及 `tests/settings-transactions.test.tsx`。它们由现有单元、Rust 或组件入口执行，不是额外的组件套件，也不改变五组发行版本纯函数门禁的含义。记录实际执行结果，不将用例文本或合成 IPC 当作 Windows 事件已验证。
+- [ ] 按[提示框与峰谷说明回归](REVIEW31_PROMPT_BADGE_FOCUS_REGRESSIONS.md) 验收提示初始 RAF 的同步撤销、安全取消归还与保存/放弃导航；打开峰谷说明后 Tab 到图表日期再按 Escape，图表处理的事件不能关闭说明或把焦点拉回峰谷按钮。另测外部未处理 Escape 关闭说明但保持当前焦点。
 - [ ] 开发与打包不运行统计引擎准备，不下载或捆绑该引擎。
 - [ ] 执行 Windows NSIS 打包，并记录实际安装包哈希。构建成功仍不等于安装后可用。
 
@@ -62,6 +74,8 @@
 - [ ] 只配用量 Token 时用量可独立工作；两种凭据来源与“账户尚未自动核对”的提示准确。
 - [ ] 清除 Token 后网页登录会话保留；忘记账户后应用 Token 与网页登录数据清除；API Key、外观偏好保留。
 - [ ] 清除操作与在途请求交错时，旧结果不能恢复已清除的凭据或账户数据。
+- [ ] 设置页等待网页登录时，分别丢弃捕获通知和结束通知、让状态／配置读取失败，再恢复读取；无须第二次点击登录也能继续核对当前会话。只确认终态时显示「同步已结束，当前配置已核对」，不凭已有 Token 或其他配置更新宣称本次成功，不清除手动草稿。
+- [ ] 取消、取消时会话已结束、关闭登录窗口、手动保存、清除 Token、忘记账户、开始新会话、离开并重进设置与慢读取交错时，旧结果不覆盖较新配置、反馈或草稿。离页后不残留该页面的定时检查。2 秒是每轮结束后的计划检查间隔，不是 Windows / WebView2 的响应时限保证。
 
 ## 5. 统计、历史与导出
 
@@ -73,10 +87,16 @@
 - [ ] 鉴权、限流、网络或单月异常按实际类型停止／重试，不能形成无界连续请求。
 - [ ] 更换或清除用量 Token 时缓存和迟到响应失效，不混入旧账户；切换范围后旧查询不覆盖新范围。
 - [ ] CSV 和 JSON 的区间合计与页面一致；JSON 原始整月来源单独标记范围；导出不含凭据、Cookie 或不应包含的数据。
+- [ ] 成功查询后注入失败，再切换范围和重新进入历史：旧来源时间、失败月份与 `stale` 标记不因缓存命中而消失；只有真正成功重试才恢复。缓存已释放时保持未知，且与未加载月份、平台未返回日期区分。
+- [ ] 非规范日期、不存在的公历日期和错月来源不进入正常日记录、趋势、合计与覆盖天数，页面保留原始日期和排除原因；缺少的真实日期仍未知。合成 31 个合法日各 10 Tokens，再加入异常日期的 900 Tokens，正常合计应为 310、覆盖 31 日，异常 900 独立保留而非变成零。
+- [ ] JSON `excludedDateRecords` 标明 `includedInTotals=false`；`monthly.excludedDateRecordCount` 是记录数而非天数。CSV 的 `excluded-invalid-date` / `excluded-outside-query-month` 行七个用量／费用数值列为空，原值仅在 `excluded_models`；来源日期、原因、警告及公式防护保留。异常证据可在所选窗口之外，不能被当作区间记录；`sourceMonthlySnapshots` 的整月汇总也不能加入区间合计。
 
 ## 6. 桌面、提醒与可访问性
 
 - [ ] 实际安装后的托盘显隐、余额更新、旧数据标识和退出可用；关窗只是隐藏。
+- [ ] 应用刚启动、前端监听未就绪时点托盘退出，以及监听就绪后退出通知未送达时，均能继续进入当前草稿协商，不要求再次点击才能发现原请求。有草稿时可保存、放弃或取消；取消后旧通知与重复检查不重弹，新点击仍可退出。主窗口恢复失败时不能直接绕过草稿退出。
+- [ ] 退出请求读取／确认接收失败时显示恢复入口；重试不复用先前的退出批准。延迟读取、确认接收、页面重建或最终退出命令时，不重复提交退出，也不让旧响应恢复已结束的操作。
+- [ ] 最终退出命令发出期间，真实键鼠输入和导航均不可再编辑；失败后恢复新编辑。退出前开始的剪贴板读取、排队登录及排队保存晚到时，不产生新草稿或后续保存；已发送保存的配置回执可同步，但不能消费新草稿或引出第二次退出。此前已请求的清除／忘记账户操作不应被擅自取消。
 - [ ] 面板隐藏后停止面板轮询；只有明确开启的余额／预算提醒独立检查。
 - [ ] 提醒在有效最新数据上触发；未知数据不触发预算判断，失效凭据暂停，恢复后重新检查。
 - [ ] 免打扰、去重与冷却在重启后仍符合设置；在 Windows 中实际看到测试通知，不以“提交成功”代替可见性。
@@ -88,12 +108,12 @@
 
 - [ ] 所有必需项都有本次提交对应的结果；失败项已修复并重新验证，或明确作为未解决阻断。
 - [ ] 对实际安装包检查版本、资源与哈希，而不是只检查源码配置。
-- [ ] 在本机 NTFS 上完成 [第 21 轮文件快照双屏障主流程回归](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)，保留真实退出码和证据目录。源码纯字节门禁、helper-only 断言或非 Windows 结果不能代替必需的 Windows 主流程验收。
-- [ ] **NOT RUN，独立必需：** 按 [第 26 轮 checksum 说明](REVIEW26_CHECKSUM_SIDECAR_REGRESSIONS.md) 运行 `verify-release-checksum.windows-tests.ps1`。在 Windows + PowerShell 7+ + 本机 NTFS 的全新证据根，使用不可执行合成文件核对 hardlink/符号链接、已存在及并发 sidecar、源/输出持锁、失败保留和字面路径；保留真实退出码、唯一完整汇总与原始证据。不能以第五组源码 PASS 代替，也不能把该合成套件作为真实包校验和、安装或升级验收。
+- [ ] 在本机 NTFS 上完成 [文件快照双屏障主流程回归](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)，保留真实退出码和证据目录。源码纯字节门禁、helper-only 断言或非 Windows 结果不能代替必需的 Windows 主流程验收。
+- [ ] **NOT RUN，独立必需：** 按 [checksum 文件验收说明](REVIEW26_CHECKSUM_SIDECAR_REGRESSIONS.md) 运行 `verify-release-checksum.windows-tests.ps1`。在 Windows + PowerShell 7+ + 本机 NTFS 的全新证据根，使用不可执行合成文件核对 hardlink/符号链接、已存在及并发 sidecar、源/输出持锁、失败保留和字面路径；保留真实退出码、唯一完整汇总与原始证据。不能以第五组源码 PASS 代替，也不能把该合成套件作为真实包校验和、安装或升级验收。
 - [ ] 用无真实账户信息的演示状态重截当前截图，覆盖账户、历史与设置；不复用旧导航截图冒充新版。
 - [ ] README、升级说明与实际行为一致，仍保留 MIT 版权和上游归属。
 - [ ] 只有在发布真实完成后才更新“未发布”状态；验收结论独立记录，不能由打标签或上传附件推导。
 
 ## English acceptance summary
 
-All checkboxes are pending, not passed. Record the exact source commit, toolchain versions, exit codes, original outputs and installer SHA-256. Run the current repository gates and Windows installer acceptance locally. Verify both clean installation and upgrade, removal of all collector entry points and backend access, preservation of old files, DeepSeek balance/login/usage, credential races, history/export accounting, tray/reminders and the actual installer contents. Removed tests, skipped checks and earlier-version results cannot count as passes for 1.3.1. New screenshots and a release claim must wait for actual evidence.
+All checkboxes are pending, not passed. Record the exact source commit, toolchain versions, exit codes, original outputs and installer SHA-256. Run the current repository gates and Windows installer acceptance locally, including all five release-version suites. Verify both clean installation and upgrade, removal of all collector entry points and backend access, preservation of old files, DeepSeek balance/login/usage, credential races, history/export accounting and isolated invalid-date records, tray/reminders and the actual installer contents. Follow the linked scenarios for startup/missed exit notifications, editing during exit and missed web-login notifications. Synthetic events and timers do not prove native Windows behavior. Removed tests, skipped checks and earlier-version results cannot count as passes for 1.3.1. New screenshots and a release claim must wait for actual evidence.
