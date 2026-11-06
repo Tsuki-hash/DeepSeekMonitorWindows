@@ -19,7 +19,7 @@ Windows 10 / 11 only. Built with Tauri 2, React 18, and Rust.
 
 **This project is not an official DeepSeek product and is not affiliated with DeepSeek.**
 
-Version 1.3.1 builds on the persistent Account / Agent / History navigation from 1.3.0 and focuses on data trust and failure recovery: a missing cost response no longer renders as ¥0.00, balance and usage back off independently, history stops by failure kind and can retry only failed months, a stale month total is no longer labelled as this month, and local collection detects overlapping sources. Download published builds from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest).
+Version 1.3.1 builds on the persistent Account / Agent / History navigation from 1.3.0 and focuses on data trust and failure recovery: a missing cost response no longer renders as ¥0.00, saving a valid credential immediately resumes both refresh channels and the tray, consecutive failures now really back off (120/240/… seconds), history stops by failure kind and retrying only failed months keeps the months that already succeeded, a stale month total is no longer labelled as this month, and local collection only treats a tool path as duplicate when it sits inside that tool's standard layout. Download published builds from [GitHub Releases](https://github.com/Tsuki-hash/DeepSeekMonitorWindows/releases/latest).
 
 ## Screenshots
 
