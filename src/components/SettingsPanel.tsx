@@ -34,6 +34,7 @@ function SettingsPanel({
   usageErrorCode,
   usage,
   showDataNotices = false,
+  targetSection,
   onRetry,
   onBack,
   onBalanceLoaded,
@@ -53,6 +54,8 @@ function SettingsPanel({
   usageErrorCode?: string;
   usage?: UsageResult | null;
   showDataNotices?: boolean;
+  /** 进入设置后需要滚动并聚焦的区块（复评 R16）。 */
+  targetSection?: "usageToken" | null;
   onRetry?: () => Promise<unknown>;
   onBack: () => void;
   onBalanceLoaded: (balance: BalanceData) => void;
@@ -110,6 +113,22 @@ function SettingsPanel({
     return () => window.clearInterval(timer);
   }, []);
   const noticesRef = React.useRef<HTMLDetailsElement>(null);
+  // 复评 R16：历史页的恢复按钮必须真正定位到用量 Token 区块，
+  // 只切到设置页顶部（API Key 区）会让用户还要自己找。
+  const usageTokenRef = React.useRef<HTMLElement>(null);
+  React.useEffect(() => {
+    if (targetSection !== "usageToken") return;
+    // 等渲染完成再滚动，否则 ref 可能还没挂载。
+    const frame = window.requestAnimationFrame(() => {
+      const node = usageTokenRef.current;
+      if (!node) return;
+      node.scrollIntoView({ block: "start", behavior: "smooth" });
+      // 把焦点移到区块标题，键盘与读屏用户能确认「到了」。
+      node.setAttribute("tabindex", "-1");
+      node.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [targetSection]);
   React.useEffect(() => {
     if (showDataNotices) noticesRef.current?.scrollIntoView({ block: "start" });
   }, [showDataNotices]);
@@ -204,155 +223,160 @@ function SettingsPanel({
           ))}
         </SettingsSection>
 
-        <SettingsSection icon={<BarChart3 size={15} />} title="用量同步 Token">
-          <p>
-            用于同步 Token 用量、消费和趋势图。DeepSeek 无官方用量
-            API，需网页登录 token（与上面的 API Key 不同）。
-          </p>
-          <p className="muted">方式一网页登录自动同步</p>
-          <div className="settings-actions usage-sync-actions">
-            <button
-              className="primary"
-              onClick={usageSyncing ? cancelUsageSync : startUsageSync}
-              disabled={busy}
-            >
-              {usageSyncing ? "取消同步" : "网页登录自动同步"}
-            </button>
-            <span
-              className={
-                config?.usageTokenConfigured
-                  ? usageError
-                    ? "configured warning"
-                    : "configured"
-                  : "configured missing"
-              }
-            >
-              {config?.usageTokenConfigured && !usageError ? (
-                <CheckCircle2 size={17} />
-              ) : (
-                <XCircle size={17} />
-              )}
-              {config?.usageTokenConfigured
-                ? usageError
-                  ? "查询异常"
-                  : "已配置"
-                : "未配置"}
-            </span>
-            <button
-              className="secondary"
-              onClick={clearUsageToken}
-              disabled={busy || !config?.usageTokenConfigured}
-            >
-              清除 Token
-            </button>
-          </div>
-          <p className="muted" role="status">
-            {usageStatus}
-          </p>
-          <details
-            className="settings-disclosure"
-            onToggle={(event) => {
-              if (!event.currentTarget.open) setConfirmForget(false);
-            }}
+        <div ref={usageTokenRef as React.RefObject<HTMLDivElement>}>
+          <SettingsSection
+            icon={<BarChart3 size={15} />}
+            title="用量同步 Token"
           >
-            <summary>账户隐私</summary>
-            <p className="muted">
-              “清除 Token”保留网页登录会话；“退出并忘记账户”同时清除本应用的
-              Token 与网页登录数据。API Key 和其他设置保留。
+            <p>
+              用于同步 Token 用量、消费和趋势图。DeepSeek 无官方用量
+              API，需网页登录 token（与上面的 API Key 不同）。
             </p>
-            {confirmForget ? (
-              <>
-                <p>清除后需要重新登录，确定继续？</p>
+            <p className="muted">方式一网页登录自动同步</p>
+            <div className="settings-actions usage-sync-actions">
+              <button
+                className="primary"
+                onClick={usageSyncing ? cancelUsageSync : startUsageSync}
+                disabled={busy}
+              >
+                {usageSyncing ? "取消同步" : "网页登录自动同步"}
+              </button>
+              <span
+                className={
+                  config?.usageTokenConfigured
+                    ? usageError
+                      ? "configured warning"
+                      : "configured"
+                    : "configured missing"
+                }
+              >
+                {config?.usageTokenConfigured && !usageError ? (
+                  <CheckCircle2 size={17} />
+                ) : (
+                  <XCircle size={17} />
+                )}
+                {config?.usageTokenConfigured
+                  ? usageError
+                    ? "查询异常"
+                    : "已配置"
+                  : "未配置"}
+              </span>
+              <button
+                className="secondary"
+                onClick={clearUsageToken}
+                disabled={busy || !config?.usageTokenConfigured}
+              >
+                清除 Token
+              </button>
+            </div>
+            <p className="muted" role="status">
+              {usageStatus}
+            </p>
+            <details
+              className="settings-disclosure"
+              onToggle={(event) => {
+                if (!event.currentTarget.open) setConfirmForget(false);
+              }}
+            >
+              <summary>账户隐私</summary>
+              <p className="muted">
+                “清除 Token”保留网页登录会话；“退出并忘记账户”同时清除本应用的
+                Token 与网页登录数据。API Key 和其他设置保留。
+              </p>
+              {confirmForget ? (
+                <>
+                  <p>清除后需要重新登录，确定继续？</p>
+                  <div className="disclosure-actions">
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={() => {
+                        setConfirmForget(false);
+                        forgetUsageSession();
+                      }}
+                    >
+                      确认清除
+                    </button>
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={() => setConfirmForget(false)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </>
+              ) : (
                 <div className="disclosure-actions">
                   <button
                     className="secondary"
                     disabled={busy}
-                    onClick={() => {
-                      setConfirmForget(false);
-                      forgetUsageSession();
-                    }}
+                    onClick={() => setConfirmForget(true)}
                   >
-                    确认清除
+                    退出并忘记账户
+                  </button>
+                </div>
+              )}
+            </details>
+            <button
+              className="link-button"
+              aria-expanded={showManualPaste}
+              aria-controls="manual-token-panel"
+              onClick={() => setShowManualPaste((value) => !value)}
+            >
+              {showManualPaste ? "收起手动粘贴" : "方式二：手动粘贴 token"}
+            </button>
+            {showManualPaste && (
+              <div id="manual-token-panel">
+                <p className="muted">
+                  获取：浏览器登录 platform.deepseek.com，按 F12
+                  打开开发者工具， 切到「控制台 / Console」标签，在 ❯
+                  提示符后输入 JSON.parse(localStorage.userToken).value
+                  回车，右键复制返回的字符串。
+                </p>
+                <p className="muted">
+                  若返回 undefined（平台可能调整了存储键名），改输入{" "}
+                  {
+                    "Object.entries(localStorage).filter(([k]) => /token/i.test(k))"
+                  }
+                  ，从结果里找形如 token 的长字符串复制。
+                </p>
+                <p className="muted">
+                  token 会过期，用量查询失败时重新获取一次即可。
+                </p>
+                <div className="key-row">
+                  <input
+                    aria-label="用量 Token"
+                    type="password"
+                    value={usageToken}
+                    placeholder={
+                      config?.usageTokenConfigured
+                        ? "•••••••••••••••••••••••••••••••••••••••••••••••••••"
+                        : ""
+                    }
+                    onChange={(event) => setUsageToken(event.target.value)}
+                  />
+                </div>
+                <div className="settings-actions">
+                  <button
+                    className="primary"
+                    onClick={saveUsageToken}
+                    disabled={busy || !usageToken.trim()}
+                  >
+                    保存 Token
                   </button>
                   <button
                     className="secondary"
+                    onClick={pasteUsageToken}
                     disabled={busy}
-                    onClick={() => setConfirmForget(false)}
                   >
-                    取消
+                    粘贴
                   </button>
                 </div>
-              </>
-            ) : (
-              <div className="disclosure-actions">
-                <button
-                  className="secondary"
-                  disabled={busy}
-                  onClick={() => setConfirmForget(true)}
-                >
-                  退出并忘记账户
-                </button>
               </div>
             )}
-          </details>
-          <button
-            className="link-button"
-            aria-expanded={showManualPaste}
-            aria-controls="manual-token-panel"
-            onClick={() => setShowManualPaste((value) => !value)}
-          >
-            {showManualPaste ? "收起手动粘贴" : "方式二：手动粘贴 token"}
-          </button>
-          {showManualPaste && (
-            <div id="manual-token-panel">
-              <p className="muted">
-                获取：浏览器登录 platform.deepseek.com，按 F12 打开开发者工具，
-                切到「控制台 / Console」标签，在 ❯ 提示符后输入
-                JSON.parse(localStorage.userToken).value
-                回车，右键复制返回的字符串。
-              </p>
-              <p className="muted">
-                若返回 undefined（平台可能调整了存储键名），改输入{" "}
-                {
-                  "Object.entries(localStorage).filter(([k]) => /token/i.test(k))"
-                }
-                ，从结果里找形如 token 的长字符串复制。
-              </p>
-              <p className="muted">
-                token 会过期，用量查询失败时重新获取一次即可。
-              </p>
-              <div className="key-row">
-                <input
-                  aria-label="用量 Token"
-                  type="password"
-                  value={usageToken}
-                  placeholder={
-                    config?.usageTokenConfigured
-                      ? "•••••••••••••••••••••••••••••••••••••••••••••••••••"
-                      : ""
-                  }
-                  onChange={(event) => setUsageToken(event.target.value)}
-                />
-              </div>
-              <div className="settings-actions">
-                <button
-                  className="primary"
-                  onClick={saveUsageToken}
-                  disabled={busy || !usageToken.trim()}
-                >
-                  保存 Token
-                </button>
-                <button
-                  className="secondary"
-                  onClick={pasteUsageToken}
-                  disabled={busy}
-                >
-                  粘贴
-                </button>
-              </div>
-            </div>
-          )}
-        </SettingsSection>
+          </SettingsSection>
+        </div>
 
         <SettingsSection icon={<Info size={15} />} title="数据状态与口径">
           <details
@@ -494,12 +518,39 @@ function SettingsPanel({
               className="segmented"
               role="radiogroup"
               aria-label="自动刷新间隔"
+              onKeyDown={(event) => {
+                // 复评 R17：radiogroup 需要方向键在选项间移动（roving tabindex）。
+                const index = refreshOptions.findIndex(
+                  (option) => option.value === refresh,
+                );
+                const delta =
+                  event.key === "ArrowRight" || event.key === "ArrowDown"
+                    ? 1
+                    : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                      ? -1
+                      : 0;
+                if (delta === 0) return;
+                event.preventDefault();
+                const next =
+                  (index + delta + refreshOptions.length) %
+                  refreshOptions.length;
+                const option = refreshOptions[next];
+                saveRefreshInterval(option.value);
+                // 焦点跟到新选中的项，读屏才会播报。
+                const buttons =
+                  event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                    "[role='radio']",
+                  );
+                buttons[next]?.focus();
+              }}
             >
               {refreshOptions.map((option) => (
                 <button
                   key={option.value}
                   role="radio"
                   aria-checked={refresh === option.value}
+                  // 只有选中项进入 Tab 序列，其余用方向键到达。
+                  tabIndex={refresh === option.value ? 0 : -1}
                   className={refresh === option.value ? "selected" : ""}
                   onClick={() => saveRefreshInterval(option.value)}
                   disabled={busy}
