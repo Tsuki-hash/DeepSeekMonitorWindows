@@ -69,11 +69,7 @@ pub fn run() {
                         && event.state == tauri_plugin_global_shortcut::ShortcutState::Released
                     {
                         if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = tray::hide_main_window_inner(&window);
-                            } else {
-                                tray::show_main_window(&window);
-                            }
+                            tray::toggle_main_window(&window);
                         }
                     }
                 })

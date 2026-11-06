@@ -1,8 +1,13 @@
 # 独立回归：只从 verify-release.ps1 的 AST 提取纯函数，不运行发行校验主流程、
 # 不启动/安装应用，不构建，不调用 Get-FileHash 或 FileVersionInfo 读取真实安装包。
-# 本文件在第 18 轮修改时仅编写/静态审阅，未执行。
+# 本文件在第 18/19 轮修改时仅编写/静态审阅，未执行。
 # 用户本机运行：pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$script:AssertionCount = 0
+$script:PassedAssertions = 0
+$script:FailedAssertions = 0
+$script:AssertionSuite = 'filename'
 $sourcePath = Join-Path $PSScriptRoot 'verify-release.ps1'
 $tokens = $null
 $parseErrors = $null
@@ -19,7 +24,17 @@ foreach ($name in $names) {
 }
 
 function Assert-Equal($Actual, $Expected, [string]$Label) {
-    if ($Actual -cne $Expected) { throw "${Label}：期望 [$Expected]，实际 [$Actual]" }
+    $script:AssertionCount += 1
+    $passed = -not ($Actual -cne $Expected)
+    if ($passed) { $script:PassedAssertions += 1 } else { $script:FailedAssertions += 1 }
+    $row = [ordered]@{
+        index = $script:AssertionCount
+        suite = $script:AssertionSuite
+        label = $Label
+        status = $(if ($passed) { 'PASS' } else { 'FAIL' })
+    } | ConvertTo-Json -Compress
+    Write-Host "RELEASE_VERSION_ASSERT $row"
+    if (-not $passed) { throw "${Label}：期望 [$Expected]，实际 [$Actual]" }
 }
 function New-VersionFixture {
     [pscustomobject]@{
@@ -42,6 +57,7 @@ foreach ($name in @('Monitor_1.3.10_x64-setup.exe', 'Monitor_11.3.1.exe', 'Monit
 }
 Assert-Equal (Test-ReleaseFileNameVersion 'Monitor_1.3.1.exe' '') $false '缺失源码版本'
 
+$script:AssertionSuite = 'pe-header'
 # 这是只用于基本结构检查的内存 fixture，不是可执行安装包，更不能代替版本资源。
 $pe = [byte[]]::new(512)
 $pe[0] = 0x4D; $pe[1] = 0x5A
@@ -70,6 +86,7 @@ Assert-Equal (Test-PortableExecutableHeader $badPe) $false '越界 optional head
 $badPe = $pe.Clone(); [BitConverter]::GetBytes([uint16]0x107).CopyTo($badPe, 88)
 Assert-Equal (Test-PortableExecutableHeader $badPe) $false '未知 optional header magic'
 
+$script:AssertionSuite = 'pe-version'
 foreach ($version in @('1.3.1', '1.3.1.0', ' 1.3.1 ')) {
     $info = New-VersionFixture; $info.FileVersion = $version; $info.ProductVersion = $version
     Assert-Equal (@(Get-PeReleaseVersionIssues $info '1.3.1').Count) 0 "受支持的 NSIS stable 文本 $version"
@@ -93,4 +110,17 @@ foreach ($version in @('1.3.1-beta.1', '1.3.1+build', '1.3.1.0', '01.3.1', '6553
     Assert-Equal (@(Get-PeReleaseVersionIssues (New-VersionFixture) $version).Count -gt 0) $true "不猜测源码版本映射 $version"
 }
 
-Write-Host 'PASS：纯函数回归完成。未执行发行校验主流程或真实安装验收。'
+# 只有真正走完所有断言才输出完成记录；旧的一句 PASS 不是执行证据。
+if ($script:AssertionCount -le 0 -or $script:FailedAssertions -ne 0) {
+    throw '纯函数回归没有非零成功执行，不能生成完成记录。'
+}
+Write-Host '纯函数回归完成。未执行发行校验主流程或真实安装验收。'
+$summary = [ordered]@{
+    schemaVersion = 1
+    scope = 'release-version-pure-functions'
+    completed = $true
+    assertions = $script:AssertionCount
+    passed = $script:PassedAssertions
+    failed = $script:FailedAssertions
+} | ConvertTo-Json -Compress
+Write-Host "RELEASE_VERSION_SUMMARY $summary"

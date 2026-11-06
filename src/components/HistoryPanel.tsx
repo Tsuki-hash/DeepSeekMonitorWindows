@@ -239,7 +239,9 @@ export function HistoryPanel({
       requestInProgress.current = true;
       setBusy(true);
       setError("");
-      setRecovery(null);
+      // A retry only starts work; it does not resolve any committed failure.
+      // Keep its recovery advice until an owned response changes the failure
+      // set. Stop/hide before the first response must leave it recoverable.
       setExportStatus("");
       setProgress({ done: 0, total: targets.length });
       for (const month of [...targets].reverse()) {
@@ -334,7 +336,9 @@ export function HistoryPanel({
     const nextWindow = historyWindow(range, todayStr(), selectedMonth);
     // Showing the native window is an explicit refresh opportunity, matching
     // App's tray contract. A fixed historical month has no new date window.
-    if (needsInitialQuery.current || !retained?.months.length) {
+    // A failed-only snapshot still has committed coverage and a retry cursor.
+    // Showing it again on the same day must not silently requery every month.
+    if (needsInitialQuery.current || !retained) {
       void request();
     } else if (
       retained.window.from !== nextWindow.from ||
@@ -367,6 +371,28 @@ export function HistoryPanel({
   }, []);
 
   const currentWindow = historyWindow(range, date, selectedMonth);
+  // Recovery belongs to the current account/selection, and retries only the
+  // failures still inside today's window. Derive this on every render: a
+  // cancelled retry must neither hide surviving failures nor revive an expired
+  // month/account's action. Keep old snapshots unchanged until a real commit.
+  const committedScope = previousScopeRef.current;
+  const ownsRecovery =
+    snapshotEpoch.current === historyCache.epoch() &&
+    committedScope?.epoch === historyCache.epoch() &&
+    committedScope.range === range &&
+    (range !== "custom" || committedScope.from.slice(0, 7) === selectedMonth);
+  const retryableFailed = ownsRecovery
+    ? failedMonthsOnly(failed, currentWindow.months)
+    : [];
+  const recoveryAction = !ownsRecovery
+    ? null
+    : retryableFailed.length
+      ? recovery === "refresh"
+        ? "partial"
+        : (recovery ?? "partial")
+      : failed.length
+        ? "refresh"
+        : recovery;
   const windowOutdated = Boolean(
     snapshot &&
     (snapshot.window.from !== currentWindow.from ||
@@ -632,9 +658,9 @@ export function HistoryPanel({
               : ""}
           </p>
         )}
-        {recovery && !busy && (
+        {recoveryAction && !busy && (
           <div className="disclosure-actions history-recovery">
-            {recovery === "relogin" && (
+            {recoveryAction === "relogin" && (
               <button
                 className="secondary"
                 onClick={() => (onConfigureUsage ?? onBack)()}
@@ -642,7 +668,7 @@ export function HistoryPanel({
                 去设置页重新同步 Token
               </button>
             )}
-            {recovery === "configure" && (
+            {recoveryAction === "configure" && (
               <button
                 className="secondary"
                 onClick={() => (onConfigureUsage ?? onBack)()}
@@ -650,21 +676,21 @@ export function HistoryPanel({
                 去设置页配置用量 Token
               </button>
             )}
-            {recovery === "refresh" && (
+            {recoveryAction === "refresh" && (
               <button className="secondary" onClick={() => void request(true)}>
                 重新查询当前区间
               </button>
             )}
-            {failed.length > 0 && recovery !== "refresh" && (
+            {retryableFailed.length > 0 && recoveryAction !== "refresh" && (
               <button
                 className="secondary"
                 disabled={busy}
                 // 第五轮复评 N01：失败月份重试必须 force —— 否则 5 分钟 TTL 内
                 // 会直接命中旧成功缓存，不发出请求却把旧值当本次成功，
                 // 清掉 failed/error 表现成「已恢复」。
-                onClick={() => void request(true, failed)}
+                onClick={() => void request(true, retryableFailed)}
               >
-                只重试失败月份（{failed.length}）
+                只重试失败月份（{retryableFailed.length}）
               </button>
             )}
           </div>

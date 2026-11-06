@@ -13,6 +13,8 @@ export type AppConfig = {
   apiKeyConfigured: boolean;
   apiKeyPreview: string | null;
   usageTokenConfigured: boolean;
+  /** Durable non-secret cleanup ID; its presence means browser deletion is unconfirmed. */
+  usageCleanupUnconfirmed?: string | null;
   refreshIntervalSeconds: number;
   autoRefreshEnabled: boolean;
   autostart: boolean;

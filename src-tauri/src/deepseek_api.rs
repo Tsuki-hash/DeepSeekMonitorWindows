@@ -925,6 +925,25 @@ fn usage_alignment_warnings(
     // R14-07：同模型允许拆成多行。比较原始模型 ID 的去重集合，不能把
     // 数量原始行数与费用模型数混比，误阻止已对齐数据的预算提醒。
     let models_mismatch = amount_models != cost_models;
+    // R19：两端月 total 可以同时漏掉同一个模型，互相比对仍然相等。
+    // 从源日范围内两端的原始日记录取得实际业务证据，并要求该原始模型
+    // 同时出现在数量和费用月 total；别名/未知模型不能靠显示槽位互相替代。
+    // 非零证据逐条判断，因此空/REQUEST 片段、同日拆对象及反序不影响结果；
+    // 全零/空桶不证明发生业务，未来日也不能污染当前月覆盖检查。
+    // 这里只告警，不从日级补造月模型或以日合计替换平台月额。
+    let missing_month_models = amount
+        .data
+        .biz_data
+        .days
+        .iter()
+        .chain(cost_total.into_iter().flat_map(|item| &item.days))
+        .filter(|day| period.is_none_or(|scope| scope.includes_day(&day.date)))
+        .flat_map(|day| &day.data)
+        .filter(|model| crate::usage::has_recorded_activity(&model.usage))
+        .any(|model| {
+            !amount_models.contains(model.model.as_str())
+                || !cost_models.contains(model.model.as_str())
+        });
     // 日期只有一侧存在，或某天算不出费用/数量，都算不齐。
     let dates_mismatch = !amount_dates.is_subset(&cost_dates)
         || !cost_dates.is_subset(&amount_dates)
@@ -946,6 +965,9 @@ fn usage_alignment_warnings(
     let mut warnings = Vec::new();
     if models_mismatch {
         warnings.push("费用与 Token 数据尚未完全对齐，请稍后刷新".into());
+    }
+    if missing_month_models {
+        warnings.push("本月数量或费用汇总缺少已有日用量的原始模型，请稍后刷新核对".into());
     }
     if dates_mismatch || missing_dates {
         warnings.push("部分日期缺少费用或数量，相关数值按未知显示".into());
@@ -1091,6 +1113,35 @@ pub(crate) mod regression_samples {
         }
     }
 
+    /// 同一合成日记录可原样加入，也可拆成空片段和逆序的单字段 day 对象。
+    pub(crate) fn append_daily_model(
+        days: &mut Vec<DayUsage>,
+        date: &str,
+        model: &str,
+        entries: &[(&str, &str)],
+        split: bool,
+    ) {
+        if split {
+            days.push(DayUsage {
+                date: date.into(),
+                data: vec![row(model, &[])],
+            });
+            for entry in entries.iter().rev() {
+                days.push(DayUsage {
+                    date: date.into(),
+                    data: vec![row(model, &[*entry])],
+                });
+            }
+        } else if let Some(day) = days.iter_mut().find(|day| day.date == date) {
+            day.data.push(row(model, entries));
+        } else {
+            days.push(DayUsage {
+                date: date.into(),
+                data: vec![row(model, entries)],
+            });
+        }
+    }
+
     /// 月额120，最后一天120，之前每天明确零；数量/费用两侧完整且对齐。
     pub(crate) fn complete_month(year: u32, month: u32, days: u32) -> (AmountResp, CostResp) {
         let counts = vec![row(
@@ -1166,9 +1217,310 @@ pub(crate) mod regression_samples {
 #[cfg(test)]
 mod tests {
     use super::regression_samples::{
-        checked_result, complete_month, missing_month_token_rows, period, row,
+        append_daily_model, checked_result, complete_month, missing_month_token_rows, period, row,
     };
     use super::*;
+
+    const MONTH_COVERAGE_WARNING: &str =
+        "本月数量或费用汇总缺少已有日用量的原始模型，请稍后刷新核对";
+
+    #[test]
+    fn r19_双方月汇总共同漏日模型仍告警_保留原月额与日明细() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for model in ["deepseek-v4-flash", "deepseek-v4-pro", "future-model"] {
+            for date in ["2026-11-01", "2026-11-10"] {
+                for split in [false, true] {
+                    let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                    append_daily_model(
+                        &mut amount.data.biz_data.days,
+                        date,
+                        model,
+                        &[("REQUEST", "1"), ("RESPONSE_TOKEN", "7")],
+                        split,
+                    );
+                    append_daily_model(
+                        &mut cost.data.biz_data[0].days,
+                        date,
+                        model,
+                        &[("REQUEST", "1"), ("RESPONSE_TOKEN", "9")],
+                        split,
+                    );
+                    let result = checked_result(&amount, &cost, scope);
+                    assert_eq!(result.warnings, vec![MONTH_COVERAGE_WARNING.to_owned()]);
+                    assert_eq!(result.month_cost, Some(120.0), "不得改成日合计129");
+                    assert_eq!(result.raw_models.len(), 1, "不得从日级补造月模型");
+                    assert_eq!(result.raw_models[0].model, "deepseek-flash");
+                    assert_eq!(result.raw_models[0].total_tokens, Some(35));
+                    assert_eq!(result.raw_models[0].cost, Some(120.0));
+                    assert_eq!(result.days.len(), 10, "同日片段只形成一条摘要");
+                    let day = result.days.iter().find(|day| day.date == date).unwrap();
+                    let is_last = date == "2026-11-10";
+                    assert_eq!(day.total_tokens, Some(if is_last { 42 } else { 7 }));
+                    assert_eq!(day.total_cost, Some(if is_last { 129.0 } else { 9.0 }));
+                    let raw = day
+                        .raw_models
+                        .iter()
+                        .find(|raw| raw.model == model)
+                        .unwrap();
+                    assert_eq!(raw.total_tokens, Some(7));
+                    assert_eq!(raw.request_count, Some(1));
+                    assert_eq!(raw.cost, Some(9.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r19_日实际证据含免费请求与小额费用_不依赖Token或金额非零() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        let cases = [
+            (
+                vec![("REQUEST", "1"), ("RESPONSE_TOKEN", "0")],
+                vec![("RESPONSE_TOKEN", "0")],
+            ),
+            (
+                vec![("RESPONSE_TOKEN", "0")],
+                vec![("REQUEST", "1"), ("RESPONSE_TOKEN", "0")],
+            ),
+            (vec![("REQUEST", "1")], vec![("RESPONSE_TOKEN", "0")]),
+            (vec![("RESPONSE_TOKEN", "0")], vec![("REQUEST", "1")]),
+            (
+                vec![("RESPONSE_TOKEN", "0")],
+                vec![("RESPONSE_TOKEN", "0.125")],
+            ),
+            (vec![("FUTURE_TOKEN", "7")], vec![("RESPONSE_TOKEN", "0")]),
+        ];
+        for (counts, costs) in cases {
+            for split in [false, true] {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                append_daily_model(
+                    &mut amount.data.biz_data.days,
+                    "2026-11-10",
+                    "future-model",
+                    &counts,
+                    split,
+                );
+                append_daily_model(
+                    &mut cost.data.biz_data[0].days,
+                    "2026-11-10",
+                    "future-model",
+                    &costs,
+                    split,
+                );
+                let result = checked_result(&amount, &cost, scope);
+                assert!(result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == MONTH_COVERAGE_WARNING));
+                assert_eq!(result.month_cost, Some(120.0));
+                let raw = result.days[9]
+                    .raw_models
+                    .iter()
+                    .find(|raw| raw.model == "future-model")
+                    .unwrap();
+                assert_eq!(
+                    raw.total_tokens,
+                    token_breakdown(&row("unused", &counts).usage).total
+                );
+                assert_eq!(
+                    raw.cost,
+                    crate::usage::cost_sum_present(&row("unused", &costs).usage)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r19_日全零模型无需月覆盖_空桶缺项仍沿用原质量规则() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for entries in [
+            vec![("RESPONSE_TOKEN", "0")],
+            vec![("REQUEST", "0"), ("FUTURE_TOKEN", "0")],
+            vec![],
+            vec![("REQUEST", "0")],
+        ] {
+            for split in [false, true] {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                append_daily_model(
+                    &mut amount.data.biz_data.days,
+                    "2026-11-10",
+                    "unused-model",
+                    &entries,
+                    split,
+                );
+                append_daily_model(
+                    &mut cost.data.biz_data[0].days,
+                    "2026-11-10",
+                    "unused-model",
+                    &entries,
+                    split,
+                );
+                let result = checked_result(&amount, &cost, scope);
+                assert!(!result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == MONTH_COVERAGE_WARNING));
+                assert_eq!(result.month_cost, Some(120.0));
+                let explicit_zero = entries.iter().any(|(kind, _)| *kind != "REQUEST");
+                assert_eq!(
+                    result.warnings.is_empty(),
+                    explicit_zero,
+                    "无业务证据不等于缺项已修好"
+                );
+                assert_eq!(result.days[9].total_cost, explicit_zero.then_some(120.0));
+                assert_eq!(result.days[9].total_tokens, explicit_zero.then_some(35));
+            }
+        }
+    }
+
+    #[test]
+    fn r19_月覆盖按固定源日检查_未来与非法日期不混入实际模型集合() {
+        for date in ["2026-11-11", "2026-10-31", "2026-12-01", "bad-date"] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            append_daily_model(
+                &mut amount.data.biz_data.days,
+                date,
+                "future-model",
+                &[("RESPONSE_TOKEN", "7")],
+                true,
+            );
+            append_daily_model(
+                &mut cost.data.biz_data[0].days,
+                date,
+                "future-model",
+                &[("RESPONSE_TOKEN", "9")],
+                true,
+            );
+            let before = period(2026, 11, "2026-11-10T15:59:59Z");
+            let result = checked_result(&amount, &cost, before);
+            assert!(!result
+                .warnings
+                .iter()
+                .any(|warning| warning == MONTH_COVERAGE_WARNING));
+            assert_eq!(result.warnings.is_empty(), date == "2026-11-11");
+            assert_eq!(
+                result
+                    .days
+                    .iter()
+                    .find(|day| day.date == date)
+                    .unwrap()
+                    .total_cost,
+                Some(9.0)
+            );
+            if date == "2026-11-11" {
+                let after = period(2026, 11, "2026-11-10T16:00:00Z");
+                assert_eq!(
+                    checked_result(&amount, &cost, after).warnings,
+                    vec![MONTH_COVERAGE_WARNING.to_owned()]
+                );
+                assert!(
+                    checked_result(&amount, &cost, before).warnings.is_empty(),
+                    "旧请求范围固定"
+                );
+            }
+        }
+        let (mut amount, mut cost) = complete_month(2026, 10, 31);
+        append_daily_model(
+            &mut amount.data.biz_data.days,
+            "2026-10-31",
+            "future-model",
+            &[("RESPONSE_TOKEN", "7")],
+            false,
+        );
+        append_daily_model(
+            &mut cost.data.biz_data[0].days,
+            "2026-10-31",
+            "future-model",
+            &[("RESPONSE_TOKEN", "9")],
+            false,
+        );
+        assert_eq!(
+            checked_result(&amount, &cost, period(2026, 10, "2026-11-10T04:00:00Z")).warnings,
+            vec![MONTH_COVERAGE_WARNING.to_owned()]
+        );
+    }
+
+    #[test]
+    fn r19_实际日模型须双方月覆盖_恢复拆片保留PROMPT口径() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for model in ["deepseek-v4-flash", "future-model"] {
+            for (amount_present, cost_present) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                let counts = [
+                    ("PROMPT_TOKEN", "30"),
+                    ("PROMPT_CACHE_HIT_TOKEN", "10"),
+                    ("PROMPT_CACHE_MISS_TOKEN", "20"),
+                    ("RESPONSE_TOKEN", "5"),
+                    ("REQUEST", "1"),
+                ];
+                let costs = [("REQUEST", "1"), ("RESPONSE_TOKEN", "9")];
+                append_daily_model(
+                    &mut amount.data.biz_data.days,
+                    "2026-11-10",
+                    model,
+                    &counts,
+                    true,
+                );
+                append_daily_model(
+                    &mut cost.data.biz_data[0].days,
+                    "2026-11-10",
+                    model,
+                    &costs,
+                    true,
+                );
+                if amount_present {
+                    amount.data.biz_data.total.push(row(model, &[]));
+                    amount
+                        .data
+                        .biz_data
+                        .total
+                        .extend(counts.iter().rev().map(|entry| row(model, &[*entry])));
+                }
+                if cost_present {
+                    cost.data.biz_data[0].total.push(row(model, &[]));
+                    cost.data.biz_data[0]
+                        .total
+                        .extend(costs.iter().rev().map(|entry| row(model, &[*entry])));
+                }
+                let result = checked_result(&amount, &cost, scope);
+                assert_eq!(
+                    result
+                        .warnings
+                        .iter()
+                        .any(|warning| warning == MONTH_COVERAGE_WARNING),
+                    !(amount_present && cost_present)
+                );
+                assert_eq!(
+                    result.month_cost,
+                    if cost_present {
+                        Some(129.0)
+                    } else if amount_present {
+                        None
+                    } else {
+                        Some(120.0)
+                    }
+                );
+                assert_eq!(
+                    result.days[9].total_tokens,
+                    Some(70),
+                    "PROMPT不与缓存明细重复计数"
+                );
+                assert_eq!(result.days[9].total_cost, Some(129.0));
+                if amount_present && cost_present {
+                    assert!(result.warnings.is_empty());
+                    let raw = result
+                        .raw_models
+                        .iter()
+                        .find(|raw| raw.model == model)
+                        .unwrap();
+                    assert_eq!(raw.total_tokens, Some(35));
+                    assert_eq!(raw.cost, Some(9.0));
+                }
+            }
+        }
+    }
 
     #[test]
     fn r18_月数量空桶与仅REQUEST产生完整性警告_保留月费与完整日数据() {

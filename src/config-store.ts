@@ -1,4 +1,5 @@
 import type { AppConfig, BalanceData } from "./types";
+import { usageSessionCleanup } from "./usage-session-cleanup.ts";
 
 // 复评 F08：已提交配置需要一个**单调提交代际**。
 //
@@ -39,11 +40,19 @@ export const subscribeCommittedConfig = (listener: () => void) => {
 // a caller display a different snapshot that the shared store did not accept.
 function requireSameSnapshot(left: AppConfig, right: AppConfig) {
   const fields = (config: AppConfig) => [
-    config.configRevision, config.apiKeyRevision, config.usageTokenRevision,
-    config.configWarnings ?? [], config.configReadError ?? null,
-    config.apiKeyConfigured, config.apiKeyPreview, config.usageTokenConfigured,
-    config.refreshIntervalSeconds, config.autoRefreshEnabled,
-    config.autostart, config.configPath,
+    config.configRevision,
+    config.apiKeyRevision,
+    config.usageTokenRevision,
+    config.configWarnings ?? [],
+    config.configReadError ?? null,
+    config.apiKeyConfigured,
+    config.apiKeyPreview,
+    config.usageTokenConfigured,
+    config.usageCleanupUnconfirmed ?? null,
+    config.refreshIntervalSeconds,
+    config.autoRefreshEnabled,
+    config.autostart,
+    config.configPath,
   ];
   if (JSON.stringify(fields(left)) !== JSON.stringify(fields(right)))
     throw new Error("配置版本与快照内容不一致，请重新读取配置");
@@ -70,6 +79,8 @@ export const setCommittedConfig = (
   if (!newer && !acceptBalance) return false;
   if (newer) {
     current = config;
+    if (config) usageSessionCleanup.observe(config);
+    else usageSessionCleanup.reset();
     if (!config) observedBalanceRevision = null;
     commitRevision += 1;
     if (!config || validatedBalance?.revision !== config.apiKeyRevision)
@@ -94,6 +105,8 @@ export const applyReadConfig = (
     return true;
   }
   current = config;
+  if (config) usageSessionCleanup.observe(config);
+  else usageSessionCleanup.reset();
   if (!config || validatedBalance?.revision !== config.apiKeyRevision)
     validatedBalance = null;
   for (const listener of listeners) listener();

@@ -26,6 +26,9 @@ function Invoke-Check {
 
 Invoke-Check '版本一致性' 'node' @('scripts/check-version.mjs')
 
+# 共享入口核对真实退出码、逐断言输出、三组覆盖和非零完成汇总。
+Invoke-Check '发行版本纯函数回归' 'node' @('scripts/run-release-version-tests.mjs') -ScenarioGate
+
 Invoke-Check '前端测试' 'npm' @('test')
 
 Invoke-Check '组件测试' 'npm' @('run', 'test:components')

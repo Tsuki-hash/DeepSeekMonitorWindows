@@ -64,6 +64,17 @@ pub fn amount(value: &str) -> Option<f64> {
         .filter(|value| value.is_finite() && *value >= 0.0 && *value < u64::MAX as f64)
 }
 
+/// R19：某个原始模型是否有实际业务记录，而不只是平台预铺的零/空桶。
+/// 数量端的 Token、两端的 REQUEST 次数及费用端的金额都可作为非零证据；
+/// REQUEST 在这里证明发生过请求，仍不参与任何金额或 Token 求和。
+/// 逐条看证据，不要求片段独自完整，不让同模型的空片段遮掉有效片段。
+/// 这不是数值质量校验：非法计数/金额继续由原有验证与警告负责。
+pub(crate) fn has_recorded_activity(usage: &[Entry]) -> bool {
+    usage
+        .iter()
+        .any(|entry| amount(&entry.amount).is_some_and(|value| value > 0.0))
+}
+
 /// 可空计数相加：任一未知即未知，溢出即未知，不把缺失补成零。
 fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     a?.checked_add(b?).filter(|value| *value <= MAX_SAFE_COUNT)
@@ -342,6 +353,29 @@ mod tests {
             kind: kind.to_string(),
             amount: amount.to_string(),
         }
+    }
+
+    #[test]
+    fn r19_实际记录证据包括请求和小额费用_不把零或空桶当业务() {
+        assert!(!has_recorded_activity(&[]));
+        for kind in ["REQUEST", "RESPONSE_TOKEN", "PROMPT_TOKEN", "FUTURE_TOKEN"] {
+            for value in ["0", "0.0", "0e0"] {
+                assert!(!has_recorded_activity(&[entry(kind, value)]));
+            }
+            assert!(has_recorded_activity(&[entry(kind, "1")]));
+        }
+        assert!(has_recorded_activity(&[entry("RESPONSE_TOKEN", "0.00001")]));
+        for value in ["", "invalid", "NaN", "inf", "-1", "1e40"] {
+            assert!(!has_recorded_activity(&[entry("RESPONSE_TOKEN", value)]));
+        }
+        let request = [entry("REQUEST", "1"), entry("RESPONSE_TOKEN", "0")];
+        assert!(has_recorded_activity(&request));
+        assert_eq!(cost_sum_present(&request), Some(0.0), "请求证据不计费");
+        assert_eq!(
+            token_breakdown(&request).total,
+            Some(0),
+            "请求证据不计 Token"
+        );
     }
 
     #[test]

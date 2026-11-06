@@ -16,6 +16,7 @@
 
 import { spawnSync } from "node:child_process";
 import { hasNotRun, readRustGateLog } from "./run-rust-tests.mjs";
+import { readReleaseVersionGateLog } from "./run-release-version-tests.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -64,7 +65,7 @@ const run = (command, commandArgs) => {
   });
   return {
     ok: result.status === 0 && !result.error,
-    code: typeof result.status === "number" ? result.status : 1,
+    code: typeof result.status === "number" ? result.status : null,
     stdout: String(result.stdout ?? ""),
     // 成功路径同样保留 stderr：编译警告与诊断都在这里。
     stderr:
@@ -125,7 +126,7 @@ const testCounts = (text) => {
 const formatCounts = (counts) => {
   if (!counts.parseable) return "不可解析（原始输出见下）";
   const executed = counts.executed ?? counts.passed + counts.failed;
-  return `tests=${counts.tests} executed=${executed} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
+  return `${counts.unit ?? "tests"}=${counts.tests} executed=${executed} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
 };
 
 // 复评 Q08：git 成败只按退出码判断 —— 干净 `status --porcelain` 的正确结果
@@ -154,9 +155,20 @@ const rustLogFile = join(
   `dsm-rust-log-${process.pid}-${Date.now()}.json`,
 );
 
+const versionLogFile = join(
+  tmpdir(),
+  `dsm-version-log-${process.pid}-${Date.now()}.json`,
+);
+
 /** DeepSeek 门禁清单须与 scripts/verify.ps1 保持一致。 */
 const checks = [
   ["版本一致性", "node", ["scripts/check-version.mjs"], true],
+  [
+    "发行版本纯函数回归",
+    "node",
+    ["scripts/run-release-version-tests.mjs", "--log-file", versionLogFile],
+    true,
+  ],
   ["前端测试", "npm", ["test"], true],
   ["组件测试", "npm", ["run", "test:components"], true],
   [
@@ -275,6 +287,7 @@ lines.push("## 工具链");
 lines.push("");
 for (const [label, command, commandArgs] of [
   ["Node", "node", ["--version"]],
+  ["PowerShell", "pwsh", ["--version"]],
   ["npm", "npm", ["--version"]],
   ["Rust", "cargo", ["--version"]],
   ["rustc", "rustc", ["--version"]],
@@ -309,11 +322,27 @@ for (const [label, command, commandArgs] of checks) {
   const result = run(command, commandArgs);
   const rustLog =
     label === "cargo test" ? readRustGateLog(rustLogFile, result.code) : null;
+  const versionLog =
+    label === "发行版本纯函数回归"
+      ? readReleaseVersionGateLog(versionLogFile, result.code)
+      : null;
   const verdict =
-    label === "cargo test"
-      ? (rustLog?.verdict ?? "ERROR")
-      : classify(label, result);
-  checkResults.push({ label, command, commandArgs, result, verdict, rustLog });
+    result.error || result.signal
+      ? "ERROR"
+      : label === "cargo test"
+        ? (rustLog?.verdict ?? "ERROR")
+        : label === "发行版本纯函数回归"
+          ? (versionLog?.verdict ?? "ERROR")
+          : classify(label, result);
+  checkResults.push({
+    label,
+    command,
+    commandArgs,
+    result,
+    verdict,
+    rustLog,
+    versionLog,
+  });
   if (verdict === "FAIL" || verdict === "ERROR") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
   const unknownCounts = {
@@ -326,11 +355,13 @@ for (const [label, command, commandArgs] of checks) {
   const counts =
     label === "cargo test"
       ? (rustLog?.rust.counts ?? unknownCounts)
-      : verdict === "NOT RUN"
-        ? unknownCounts
-        : testCounts(`${result.stdout}\n${result.stderr}`);
+      : label === "发行版本纯函数回归"
+        ? (versionLog?.powershell.counts ?? unknownCounts)
+        : verdict === "NOT RUN"
+          ? unknownCounts
+          : testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
-    `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
+    `| ${label} | ${verdict} | ${result.code ?? "无退出码"} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
 }
 
@@ -351,19 +382,23 @@ for (const {
   result,
   verdict,
   rustLog,
+  versionLog,
 } of checkResults) {
   lines.push(
-    `<details><summary>${label} — ${verdict}（退出码 ${result.code}）</summary>`,
+    `<details><summary>${label} — ${verdict}（退出码 ${result.code ?? "无退出码"}）</summary>`,
   );
   lines.push("");
   lines.push("```text");
   // 复评 T09：command/commandArgs 在外层解构对象上，不在 result 里；
   // 记录必须能重建真实调用（可重放）。
   lines.push(`[command] ${command} ${commandArgs.join(" ")}（cwd: ${root}）`);
-  lines.push((result.stdout || "(stdout 为空)").trim());
+  lines.push(
+    `[process] exit=${result.code ?? "null"} signal=${result.signal ?? "null"} error=${result.error ?? "null"}`,
+  );
+  lines.push(result.stdout || "(stdout 为空)");
   lines.push("");
   lines.push("[stderr]");
-  lines.push(result.stderr.trim() || "(stderr 为空)");
+  lines.push(result.stderr || "(stderr 为空)");
   lines.push("```");
   lines.push("");
   if (label === "cargo test") {
@@ -375,6 +410,18 @@ for (const {
     lines.push(
       rustLog
         ? JSON.stringify(rustLog, null, 2)
+        : "结构化证据缺失或不一致，拒绝计为通过。",
+    );
+    lines.push("```");
+    lines.push("");
+  }
+  if (label === "发行版本纯函数回归") {
+    lines.push("纯函数断言证据（不读取真实安装包，也不代表安装升级验收）：");
+    lines.push("");
+    lines.push("```json");
+    lines.push(
+      versionLog
+        ? JSON.stringify(versionLog, null, 2)
         : "结构化证据缺失或不一致，拒绝计为通过。",
     );
     lines.push("```");
@@ -444,7 +491,7 @@ lines.push(
   "- Rust 发布门禁必须在 Windows 本机用明确 MSVC 目标执行；逐项验证 DPAPI、迁移、同秘密重加密语义身份、凭据提交版本和缓存监听。非 Windows、跳过、过滤或缺失必需测试均不构成发布 PASS。",
 );
 lines.push(
-  "- executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。NOT RUN 的原始 passed 不纳入可信通过计数。",
+  "- Rust executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。发行版本纯函数回归单独标记 assertions，要求文件名、PE 头、版本资源三组非零断言及唯一完成汇总；它不读取或验证真实安装包。NOT RUN 的原始 passed 不纳入可信通过计数。",
 );
 lines.push(
   "- 多工具 Agent 统计已移除：引擎集成、WSL/SQLite 工具扫描与目录链接能力探针不再执行，不计为 PASS 或 NOT RUN。",
@@ -486,10 +533,12 @@ if (out) {
   console.log(text);
 }
 // 只删除本次运行自己创建的临时门禁日志，不涉及用户配置、缓存或历史。
-try {
-  if (existsSync(rustLogFile)) rmSync(rustLogFile, { force: true });
-} catch {
-  /* 清理失败不影响结论 */
+for (const logFile of [rustLogFile, versionLogFile]) {
+  try {
+    if (existsSync(logFile)) rmSync(logFile, { force: true });
+  } catch {
+    /* 清理失败不影响结论 */
+  }
 }
 
 // 失败必须传播到退出码；NOT RUN 在发版语境下同样不放行。

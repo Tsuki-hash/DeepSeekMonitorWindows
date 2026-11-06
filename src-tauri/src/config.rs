@@ -97,6 +97,40 @@ pub fn edit_config(
     Ok(config)
 }
 
+/// Record the unresolved privacy operation and remove the Token in ONE atomic
+/// config commit. No browser deletion is allowed before this write succeeds.
+/// IDs survive process restarts and are never inferred from process-local
+/// credential revisions. Ordinary saves/preferences retain this marker.
+pub fn begin_usage_cleanup() -> Result<(StoredConfig, u64), String> {
+    let config = edit_config(|stored| {
+        let next = stored
+            .usage_cleanup_sequence
+            .max(stored.usage_cleanup_unconfirmed.unwrap_or(0))
+            .checked_add(1)
+            .ok_or("无法记录账户清理操作，原配置未改动")?;
+        stored.usage_cleanup_sequence = next;
+        stored.usage_cleanup_unconfirmed = Some(next);
+        stored.usage_token = None;
+        Ok(())
+    })?;
+    let operation = config.usage_cleanup_sequence;
+    Ok((config, operation))
+}
+
+/// Only the matching command's confirmed browser-success receipt can remove
+/// the marker. A later retry/login/preference commit is read under the same lock;
+/// never rewrite a stale pre-cleanup snapshot over the newer account.
+pub fn confirm_usage_cleanup(operation: u64) -> Result<bool, String> {
+    let _guard = lock_config_io();
+    let mut stored = read_stored_config_unlocked()?;
+    if stored.usage_cleanup_unconfirmed != Some(operation) {
+        return Ok(false);
+    }
+    stored.usage_cleanup_unconfirmed = None;
+    write_stored_config_unlocked(&stored)?;
+    Ok(true)
+}
+
 /// 只读配置。与 `edit_config` 互斥，保证读到的是一致快照。
 pub fn read_config() -> Result<StoredConfig, String> {
     read_stored_config()
@@ -204,6 +238,13 @@ pub struct StoredConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub usage_token: Option<String>,
+    /// Non-secret durable cleanup identity. The marker is written atomically
+    /// with Token removal, before any WebView2 deletion can start. A restart
+    /// cannot turn its absence of an in-memory receipt into cleanup success.
+    #[serde(default)]
+    pub usage_cleanup_sequence: u64,
+    #[serde(default)]
+    pub usage_cleanup_unconfirmed: Option<u64>,
     #[serde(default = "default_refresh_interval_seconds")]
     pub refresh_interval_seconds: u64,
     #[serde(default)]
@@ -244,6 +285,8 @@ pub struct AppConfig {
     pub api_key_configured: bool,
     pub api_key_preview: Option<String>,
     pub usage_token_configured: bool,
+    /// Decimal identity only: no Token, cookie, account fingerprint or raw error.
+    pub usage_cleanup_unconfirmed: Option<String>,
     pub refresh_interval_seconds: u64,
     pub auto_refresh_enabled: bool,
     pub autostart: bool,
@@ -563,6 +606,7 @@ pub fn to_app_config(config: StoredConfig) -> Result<AppConfig, String> {
         api_key_configured: api_key_preview.is_some(),
         api_key_preview,
         usage_token_configured,
+        usage_cleanup_unconfirmed: config.usage_cleanup_unconfirmed.map(|id| id.to_string()),
         refresh_interval_seconds: config.refresh_interval_seconds,
         auto_refresh_enabled: config.auto_refresh_enabled,
         autostart: config.autostart,
@@ -574,6 +618,135 @@ pub fn to_app_config(config: StoredConfig) -> Result<AppConfig, String> {
 mod tests {
     use super::*;
     use crate::test_support::TempConfigDir;
+
+    #[test]
+    fn r19_cleanup_marker_and_token_removal_are_one_restart_readable_commit() {
+        let dir = TempConfigDir::new("cleanup-restart-marker");
+        let path = config_path().unwrap();
+        fs::write(
+            &path,
+            r#"{"usage_token":"SYNTHETIC_OLD_TOKEN","refresh_interval_seconds":300}"#,
+        )
+        .unwrap();
+        let (cleared, operation) = begin_usage_cleanup().unwrap();
+        assert_eq!(cleared.usage_token, None);
+        assert_eq!(cleared.usage_cleanup_unconfirmed, Some(operation));
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("SYNTHETIC_OLD_TOKEN"));
+        // Deserialize fresh disk bytes rather than depending on process-local
+        // Atomic revisions: this is the record available after a restart.
+        let reopened: StoredConfig = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(reopened.usage_token, None);
+        assert_eq!(reopened.usage_cleanup_unconfirmed, Some(operation));
+        assert_eq!(reopened.refresh_interval_seconds, 300);
+        let public = to_app_config(reopened).unwrap();
+        assert_eq!(
+            public.usage_cleanup_unconfirmed,
+            Some(operation.to_string())
+        );
+        assert!(!public.usage_token_configured);
+        assert!(!dir.path().join("config.json.tmp").exists());
+        // A timeout or failure does not call confirm: unrelated writes/readback
+        // must continue to preserve the incomplete marker.
+        edit_config(|stored| {
+            stored.auto_refresh_enabled = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            read_stored_config().unwrap().usage_cleanup_unconfirmed,
+            Some(operation)
+        );
+    }
+
+    #[test]
+    fn r19_marker_write_failure_cannot_remove_token_or_overwrite_recovery_material() {
+        let dir = TempConfigDir::new("cleanup-marker-write-failure");
+        let path = config_path().unwrap();
+        let original = br#"{"usage_token":"SYNTHETIC_UNCHANGED_TOKEN"}"#;
+        fs::write(&path, original).unwrap();
+        // Force the existing atomic writer to fail before rename. Migration,
+        // if attempted, must fail closed too and preserve the original bytes.
+        fs::create_dir(dir.path().join("config.json.tmp")).unwrap();
+        assert!(begin_usage_cleanup().is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn r19_only_matching_success_removes_marker_and_ids_survive_reopen() {
+        let _dir = TempConfigDir::new("cleanup-marker-ownership");
+        let (_, old) = begin_usage_cleanup().unwrap();
+        let (_, current) = begin_usage_cleanup().unwrap();
+        assert!(current > old);
+        let before = fs::read(config_path().unwrap()).unwrap();
+        assert!(!confirm_usage_cleanup(old).unwrap());
+        assert_eq!(fs::read(config_path().unwrap()).unwrap(), before);
+        assert_eq!(
+            read_stored_config().unwrap().usage_cleanup_unconfirmed,
+            Some(current)
+        );
+        assert!(confirm_usage_cleanup(current).unwrap());
+        let reopened = read_stored_config().unwrap();
+        assert_eq!(reopened.usage_cleanup_unconfirmed, None);
+        assert_eq!(reopened.usage_cleanup_sequence, current);
+        assert!(!confirm_usage_cleanup(current).unwrap());
+        let (_, retry) = begin_usage_cleanup().unwrap();
+        assert!(retry > current);
+    }
+
+    #[test]
+    fn r19_failed_confirmation_keeps_durable_warning_and_preserves_original_file() {
+        let dir = TempConfigDir::new("cleanup-confirm-write-failure");
+        let (_, operation) = begin_usage_cleanup().unwrap();
+        let before = fs::read(config_path().unwrap()).unwrap();
+        fs::create_dir(dir.path().join("config.json.tmp")).unwrap();
+        assert!(confirm_usage_cleanup(operation).is_err());
+        assert_eq!(fs::read(config_path().unwrap()).unwrap(), before);
+        assert_eq!(
+            read_stored_config().unwrap().usage_cleanup_unconfirmed,
+            Some(operation)
+        );
+    }
+
+    #[test]
+    fn r19_cleanup_counter_overflow_fails_before_mutation() {
+        let _dir = TempConfigDir::new("cleanup-sequence-overflow");
+        let path = config_path().unwrap();
+        let original = format!("{{\"usage_cleanup_sequence\":{}}}", u64::MAX);
+        fs::write(&path, &original).unwrap();
+        assert!(begin_usage_cleanup().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r19_late_cleanup_confirmation_preserves_new_account_and_preferences() {
+        let _dir = TempConfigDir::new("cleanup-confirm-new-account");
+        let (_, operation) = begin_usage_cleanup().unwrap();
+        let replacement = edit_validated_credential(
+            ValidatedCredential::UsageToken,
+            "SYNTHETIC_REPLACEMENT_TOKEN".into(),
+        )
+        .unwrap();
+        assert_eq!(replacement.usage_cleanup_unconfirmed, Some(operation));
+        edit_config(|stored| {
+            stored.refresh_interval_seconds = 1800;
+            Ok(())
+        })
+        .unwrap();
+        assert!(confirm_usage_cleanup(operation).unwrap());
+        let current = read_stored_config().unwrap();
+        assert_eq!(
+            current.usage_token.as_deref(),
+            Some("SYNTHETIC_REPLACEMENT_TOKEN")
+        );
+        assert_eq!(
+            current.usage_token_revision,
+            replacement.usage_token_revision
+        );
+        assert_eq!(current.refresh_interval_seconds, 1800);
+        assert_eq!(current.usage_cleanup_unconfirmed, None);
+    }
 
     #[test]
     fn 加密失败拒绝序列化_不改变旧配置文件() {

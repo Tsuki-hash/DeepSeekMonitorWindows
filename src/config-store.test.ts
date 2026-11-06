@@ -21,6 +21,7 @@ import {
   subscribeCommittedConfig,
 } from "./config-store.ts";
 import type { AppConfig } from "./types";
+import { usageSessionCleanup } from "./usage-session-cleanup.ts";
 
 let fixtureRevision = 0;
 const config = (over: Partial<AppConfig> = {}): AppConfig => ({
@@ -207,8 +208,14 @@ test("N09: equal revision with different contents is a contract error, never a s
   const saved = config({ apiKeyConfigured: true });
   setCommittedConfig(saved);
   const conflicting = { ...saved, apiKeyConfigured: false };
-  assert.throws(() => applyReadConfig(conflicting, getCommitRevision()), "same-version contents must agree");
-  assert.throws(() => setCommittedConfig(conflicting), "same-version contents must agree");
+  assert.throws(
+    () => applyReadConfig(conflicting, getCommitRevision()),
+    "same-version contents must agree",
+  );
+  assert.throws(
+    () => setCommittedConfig(conflicting),
+    "same-version contents must agree",
+  );
   assert.equal(getCommittedConfig(), saved);
   assert.equal(applyReadConfig({ ...saved }, getCommitRevision()), true);
   assert.equal(getCommittedConfig(), saved);
@@ -227,9 +234,65 @@ test("N09: versioned unavailable disk snapshot revokes credentials and rejects o
   assert.equal(isCurrentCredential(saved, "usageToken"), false);
   assert.equal(setCommittedConfig(saved), false);
   assert.equal(applyReadConfig(saved, oldRead), false);
-  const restored = config({ apiKeyConfigured: true, usageTokenConfigured: true });
+  const restored = config({
+    apiKeyConfigured: true,
+    usageTokenConfigured: true,
+  });
   setCommittedConfig(restored);
   assert.equal(setCommittedConfig(revoked), false);
   assert.equal(getCommittedConfig(), restored);
   setCommittedConfig(null);
+});
+
+test("R19: accepted global snapshots update privacy attribution without any settings-page subscriber", () => {
+  setCommittedConfig(null);
+  try {
+    const saved = config({ usageTokenConfigured: true });
+    setCommittedConfig(saved);
+    const owner = usageSessionCleanup.begin(saved);
+    assert.ok(owner);
+    const cleared = config({ usageTokenConfigured: false });
+    setCommittedConfig(cleared);
+    assert.equal(usageSessionCleanup.snapshot?.tokenCleared, true);
+    assert.equal(usageSessionCleanup.snapshot?.superseded, false);
+    const replacement = config({ usageTokenConfigured: true });
+    assert.equal(applyReadConfig(replacement, getCommitRevision()), true);
+    assert.equal(usageSessionCleanup.snapshot?.superseded, true);
+    assert.equal(
+      usageSessionCleanup.snapshot?.tokenRevision,
+      saved.usageTokenRevision,
+    );
+    setCommittedConfig(cleared); // Rejected stale receipt cannot rebind ownership.
+    assert.equal(getCommittedConfig(), replacement);
+    assert.equal(
+      usageSessionCleanup.finish(owner, "Synthetic previous failure"),
+      true,
+    );
+    assert.equal(usageSessionCleanup.status?.includes("此前的"), true);
+    assert.equal(
+      usageSessionCleanup.status?.includes("Synthetic previous failure"),
+      true,
+    );
+  } finally {
+    setCommittedConfig(null);
+  }
+});
+
+test("R19: the durable cleanup marker participates in same-version snapshot consistency", () => {
+  setCommittedConfig(null);
+  try {
+    const marked = config({ usageCleanupUnconfirmed: "9007199254740993" });
+    setCommittedConfig(marked);
+    assert.equal(usageSessionCleanup.snapshot?.phase, "unconfirmed");
+    assert.throws(() =>
+      setCommittedConfig({ ...marked, usageCleanupUnconfirmed: null }),
+    );
+    assert.equal(getCommittedConfig(), marked);
+    assert.equal(
+      usageSessionCleanup.snapshot?.persistedOperationId,
+      "9007199254740993",
+    );
+  } finally {
+    setCommittedConfig(null);
+  }
 });

@@ -501,13 +501,13 @@ pub(crate) async fn forget_usage_session(
         if let Some(login) = previous_login {
             login.close().map_err(|e| e.to_string())?;
         }
-        to_app_config(edit_config(|stored| {
-            stored.usage_token = None;
-            Ok(())
-        })?)
+        // The durable marker and Token removal share one atomic config write.
+        // Closing/restarting after this point must retain an unconfirmed warning.
+        let (stored, operation) = crate::config::begin_usage_cleanup()?;
+        Ok::<_, String>((to_app_config(stored)?, operation))
     })();
-    let config = match prepared {
-        Ok(config) => config,
+    let (config, operation) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             session.finish_clear();
             return Err(error);
@@ -515,6 +515,14 @@ pub(crate) async fn forget_usage_session(
     };
     let _ = app.emit("usage-token-cleared", &config);
     crate::browsing_data::clear(&window).await?;
+    // Timeouts/failures never remove the marker, even if an unowned late event
+    // arrives. Failure to persist confirmation remains conservatively unknown.
+    crate::config::confirm_usage_cleanup(operation).map_err(|_| {
+        "网页登录数据清理已返回成功，但无法保存清理确认；重启后仍需核对，请在账户隐私中显式重试"
+            .to_string()
+    })?;
+    // Keep the original cleared-account receipt. Returning a newer account's
+    // config here would let the old operation consume that account's draft.
     Ok(config)
 }
 

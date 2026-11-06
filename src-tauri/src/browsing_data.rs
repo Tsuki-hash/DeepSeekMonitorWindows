@@ -29,6 +29,10 @@ pub async fn clear(window: &WebviewWindow) -> Result<(), String> {
                 profile.ClearBrowsingDataAll(&ClearBrowsingDataCompletedHandler::create(Box::new(
                     move |status| {
                         callback_app.state::<SyncSession>().finish_clear();
+                        // This unowned event also fires on failure and after a
+                        // timeout. It only restores appearance preferences; it
+                        // must never clear the durable privacy marker or claim
+                        // success. The owning command checks `status` below.
                         let _ = callback_app.emit("browsing-data-cleared", ());
                         if let Some(tx) = callback_sender
                             .lock()

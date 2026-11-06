@@ -444,6 +444,7 @@ fn budget_sample(data: deepseek_api::UsageResult, options: &AlertOptions) -> (St
     let Some(month_cost) = data.month_cost else {
         return ("invalid_data".into(), false);
     };
+    // 包括日实际模型未被双方月汇总覆盖：保留展示的原月额，不代表可用于预算。
     if !data.warnings.is_empty() || !month_cost.is_finite() || !(0.0..=1e12).contains(&month_cost) {
         return ("invalid_data".into(), false);
     }
@@ -650,6 +651,257 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r19_月汇总共同漏日模型经生产链路预算失败关闭() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period,
+        };
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for model in ["deepseek-v4-flash", "deepseek-v4-pro", "future-model"] {
+            for date in ["2026-11-01", "2026-11-10"] {
+                for split in [false, true] {
+                    let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                    append_daily_model(
+                        &mut amount.data.biz_data.days,
+                        date,
+                        model,
+                        &[("REQUEST", "1"), ("RESPONSE_TOKEN", "7")],
+                        split,
+                    );
+                    append_daily_model(
+                        &mut cost.data.biz_data[0].days,
+                        date,
+                        model,
+                        &[("REQUEST", "1"), ("RESPONSE_TOKEN", "9")],
+                        split,
+                    );
+                    for threshold in [100.0, 120.0, 121.0, 129.0] {
+                        let data = checked_result(&amount, &cost, scope);
+                        assert_eq!(data.month_cost, Some(120.0));
+                        assert!(data
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.contains("汇总缺少已有日用量")));
+                        assert!(data
+                            .days
+                            .iter()
+                            .all(|day| day.total_tokens.is_some() && day.total_cost.is_some()));
+                        let options = AlertOptions {
+                            monthly_budget_cny: threshold,
+                            ..Default::default()
+                        };
+                        assert_eq!(
+                            outcome(Some(Ok(data)), |data| budget_sample(data, &options)),
+                            Some(("invalid_data".into(), false)),
+                            "待核对不能变成正常未达线或触发通知"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r19_零Token免费请求或仅费用证据也不能放行缺模型月汇总() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period,
+        };
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for (counts, costs) in [
+            (
+                vec![("REQUEST", "1"), ("RESPONSE_TOKEN", "0")],
+                vec![("RESPONSE_TOKEN", "0")],
+            ),
+            (
+                vec![("RESPONSE_TOKEN", "0")],
+                vec![("REQUEST", "1"), ("RESPONSE_TOKEN", "0")],
+            ),
+            (vec![("REQUEST", "1")], vec![("RESPONSE_TOKEN", "0")]),
+            (vec![("RESPONSE_TOKEN", "0")], vec![("REQUEST", "1")]),
+            (
+                vec![("RESPONSE_TOKEN", "0")],
+                vec![("RESPONSE_TOKEN", "0.125")],
+            ),
+        ] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            append_daily_model(
+                &mut amount.data.biz_data.days,
+                "2026-11-10",
+                "future-model",
+                &counts,
+                true,
+            );
+            append_daily_model(
+                &mut cost.data.biz_data[0].days,
+                "2026-11-10",
+                "future-model",
+                &costs,
+                true,
+            );
+            let data = checked_result(&amount, &cost, scope);
+            assert_eq!(data.month_cost, Some(120.0));
+            assert!(data
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("汇总缺少已有日用量")));
+            assert_eq!(
+                budget_sample(data, &Default::default()),
+                ("invalid_data".into(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn r19_保留月显式零也不掩盖日实际模型遗漏() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period,
+        };
+        let (mut amount, mut cost) = complete_month(2026, 11, 10);
+        amount.data.biz_data.total = amount.data.biz_data.days[0].data.clone();
+        amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+        cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+        cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+        append_daily_model(
+            &mut amount.data.biz_data.days,
+            "2026-11-10",
+            "future-model",
+            &[("RESPONSE_TOKEN", "7")],
+            false,
+        );
+        append_daily_model(
+            &mut cost.data.biz_data[0].days,
+            "2026-11-10",
+            "future-model",
+            &[("RESPONSE_TOKEN", "9")],
+            false,
+        );
+        let data = checked_result(&amount, &cost, period(2026, 11, "2026-11-10T04:00:00Z"));
+        assert_eq!(data.month_cost, Some(0.0), "保留平台月零，不用日额9替代");
+        assert_eq!(data.days[9].total_tokens, Some(7));
+        assert_eq!(data.days[9].total_cost, Some(9.0));
+        assert!(data
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("汇总缺少已有日用量")));
+        assert_eq!(
+            budget_sample(data, &Default::default()),
+            ("invalid_data".into(), false),
+            "不是正常未达线"
+        );
+    }
+
+    #[test]
+    fn r19_全零日桶和未来占位不误阻预算_当前空桶仍待核对() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period,
+        };
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for (date, entries, valid) in [
+            (
+                "2026-11-10",
+                vec![("REQUEST", "0"), ("RESPONSE_TOKEN", "0")],
+                true,
+            ),
+            ("2026-11-10", vec![], false),
+            ("2026-11-10", vec![("REQUEST", "0")], false),
+            ("2026-11-11", vec![], true),
+            ("2026-11-11", vec![("REQUEST", "1")], true),
+            ("2026-11-11", vec![("RESPONSE_TOKEN", "9")], true),
+        ] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            append_daily_model(
+                &mut amount.data.biz_data.days,
+                date,
+                "unused-model",
+                &entries,
+                true,
+            );
+            append_daily_model(
+                &mut cost.data.biz_data[0].days,
+                date,
+                "unused-model",
+                &entries,
+                true,
+            );
+            for (threshold, trigger) in [(100.0, true), (120.0, true), (121.0, false)] {
+                let data = checked_result(&amount, &cost, scope);
+                assert!(!data
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("汇总缺少已有日用量")));
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                let expected = if valid {
+                    ("ok".into(), trigger)
+                } else {
+                    ("invalid_data".into(), false)
+                };
+                assert_eq!(budget_sample(data, &options), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn r19_新源日纳入实际模型后预算关闭_双方月总量恢复再按原阈值判断() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period, row,
+        };
+        for model in ["deepseek-v4-flash", "future-model"] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            append_daily_model(
+                &mut amount.data.biz_data.days,
+                "2026-11-11",
+                model,
+                &[("REQUEST", "1"), ("RESPONSE_TOKEN", "7")],
+                true,
+            );
+            append_daily_model(
+                &mut cost.data.biz_data[0].days,
+                "2026-11-11",
+                model,
+                &[("REQUEST", "1"), ("RESPONSE_TOKEN", "9")],
+                true,
+            );
+            let before = period(2026, 11, "2026-11-10T15:59:59Z");
+            let after = period(2026, 11, "2026-11-10T16:00:00Z");
+            assert_eq!(
+                budget_sample(checked_result(&amount, &cost, before), &Default::default()),
+                ("ok".into(), true)
+            );
+            assert_eq!(
+                budget_sample(checked_result(&amount, &cost, after), &Default::default()),
+                ("invalid_data".into(), false)
+            );
+            amount.data.biz_data.total.extend([
+                row(model, &[]),
+                row(model, &[("REQUEST", "1")]),
+                row(model, &[("RESPONSE_TOKEN", "7")]),
+            ]);
+            assert_eq!(
+                budget_sample(checked_result(&amount, &cost, after), &Default::default()),
+                ("invalid_data".into(), false),
+                "只恢复单端不放行"
+            );
+            cost.data.biz_data[0].total.extend([
+                row(model, &[("RESPONSE_TOKEN", "9")]),
+                row(model, &[("REQUEST", "1")]),
+                row(model, &[]),
+            ]);
+            for (threshold, trigger) in [(120.0, true), (129.0, true), (130.0, false)] {
+                let data = checked_result(&amount, &cost, after);
+                assert_eq!(data.month_cost, Some(129.0));
+                assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(budget_sample(data, &options), ("ok".into(), trigger));
+            }
+        }
+    }
 
     #[test]
     fn r18_完整日记录与有效月费不能放行月数量空桶或仅REQUEST() {

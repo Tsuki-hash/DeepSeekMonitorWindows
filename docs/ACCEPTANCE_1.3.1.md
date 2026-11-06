@@ -17,7 +17,9 @@
 ## 1. 源码、依赖与构建
 
 - [ ] 三处应用版本一致为 1.3.1，锁文件与提交对应。
-- [ ] 干净安装依赖后，执行当前 `package.json` 与 `scripts/verify.ps1` 定义的前端类型／单测、组件回归、脚本门禁、lint、格式、构建及 Rust 校验。
+- [ ] 干净安装依赖后，执行当前 `package.json` 与 `scripts/verify.ps1` 定义的前端类型／单测、组件回归、发行版本纯函数回归、脚本门禁、lint、格式、构建及 Rust 校验。
+- [ ] `npm run verify` 与 `npm run release:record -- ...` 均实际执行 `scripts/run-release-version-tests.mjs`，由其启动 `verify-release-version.static-tests.ps1`；核对三组非零断言、唯一完成汇总及原生退出码 0。缺 pwsh／脚本、非零退出、零断言、旧 PASS 文案或缺证据均不能通过。
+- [ ] 发行记录保留版本纯函数的完整 stdout/stderr、真实 pwsh 退出码、信号／启动错误与 schema v1 日志；表格的入口退出码不冒充原生退出码。纯函数计数以 assertions 标注，不能作为真实安装包或安装升级的验收证据。
 - [ ] 依赖审计结果被真实记录；网络错误或无法取得结果不是“无漏洞”。
 - [ ] 测试实际执行数大于零；没有把已移除的 Agent 测试、空集合或跳过计为通过。
 - [ ] 按 [发布门禁说明](RELEASE_GATES_1.3.1.md) 在 Windows 本机运行 Rust 门禁：11 项必需 Windows 测试全部真实完成，schema v3 的逐项覆盖、完成行和总数一致。非 Windows／中文跳过／缺必需项的注入均阻断放行。

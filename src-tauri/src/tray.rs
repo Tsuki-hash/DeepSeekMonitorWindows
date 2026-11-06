@@ -190,7 +190,15 @@ fn position_main_window_in_work_area(
     window: &WebviewWindow,
     monitor: &tauri::Monitor,
     placement: MainWindowPlacement,
-) -> tauri::Result<()> {
+) -> Result<(), String> {
+    // Windows iconic 外框不是恢复后的面板尺寸，不能拿它参与缩小和定位。
+    // 最大化窗口也交还系统管理，set_position 会破坏原有最大化状态。
+    if window.is_minimized().map_err(|error| error.to_string())? {
+        return Err("主窗口仍在最小化，未调整窗口几何".into());
+    }
+    if window.is_maximized().map_err(|error| error.to_string())? {
+        return Ok(());
+    }
     let work_area = monitor.work_area();
     let area = window_pos::WorkArea {
         x: work_area.position.x,
@@ -199,13 +207,16 @@ fn position_main_window_in_work_area(
         height: work_area.size.height as i32,
     };
     let scale_factor = monitor.scale_factor();
-    let size = window.outer_size()?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
     let geometry = main_window_geometry(area, size.width, size.height, scale_factor, placement);
-    apply_main_window_geometry(window, size, geometry)?;
+    apply_main_window_geometry(window, size, geometry).map_err(|error| error.to_string())?;
 
     // 跨屏定位可能触发 DPI 尺寸调整。读取实际尺寸后再约束一次，不能让系统
     // 在首次缩小之后又把窗口放大到工作区外；第二次定位仍在同一目标工作区。
-    let actual_size = window.outer_size()?;
+    if window.is_minimized().map_err(|error| error.to_string())? {
+        return Err("主窗口已最小化，未继续调整窗口几何".into());
+    }
+    let actual_size = window.outer_size().map_err(|error| error.to_string())?;
     if actual_size.width != geometry.0 || actual_size.height != geometry.1 {
         let geometry = main_window_geometry(
             area,
@@ -214,12 +225,13 @@ fn position_main_window_in_work_area(
             scale_factor,
             placement,
         );
-        apply_main_window_geometry(window, actual_size, geometry)?;
+        apply_main_window_geometry(window, actual_size, geometry)
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-fn position_near_tray(window: &WebviewWindow) -> tauri::Result<()> {
+fn position_near_tray(window: &WebviewWindow) -> Result<(), String> {
     // 定位锚点优先取托盘图标中心；托盘事件还没发生过（例如从菜单项「显示主面板」
     // 唤出）时退回光标位置。按锚点最近的工作区边贴靠（几何在 window_pos）。
     let anchor = last_tray_rect()
@@ -230,13 +242,18 @@ fn position_near_tray(window: &WebviewWindow) -> tauri::Result<()> {
                 .ok()
                 .map(|point| (point.x, point.y))
         })
-        .ok_or(tauri::Error::WindowNotFound)?;
+        .ok_or("无法读取主窗口定位锚点")?;
 
     let monitor = window
-        .monitor_from_point(anchor.0, anchor.1)?
-        .or(window.current_monitor()?)
-        .or(window.primary_monitor()?)
-        .ok_or(tauri::Error::WindowNotFound)?;
+        .monitor_from_point(anchor.0, anchor.1)
+        .map_err(|error| error.to_string())?
+        .or(window
+            .current_monitor()
+            .map_err(|error| error.to_string())?)
+        .or(window
+            .primary_monitor()
+            .map_err(|error| error.to_string())?)
+        .ok_or("无法读取主窗口所在显示器")?;
 
     position_main_window_in_work_area(
         window,
@@ -253,9 +270,18 @@ pub(crate) fn persist_position_for_exit(window: &WebviewWindow) {
 }
 
 fn persist_main_window_position(window: &WebviewWindow) {
+    // 查询失败也不覆盖已有正常坐标。最小化时 GetWindowRect 可能给出 iconic
+    // 坐标；最大化外框同样不应替换用户原来的普通窗口位置。
+    if !can_persist_main_window_position(window.is_minimized().ok(), window.is_maximized().ok()) {
+        return;
+    }
     let Ok(position) = window.outer_position() else {
         return;
     };
+    // IPC 隐藏/退出入口不一定在 UI 线程；读取位置期间若状态改变，放弃写入。
+    if !can_persist_main_window_position(window.is_minimized().ok(), window.is_maximized().ok()) {
+        return;
+    }
     let _ = crate::config::edit_config(|config| {
         config.window_position = Some([position.x, position.y]);
         Ok(())
@@ -282,15 +308,158 @@ pub(crate) fn restore_saved_position(window: &WebviewWindow) -> bool {
         .is_ok()
 }
 
-pub(crate) fn show_main_window(window: &WebviewWindow) {
-    // 优先回到用户上次停留的位置；没有记录或记录失效时才按托盘附近定位
-    if !restore_saved_position(window) {
-        let _ = position_near_tray(window);
+fn can_persist_main_window_position(minimized: Option<bool>, maximized: Option<bool>) -> bool {
+    minimized == Some(false) && maximized == Some(false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MainWindowVisibility {
+    visible: bool,
+    minimized: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainWindowIntent {
+    Show,
+    Toggle,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestorePlacement {
+    Saved,
+    Current,
+}
+
+/// 供原生入口和决策回归共用；替身只证明调用顺序，不能替代 Windows 验收。
+trait MainWindowActions {
+    fn visibility(&self) -> Result<MainWindowVisibility, String>;
+    fn unminimize(&self) -> Result<(), String>;
+    fn position(&self, placement: RestorePlacement) -> Result<(), String>;
+    fn show(&self) -> Result<(), String>;
+    fn focus(&self) -> Result<(), String>;
+    fn hide(&self) -> Result<(), String>;
+    fn emit_shown(&self) -> Result<(), String>;
+    fn emit_quit(&self) -> Result<(), String>;
+}
+
+fn apply_main_window_intent(
+    window: &impl MainWindowActions,
+    intent: MainWindowIntent,
+) -> Result<(), String> {
+    // is_visible 在 Windows 最小化后仍可为 true。未知状态不冒充隐藏/正常。
+    let initial = window.visibility()?;
+    if intent == MainWindowIntent::Toggle && initial.visible && !initial.minimized {
+        return window.hide();
     }
-    let _ = window.show();
-    let _ = window.set_focus();
-    // 通知前端：面板被唤出，立刻拉一次最新数据
-    let _ = window.emit(EVENT_MAIN_WINDOW_SHOWN, ());
+
+    if initial.minimized {
+        window.unminimize()?;
+        // 未真正恢复时不读 iconic 尺寸、不发送 shown 或不可达的退出意图。
+        if window.visibility()?.minimized {
+            return Err("主窗口仍在最小化，请重试恢复窗口".into());
+        }
+    }
+
+    let placement = if initial.minimized || initial.visible {
+        // SW_RESTORE 恢复系统保留的正常外框；已显示时同样保留用户刚拖动的
+        // 位置。只在工作区变化时夹取，不能用更旧的配置覆盖当前正常外框。
+        RestorePlacement::Current
+    } else {
+        RestorePlacement::Saved
+    };
+    if let Err(error) = window.position(placement) {
+        // 定位仍为尽力而为；显示失败则由后续状态核验阻止假成功。
+        log::warn!("恢复主窗口位置失败：{error}");
+    }
+    window.show()?;
+    let visible = window.visibility()?;
+    if !visible.visible || visible.minimized {
+        return Err("主窗口未恢复显示，请重试".into());
+    }
+    let focused = window.focus();
+    // 窗口已显示，即使前台焦点请求失败，也要让前端恢复刷新。
+    window.emit_shown()?;
+    focused?;
+    if intent == MainWindowIntent::Quit {
+        // 必须在窗口成功恢复后才交给草稿协商；任何失败都不直接退出。
+        window.emit_quit()?;
+    }
+    Ok(())
+}
+
+struct NativeMainWindow<'a>(&'a WebviewWindow);
+
+impl MainWindowActions for NativeMainWindow<'_> {
+    fn visibility(&self) -> Result<MainWindowVisibility, String> {
+        Ok(MainWindowVisibility {
+            visible: self.0.is_visible().map_err(|error| error.to_string())?,
+            minimized: self.0.is_minimized().map_err(|error| error.to_string())?,
+        })
+    }
+    fn unminimize(&self) -> Result<(), String> {
+        self.0.unminimize().map_err(|error| error.to_string())
+    }
+    fn position(&self, placement: RestorePlacement) -> Result<(), String> {
+        if placement == RestorePlacement::Current {
+            if let Ok(position) = self.0.outer_position() {
+                if let Ok(Some(monitor)) = self
+                    .0
+                    .monitor_from_point(position.x as f64, position.y as f64)
+                {
+                    return position_main_window_in_work_area(
+                        self.0,
+                        &monitor,
+                        MainWindowPlacement::SavedPosition(position.x, position.y),
+                    );
+                }
+            }
+        }
+        if restore_saved_position(self.0) {
+            return Ok(());
+        }
+        position_near_tray(self.0)
+    }
+    fn show(&self) -> Result<(), String> {
+        self.0.show().map_err(|error| error.to_string())
+    }
+    fn focus(&self) -> Result<(), String> {
+        self.0.set_focus().map_err(|error| error.to_string())
+    }
+    fn hide(&self) -> Result<(), String> {
+        hide_main_window_inner(self.0)
+    }
+    fn emit_shown(&self) -> Result<(), String> {
+        self.0
+            .emit(EVENT_MAIN_WINDOW_SHOWN, ())
+            .map_err(|error| error.to_string())
+    }
+    fn emit_quit(&self) -> Result<(), String> {
+        self.0
+            .emit(EVENT_QUIT_REQUESTED, ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn dispatch_main_window_intent(window: &WebviewWindow, intent: MainWindowIntent) {
+    let main = window.clone();
+    // 单实例通知/热键可能来自其他线程。把状态读取和 native setters 放在同一
+    // UI 回调内，避免 unminimize 仅入队而几何读取已经开始，也让快速切换串行。
+    if let Err(error) = window.run_on_main_thread(move || {
+        if let Err(error) = apply_main_window_intent(&NativeMainWindow(&main), intent) {
+            log::warn!("主窗口操作 {intent:?} 失败：{error}");
+        }
+    }) {
+        log::warn!("调度主窗口操作 {intent:?} 失败：{error}");
+    }
+}
+
+pub(crate) fn show_main_window(window: &WebviewWindow) {
+    dispatch_main_window_intent(window, MainWindowIntent::Show);
+}
+
+pub(crate) fn toggle_main_window(window: &WebviewWindow) {
+    dispatch_main_window_intent(window, MainWindowIntent::Toggle);
 }
 
 pub(crate) fn hide_main_window_inner(window: &WebviewWindow) -> Result<(), String> {
@@ -318,8 +487,7 @@ pub(crate) fn request_quit(app: &tauri::AppHandle) {
         app.exit(0);
         return;
     };
-    show_main_window(&window);
-    let _ = window.emit(EVENT_QUIT_REQUESTED, ());
+    dispatch_main_window_intent(&window, MainWindowIntent::Quit);
 }
 
 /// 装配托盘图标与菜单（lib.rs 的 setup 调用）。
@@ -378,12 +546,7 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
             let app = tray.app_handle();
             if let Some(window) = app.get_webview_window("main") {
-                let is_visible = window.is_visible().unwrap_or(false);
-                if is_visible {
-                    let _ = hide_main_window_inner(&window);
-                } else {
-                    show_main_window(&window);
-                }
+                toggle_main_window(&window);
             }
         });
 
@@ -398,6 +561,10 @@ pub(crate) fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 #[path = "tray_placement_tests.rs"]
 mod placement_tests;
+
+#[cfg(test)]
+#[path = "tray_restore_tests.rs"]
+mod restore_tests;
 
 #[cfg(test)]
 mod overview_tests {

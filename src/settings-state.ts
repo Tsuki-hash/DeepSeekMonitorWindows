@@ -24,10 +24,8 @@ import { CredentialDraft } from "./credential-draft";
 import type { CredentialSnapshot } from "./credential-draft";
 import { ApiKeyFeedback } from "./api-key-feedback";
 import { UsageTokenFeedback } from "./usage-token-feedback";
-import type {
-  UsageSessionCleanupOwner,
-  UsageTokenFeedbackOwner,
-} from "./usage-token-feedback";
+import type { UsageTokenFeedbackOwner } from "./usage-token-feedback";
+import { usageSessionCleanup } from "./usage-session-cleanup";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -137,7 +135,7 @@ export function useSettingsState(): SettingsState {
     commit: commitUsageToken,
   } = useCredentialDraft(lifecycle);
   const tokenFeedback = React.useRef(
-    new UsageTokenFeedback(getCommittedConfig()),
+    new UsageTokenFeedback(getCommittedConfig(), usageSessionCleanup),
   );
   React.useLayoutEffect(() => {
     const owner = lifecycle.current;
@@ -153,7 +151,6 @@ export function useSettingsState(): SettingsState {
       key.clear();
       token.clear();
       feedback.edit();
-      feedback.invalidateCleanup();
     };
   }, [keyDraft, tokenDraft]);
   const capturePage = React.useCallback(() => {
@@ -206,6 +203,22 @@ export function useSettingsState(): SettingsState {
   const [usageStatus, setUsageStatus] = React.useState(
     () => tokenFeedback.current.status,
   );
+  // Reconcile privacy results even when the initiating page has gone away.
+  // This subscription updates only display/busy state, never this page's draft.
+  const [cleanupPending, setCleanupPending] = React.useState(
+    () => usageSessionCleanup.pending,
+  );
+  React.useEffect(() => {
+    const current = capturePage();
+    const syncCleanup = () => {
+      if (!current()) return;
+      setCleanupPending(usageSessionCleanup.pending);
+      setUsageStatus(tokenFeedback.current.status);
+    };
+    const unsubscribe = usageSessionCleanup.subscribe(syncCleanup);
+    syncCleanup();
+    return unsubscribe;
+  }, [capturePage]);
   const setUsageToken = React.useCallback(
     (value: string) => {
       if (!lifecycle.current.active) return;
@@ -928,16 +941,12 @@ export function useSettingsState(): SettingsState {
       });
   }, [tokenDraft, commitUsageToken]);
 
-  // Versioned events update saved state only. Only this operation's response
-  // may consume its draft revision; backend versions are not draft ownership.
-  // This also makes old/duplicate events harmless after unmount or a new forget.
-  const forgetOwner = React.useRef<{
-    operation: number;
-    consumed: boolean;
-    cleanup: UsageSessionCleanupOwner;
-  } | null>(null);
+  // Privacy results belong to an app-lifetime operation. Only its original
+  // page/draft owner may consume a candidate, but every later page sees results.
   const forgetUsageSession = React.useCallback(() => {
-    if (!lifecycle.current.active || forgetOwner.current) return;
+    if (!lifecycle.current.active) return;
+    const cleanup = usageSessionCleanup.begin(getCommittedConfig());
+    if (!cleanup) return;
     syncRequestId.current += 1;
     syncOwner.current.invalidate();
     syncFeedbackOwner.current = null;
@@ -945,18 +954,11 @@ export function useSettingsState(): SettingsState {
     const revision = tokenDraft.current.revision;
     const feedback = tokenFeedback.current.begin(revision, null);
     const generation = lifecycle.current.generation;
-    const owner = {
-      operation: beginUsageTokenOperation(),
-      consumed: false,
-      cleanup: tokenFeedback.current.beginCleanup(),
-    };
-    forgetOwner.current = owner;
-    const currentPage = () =>
+    const operation = beginUsageTokenOperation();
+    const current = () =>
       lifecycle.current.active &&
       lifecycle.current.generation === generation &&
-      forgetOwner.current === owner;
-    const current = () =>
-      currentPage() && isCurrentUsageTokenOperation(owner.operation);
+      isCurrentUsageTokenOperation(operation);
     setBusy(true);
     setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
@@ -965,9 +967,9 @@ export function useSettingsState(): SettingsState {
       )
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
-        if (!currentPage() || owner.consumed) return;
-        owner.consumed = true;
-        tokenFeedback.current.finishCleanup(owner.cleanup, null);
+        // The owned IPC receipt is the only proof of browser cleanup success.
+        // Unowned browsing-data-cleared events cannot settle this operation.
+        if (!usageSessionCleanup.finish(cleanup, null)) return;
         const ownsReceipt =
           current() &&
           isCurrentCredential(nextConfig, "usageToken") &&
@@ -979,31 +981,15 @@ export function useSettingsState(): SettingsState {
             true,
           );
         if (ownsReceipt) commitUsageToken(revision);
-        setUsageStatus(tokenFeedback.current.status);
+        if (current()) setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (currentPage()) {
-          // Privacy failure belongs to the cleanup operation, not to the draft.
-          // New login/save labels it as a previous cleanup; editing B/ABA does not.
-          tokenFeedback.current.finishCleanup(
-            owner.cleanup,
-            errorMessage(error),
-          );
-          setUsageStatus(tokenFeedback.current.status);
-        }
+        // No page guard: the user still needs this warning after navigating away.
+        usageSessionCleanup.finish(cleanup, errorMessage(error));
       })
       .finally(() => {
-        if (forgetOwner.current !== owner) return;
-        forgetOwner.current = null;
-        if (currentAfterForget()) setBusy(false);
+        if (current()) setBusy(false);
       });
-    function currentAfterForget() {
-      return (
-        lifecycle.current.active &&
-        lifecycle.current.generation === generation &&
-        isCurrentUsageTokenOperation(owner.operation)
-      );
-    }
   }, [tokenDraft, commitUsageToken]);
 
   React.useEffect(() => {
@@ -1195,7 +1181,7 @@ export function useSettingsState(): SettingsState {
     config,
     configPath,
     status,
-    busy,
+    busy: busy || cleanupPending,
     appVersion,
     apiKey,
     setApiKey,

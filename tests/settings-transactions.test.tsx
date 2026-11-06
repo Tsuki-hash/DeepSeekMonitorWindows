@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { App } from "../src/App";
 import { useSettingsState } from "../src/settings-state";
+import { usageSessionCleanup } from "../src/usage-session-cleanup";
 import {
   applyReadConfig,
   getCommitRevision,
@@ -512,7 +513,7 @@ scenario(
   },
 );
 scenario(
-  "R09: failed forget is retryable and old response cannot affect remount",
+  "R19: failed forget retries retain results across remount without consuming its new draft",
   async (concurrent) => {
     const pending = deferred();
     handlers.forget_usage_session = () => pending.promise;
@@ -532,6 +533,7 @@ scenario(
     await act(async () => state.setUsageToken("TOKEN_A"));
     await finish(retry, baseConfig({ usageTokenConfigured: false }));
     assert.equal(state.usageToken, "TOKEN_A");
+    assert.match(state.usageStatus, /已清除监控 Token 和应用内网页登录数据/);
     assert.equal(state.busy, false);
   },
 );
@@ -899,6 +901,8 @@ scenario(
     assert.equal(getCommittedConfig(), captured);
     assert.equal(state.usageToken, "TOKEN_C");
     assert.equal(state.config.usageTokenConfigured, true);
+    assert.match(state.usageStatus, /^用量 Token 已配置。此前的/);
+    assert.match(state.usageStatus, /后续新登录或保存的账户不在该次清理范围内/);
   },
 );
 
@@ -1427,8 +1431,8 @@ for (const [command, action] of [
       assert.ok(clearArgs.cancelledRequestIds.includes(webRequest));
       assert.ok(clearArgs.cancelledRequestIds.includes(manualArgs.requestId));
 
-      // Even after a page change enables its controls, a fresh login waits for
-      // the older clear to settle instead of being accidentally closed by it.
+      // Even if a fresh login is requested directly after remount, it waits
+      // for the older clear. Forget's busy/notice also survives the remount.
       await act(async () => renderer.unmount());
       renderer = null;
       await mount(<Probe />, concurrent);
@@ -2770,7 +2774,7 @@ for (const oldFails of [false, true]) {
 }
 
 scenario(
-  "R18: old forget failure after remount cannot attach to the new page draft",
+  "R19: old forget failure after remount is visible without attaching to the new page draft",
   async (concurrent) => {
     const forgetting = deferred();
     handlers.forget_usage_session = () => forgetting.promise;
@@ -2782,16 +2786,380 @@ scenario(
     renderer = null;
     await mount(<Probe />, concurrent);
     await act(async () => state.setUsageToken("SYNTHETIC_NEW_PAGE_TOKEN"));
-    const displayed = state.usageStatus;
+    assert.match(state.usageStatus, /正在清理网页登录数据/);
+    assert.equal(state.busy, true);
     await act(async () =>
       forgetting.reject(new Error("Synthetic unmounted cleanup failure")),
     );
     await flush();
-    assert.equal(state.usageStatus, displayed);
+    assert.match(
+      state.usageStatus,
+      /监控 Token 已清除；网页登录数据清理尚未确认完成/,
+    );
+    assert.match(state.usageStatus, /Synthetic unmounted cleanup failure/);
     assert.equal(state.usageToken, "SYNTHETIC_NEW_PAGE_TOKEN");
     assert.equal(state.busy, false);
   },
 );
+
+// R19: exercise actual App navigation with no dirty draft. The settings page can
+// leave immediately while WebView2 is pending; its privacy result must not leave.
+for (const timing of ["before-leave", "while-away", "after-remount"]) {
+  for (const outcome of ["failure", "timeout", "success"]) {
+    for (const edits of ["none", "B", "ABA"]) {
+      scenario(
+        `R19: no-draft navigation retains cleanup ${outcome} ${timing} and protects ${edits} on the new page`,
+        async (concurrent) => {
+          const forgetting = deferred();
+          handlers.forget_usage_session = () => forgetting.promise;
+          await openSettings(concurrent);
+          await click(button("退出并忘记账户"));
+          await click(button("确认清除"));
+          const owner = usageSessionCleanup.snapshot.owner;
+          const cleared = nextCredentialConfig("usageToken", false);
+          config = cleared;
+          await emit("usage-token-cleared", cleared);
+          const error =
+            outcome === "timeout"
+              ? "监控 Token 已清除，网页登录数据仍在清理；完成前无法重新同步"
+              : "Synthetic R19 WebView2 failure";
+          const settle = async () => {
+            if (outcome === "success") await finish(forgetting, cleared);
+            else {
+              await act(async () => forgetting.reject(new Error(error)));
+              await flush();
+            }
+          };
+          if (timing === "before-leave") await settle();
+          await click(input("返回主面板"));
+          assert.equal(prompt(), 0);
+          assert.equal(panel("dashboard"), 1);
+          if (timing === "while-away") await settle();
+          await click(input("设置"));
+          assert.equal(usageSessionCleanup.snapshot.owner, owner);
+          if (timing === "after-remount") {
+            assert.match(textOf(renderer.toJSON()), /正在清理网页登录数据/);
+            assert.equal(button("退出并忘记账户").props.disabled, true);
+          }
+          await manual();
+          assert.equal(input("用量 Token").props.value, "");
+          if (edits !== "none")
+            await change("用量 Token", "SYNTHETIC_NEW_PAGE_TOKEN_B");
+          if (edits === "ABA") {
+            await change("用量 Token", "SYNTHETIC_NEW_PAGE_TOKEN_A");
+            await change("用量 Token", "SYNTHETIC_NEW_PAGE_TOKEN_B");
+          }
+          if (timing === "after-remount") await settle();
+          const text = textOf(renderer.toJSON());
+          if (outcome === "success")
+            assert.match(text, /已清除监控 Token 和应用内网页登录数据/);
+          else {
+            assert.match(
+              text,
+              /监控 Token 已清除；网页登录数据清理尚未确认完成/,
+            );
+            assert.ok(text.includes(error));
+            assert.match(text, /重试/);
+          }
+          assert.equal(
+            input("用量 Token").props.value,
+            edits === "none" ? "" : "SYNTHETIC_NEW_PAGE_TOKEN_B",
+          );
+          assert.equal(button("退出并忘记账户").props.disabled, false);
+          const status = usageSessionCleanup.snapshot;
+          await emit("browsing-data-cleared", null);
+          await emit("usage-token-cleared", cleared);
+          assert.equal(usageSessionCleanup.snapshot, status);
+          assert.equal(submitted("forget_usage_session").length, 1);
+          assert.equal(submitted("save_usage_token").length, 0);
+          await click(input("返回主面板"));
+          assert.equal(prompt(), edits === "none" ? 0 : 1);
+        },
+      );
+    }
+  }
+}
+
+scenario(
+  "R19: pending cleanup survives repeated clean navigation without duplicate IPC or a false success event",
+  async (concurrent) => {
+    const forgetting = deferred();
+    handlers.forget_usage_session = () => forgetting.promise;
+    await openSettings(concurrent);
+    await click(button("退出并忘记账户"));
+    await click(button("确认清除"));
+    const owner = usageSessionCleanup.snapshot.owner;
+    // The Token commit arrives with SettingsPanel absent: App must still apply it.
+    await click(input("返回主面板"));
+    config = nextCredentialConfig("usageToken", false);
+    await emit("usage-token-cleared", config);
+    for (let visit = 0; visit < 2; visit++) {
+      await click(input("设置"));
+      assert.match(
+        textOf(renderer.toJSON()),
+        /监控 Token 已清除；正在清理网页登录数据/,
+      );
+      assert.equal(button("退出并忘记账户").props.disabled, true);
+      assert.equal(usageSessionCleanup.snapshot.owner, owner);
+      await emit("browsing-data-cleared", null);
+      assert.equal(usageSessionCleanup.snapshot.phase, "pending");
+      await click(input("返回主面板"));
+      assert.equal(prompt(), 0);
+    }
+    await finish(forgetting, config);
+    await click(input("设置"));
+    assert.match(
+      textOf(renderer.toJSON()),
+      /已清除监控 Token 和应用内网页登录数据/,
+    );
+    assert.equal(submitted("forget_usage_session").length, 1);
+  },
+);
+
+for (const newer of ["save", "login"]) {
+  for (const oldFails of [false, true]) {
+    scenario(
+      `R19: remounted ${newer} keeps previous cleanup ${oldFails ? "failure" : "success"} historical and never retries it`,
+      async (concurrent) => {
+        const forgetting = deferred();
+        const replacement = deferred();
+        handlers.forget_usage_session = () => forgetting.promise;
+        handlers.save_usage_token = () => replacement.promise;
+        handlers.start_usage_sync = () => replacement.promise;
+        await mount(<Probe />, concurrent);
+        await act(async () => state.forgetUsageSession());
+        const cleared = nextCredentialConfig("usageToken", false);
+        config = cleared;
+        await emit("usage-token-cleared", cleared);
+        await act(async () => renderer.unmount());
+        renderer = null;
+        await mount(<Probe />, concurrent);
+        await act(async () =>
+          state.setUsageToken("SYNTHETIC_NEW_ACCOUNT_TOKEN"),
+        );
+        let saved;
+        await act(async () => {
+          if (newer === "save") saved = state.saveUsageToken();
+          else state.startUsageSync();
+        });
+        assert.match(state.usageStatus, /此前的“退出并忘记账户”仍在等待/);
+        if (oldFails) {
+          await act(async () =>
+            forgetting.reject(
+              new Error("Synthetic R19 previous cleanup failure"),
+            ),
+          );
+          await flush();
+        } else await finish(forgetting, cleared);
+        assert.equal(state.usageToken, "SYNTHETIC_NEW_ACCOUNT_TOKEN");
+        assert.match(state.usageStatus, /此前的“退出并忘记账户”/);
+        const current = nextCredentialConfig("usageToken", true);
+        config = current;
+        if (newer === "save") {
+          await finish(replacement, current);
+          assert.equal(await saved, true);
+          assert.equal(state.usageToken, "");
+        } else {
+          const requestId = submitted("start_usage_sync").at(-1).args.requestId;
+          const active = syncStatus(requestId, true);
+          await finish(replacement, { ...active, synced: false });
+          await emit("usage-token-captured", capturedPayload(current, active));
+          assert.equal(state.usageToken, "SYNTHETIC_NEW_ACCOUNT_TOKEN");
+        }
+        await act(async () => renderer.unmount());
+        renderer = null;
+        await mount(<Probe />, concurrent);
+        assert.match(state.usageStatus, /^用量 Token 已配置。此前的/);
+        assert.match(
+          state.usageStatus,
+          oldFails
+            ? /Synthetic R19 previous cleanup failure/
+            : /后续新登录或保存的账户不在该次清理范围内/,
+        );
+        await emit("usage-token-cleared", cleared);
+        await emit("browsing-data-cleared", null);
+        assert.equal(getCommittedConfig(), current);
+        assert.equal(submitted("forget_usage_session").length, 1);
+        assert.equal(state.busy, false);
+      },
+    );
+  }
+}
+
+for (const failsWhileAway of [false, true]) {
+  scenario(
+    `R19: explicit retry after remounted timeout owns a new operation and ignores old receipts (${failsWhileAway})`,
+    async (concurrent) => {
+      const forgetting = deferred();
+      handlers.forget_usage_session = () => forgetting.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.forgetUsageSession());
+      const old = usageSessionCleanup.snapshot.owner;
+      const cleared = nextCredentialConfig("usageToken", false);
+      config = cleared;
+      await emit("usage-token-cleared", cleared);
+      await act(async () => renderer.unmount());
+      renderer = null;
+      if (!failsWhileAway) await mount(<Probe />, concurrent);
+      await act(async () =>
+        forgetting.reject(
+          new Error(
+            "监控 Token 已清除，网页登录数据仍在清理；完成前无法重新同步",
+          ),
+        ),
+      );
+      await flush();
+      if (failsWhileAway) await mount(<Probe />, concurrent);
+      assert.match(state.usageStatus, /尚未确认完成/);
+      await emit("browsing-data-cleared", null);
+      assert.equal(submitted("forget_usage_session").length, 1);
+      const retry = deferred();
+      handlers.forget_usage_session = () => retry.promise;
+      await act(async () => state.forgetUsageSession());
+      const owner = usageSessionCleanup.snapshot.owner;
+      assert.ok(owner.generation > old.generation);
+      await act(async () => state.forgetUsageSession());
+      assert.equal(submitted("forget_usage_session").length, 2);
+      await act(async () => renderer.unmount());
+      renderer = null;
+      await mount(<Probe />, concurrent);
+      await act(async () =>
+        state.setUsageToken("SYNTHETIC_RETRY_NEW_PAGE_TOKEN"),
+      );
+      await act(async () => {
+        assert.equal(usageSessionCleanup.finish(old, null), false);
+        assert.equal(
+          usageSessionCleanup.finish(old, "Synthetic stale failure"),
+          false,
+        );
+      });
+      await emit("usage-token-cleared", cleared);
+      await emit("browsing-data-cleared", null);
+      assert.equal(usageSessionCleanup.snapshot.owner, owner);
+      assert.match(state.usageStatus, /正在清理网页登录数据/);
+      assert.equal(state.busy, true);
+      await finish(retry, nextCredentialConfig("usageToken", false));
+      assert.match(state.usageStatus, /已清除监控 Token 和应用内网页登录数据/);
+      assert.equal(state.usageToken, "SYNTHETIC_RETRY_NEW_PAGE_TOKEN");
+      assert.equal(state.busy, false);
+    },
+  );
+}
+
+// This is a fresh in-memory frontend with only the durable backend marker. The
+// fixture intentionally reuses process-local revisions, which are not identity
+// evidence after restart, and never asks the renderer to auto-run cleanup.
+for (const newerAccount of [false, true]) {
+  scenario(
+    `R19: fresh app restores durable incomplete cleanup without deleting a newer account (${newerAccount})`,
+    async (concurrent) => {
+      config = baseConfig({
+        usageTokenConfigured: newerAccount,
+        usageCleanupUnconfirmed: "9007199254740993",
+      });
+      await openSettings(concurrent);
+      assert.match(textOf(renderer.toJSON()), /应用重新打开后无法确认/);
+      assert.match(textOf(renderer.toJSON()), /不代表当前账户已退出/);
+      assert.equal(usageSessionCleanup.snapshot.phase, "unconfirmed");
+      assert.equal(button("退出并忘记账户").props.disabled, false);
+      await manual();
+      await change("用量 Token", "SYNTHETIC_RESTART_DRAFT_A");
+      await change("用量 Token", "SYNTHETIC_RESTART_DRAFT_B");
+      await change("用量 Token", "SYNTHETIC_RESTART_DRAFT_A");
+      await emit("browsing-data-cleared", null);
+      assert.equal(
+        input("用量 Token").props.value,
+        "SYNTHETIC_RESTART_DRAFT_A",
+      );
+      assert.match(textOf(renderer.toJSON()), /应用重新打开后无法确认/);
+      assert.equal(submitted("forget_usage_session").length, 0);
+      await leave("放弃修改并离开");
+      await click(input("设置"));
+      assert.match(textOf(renderer.toJSON()), /应用重新打开后无法确认/);
+      const retry = deferred();
+      handlers.forget_usage_session = () => retry.promise;
+      await click(button("退出并忘记账户"));
+      assert.equal(submitted("forget_usage_session").length, 0);
+      await click(button("确认清除"));
+      assert.equal(submitted("forget_usage_session").length, 1);
+      const cleared = nextCredentialConfig("usageToken", false);
+      const marked = {
+        ...cleared,
+        usageCleanupUnconfirmed: "9007199254740994",
+      };
+      config = marked;
+      await emit("usage-token-cleared", marked);
+      assert.match(textOf(renderer.toJSON()), /正在清理网页登录数据/);
+      // Backend confirmation persistence is not a browser-success receipt in UI.
+      const confirmed = {
+        ...marked,
+        configRevision: ++fixtureRevision,
+        usageCleanupUnconfirmed: null,
+      };
+      config = confirmed;
+      await emit("credential-config-changed", confirmed);
+      assert.equal(usageSessionCleanup.snapshot.phase, "pending");
+      await finish(retry, marked);
+      assert.equal(getCommittedConfig(), confirmed);
+      assert.match(
+        textOf(renderer.toJSON()),
+        /已清除监控 Token 和应用内网页登录数据/,
+      );
+    },
+  );
+}
+
+for (const decision of ["保存并离开", "放弃修改并离开"]) {
+  scenario(
+    `R19: dirty navigation ${decision} retains earlier privacy failure after reopening`,
+    async (concurrent) => {
+      const forgetting = deferred();
+      const saving = deferred();
+      handlers.forget_usage_session = () => forgetting.promise;
+      handlers.save_usage_token = () => saving.promise;
+      await openSettings(concurrent);
+      await click(button("退出并忘记账户"));
+      await click(button("确认清除"));
+      const cleared = nextCredentialConfig("usageToken", false);
+      config = cleared;
+      await emit("usage-token-cleared", cleared);
+      await manual();
+      await change("用量 Token", "SYNTHETIC_NAVIGATION_NEW_ACCOUNT");
+      await leave(decision);
+      if (decision === "保存并离开") {
+        assert.equal(prompt(), 1);
+        assert.equal(submitted("save_usage_token").length, 0);
+      } else assert.equal(panel("dashboard"), 1);
+      await act(async () =>
+        forgetting.reject(
+          new Error("Synthetic R19 navigation cleanup failure"),
+        ),
+      );
+      await flush();
+      if (decision === "保存并离开") {
+        assert.equal(submitted("save_usage_token").length, 1);
+        config = nextCredentialConfig("usageToken", true);
+        await finish(saving, config);
+        assert.equal(panel("dashboard"), 1);
+      }
+      await click(input("设置"));
+      assert.match(
+        textOf(renderer.toJSON()),
+        /Synthetic R19 navigation cleanup failure/,
+      );
+      if (decision === "保存并离开")
+        assert.match(textOf(renderer.toJSON()), /此前的“退出并忘记账户”/);
+      else
+        assert.match(
+          textOf(renderer.toJSON()),
+          /监控 Token 已清除；网页登录数据清理尚未确认完成/,
+        );
+      await manual();
+      assert.equal(input("用量 Token").props.value, "");
+      assert.equal(submitted("forget_usage_session").length, 1);
+    },
+  );
+}
 
 for (const eventFirst of [false, true]) {
   scenario(

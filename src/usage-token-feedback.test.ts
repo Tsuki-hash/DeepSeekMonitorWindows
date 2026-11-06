@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { UsageTokenFeedback } from "./usage-token-feedback.ts";
+import { UsageSessionCleanup } from "./usage-session-cleanup.ts";
 
 const saved = {
   usageTokenRevision: 1,
@@ -110,6 +111,7 @@ test("R18: cleanup failure survives edits and ABA without relaxing draft ownersh
   const feedback = new UsageTokenFeedback(saved);
   const draft = feedback.begin(1, null);
   const cleanup = feedback.beginCleanup();
+  assert.ok(cleanup);
   feedback.observe({
     ...saved,
     usageTokenRevision: 2,
@@ -140,6 +142,7 @@ test("R18: cleanup failure survives edits and ABA without relaxing draft ownersh
 test("R18: pre-clear failure does not claim the persisted Token was removed", () => {
   const feedback = new UsageTokenFeedback(saved);
   const cleanup = feedback.beginCleanup();
+  assert.ok(cleanup);
   feedback.finishCleanup(cleanup, "Synthetic disk failure");
   assert.equal(feedback.status.startsWith("尚未确认监控 Token 已清除"), true);
   assert.equal(feedback.status.includes("Synthetic disk failure"), true);
@@ -148,8 +151,10 @@ test("R18: pre-clear failure does not claim the persisted Token was removed", ()
 test("R18: explicit retry has its own cleanup generation and rejects later old results", () => {
   const feedback = new UsageTokenFeedback(saved);
   const old = feedback.beginCleanup();
+  assert.ok(old);
   assert.equal(feedback.finishCleanup(old, "First cleanup failure"), true);
   const retry = feedback.beginCleanup();
+  assert.ok(retry);
   assert.equal(retry.generation > old.generation, true);
   const waiting = feedback.status;
   assert.equal(feedback.finishCleanup(old, null), false);
@@ -169,6 +174,7 @@ test("R18: superseded cleanup has its own result, not the newer candidate's stat
   for (const error of [null, "Previous cleanup failure"]) {
     const feedback = new UsageTokenFeedback(saved);
     const cleanup = feedback.beginCleanup();
+    assert.ok(cleanup);
     feedback.supersedeCleanup();
     const candidate = feedback.begin(2, "Validating current candidate");
     assert.equal(feedback.finishCleanup(cleanup, error), true);
@@ -184,6 +190,7 @@ test("R18: superseded cleanup has its own result, not the newer candidate's stat
     );
     assert.equal(feedback.status.startsWith("Current candidate saved。"), true);
     const retry = feedback.beginCleanup();
+    assert.ok(retry);
     assert.equal(
       feedback.finishCleanup(cleanup, "Late previous result"),
       false,
@@ -192,24 +199,30 @@ test("R18: superseded cleanup has its own result, not the newer candidate's stat
   }
 });
 
-test("R18: trusted account replacement and page cleanup do not revive old privacy owners", () => {
-  const feedback = new UsageTokenFeedback(saved);
-  const cleanup = feedback.beginCleanup();
-  feedback.observe({ ...saved, usageTokenRevision: 2 });
+test("R19: trusted account replacement and page disposal retain historical privacy results", () => {
+  const cleanupState = new UsageSessionCleanup();
+  const previous = new UsageTokenFeedback(saved, cleanupState);
+  const cleanup = previous.beginCleanup();
+  assert.ok(cleanup);
+  const newer = { ...saved, usageTokenRevision: 2 };
+  previous.observe(newer);
+  previous.edit(); // The page disposes its candidate owner, not the privacy owner.
+  const next = new UsageTokenFeedback(newer, cleanupState);
+  assert.equal(next.status.includes("此前的“退出并忘记账户”"), true);
+  assert.equal(next.status.includes("仍在等待"), true);
   assert.equal(
-    feedback.finishCleanup(cleanup, "Previous cleanup failure"),
+    previous.finishCleanup(cleanup, "Previous cleanup failure"),
     true,
   );
-  assert.equal(feedback.status.startsWith("用量 Token 已配置。此前的"), true);
-  feedback.invalidateCleanup();
-  assert.equal(feedback.finishCleanup(cleanup, null), false);
-  assert.equal(feedback.status, "用量 Token 已配置");
-  assert.equal(new UsageTokenFeedback(saved).status, "用量 Token 已配置");
+  assert.equal(next.status.startsWith("用量 Token 已配置。此前的"), true);
+  assert.equal(next.status.includes("Previous cleanup failure"), true);
+  assert.equal(previous.finishCleanup(cleanup, null), false);
 });
 
 test("R18: root read errors dominate without deleting the cleanup failure", () => {
   const feedback = new UsageTokenFeedback(saved);
   const cleanup = feedback.beginCleanup();
+  assert.ok(cleanup);
   feedback.observe({ ...saved, configReadError: "Synthetic root read error" });
   feedback.finishCleanup(cleanup, "Synthetic cleanup failure");
   assert.equal(feedback.status, "Synthetic root read error");
