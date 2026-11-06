@@ -2686,17 +2686,6 @@ button:disabled:hover {
   color: var(--brand-ink);
 }
 
-/* 面板尺寸切换：与主导航同排，弱化为图标按钮。 */
-.nav-mode-toggle {
-  margin-left: auto;
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border-radius: 50%;
-}
-
 /* 首页内部滚动区（复评 F04）：引导卡与数据同处一列，避免 stage 多出第三个网格子项。
    面板本身不再裁掉底部内容，导航行高度保持 48px 不变。 */
 .dashboard-scroll {

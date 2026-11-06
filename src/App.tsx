@@ -43,9 +43,7 @@ import { HistoryPanel } from "./components/HistoryPanel";
 import { TrayBalancePublisher } from "./tray-balance";
 import { OnboardingPanel } from "./components/OnboardingPanel";
 import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
-import { panelModeLabel, suggestedMode } from "./panel-mode";
-import type { PanelMode } from "./panel-mode";
-import { Maximize2, Minimize2 } from "lucide-react";
+import { suggestedMode } from "./panel-mode";
 import { attemptLeave, useLeaveGuard } from "./leave-guard";
 import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
@@ -919,9 +917,10 @@ function App() {
     revision: channelRevision.usage,
   });
 
-  // 面板尺寸（评审 P2）：用户显式切换后固定，不再被视图建议覆盖。
-  const [manualMode, setManualMode] = React.useState<PanelMode | null>(null);
-  const mode = suggestedMode(view, manualMode);
+  // 面板尺寸：完全由当前视图决定（账户页紧凑、历史页展开）。
+  // 手动切换按钮已移除 —— 它只服务历史页这一个场景，而视图本身已经
+  // 自动切换；保留手动状态反而会让历史页不再自动展开。
+  const mode = suggestedMode(view);
   React.useEffect(() => {
     void invoke("set_panel_mode", { mode }).catch(() => {
       // 浏览器预览没有 Tauri IPC；尺寸切换失败不影响数据展示。
@@ -1422,21 +1421,6 @@ function App() {
                 {label}
               </button>
             ))}
-            <button
-              className="nav-mode-toggle"
-              aria-label={panelModeLabel(mode)}
-              title={panelModeLabel(mode)}
-              onClick={() => {
-                if (quitInteractionGate.allowed())
-                  setManualMode(mode === "expanded" ? "compact" : "expanded");
-              }}
-            >
-              {mode === "expanded" ? (
-                <Minimize2 size={15} />
-              ) : (
-                <Maximize2 size={15} />
-              )}
-            </button>
           </nav>
         )}
       </div>
