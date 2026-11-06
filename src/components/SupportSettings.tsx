@@ -1,4 +1,5 @@
 import React from "react";
+import { useQuitInteractionGate } from "../quit-interaction-context";
 import { invoke } from "@tauri-apps/api/core";
 import { errorMessage } from "../error-state";
 import { updateTime } from "../data-display";
@@ -19,12 +20,14 @@ type ReleaseCheck = {
 };
 
 export function SupportSettings() {
+  const interactionGate = useQuitInteractionGate();
   const [busy, setBusy] = React.useState(false);
   const [status, setStatus] = React.useState("");
   const [diagnostics, setDiagnostics] = React.useState("");
   const [release, setRelease] = React.useState<ReleaseCheck | null>(null);
   const [releaseError, setReleaseError] = React.useState(false);
   const checkRelease = async () => {
+    if (!interactionGate.allowed()) return;
     setBusy(true);
     setStatus("");
     setReleaseError(false);
@@ -38,6 +41,7 @@ export function SupportSettings() {
     }
   };
   const openPage = async (page: "releases" | "issues") => {
+    if (!interactionGate.allowed()) return;
     setBusy(true);
     setStatus("");
     try {
@@ -50,6 +54,7 @@ export function SupportSettings() {
     }
   };
   const loadDiagnostics = async () => {
+    if (!interactionGate.allowed()) return;
     setBusy(true);
     setStatus("");
     try {
@@ -71,6 +76,7 @@ export function SupportSettings() {
     }
   };
   const copyDiagnostics = async () => {
+    if (!interactionGate.allowed()) return;
     try {
       await navigator.clipboard.writeText(diagnostics);
       setStatus("诊断信息已复制");

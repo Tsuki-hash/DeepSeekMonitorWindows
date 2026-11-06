@@ -13,7 +13,7 @@ import { invalidateUsageRequests } from "../src/usage-api";
 import { draftGuardActions } from "../src/draft-guard";
 import type { AppConfig, UsageResult } from "../src/types";
 
-// R29/R30/R31: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
+// R29-R32: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
 // records open/scrollIntoView/focus, including child refs if reintroduced.
 // It does not implement navigation or cancellation decisions for the component.
 // No DOM, native keyboard, WebView2, StrictEffects or screen reader is exercised.
@@ -128,6 +128,17 @@ class FocusNode {
   }
   querySelector(selector: string) {
     return this.isConnected ? select(selector, this.host) : null;
+  }
+  querySelectorAll(selector: string) {
+    assert.equal(selector, "[role='radio']");
+    return this.isConnected
+      ? this.host
+          .findAll(
+            (host: any) =>
+              host.type === "button" && host.props.role === "radio",
+          )
+          .map(nodeFor)
+      : [];
   }
   focus() {
     // Record rejected calls too: invalid-return tests must observe a bad
@@ -310,9 +321,10 @@ async function flush() {
   await act(async () => {
     for (let i = 0; i < 40; i++) await Promise.resolve();
   });
-  // Model only the disconnected-element fallback; do not emulate navigation.
+  // Model Chromium's disconnected/disabled focus fallback, never navigation.
+  // The R32 browser fixture separately checks real document.activeElement.
   const active = g.document.activeElement;
-  if (active instanceof FocusNode && !active.isConnected) {
+  if (active instanceof FocusNode && (!active.isConnected || active.disabled)) {
     g.document.activeElement = body;
   }
 }
@@ -1290,3 +1302,211 @@ scenario(
     assertUntouched();
   },
 );
+
+for (const outcome of ["saved", "failed", "cancelled", "revisited"] as const) {
+  scenario(
+    `R32 focused Save hands focus to Cancel before disabling (${outcome})`,
+    async (target) => {
+      const originalIpc = g.__settingsIpc;
+      let resolve!: (value: unknown) => void;
+      let reject!: (reason: Error) => void;
+      const saving = new Promise((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      let calls = 0;
+      let settled = false;
+      const succeed = () => {
+        settled = true;
+        config = makeConfig();
+        resolve({
+          config: { ...config },
+          balance: {
+            isAvailable: true,
+            currency: "CNY",
+            totalBalance: "3",
+            grantedBalance: "0",
+            toppedUpBalance: "3",
+          },
+        });
+      };
+      g.__settingsIpc = (command: string, args: unknown) => {
+        if (command !== "save_api_key") return originalIpc(command, args);
+        calls += 1;
+        return saving;
+      };
+      try {
+        const { origin, first, cancel, discard } =
+          await openLeavePrompt(target);
+        await drainFrames();
+        assert.equal(g.document.activeElement, first);
+        const cancelNode = nodeFor(cancel);
+        if (outcome === "revisited") {
+          targetNode(target).focus();
+          first.focus();
+        }
+        clearLogs();
+        await call(() => first.host.props.onClick());
+        assert.equal(calls, 1);
+        assert.equal(first.disabled, true);
+        assert.equal(discard.props.disabled, true);
+        assert.equal(cancelNode.disabled, false);
+        assert.equal(g.document.activeElement, cancelNode);
+        assert.deepEqual(focusLog, [cancelNode.label]);
+        assert.equal(frames.size, 0);
+        clearLogs();
+        await call(() => {
+          first.host.props.onClick();
+          discard.props.onClick();
+        });
+        assert.equal(calls, 1);
+        assert.equal(g.document.activeElement, cancelNode);
+        assertUntouched();
+
+        if (outcome === "cancelled") {
+          await call(() => cancel.props.onClick());
+          assert.equal(g.document.activeElement, origin);
+          clearLogs();
+        }
+        await call(() => {
+          if (outcome === "failed" || outcome === "revisited") {
+            settled = true;
+            reject(new Error("Synthetic R32 save failure"));
+          } else succeed();
+        });
+        assertUntouched();
+        if (outcome === "saved") {
+          assert.equal(panelName(), "dashboard-panel");
+          await drainFrames();
+          assert.deepEqual(focusLog, ["dashboard-panel:heading"]);
+        } else {
+          assert.equal(panelName(), "settings-panel");
+          assert.equal(frames.size, 0);
+          if (outcome === "failed" || outcome === "revisited") {
+            assert.equal(g.document.activeElement, cancelNode);
+            assert.equal(first.disabled, false);
+            assert.equal(apiKeyInput().props.value, "SYNTHETIC_DRAFT");
+            await call(() => cancel.props.onClick());
+            assert.equal(
+              g.document.activeElement,
+              outcome === "revisited" ? body : origin,
+              "The new Save handoff must not revive old return ownership",
+            );
+          }
+        }
+      } finally {
+        if (!settled) await call(succeed);
+        g.__settingsIpc = originalIpc;
+      }
+    },
+  );
+}
+
+for (const outcome of ["saved", "failed"] as const) {
+  scenario(
+    `R32 refresh radio retains real target and blocks repeated writes (${outcome})`,
+    async (target) => {
+      const originalIpc = g.__settingsIpc;
+      const writes: Array<{
+        seconds: number;
+        resolve: (value: unknown) => void;
+        reject: (reason: Error) => void;
+        settled: boolean;
+      }> = [];
+      g.__settingsIpc = (command: string, args: any) => {
+        if (command !== "save_refresh_interval")
+          return originalIpc(command, args);
+        return new Promise((resolve, reject) => {
+          writes.push({
+            seconds: args.refreshIntervalSeconds,
+            resolve,
+            reject,
+            settled: false,
+          });
+        });
+      };
+      const succeed = (write: (typeof writes)[number]) => {
+        write.settled = true;
+        config = {
+          ...config,
+          configRevision: ++revision,
+          refreshIntervalSeconds: write.seconds,
+        };
+        write.resolve({ ...config });
+      };
+      try {
+        await enter(target);
+        await drainFrames();
+        await call(() => {
+          config = {
+            ...config,
+            configRevision: ++revision,
+            autoRefreshEnabled: true,
+          };
+          setCommittedConfig(config);
+        });
+        const group = renderer.root.findByProps({ role: "radiogroup" });
+        const radios = group.findAllByProps({ role: "radio" });
+        assert.equal(radios.length, 4);
+        const radioNodes = radios.map(nodeFor);
+        const press = (index: number, key = "ArrowRight") =>
+          group.props.onKeyDown({
+            key,
+            target: radioNodes[index],
+            currentTarget: nodeFor(group),
+            preventDefault() {},
+          });
+        radioNodes[0].focus();
+        clearLogs();
+        await call(() => {
+          press(0);
+          // Same-turn handlers before React busy commits must not submit or
+          // move focus again. Production useSettingsState also owns IPC lock.
+          press(1);
+          radios[2].props.onClick();
+        });
+        assert.equal(writes.length, 1);
+        assert.equal(writes[0].seconds, 300);
+        assert.equal(g.document.activeElement, radioNodes[1]);
+        assert.equal(radios[1].props["aria-checked"], true);
+        for (const radio of radios) {
+          assert.equal(radio.props["aria-disabled"], true);
+          assert.equal(Boolean(radio.props.disabled), false);
+        }
+        clearLogs();
+        await call(() => {
+          press(1);
+          radios[2].props.onClick();
+          radios[1].props.onClick(); // Enter/Space's native click path.
+        });
+        assert.equal(writes.length, 1);
+        assert.equal(g.document.activeElement, radioNodes[1]);
+        assertUntouched();
+        await call(() => {
+          if (outcome === "failed") {
+            writes[0].settled = true;
+            writes[0].reject(new Error("Synthetic R32 preference failure"));
+          } else succeed(writes[0]);
+        });
+        assert.equal(g.document.activeElement, radioNodes[1]);
+        assert.equal(radios[0].props["aria-checked"], outcome === "failed");
+        assert.equal(radios[1].props["aria-checked"], outcome === "saved");
+        assert.equal(radios[1].props["aria-disabled"], false);
+        assertUntouched();
+        // After failure the selection is 60 but focus is 300. ArrowRight must
+        // reach 1800 from actual focus, not retry 300 from the rollback value.
+        await call(() => press(1));
+        assert.equal(writes.length, 2);
+        assert.equal(writes[1].seconds, 1800);
+        assert.equal(g.document.activeElement, radioNodes[2]);
+        await call(() => succeed(writes[1]));
+        assert.equal(g.document.activeElement, radioNodes[2]);
+      } finally {
+        for (const write of writes) {
+          if (!write.settled) await call(() => succeed(write));
+        }
+        g.__settingsIpc = originalIpc;
+      }
+    },
+  );
+}

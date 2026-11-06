@@ -2,6 +2,7 @@
 // invoke / listen / 剪贴板调用、保存回滚与用户反馈集中在这里。
 
 import React from "react";
+import { useQuitInteractionGate } from "./quit-interaction-context";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -50,15 +51,16 @@ const apiKeyRequests = new ApiKeyRequests();
 function useCredentialDraft(
   lifecycle: React.MutableRefObject<{ active: boolean; generation: number }>,
 ) {
+  const interactionGate = useQuitInteractionGate();
   const draft = React.useRef(new CredentialDraft());
   const [value, setValue] = React.useState("");
   const edit = React.useCallback(
     (next: string) => {
-      if (!lifecycle.current.active) return;
+      if (!lifecycle.current.active || !interactionGate.allowed()) return;
       draft.current.edit(next);
       setValue(next);
     },
-    [lifecycle],
+    [lifecycle, interactionGate],
   );
   const clear = React.useCallback(() => {
     if (!lifecycle.current.active) return;
@@ -119,6 +121,7 @@ export type SettingsState = {
 };
 
 export function useSettingsState(): SettingsState {
+  const interactionGate = useQuitInteractionGate();
   const lifecycle = React.useRef({ active: true, generation: 0 });
   const {
     draft: keyDraft,
@@ -437,8 +440,9 @@ export function useSettingsState(): SettingsState {
   }, [capturePage, tokenDraft]);
 
   const pasteApiKey = React.useCallback(async () => {
+    const allowed = interactionGate.capture();
     const current = capturePage();
-    if (!current()) return;
+    if (!current() || !allowed()) return;
     const owner = keyFeedback.current.begin(
       keyDraft.current.revision,
       "正在读取剪贴板…",
@@ -448,6 +452,7 @@ export function useSettingsState(): SettingsState {
       const text = await navigator.clipboard.readText();
       if (
         !current() ||
+        !allowed() ||
         !keyFeedback.current.ownsIntent(owner, keyDraft.current.revision)
       )
         return;
@@ -455,7 +460,7 @@ export function useSettingsState(): SettingsState {
       keyFeedback.current.begin(keyDraft.current.revision, "已从剪贴板读取");
       setStatus(keyFeedback.current.status);
     } catch {
-      if (!current()) return;
+      if (!current() || !allowed()) return;
       keyFeedback.current.update(
         owner,
         keyDraft.current.revision,
@@ -463,13 +468,17 @@ export function useSettingsState(): SettingsState {
       );
       setStatus(keyFeedback.current.status);
     }
-  }, [editApiKey, keyDraft, capturePage]);
+  }, [editApiKey, keyDraft, capturePage, interactionGate]);
 
-  const keySaves = React.useRef(new Map<number, Promise<boolean>>());
+  const keySaves = React.useRef(
+    new Map<number, { promise: Promise<boolean>; current: () => boolean }>(),
+  );
   const saveKeySnapshot = React.useCallback(
     (submitted: CredentialSnapshot): Promise<boolean> => {
+      const allowed = interactionGate.capture();
+      if (!allowed()) return Promise.resolve(false);
       const pending = keySaves.current.get(submitted.revision);
-      if (pending) return pending;
+      if (pending?.current()) return pending.promise;
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
       const feedbackOwner =
@@ -483,21 +492,26 @@ export function useSettingsState(): SettingsState {
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
         isCurrentApiKeyOperation(operation);
+      const ownsSubmission = () => current() && allowed();
       const saving = (async () => {
         setBusy(true);
         setStatus(keyFeedback.current.status);
         try {
           const { config: nextConfig, balance } = await apiKeyRequests.save(
             requestId,
-            (supersededRequestIds) =>
-              invoke<SavedApiKey>("save_api_key", {
+            (supersededRequestIds) => {
+              // Clear can hold this operation behind an await. An intervening
+              // exit attempt revokes it even if exit has already failed.
+              if (!ownsSubmission()) throw new Error("保存请求已撤销");
+              return invoke<SavedApiKey>("save_api_key", {
                 apiKey: submitted.value,
                 requestId,
                 supersededRequestIds,
-              }),
+              });
+            },
           );
           setCommittedConfig(nextConfig, balance);
-          if (!current() || !isCurrentCredential(nextConfig, "apiKey"))
+          if (!ownsSubmission() || !isCurrentCredential(nextConfig, "apiKey"))
             return false;
           const symbol = currencySymbol(balance.currency);
           const tip = balance.isAvailable ? "" : "（余额不足）";
@@ -511,7 +525,7 @@ export function useSettingsState(): SettingsState {
           setStatus(keyFeedback.current.status);
           return true;
         } catch (error) {
-          if (current()) {
+          if (ownsSubmission()) {
             keyFeedback.current.update(
               feedbackOwner,
               keyDraft.current.revision,
@@ -523,11 +537,17 @@ export function useSettingsState(): SettingsState {
         } finally {
           if (current()) setBusy(false);
         }
-      })().finally(() => keySaves.current.delete(submitted.revision));
-      keySaves.current.set(submitted.revision, saving);
+      })().finally(() => {
+        if (keySaves.current.get(submitted.revision)?.promise === saving)
+          keySaves.current.delete(submitted.revision);
+      });
+      keySaves.current.set(submitted.revision, {
+        promise: saving,
+        current: ownsSubmission,
+      });
       return saving;
     },
-    [commitApiKey, keyDraft],
+    [commitApiKey, keyDraft, interactionGate],
   );
   const saveApiKey = React.useCallback(
     () => saveKeySnapshot(keyDraft.current.snapshot()),
@@ -581,8 +601,9 @@ export function useSettingsState(): SettingsState {
   }, [keyDraft, commitApiKey]);
 
   const pasteUsageToken = React.useCallback(async () => {
+    const allowed = interactionGate.capture();
     const current = capturePage();
-    if (!current()) return;
+    if (!current() || !allowed()) return;
     const owner = tokenFeedback.current.begin(
       tokenDraft.current.revision,
       "正在读取剪贴板…",
@@ -592,6 +613,7 @@ export function useSettingsState(): SettingsState {
       const text = await navigator.clipboard.readText();
       if (
         !current() ||
+        !allowed() ||
         !tokenFeedback.current.ownsIntent(owner, tokenDraft.current.revision)
       )
         return;
@@ -602,7 +624,7 @@ export function useSettingsState(): SettingsState {
       );
       setUsageStatus(tokenFeedback.current.status);
     } catch {
-      if (!current()) return;
+      if (!current() || !allowed()) return;
       tokenFeedback.current.update(
         owner,
         tokenDraft.current.revision,
@@ -610,11 +632,12 @@ export function useSettingsState(): SettingsState {
       );
       setUsageStatus(tokenFeedback.current.status);
     }
-  }, [editUsageToken, tokenDraft, capturePage]);
+  }, [editUsageToken, tokenDraft, capturePage, interactionGate]);
 
   const startUsageSync = React.useCallback(() => {
+    const allowed = interactionGate.capture();
     const current = capturePage();
-    if (!current()) return;
+    if (!current() || !allowed()) return;
     tokenFeedback.current.supersedeCleanup();
     const requestId = newUsageSyncRequest();
     syncOwner.current.begin(requestId);
@@ -625,15 +648,27 @@ export function useSettingsState(): SettingsState {
     );
     syncFeedbackOwner.current = { requestId, feedback };
     const sequence = ++syncRequestId.current;
+    let revokedBeforeSend = false;
     setUsageSyncing(true);
     setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
-      .start(requestId, (supersededRequestIds) =>
-        invoke<UsageSyncStarted>("start_usage_sync", {
+      .start(requestId, (supersededRequestIds) => {
+        // Clear/Forget may hold this login across page changes or an exit
+        // attempt. Unlocking after failed exit must not revive the old login.
+        if (
+          !current() ||
+          !allowed() ||
+          sequence !== syncRequestId.current ||
+          !syncOwner.current.owns(requestId)
+        ) {
+          revokedBeforeSend = true;
+          throw new Error("同步请求已撤销");
+        }
+        return invoke<UsageSyncStarted>("start_usage_sync", {
           requestId,
           supersededRequestIds,
-        }),
-      )
+        });
+      })
       .then(async (result) => {
         if (
           !current() ||
@@ -692,16 +727,21 @@ export function useSettingsState(): SettingsState {
         )
           return;
         setUsageSyncing(false);
+        if (
+          revokedBeforeSend &&
+          syncFeedbackOwner.current?.feedback === feedback
+        )
+          syncFeedbackOwner.current = null;
         tokenFeedback.current.update(
           feedback,
           tokenDraft.current.revision,
-          errorMessage(error),
+          revokedBeforeSend ? null : errorMessage(error),
           true,
           "sync",
         );
         setUsageStatus(tokenFeedback.current.status);
       });
-  }, [capturePage, tokenDraft]);
+  }, [capturePage, tokenDraft, interactionGate]);
 
   const cancelUsageSync = React.useCallback(() => {
     const current = capturePage();
@@ -800,7 +840,8 @@ export function useSettingsState(): SettingsState {
   );
   const saveTokenSnapshot = React.useCallback(
     (submitted: CredentialSnapshot): Promise<boolean> => {
-      if (!lifecycle.current.active || !submitted.value.trim())
+      const allowed = interactionGate.capture();
+      if (!allowed() || !lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
       tokenFeedback.current.supersedeCleanup();
       const feedback =
@@ -822,6 +863,7 @@ export function useSettingsState(): SettingsState {
         lifecycle.current.active &&
         lifecycle.current.generation === generation &&
         isCurrentUsageTokenOperation(operation);
+      const ownsSubmission = () => current() && allowed();
       const requestId = newUsageSyncRequest();
       syncOwner.current.begin(requestId);
       syncFeedbackOwner.current = null;
@@ -834,15 +876,20 @@ export function useSettingsState(): SettingsState {
         try {
           const nextConfig = await usageSyncRequests.start(
             requestId,
-            (supersededRequestIds) =>
-              invoke<AppConfig>("save_usage_token", {
+            (supersededRequestIds) => {
+              if (!ownsSubmission()) throw new Error("保存请求已撤销");
+              return invoke<AppConfig>("save_usage_token", {
                 usageToken: submitted.value,
                 requestId,
                 supersededRequestIds,
-              }),
+              });
+            },
           );
           setCommittedConfig(nextConfig);
-          if (!current() || !isCurrentCredential(nextConfig, "usageToken"))
+          if (
+            !ownsSubmission() ||
+            !isCurrentCredential(nextConfig, "usageToken")
+          )
             return false;
           const ownsReceipt =
             syncOwner.current.owns(requestId) &&
@@ -856,7 +903,7 @@ export function useSettingsState(): SettingsState {
           setUsageStatus(tokenFeedback.current.status);
           return true;
         } catch (error) {
-          if (current() && syncOwner.current.owns(requestId)) {
+          if (ownsSubmission() && syncOwner.current.owns(requestId)) {
             tokenFeedback.current.update(
               owner.feedback,
               tokenDraft.current.revision,
@@ -876,12 +923,12 @@ export function useSettingsState(): SettingsState {
       tokenSaves.current.set(submitted.revision, {
         promise: saving,
         owner,
-        current,
+        current: ownsSubmission,
         requestId,
       });
       return saving;
     },
-    [commitUsageToken, tokenDraft],
+    [commitUsageToken, tokenDraft, interactionGate],
   );
   const saveUsageToken = React.useCallback(
     () => saveTokenSnapshot(tokenDraft.current.snapshot()),
@@ -1014,11 +1061,13 @@ export function useSettingsState(): SettingsState {
         lifecycle.current.active &&
         (keyDraft.current.dirty || tokenDraft.current.dirty);
       const prepareSave = () => {
+        const allowed = interactionGate.capture();
         const key = keyDraft.current.snapshot();
         const token = tokenDraft.current.snapshot();
         const generation = lifecycle.current.generation;
         return async () => {
           if (
+            !allowed() ||
             !lifecycle.current.active ||
             lifecycle.current.generation !== generation
           )
@@ -1026,13 +1075,14 @@ export function useSettingsState(): SettingsState {
           const results: boolean[] = [];
           if (key.value.trim()) results.push(await saveKeyRef.current(key));
           if (
+            !allowed() ||
             !lifecycle.current.active ||
             lifecycle.current.generation !== generation
           )
             return false;
           if (token.value.trim())
             results.push(await saveTokenRef.current(token));
-          return results.every(Boolean) && !dirty();
+          return allowed() && results.every(Boolean) && !dirty();
         };
       };
       register({
@@ -1050,7 +1100,7 @@ export function useSettingsState(): SettingsState {
         },
       });
     },
-    [keyDraft, discardApiKey, tokenDraft, discardUsageToken],
+    [keyDraft, discardApiKey, tokenDraft, discardUsageToken, interactionGate],
   );
 
   const saveRefreshInterval = React.useCallback(
@@ -1184,9 +1234,13 @@ export function useSettingsState(): SettingsState {
     busy: busy || cleanupPending,
     appVersion,
     apiKey,
-    setApiKey,
+    setApiKey: (value) => {
+      if (interactionGate.allowed()) setApiKey(value);
+    },
     usageToken,
-    setUsageToken,
+    setUsageToken: (value) => {
+      if (interactionGate.allowed()) setUsageToken(value);
+    },
     refresh,
     autoRefresh,
     autostart,
@@ -1194,19 +1248,43 @@ export function useSettingsState(): SettingsState {
     settingErrors,
     usageSyncing,
     showManualPaste,
-    setShowManualPaste,
-    saveApiKey,
-    clearApiKey,
-    pasteApiKey,
-    saveUsageToken,
-    clearUsageToken,
-    forgetUsageSession,
-    pasteUsageToken,
-    startUsageSync,
-    cancelUsageSync,
-    saveRefreshInterval,
-    saveAutoRefreshEnabled,
-    saveAutostart,
+    setShowManualPaste: (value) => {
+      if (interactionGate.allowed()) setShowManualPaste(value);
+    },
+    saveApiKey: () =>
+      interactionGate.allowed() ? saveApiKey() : Promise.resolve(false),
+    clearApiKey: () => {
+      if (interactionGate.allowed()) clearApiKey();
+    },
+    pasteApiKey: () => {
+      if (interactionGate.allowed()) return pasteApiKey();
+    },
+    saveUsageToken: () =>
+      interactionGate.allowed() ? saveUsageToken() : Promise.resolve(false),
+    clearUsageToken: () => {
+      if (interactionGate.allowed()) clearUsageToken();
+    },
+    forgetUsageSession: () => {
+      if (interactionGate.allowed()) forgetUsageSession();
+    },
+    pasteUsageToken: () => {
+      if (interactionGate.allowed()) return pasteUsageToken();
+    },
+    startUsageSync: () => {
+      if (interactionGate.allowed()) startUsageSync();
+    },
+    cancelUsageSync: () => {
+      if (interactionGate.allowed()) cancelUsageSync();
+    },
+    saveRefreshInterval: (value) => {
+      if (interactionGate.allowed()) saveRefreshInterval(value);
+    },
+    saveAutoRefreshEnabled: (value) => {
+      if (interactionGate.allowed()) saveAutoRefreshEnabled(value);
+    },
+    saveAutostart: (value) => {
+      if (interactionGate.allowed()) saveAutostart(value);
+    },
     registerCredentialBlocker,
   };
 }

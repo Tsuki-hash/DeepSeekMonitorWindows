@@ -37,12 +37,12 @@ export function QuitRecovery({
               : "正在恢复退出监听…"}
           </strong>
           <p>
-            退出监听注册失败。恢复后请再次选择托盘退出，或使用下方安全退出。
+            退出监听或请求同步失败。重试后会继续处理尚未接收的退出请求，也可使用下方安全退出。
           </p>
           <button
             type="button"
             className="secondary"
-            disabled={state.listener === "registering"}
+            disabled={busy || state.listener === "registering"}
             onClick={onRetryListener}
           >
             {state.listener === "registering" ? "正在重试…" : "重试退出监听"}
@@ -60,6 +60,7 @@ export function QuitRecovery({
           {state.command === "confirmed"
             ? "退出请求已提交，正在关闭…"
             : "正在请求退出…"}
+          为保护修改，编辑和页面切换已暂停。
         </p>
       ) : (
         <p>安全退出仍会先询问如何处理未保存的修改。</p>

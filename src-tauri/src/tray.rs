@@ -435,6 +435,12 @@ impl MainWindowActions for NativeMainWindow<'_> {
             .map_err(|error| error.to_string())
     }
     fn emit_quit(&self) -> Result<(), String> {
+        // Commit intent before the best-effort wake. A missing JS listener or
+        // failed emit cannot erase it; the post-listen handshake reads it.
+        self.0
+            .app_handle()
+            .state::<crate::quit_intent::QuitIntent>()
+            .publish()?;
         self.0
             .emit(EVENT_QUIT_REQUESTED, ())
             .map_err(|error| error.to_string())
@@ -475,7 +481,7 @@ pub(crate) fn hide_main_window_inner(window: &WebviewWindow) -> Result<(), Strin
 ///
 /// 旧实现从托盘右键「退出」直接结束进程，前端已经建立的
 /// 「保存/放弃/留在此页」草稿协商完全被绕过：未保存的提醒阈值或采集目录
-/// 被静默丢弃。现在托盘先唤出主窗口、发出**唯一** quit intent，由前端
+/// 被静默丢弃。现在托盘先唤出主窗口、保留单调 quit intent 并唤醒前端，由前端
 /// 草稿会话处理；用户确认（无草稿 / 已保存 / 已放弃）后由受主窗口权限
 /// 限制的 `confirm_quit` 命令真正退出。
 pub(crate) const EVENT_QUIT_REQUESTED: &str = "quit-requested";
@@ -483,8 +489,8 @@ pub(crate) const EVENT_QUIT_REQUESTED: &str = "quit-requested";
 /// 复评 F11：请求退出 —— 唤出窗口并交给前端协商。
 pub(crate) fn request_quit(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
-        // 没有主窗口可协商（极端情况）：保持原行为，避免退出无界等待。
-        app.exit(0);
+        // 无主窗口就无法完成草稿协商；绝不能退回原生直接退出。
+        log::warn!("主窗口不可用，未提交退出请求");
         return;
     };
     dispatch_main_window_intent(&window, MainWindowIntent::Quit);

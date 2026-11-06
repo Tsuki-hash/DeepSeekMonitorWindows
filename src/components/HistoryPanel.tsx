@@ -17,7 +17,7 @@ import { fetchMonthUsage } from "../usage-api";
 import { historyCache, HistoryCacheFailure } from "../history-cache";
 import {
   buildHistory,
-  historyWindow,
+  resolveHistoryWindow,
   historyDates,
   historyExport,
   returnedHistoryModels,
@@ -32,7 +32,11 @@ import {
 } from "../history-failure";
 import type { HistoryRange, HistorySnapshot } from "../history";
 import type { WindowVisibilityGate } from "../window-visibility-gate";
-import { getCommittedConfig, subscribeCommittedConfig } from "../config-store";
+import {
+  getCommittedConfig,
+  getConfigSubscriptionReady,
+  subscribeCommittedConfig,
+} from "../config-store";
 
 // 复评 R17：顶部/趋势合计改用共享的安全版本（Token 检查安全整数，
 // 金额只检查有限），不再用裸 reduce 产生不安全整数。
@@ -85,6 +89,7 @@ export function HistoryPanel({
   const [showUnused, setShowUnused] = React.useState(false);
   const [storedSelected, setSelected] = React.useState("");
   const missingModelHintId = React.useId();
+  const invalidRangeHintId = React.useId();
   const [storedSnapshot, setSnapshot] = React.useState<HistorySnapshot | null>(
     null,
   );
@@ -115,6 +120,7 @@ export function HistoryPanel({
   configStateRef.current = { configReady, configReadError };
   const configBlocked = React.useCallback(
     () =>
+      !getConfigSubscriptionReady() ||
       !configStateRef.current.configReady ||
       Boolean(
         configStateRef.current.configReadError ||
@@ -135,8 +141,15 @@ export function HistoryPanel({
     historyCache.subscribe,
     historyCache.epoch,
   );
-  // The display clock may invalidate the date label, never the request identity.
+  // Normal date ticks only change labels; invalid selections revoke old work.
   const date = todayStr();
+  const { window: currentWindow, error: rangeError } = resolveHistoryWindow(
+    range,
+    date,
+    selectedMonth,
+  );
+  const rangeSelectionRef = React.useRef({ range, selectedMonth });
+  rangeSelectionRef.current = { range, selectedMonth };
   const visibleRef = React.useRef(windowVisible);
   visibleRef.current = windowVisible;
   const configuredRef = React.useRef(usageTokenConfigured);
@@ -144,6 +157,38 @@ export function HistoryPanel({
   const requestInProgress = React.useRef(false);
   const needsInitialQuery = React.useRef(true);
   const sequence = React.useRef({ value: 0 });
+  const rangeRevoked = React.useRef(false);
+  const revokeRange = React.useCallback(() => {
+    if (rangeRevoked.current) return;
+    rangeRevoked.current = true;
+    sequence.current.value++;
+    requestInProgress.current = false;
+    historyCache.invalidate();
+    if (mounted.current) {
+      setBusy(false);
+      setClock(Date.now());
+    }
+  }, []);
+  const readCurrentWindow = React.useCallback(() => {
+    const selection = rangeSelectionRef.current;
+    const result = resolveHistoryWindow(
+      selection.range,
+      todayStr(),
+      selection.selectedMonth,
+    );
+    if (!result.window) {
+      // Event/continuation checks revoke before any React commit is needed.
+      revokeRange();
+    } else rangeRevoked.current = false;
+    return result.window;
+  }, [revokeRange]);
+  React.useLayoutEffect(() => {
+    // Persist the invalidity this committed render already observed. Reading
+    // the clock again could see recovery and lose the revocation (A → B → A).
+    // Run on every commit: a valid entry-point read can re-arm the gate even if
+    // two invalid renders have the same error text. Repeated revokes are no-ops.
+    if (rangeError) revokeRange();
+  });
   const configurationRevoked = React.useRef(false);
   React.useEffect(() => {
     const synchronize = () => {
@@ -204,6 +249,7 @@ export function HistoryPanel({
   // passive reset effect: this includes model names and feedback, not just data.
   const ownsView =
     !queriesBlocked &&
+    !rangeError &&
     scopeEpoch.current === epoch &&
     epoch === historyCache.epoch();
   const snapshot =
@@ -227,10 +273,17 @@ export function HistoryPanel({
       if (!visibleRef.current || windowVisibilityGate?.isVisible() === false)
         return;
       if (configBlocked()) return;
+      const window = readCurrentWindow();
+      if (
+        !window ||
+        rangeSelectionRef.current.range !== range ||
+        (range === "custom" &&
+          rangeSelectionRef.current.selectedMonth !== selectedMonth)
+      )
+        return;
       const visibilityEpoch = windowVisibilityGate?.epoch();
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
-      const window = historyWindow(range, todayStr(), selectedMonth);
       const requestedScope: HistoryScope = {
         range,
         from: window.from,
@@ -304,12 +357,16 @@ export function HistoryPanel({
       // 复评 R04：所有写状态的地方都必须先确认「这次请求仍然有效」。
       // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
       const stillOwner = () =>
+        id === sequence.current.value &&
+        requestedEpoch === historyCache.epoch() &&
+        rangeSelectionRef.current.range === range &&
+        (range !== "custom" ||
+          rangeSelectionRef.current.selectedMonth === selectedMonth) &&
+        readCurrentWindow() !== null &&
         !configBlocked() &&
         visibleRef.current &&
         windowVisibilityGate?.isVisible() !== false &&
         windowVisibilityGate?.epoch() === visibilityEpoch &&
-        id === sequence.current.value &&
-        requestedEpoch === historyCache.epoch() &&
         scopeEpoch.current === requestedScope.epoch;
       // 统一收尾：按月份合并（区分 attempted/successful/failed/unloaded），
       // 正常结束与提前停止走同一条边界计算（复评 F02/R02/R05）。
@@ -385,6 +442,11 @@ export function HistoryPanel({
                 // revoke trust after request() but before the actual IPC call.
                 if (configBlocked())
                   throw new Error("配置状态已变化，请重新读取配置");
+                if (
+                  !readCurrentWindow() ||
+                  !resolveHistoryWindow(range, todayStr(), selectedMonth).window
+                )
+                  throw new Error("历史区间已失效，请选择有效历史月份");
                 return fetchMonthUsage(number, year);
               },
               force,
@@ -452,7 +514,13 @@ export function HistoryPanel({
       requestInProgress.current = false;
       setBusy(false);
     },
-    [range, selectedMonth, windowVisibilityGate, configBlocked],
+    [
+      range,
+      selectedMonth,
+      windowVisibilityGate,
+      configBlocked,
+      readCurrentWindow,
+    ],
   );
   const previousConfigError = React.useRef(publishedConfigError);
   React.useEffect(() => {
@@ -490,7 +558,7 @@ export function HistoryPanel({
   };
   React.useEffect(() => {
     // Selection, credential epoch and configuration trust changes clear data.
-    // A display clock tick must not discard loaded batches or model filters.
+    // Ordinary date ticks preserve batches/filters; an invalid range cannot.
     sequence.current.value++;
     requestInProgress.current = false;
     needsInitialQuery.current = true;
@@ -512,7 +580,7 @@ export function HistoryPanel({
     return () => {
       owner.value++;
     };
-  }, [request, epoch, configReady, configurationError]);
+  }, [request, epoch, configReady, configurationError, rangeError]);
   const previousVisible = React.useRef(windowVisible);
   React.useEffect(() => {
     const wasVisible = previousVisible.current;
@@ -524,7 +592,8 @@ export function HistoryPanel({
     if (wasVisible) return;
     setClock(Date.now());
     const retained = snapshotRef.current;
-    const nextWindow = historyWindow(range, todayStr(), selectedMonth);
+    const nextWindow = readCurrentWindow();
+    if (!nextWindow) return;
     // Showing the native window is an explicit refresh opportunity, matching
     // App's tray contract. A fixed historical month has no new date window.
     // A failed-only snapshot still has committed coverage and a retry cursor.
@@ -546,11 +615,21 @@ export function HistoryPanel({
         changedMonths.length ? changedMonths : nextWindow.months.slice(-1),
       );
     }
-  }, [windowVisible, range, selectedMonth, request, stopForVisibility]);
+  }, [
+    windowVisible,
+    range,
+    selectedMonth,
+    request,
+    stopForVisibility,
+    readCurrentWindow,
+  ]);
   React.useEffect(() => {
-    const tick = () => setClock(Date.now());
+    const tick = () => {
+      readCurrentWindow();
+      setClock(Date.now());
+    };
     const timer = window.setInterval(tick, 60000);
-    // Browser wake-up only updates labels. Native show above owns any query.
+    // Browser wake-up updates labels and validates the range, never starts IPC.
     const onVisible = () => {
       if (document.visibilityState === "visible") tick();
     };
@@ -559,9 +638,7 @@ export function HistoryPanel({
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
-
-  const currentWindow = historyWindow(range, date, selectedMonth);
+  }, [readCurrentWindow]);
   // Recovery belongs to the current account/selection, and retries only the
   // failures still inside today's window. Derive this on every render: a
   // cancelled retry must neither hide surviving failures nor revive an expired
@@ -573,9 +650,10 @@ export function HistoryPanel({
     committedScope?.epoch === historyCache.epoch() &&
     committedScope.range === range &&
     (range !== "custom" || committedScope.from.slice(0, 7) === selectedMonth);
-  const retryableFailed = ownsRecovery
-    ? failedMonthsOnly(failed, currentWindow.months)
-    : [];
+  const retryableFailed =
+    ownsRecovery && currentWindow
+      ? failedMonthsOnly(failed, currentWindow.months)
+      : [];
   const recoveryAction = !ownsRecovery
     ? null
     : retryableFailed.length
@@ -587,6 +665,7 @@ export function HistoryPanel({
         : recovery;
   const windowOutdated = Boolean(
     snapshot &&
+    currentWindow &&
     (snapshot.window.from !== currentWindow.from ||
       snapshot.window.to !== currentWindow.to),
   );
@@ -699,6 +778,10 @@ export function HistoryPanel({
   const download = (format: "csv" | "json") => {
     if (
       configBlocked() ||
+      !readCurrentWindow() ||
+      rangeSelectionRef.current.range !== range ||
+      (range === "custom" &&
+        rangeSelectionRef.current.selectedMonth !== selectedMonth) ||
       !snapshot ||
       busy ||
       // Check this callback's immutable render epoch and snapshot identity.
@@ -743,7 +826,9 @@ export function HistoryPanel({
         <button
           className="history-icon-button"
           aria-label="重新查询历史"
-          disabled={busy || !windowVisible || queriesBlocked}
+          disabled={
+            busy || !windowVisible || queriesBlocked || Boolean(rangeError)
+          }
           onClick={() => void request(true)}
         >
           <RefreshCw size={18} className={busy ? "refresh-spin" : undefined} />
@@ -791,6 +876,15 @@ export function HistoryPanel({
             : "窗口不可见或状态尚未确认，历史查询已暂停。确认窗口可见后可重新查询；已取得记录保留。"}
         </p>
       )}
+      {rangeError && (
+        <p
+          id={invalidRangeHintId}
+          className="history-message warning"
+          role="alert"
+        >
+          {rangeError} 历史查询和导出已暂停。
+        </p>
+      )}
       <div className="history-range" role="group" aria-label="历史统计区间">
         {(
           [
@@ -818,17 +912,12 @@ export function HistoryPanel({
             type="month"
             disabled={!windowVisible || queriesBlocked}
             aria-label="历史月份"
+            aria-invalid={Boolean(rangeError)}
+            aria-describedby={rangeError ? invalidRangeHintId : undefined}
             min="2020-01"
             max={date.slice(0, 7)}
             value={selectedMonth}
-            onChange={(event) => {
-              if (
-                event.target.value &&
-                event.target.value >= "2020-01" &&
-                event.target.value <= date.slice(0, 7)
-              )
-                setSelectedMonth(event.target.value);
-            }}
+            onChange={(event) => setSelectedMonth(event.target.value)}
           />
         </label>
       )}

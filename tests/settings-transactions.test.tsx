@@ -66,6 +66,8 @@ let calls = [];
 let handlers = {};
 let fixtureRevision = 0;
 let fixtureSyncGeneration = 0;
+let quitIssued = 0;
+let quitAcknowledged = 0;
 const syncStatus = (requestId = null, active = false, kind = "web") => ({
   generation: ++fixtureSyncGeneration,
   requestId,
@@ -120,6 +122,11 @@ g.__settingsIpc = async (command, args) => {
   calls.push({ command, args });
   if (handlers[command]) return handlers[command](args);
   switch (command) {
+    case "get_pending_quit_intent":
+      return quitIssued > quitAcknowledged ? String(quitIssued) : null;
+    case "acknowledge_quit_intent":
+      quitAcknowledged = Math.max(quitAcknowledged, Number(args.intent));
+      return null;
     case "get_app_config":
       return { ...config };
     case "get_usage_sync_status":
@@ -238,6 +245,7 @@ const change = async (label, value) => {
   await flush();
 };
 const emit = async (name, payload) => {
+  if (name === "quit-requested") quitIssued += 1;
   await act(async () => {
     for (const fn of g.__settingsListeners.get(name) ?? []) fn({ payload });
   });
@@ -291,6 +299,7 @@ function scenario(name, body) {
   for (const concurrent of [false, true])
     test(`${name} (${concurrent ? "concurrent" : "legacy"}, StrictMode)`, async () => {
       calls = [];
+      quitAcknowledged = quitIssued;
       handlers = {};
       config = baseConfig();
       alerts = defaultAlerts();

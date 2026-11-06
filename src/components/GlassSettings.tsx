@@ -1,4 +1,5 @@
 import React from "react";
+import { useQuitInteractionGate } from "../quit-interaction-context";
 import {
   alphaFromTransparency,
   clampGlass,
@@ -57,8 +58,10 @@ export function applyStoredGlass() {
   return transparency;
 }
 export function GlassSettings() {
+  const interactionGate = useQuitInteractionGate();
   const [value, setValue] = React.useState(applyStoredGlass);
   const update = (next: number) => {
+    if (!interactionGate.allowed()) return;
     localStorage.setItem(GLASS_KEY, String(next));
     applyStoredGlass();
     setValue(next);

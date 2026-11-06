@@ -24,6 +24,18 @@ export const markBalanceObserved = (revision: number | undefined) => {
 };
 const listeners = new Set<() => void>();
 
+// App owns the native subscription lifecycle. A known snapshot is not enough
+// while change delivery is unavailable: old callbacks must also fail closed.
+// Standalone consumers keep their existing contract until an App owner starts.
+let configSubscriptionReady = true;
+export const getConfigSubscriptionReady = () => configSubscriptionReady;
+export const setConfigSubscriptionReady = (ready: boolean) => {
+  if (configSubscriptionReady === ready) return;
+  configSubscriptionReady = ready;
+  if (!ready) validatedBalance = null;
+  for (const listener of listeners) listener();
+};
+
 export const getCommittedConfig = () => current;
 
 /** 当前提交代际：读取方在发起请求时捕获，返回时据此判断是否过期。 */
@@ -35,6 +47,17 @@ export const subscribeCommittedConfig = (listener: () => void) => {
     listeners.delete(listener);
   };
 };
+
+// Native snapshots share one process-local counter. Missing, rounded, or
+// otherwise incomparable versions cannot establish which account owns data.
+function requireConfigRevision(config: AppConfig) {
+  if (
+    !config ||
+    !Number.isSafeInteger(config.configRevision) ||
+    config.configRevision < 0
+  )
+    throw new Error("配置版本不可比较，请重新读取配置");
+}
 
 // Equal versions are idempotent only when every public field is equal. Never let
 // a caller display a different snapshot that the shared store did not accept.
@@ -63,6 +86,7 @@ export const setCommittedConfig = (
   config: AppConfig | null,
   balance?: BalanceData,
 ): boolean => {
+  if (config !== null) requireConfigRevision(config);
   if (config && current && config.configRevision === current.configRevision)
     requireSameSnapshot(config, current);
   const newer =
@@ -97,6 +121,7 @@ export const applyReadConfig = (
   config: AppConfig | null,
   startedAt: number,
 ): boolean => {
+  if (config !== null) requireConfigRevision(config);
   if (startedAt !== commitRevision) return false;
   if (config && current && config.configRevision < current.configRevision)
     return false;

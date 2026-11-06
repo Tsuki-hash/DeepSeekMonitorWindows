@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>R32 保存期间真实 DOM 焦点回归</title>
+    <style>
+      body {
+        font: 16px/1.6 sans-serif;
+        margin: 24px;
+      }
+      button,
+      input {
+        font: inherit;
+        margin: 6px;
+      }
+      :focus {
+        outline: 3px solid #155eef;
+        outline-offset: 2px;
+      }
+      [aria-disabled="true"] {
+        opacity: 0.65;
+      }
+      #fixture {
+        border: 1px solid #aaa;
+        padding: 16px;
+        min-height: 100px;
+      }
+      pre {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>R32 保存期间真实 DOM 焦点回归</h1>
+    <p>
+      待执行入口：通过项目现有 Vite 开发服务器打开
+      /tests/keyboard-save-focus.browser.html，再点击下方按钮。
+      本页只挂载生产提示与刷新间隔组件，不调用 Tauri、不保存配置或退出应用。
+    </p>
+    <p>
+      使用真实 createRoot、StrictMode、DOM 布局、focus 和 disabled 行为。
+      按键事件与 click 由程序派发，不替代真实 Enter/Space/Tab、读屏或
+      Windows/WebView2 验收。
+      测试期间请保持此窗口位于前台。代码提交时未执行本页。
+    </p>
+    <button id="run" type="button">运行真实 DOM 焦点回归</button>
+    <pre id="results" role="status">未执行</pre>
+    <div id="fixture"></div>
+    <script type="module" src="./keyboard-save-focus.browser.tsx"></script>
+  </body>
+</html>

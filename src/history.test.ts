@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   historyWindow,
+  resolveHistoryWindow,
   historyDates,
   isHistoryDate,
   buildHistory,
@@ -16,6 +17,46 @@ import {
 } from "./history.ts";
 import { HistoryCache } from "./history-cache.ts";
 import type { RawModelUsage, UsageResult } from "./types";
+
+test("R32：安全历史区间入口保留跨月回拨后的非法选择，不向 UI 抛异常", () => {
+  assert.equal(
+    resolveHistoryWindow("custom", "2026-11-01", "2026-11").error,
+    null,
+  );
+  const rolledBack = resolveHistoryWindow("custom", "2026-10-31", "2026-11");
+  assert.equal(rolledBack.window, null);
+  assert.ok(rolledBack.error?.includes("请选择有效历史月份"));
+  assert.ok(rolledBack.error?.includes("当前选择已保留"));
+  const recovered = resolveHistoryWindow("custom", "2026-10-31", "2026-10");
+  assert.equal(recovered.error, null);
+  assert.deepEqual(
+    recovered.window,
+    historyWindow("custom", "2026-10-31", "2026-10"),
+  );
+  for (const month of ["", "2019-12", "2026-13", "not-a-month"])
+    assert.equal(
+      resolveHistoryWindow("custom", "2026-10-31", month).window,
+      null,
+    );
+});
+
+test("R32：所有 UI 区间入口对无效系统日期返回错误，对正常日期保持原口径", () => {
+  for (const range of [
+    "month",
+    "previous",
+    "30days",
+    "custom",
+    "all",
+  ] as const) {
+    for (const date of ["invalid-date", "2026-02-30"])
+      assert.equal(resolveHistoryWindow(range, date, "2026-10").window, null);
+    assert.deepEqual(
+      resolveHistoryWindow(range, "2026-11-01", "2026-10").window,
+      historyWindow(range, "2026-11-01", "2026-10"),
+    );
+  }
+});
+
 const model = (name = "new-model"): RawModelUsage => ({
   model: name,
   groupKey: null,

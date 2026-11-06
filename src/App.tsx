@@ -22,6 +22,11 @@ import { balancePublishable } from "./refresh-policy";
 import { useChannelScheduler } from "./use-channel-scheduler";
 import { WindowVisibilityGate } from "./window-visibility-gate";
 import { useQuitRequest } from "./use-quit-request";
+import { QuitInteractionGate } from "./quit-interaction";
+import {
+  QuitInteractionContext,
+  useQuitInteractionBoundary,
+} from "./quit-interaction-context";
 import { QuitRecovery, quitRecoveryVisible } from "./components/QuitRecovery";
 import {
   initialChannelState,
@@ -46,12 +51,12 @@ import { LeaveDecisionRunner } from "./leave-guard";
 import type { LeaveDecision } from "./leave-guard";
 import { LeavePromptDialog } from "./components/LeavePromptDialog";
 import {
-  applyReadConfig,
-  getCommitRevision,
   getCommittedConfig,
+  getConfigSubscriptionReady,
   getValidatedBalance,
   markBalanceObserved,
   setCommittedConfig,
+  setConfigSubscriptionReady,
   subscribeCommittedConfig,
 } from "./config-store";
 
@@ -73,6 +78,7 @@ type ViewFocusRequest = {
 };
 
 function App() {
+  const [quitInteractionGate] = React.useState(() => new QuitInteractionGate());
   // 页面与导航代际一起提交，不能让旧 RAF 误认并发渲染中的新页面。
   const [page, setPage] = React.useState<{
     view: ViewName;
@@ -81,6 +87,7 @@ function App() {
   }>({ view: "dashboard", navigationId: 0, settingsTarget: null });
   const { view } = page;
   const stageRef = React.useRef<HTMLDivElement>(null);
+  useQuitInteractionBoundary(quitInteractionGate, stageRef);
   const committedPage = React.useRef(page);
   const navigationId = React.useRef(0);
   const focusFrame = React.useRef<number | null>(null);
@@ -123,6 +130,7 @@ function App() {
       origin: DetailFocusOrigin | null = null,
       target: SettingsFocusTarget = null,
     ) => {
+      if (!quitInteractionGate.allowed()) return navigationId.current;
       cancelViewFocus();
       const nextId = ++navigationId.current;
       const settingsTarget = nextView === "settings" ? target : null;
@@ -145,7 +153,7 @@ function App() {
       setPage({ view: nextView, navigationId: nextId, settingsTarget });
       return nextId;
     },
-    [cancelViewFocus],
+    [cancelViewFocus, quitInteractionGate],
   );
   // 全局离开拦截（复评 F09）：任何导航出口都先问 blocker，草稿不再被静默丢弃。
   const { blocker: leaveBlocker, register: registerLeaveBlocker } =
@@ -255,7 +263,11 @@ function App() {
     (silent = false) => {
       // 配置不可读不是「尚未配置」。错误快照拥有账户状态，重读恢复前
       // 不再让手动刷新、托盘唤出或调度器覆盖这个错误与撤销结果。
-      if (getCommittedConfig()?.configReadError) return Promise.resolve();
+      if (
+        !getConfigSubscriptionReady() ||
+        getCommittedConfig()?.configReadError
+      )
+        return Promise.resolve();
       const requestId = ++balanceRequestId.current;
       const credentialRevision = getCommittedConfig()?.apiKeyRevision;
       if (silent) {
@@ -264,7 +276,14 @@ function App() {
         setBalanceState("loading");
       }
       return balanceGate.current
-        .run(() => invoke<BalanceData>("fetch_balance"))
+        .run(() => {
+          if (
+            !getConfigSubscriptionReady() ||
+            getCommittedConfig()?.configReadError
+          )
+            throw new Error("账户配置同步尚未就绪，请恢复同步后重试");
+          return invoke<BalanceData>("fetch_balance");
+        })
         .then((data) => {
           if (requestId !== balanceRequestId.current) {
             return;
@@ -324,7 +343,11 @@ function App() {
   const usageSnapshot = React.useRef<UsageResult | null>(null);
   const loadUsage = React.useCallback(
     (silent = false) => {
-      if (getCommittedConfig()?.configReadError) return Promise.resolve();
+      if (
+        !getConfigSubscriptionReady() ||
+        getCommittedConfig()?.configReadError
+      )
+        return Promise.resolve();
       const requestId = ++usageRequestId.current;
       const retained = currentUsageSnapshot(usageSnapshot.current, todayStr());
       usageSnapshot.current = retained;
@@ -410,6 +433,18 @@ function App() {
     usageTokenConfigured: boolean;
     configReadError: string | null;
   } | null>(null);
+  const [configSubscriptionState, setConfigSubscriptionState] = React.useState<
+    "loading" | "ready" | "failed"
+  >("loading");
+  const [configSubscriptionAttempt, retryConfigSubscription] = React.useReducer(
+    (attempt: number) => attempt + 1,
+    0,
+  );
+  const configObserver = React.useRef<{
+    active: () => boolean;
+    subscribed: boolean;
+    fail: () => void;
+  } | null>(null);
 
   // Application ownership is independent of the settings page. Every committed
   // credential version invalidates the old account's requests, data and tray.
@@ -420,6 +455,39 @@ function App() {
     const synchronize = () => {
       const next = getCommittedConfig();
       const previous = observedCredentials.current;
+      if (!getConfigSubscriptionReady()) {
+        // Subscription uncertainty revokes the account, not only its labels.
+        // Keep the committed revision for stale-read rejection, but no data or
+        // cache may remain usable until live listeners and a snapshot agree.
+        observedCredentials.current = null;
+        observedBalance.current = null;
+        invalidateAccountFocus();
+        balanceRequestId.current += 1;
+        balanceGate.current.invalidate();
+        usageRequestId.current += 1;
+        invalidateUsageRequests();
+        availableSnapshot.current = { balance: false, usage: false };
+        usageSnapshot.current = null;
+        setConfigSnapshot(null);
+        setAutoRefreshEnabled(false);
+        setBalance(null);
+        setBalanceUpdatedAt(null);
+        setBalanceCredentialValid(false);
+        setUsage(null);
+        setUsageUpdatedAt(null);
+        setBalanceState("loading");
+        setUsageState("loading");
+        setBalanceError("");
+        setUsageError("");
+        setBalanceErrorCode(undefined);
+        setUsageErrorCode(undefined);
+        trayPublisher.current?.update({
+          total: null,
+          currency: null,
+          stale: false,
+        });
+        return;
+      }
       if (!next) {
         if (previous) invalidateAccountFocus();
         observedCredentials.current = null;
@@ -574,28 +642,146 @@ function App() {
     return unsubscribe;
   }, [applyChannel, loadBalance, loadUsage, invalidateAccountFocus]);
 
-  // Reads only feed the committed store. Scheduler and onboarding state have
-  // one owner above; neither a stale GET nor its failure may reset them.
+  // Read/event arrival order is not backend commit order. A post-subscription
+  // read and a delayed event/receipt converge on the greatest configRevision.
   const reloadConfig = React.useCallback(() => {
-    const startedAt = getCommitRevision();
-    const snapshotAtStart = getCommittedConfig();
-    return invoke<AppConfig>("get_app_config")
-      .then((config) => {
-        applyReadConfig(config, startedAt);
-        return getCommittedConfig();
-      })
-      .catch(() =>
-        // A late read failure owns neither a newer commit nor another accepted
-        // read. In either case the current snapshot remains the result.
-        getCommitRevision() !== startedAt ||
-        getCommittedConfig() !== snapshotAtStart
-          ? getCommittedConfig()
-          : null,
-      );
+    const observer = configObserver.current;
+    if (!observer?.active() || !observer.subscribed)
+      return Promise.resolve(null);
+    const finish = () => {
+      if (configObserver.current !== observer || !observer.active())
+        return null;
+      const current = getCommittedConfig();
+      if (!current) {
+        observer.fail();
+        return null;
+      }
+      setConfigSubscriptionReady(true);
+      setConfigSubscriptionState("ready");
+      return current;
+    };
+    return invoke<AppConfig>("get_app_config").then(
+      (config) => {
+        if (configObserver.current !== observer || !observer.active())
+          return null;
+        try {
+          if (!config) throw new Error("缺少账户配置快照");
+          // Unlike a component's optional read, this snapshot closes the
+          // subscription gap. A local commit counter must not discard C(v3)
+          // merely because a delayed B(v2) event/write receipt arrived first.
+          // The store checks comparability/equal-version content and retains
+          // a newer whole snapshot if this read is older than that snapshot.
+          setCommittedConfig(config);
+        } catch {
+          observer.fail();
+          return null;
+        }
+        return finish();
+      },
+      () => {
+        if (configObserver.current !== observer || !observer.active())
+          return null;
+        // A failed optional reread does not mean working event subscriptions
+        // disappeared. During bootstrap, even a delivered event may predate
+        // the missed change: only a successful subscribed read closes the gap.
+        if (!getConfigSubscriptionReady()) observer.fail();
+        return null;
+      },
+    );
   }, []);
   React.useEffect(() => {
-    void reloadConfig();
-  }, [reloadConfig]);
+    let disposed = false;
+    let failed = false;
+    const unlisteners = new Set<() => void>();
+    const active = () => !disposed && !failed;
+    const release = (off: () => void) => {
+      try {
+        void Promise.resolve(off()).catch(() => undefined);
+      } catch {
+        // Callback ownership is revoked even if native cleanup fails.
+      }
+    };
+    const releaseAll = () => {
+      const registered = [...unlisteners];
+      unlisteners.clear();
+      registered.forEach(release);
+    };
+    const observer = {
+      active,
+      subscribed: false,
+      fail: () => {
+        if (!active()) return;
+        failed = true;
+        observer.subscribed = false;
+        setConfigSubscriptionReady(false);
+        setConfigSubscriptionState("failed");
+        releaseAll();
+      },
+    };
+    configObserver.current = observer;
+    setConfigSubscriptionReady(false);
+    setConfigSubscriptionState("loading");
+    const acceptConfig = (config: AppConfig | null | undefined) => {
+      if (!active()) return;
+      try {
+        if (!config) throw new Error("缺少账户配置快照");
+        setCommittedConfig(config);
+      } catch {
+        observer.fail();
+      }
+    };
+    const register = async (
+      name: string,
+      callback: (event: { payload: unknown }) => void,
+    ) => {
+      const off = await listen(name, (event) => {
+        if (active()) callback(event);
+      });
+      if (!active()) release(off);
+      else unlisteners.add(off);
+    };
+    void Promise.all([
+      register("usage-token-captured", ({ payload }) =>
+        acceptConfig((payload as UsageTokenCaptured | null)?.config),
+      ),
+      register("usage-token-cleared", ({ payload }) =>
+        acceptConfig(payload as AppConfig),
+      ),
+      register("credential-config-changed", ({ payload }) =>
+        acceptConfig(payload as AppConfig),
+      ),
+      register("browsing-data-cleared", () => {
+        const current = document.documentElement.getAttribute(THEME_ATTR);
+        localStorage.setItem(
+          THEME_STORAGE_KEY,
+          current === "dark" ? "dark" : "light",
+        );
+        localStorage.setItem(THEME_MIGRATION_KEY, "1");
+        applyStoredGlass();
+      }),
+    ])
+      .then(() => {
+        if (!active()) return;
+        observer.subscribed = true;
+        // Reads only begin after every listener is installed. A change before
+        // installation is in this snapshot; backend versions reconcile events.
+        void reloadConfig();
+      })
+      .catch(observer.fail);
+    return () => {
+      disposed = true;
+      observer.subscribed = false;
+      releaseAll();
+      if (configObserver.current === observer) {
+        configObserver.current = null;
+        setConfigSubscriptionReady(false);
+        balanceRequestId.current += 1;
+        balanceGate.current.invalidate();
+        usageRequestId.current += 1;
+        invalidateUsageRequests();
+      }
+    };
+  }, [configSubscriptionAttempt, reloadConfig]);
   const retrySettingsUpdate = React.useCallback(async () => {
     if (getCommittedConfig()?.configReadError) {
       // The unreadable snapshot intentionally blocks account fetches. Reread it
@@ -755,6 +941,7 @@ function App() {
   // 统一的导航出口：有未保存草稿时先拦下来，用户决定后再执行。
   const navigate = React.useCallback(
     (action: () => void) => {
+      if (!quitInteractionGate.allowed()) return;
       // 即使新意图被草稿拦截，旧页面的待执行焦点也不再拥有导航。
       cancelViewFocus();
       if (attemptLeave(leaveBlocker.current, action) === "blocked") {
@@ -774,18 +961,21 @@ function App() {
       // 现在无论走哪条分支，都先作废旧决策并清掉提示，再执行新动作。
       leaveRunner.current?.cancel();
     },
-    [leaveBlocker, cancelViewFocus],
+    [leaveBlocker, cancelViewFocus, quitInteractionGate],
   );
 
   // 复评 F11：托盘「退出」不再直接结束进程 —— 它先唤出窗口并发出唯一
   // quit intent，这里把它当作一次导航意图交给草稿会话：无草稿直接退出，
   // 有草稿则三选一，保存/放弃成功后才由 confirm_quit 真正退出。
-  const quitRequest = useQuitRequest(navigate);
+  const quitRequest = useQuitRequest(navigate, quitInteractionGate);
   const showRecovery =
-    visibilityError || quitRecoveryVisible(quitRequest.state);
+    visibilityError ||
+    configSubscriptionState !== "ready" ||
+    quitRecoveryVisible(quitRequest.state);
 
   const decideLeave = React.useCallback(
     (decision: LeaveDecision) => {
+      if (!quitInteractionGate.allowed()) return;
       if (!pendingLeave) return;
       if (decision === "cancel") {
         // 取消使当前令牌失效：保存途中迟到的成功也不得导航。
@@ -795,15 +985,16 @@ function App() {
       // 连点只认第一次：运行器在提交中忽略后续 decide。
       leaveRunner.current?.decide(decision);
     },
-    [pendingLeave],
+    [pendingLeave, quitInteractionGate],
   );
 
   const hideWindow = React.useCallback(() => {
+    if (!quitInteractionGate.allowed()) return;
     cancelViewFocus();
     void invoke("hide_main_window").catch(() => {
       // Browser preview has no Tauri IPC. Keep it non-blocking for visual checks.
     });
-  }, [cancelViewFocus]);
+  }, [cancelViewFocus, quitInteractionGate]);
 
   // 记账日期驱动（评审 P1：跨月后不能把旧累计称为「本月」）。
   // 独立于刷新路径：即使自动刷新关闭、用户一直开着面板，跨过北京时间月界时
@@ -848,44 +1039,6 @@ function App() {
       cancelled = true;
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, []);
-
-  // 无论设置页是否挂载，登录同步成功都使旧凭据响应失效并刷新主数据。
-  React.useEffect(() => {
-    const acceptConfig = (event: { payload: AppConfig }) => {
-      setCommittedConfig(event.payload);
-    };
-    const captured = listen<UsageTokenCaptured>(
-      "usage-token-captured",
-      ({ payload }) => {
-        setCommittedConfig(payload.config);
-      },
-    );
-    const cleared = listen<AppConfig>("usage-token-cleared", acceptConfig);
-    const changed = listen<AppConfig>(
-      "credential-config-changed",
-      acceptConfig,
-    );
-    const browsingCleared = listen("browsing-data-cleared", () => {
-      // 「退出并忘记账户」只应清除网页登录数据，外观偏好必须保留。
-      // 主题与透明度都存在 localStorage 里，清理 WebView 数据会一并清掉，
-      // 所以先把当前生效值写回，再重新应用，避免用户以为设置被重置。
-      const current = document.documentElement.getAttribute(THEME_ATTR);
-      localStorage.setItem(
-        THEME_STORAGE_KEY,
-        current === "dark" ? "dark" : "light",
-      );
-      localStorage.setItem(THEME_MIGRATION_KEY, "1");
-      applyStoredGlass();
-    });
-    return () => {
-      void captured.then((unlisten) => unlisten()).catch(() => undefined);
-      void cleared.then((unlisten) => unlisten()).catch(() => undefined);
-      void changed.then((unlisten) => unlisten()).catch(() => undefined);
-      void browsingCleared
-        .then((unlisten) => unlisten())
-        .catch(() => undefined);
     };
   }, []);
 
@@ -1052,212 +1205,242 @@ function App() {
   ) : null;
 
   return (
-    <div
-      ref={stageRef}
-      data-panel-mode={mode}
-      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${showRecovery ? "visibility-unavailable" : ""}`}
-    >
-      {showRecovery && (
-        <div className="visibility-error">
-          {visibilityError && (
-            <section className="config-read-error" role="alert">
-              <strong>无法确认窗口显隐状态</strong>
-              <p>
-                自动刷新、历史查询和导航自动聚焦已暂停。账户面板仍可手动刷新；
-                历史查询需先重试窗口状态。
-              </p>
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => retryVisibility()}
+    <QuitInteractionContext.Provider value={quitInteractionGate}>
+      <div
+        ref={stageRef}
+        data-panel-mode={mode}
+        className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${showRecovery ? "visibility-unavailable" : ""}`}
+      >
+        {showRecovery && (
+          <div className="visibility-error">
+            {configSubscriptionState !== "ready" && (
+              <section
+                className="config-read-error"
+                role={configSubscriptionState === "failed" ? "alert" : "status"}
               >
-                重试窗口状态
-              </button>
-            </section>
-          )}
-          <QuitRecovery
-            state={quitRequest.state}
-            onRetryListener={quitRequest.retryListener}
-            onQuit={quitRequest.requestQuit}
-          />
-        </div>
-      )}
-      {view === "dashboard" && (
-        <>
-          <DashboardPanel
-            onboarding={
-              configSnapshot?.configReadError ? (
-                <section className="config-read-error" role="alert">
-                  <strong>配置读取失败</strong>
-                  <p>{configSnapshot.configReadError}</p>
-                  <p className="muted">
-                    暂时无法确认已保存的账户配置，旧账户数据已停止显示。修复配置后可重新读取。
-                  </p>
-                  <div className="disclosure-actions">
-                    <button
-                      className="secondary"
-                      onClick={() => setView("settings")}
-                    >
-                      打开设置
-                    </button>
-                    <button
-                      className="primary"
-                      onClick={() => void reloadConfig()}
-                    >
-                      重新读取配置
-                    </button>
-                  </div>
-                </section>
-              ) : showOnboarding ? (
-                <OnboardingPanel
-                  tasks={onboardingTasks({
-                    apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
-                    usageTokenConfigured:
-                      configSnapshot?.usageTokenConfigured ?? false,
-                    dismissed: onboardingDismissed,
-                  })}
-                  onChoose={(task) => {
-                    setOnboardingDismissed(true);
-                    setView(
-                      "settings",
-                      null,
-                      task === "platform" ? "usageToken" : null,
-                    );
-                  }}
-                  onDismiss={() => setOnboardingDismissed(true)}
-                />
-              ) : null
-            }
-            onHistory={() => setView("history")}
+                <strong>
+                  {configSubscriptionState === "failed"
+                    ? "账户配置同步不可用"
+                    : "正在确认账户配置同步…"}
+                </strong>
+                <p>
+                  账户与历史查询已暂停，旧账户数据和导出已撤销。恢复同步后重新读取当前配置。
+                </p>
+                {configSubscriptionState === "failed" && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => retryConfigSubscription()}
+                  >
+                    重试账户同步
+                  </button>
+                )}
+              </section>
+            )}
+            {visibilityError && (
+              <section className="config-read-error" role="alert">
+                <strong>无法确认窗口显隐状态</strong>
+                <p>
+                  自动刷新、历史查询和导航自动聚焦已暂停。账户面板仍可手动刷新；
+                  历史查询需先重试窗口状态。
+                </p>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => retryVisibility()}
+                >
+                  重试窗口状态
+                </button>
+              </section>
+            )}
+            <QuitRecovery
+              state={quitRequest.state}
+              onRetryListener={quitRequest.retryListener}
+              onQuit={quitRequest.requestQuit}
+            />
+          </div>
+        )}
+        {view === "dashboard" && (
+          <>
+            <DashboardPanel
+              onboarding={
+                configSnapshot?.configReadError ? (
+                  <section className="config-read-error" role="alert">
+                    <strong>配置读取失败</strong>
+                    <p>{configSnapshot.configReadError}</p>
+                    <p className="muted">
+                      暂时无法确认已保存的账户配置，旧账户数据已停止显示。修复配置后可重新读取。
+                    </p>
+                    <div className="disclosure-actions">
+                      <button
+                        className="secondary"
+                        onClick={() => setView("settings")}
+                      >
+                        打开设置
+                      </button>
+                      <button
+                        className="primary"
+                        onClick={() => void reloadConfig()}
+                      >
+                        重新读取配置
+                      </button>
+                    </div>
+                  </section>
+                ) : showOnboarding ? (
+                  <OnboardingPanel
+                    tasks={onboardingTasks({
+                      apiKeyConfigured:
+                        configSnapshot?.apiKeyConfigured ?? false,
+                      usageTokenConfigured:
+                        configSnapshot?.usageTokenConfigured ?? false,
+                      dismissed: onboardingDismissed,
+                    })}
+                    onChoose={(task) => {
+                      if (!quitInteractionGate.allowed()) return;
+                      setOnboardingDismissed(true);
+                      setView(
+                        "settings",
+                        null,
+                        task === "platform" ? "usageToken" : null,
+                      );
+                    }}
+                    onDismiss={() => setOnboardingDismissed(true)}
+                  />
+                ) : null
+              }
+              onHistory={() => setView("history")}
+              balanceUpdatedAt={balanceUpdatedAt}
+              usageUpdatedAt={usageUpdatedAt}
+              balance={balance}
+              balanceState={balanceState}
+              balanceError={balanceError}
+              usage={usage}
+              usageState={usageState}
+              usageError={usageError}
+              onRefresh={() => refreshAll()}
+              onClose={hideWindow}
+              onSettings={() => setView("settings")}
+              onDataStatus={() => setView("settings", null, "dataNotices")}
+              onDetail={(nextModel, trigger) => {
+                if (!quitInteractionGate.allowed()) return;
+                // 只记实际进入的原生入口，不记卸载后失效的 DOM 引用。
+                const fromDashboard =
+                  committedPage.current.view === "dashboard" &&
+                  committedPage.current.navigationId === navigationId.current &&
+                  committedAccountFocusEpoch === accountFocusEpoch.current &&
+                  trigger?.isConnected &&
+                  trigger.tagName === "BUTTON" &&
+                  trigger.dataset.usageModel === nextModel &&
+                  stageRef.current?.contains(trigger);
+                setModel(nextModel);
+                const detailNavigationId = setView("detail");
+                if (fromDashboard) {
+                  detailFocusOrigin.current = {
+                    model: nextModel,
+                    navigationId: detailNavigationId,
+                    accountEpoch: accountFocusEpoch.current,
+                  };
+                }
+              }}
+            />
+          </>
+        )}
+        {view === "settings" && (
+          <SettingsPanel
+            balanceState={balanceState}
+            usageState={usageState}
+            balanceErrorCode={balanceErrorCode}
+            usageErrorCode={usageErrorCode}
+            onRetry={retrySettingsUpdate}
             balanceUpdatedAt={balanceUpdatedAt}
             usageUpdatedAt={usageUpdatedAt}
-            balance={balance}
-            balanceState={balanceState}
             balanceError={balanceError}
+            usageError={usageError}
+            usage={usage}
+            // 第五轮复评 N04：提醒设置草稿注册进同一个 App 级离开拦截；
+            // 关闭设置页也走 navigate，脏草稿不再被静默丢弃。
+            onRegisterLeaveBlocker={registerLeaveBlocker}
+            onBack={() => navigate(() => setView("dashboard"))}
+          />
+        )}
+        {view === "detail" && (
+          <ModelDetailPanel
+            onDataStatus={() => setView("settings", null, "dataNotices")}
+            updatedAt={usageUpdatedAt}
+            onSettings={() => setView("settings")}
+            model={model}
             usage={usage}
             usageState={usageState}
             usageError={usageError}
-            onRefresh={() => refreshAll()}
-            onClose={hideWindow}
-            onSettings={() => setView("settings")}
-            onDataStatus={() => setView("settings", null, "dataNotices")}
-            onDetail={(nextModel, trigger) => {
-              // 只记实际进入的原生入口，不记卸载后失效的 DOM 引用。
-              const fromDashboard =
-                committedPage.current.view === "dashboard" &&
+            onBack={() => {
+              const origin = detailFocusOrigin.current;
+              const returningFromDetail =
+                committedPage.current.view === "detail" &&
                 committedPage.current.navigationId === navigationId.current &&
-                committedAccountFocusEpoch === accountFocusEpoch.current &&
-                trigger?.isConnected &&
-                trigger.tagName === "BUTTON" &&
-                trigger.dataset.usageModel === nextModel &&
-                stageRef.current?.contains(trigger);
-              setModel(nextModel);
-              const detailNavigationId = setView("detail");
-              if (fromDashboard) {
-                detailFocusOrigin.current = {
-                  model: nextModel,
-                  navigationId: detailNavigationId,
-                  accountEpoch: accountFocusEpoch.current,
-                };
-              }
+                origin?.navigationId === page.navigationId &&
+                origin.model === model;
+              setView("dashboard", returningFromDetail ? origin : null);
             }}
           />
-        </>
-      )}
-      {view === "settings" && (
-        <SettingsPanel
-          balanceState={balanceState}
-          usageState={usageState}
-          balanceErrorCode={balanceErrorCode}
-          usageErrorCode={usageErrorCode}
-          onRetry={retrySettingsUpdate}
-          balanceUpdatedAt={balanceUpdatedAt}
-          usageUpdatedAt={usageUpdatedAt}
-          balanceError={balanceError}
-          usageError={usageError}
-          usage={usage}
-          // 第五轮复评 N04：提醒设置草稿注册进同一个 App 级离开拦截；
-          // 关闭设置页也走 navigate，脏草稿不再被静默丢弃。
-          onRegisterLeaveBlocker={registerLeaveBlocker}
-          onBack={() => navigate(() => setView("dashboard"))}
-        />
-      )}
-      {view === "detail" && (
-        <ModelDetailPanel
-          onDataStatus={() => setView("settings", null, "dataNotices")}
-          updatedAt={usageUpdatedAt}
-          onSettings={() => setView("settings")}
-          model={model}
-          usage={usage}
-          usageState={usageState}
-          usageError={usageError}
-          onBack={() => {
-            const origin = detailFocusOrigin.current;
-            const returningFromDetail =
-              committedPage.current.view === "detail" &&
-              committedPage.current.navigationId === navigationId.current &&
-              origin?.navigationId === page.navigationId &&
-              origin.model === model;
-            setView("dashboard", returningFromDetail ? origin : null);
-          }}
-        />
-      )}
-      {view === "history" && (
-        <HistoryPanel
-          windowVisible={windowVisible}
-          windowVisibilityGate={windowVisibilityGate}
-          visibilityError={visibilityError}
-          onBack={() => navigate(() => setView("dashboard"))}
-          usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
-          configReady={configSnapshot !== null}
-          configReadError={configSnapshot?.configReadError}
-          onReloadConfig={async () => {
-            const config = await reloadConfig();
-            return Boolean(config && !config.configReadError);
-          }}
-          onConfigureUsage={() => {
-            // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
-            setView("settings", null, "usageToken");
-          }}
-        />
-      )}
-      {leavePrompt}
-      {["dashboard", "history"].includes(view) && (
-        <nav className="primary-navigation" aria-label="主导航">
-          {(
-            [
-              ["dashboard", "账户"],
-              ["history", "历史"],
-            ] as const
-          ).map(([target, label]) => (
+        )}
+        {view === "history" && (
+          <HistoryPanel
+            windowVisible={windowVisible}
+            windowVisibilityGate={windowVisibilityGate}
+            visibilityError={visibilityError}
+            onBack={() => navigate(() => setView("dashboard"))}
+            usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
+            configReady={configSnapshot !== null}
+            configReadError={configSnapshot?.configReadError}
+            onReloadConfig={async () => {
+              const config = await reloadConfig();
+              return Boolean(config && !config.configReadError);
+            }}
+            onConfigureUsage={() => {
+              // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
+              setView("settings", null, "usageToken");
+            }}
+          />
+        )}
+        {leavePrompt}
+        {["dashboard", "history"].includes(view) && (
+          <nav className="primary-navigation" aria-label="主导航">
+            {(
+              [
+                ["dashboard", "账户"],
+                ["history", "历史"],
+              ] as const
+            ).map(([target, label]) => (
+              <button
+                key={target}
+                aria-current={view === target ? "page" : undefined}
+                onClick={() => {
+                  if (view === target) return;
+                  navigate(() => setView(target));
+                }}
+              >
+                {label}
+              </button>
+            ))}
             <button
-              key={target}
-              aria-current={view === target ? "page" : undefined}
+              className="nav-mode-toggle"
+              aria-label={panelModeLabel(mode)}
+              title={panelModeLabel(mode)}
               onClick={() => {
-                if (view === target) return;
-                navigate(() => setView(target));
+                if (quitInteractionGate.allowed())
+                  setManualMode(mode === "expanded" ? "compact" : "expanded");
               }}
             >
-              {label}
+              {mode === "expanded" ? (
+                <Minimize2 size={15} />
+              ) : (
+                <Maximize2 size={15} />
+              )}
             </button>
-          ))}
-          <button
-            className="nav-mode-toggle"
-            aria-label={panelModeLabel(mode)}
-            title={panelModeLabel(mode)}
-            onClick={() =>
-              setManualMode(mode === "expanded" ? "compact" : "expanded")
-            }
-          >
-            {mode === "expanded" ? (
-              <Minimize2 size={15} />
-            ) : (
-              <Maximize2 size={15} />
-            )}
-          </button>
-        </nav>
-      )}
-    </div>
+          </nav>
+        )}
+      </div>
+    </QuitInteractionContext.Provider>
   );
 }
 export { App };

@@ -220,14 +220,32 @@ const assertNoFilteredUsage = () => {
     "daily rows and independent source rows use the same selected raw value",
   );
 };
+// A parent snapshot lifecycle runs after the whole subtree rendered, but before
+// mutations and every child layout effect. Unlike an outer Profiler callback,
+// this can model a system-clock recovery before HistoryPanel revokes its epoch.
+class BeforeHistoryLayout extends React.Component<{
+  onBeforeLayout: () => void;
+  children: React.ReactNode;
+}> {
+  getSnapshotBeforeUpdate() {
+    this.props.onBeforeLayout();
+    return null;
+  }
+  componentDidUpdate() {}
+  render() {
+    return this.props.children;
+  }
+}
+
 async function fixture(
   concurrent: boolean,
-  inspect: () => Promise<void>,
+  inspect: (rerender: () => void) => Promise<void>,
   initialLoad: (month: string) => Promise<UsageResult> = async (month) =>
     usage(month),
   initialInstant = "2026-10-31T15:59:00Z",
   initialProps: Partial<React.ComponentProps<typeof HistoryPanel>> = {},
   onCommit?: () => void,
+  onBeforeLayout?: () => void,
 ) {
   now = NativeDate.parse(initialInstant);
   calls = [];
@@ -235,25 +253,34 @@ async function fixture(
   load = initialLoad;
   setCommittedConfig(null);
   historyCache.invalidate();
-  await act(async () => {
+  const renderPanel = () => {
     const panel = (
       <HistoryPanel onBack={noop} windowVisible {...initialProps} />
     );
-    view = Renderer.create(
-      onCommit ? (
-        <React.Profiler id="history-commits" onRender={onCommit}>
-          {panel}
-        </React.Profiler>
-      ) : (
-        panel
-      ),
-      { unstable_isConcurrent: concurrent } as any,
+    const profiled = onCommit ? (
+      <React.Profiler id="history-commits" onRender={onCommit}>
+        {panel}
+      </React.Profiler>
+    ) : (
+      panel
     );
+    return onBeforeLayout ? (
+      <BeforeHistoryLayout onBeforeLayout={onBeforeLayout}>
+        {profiled}
+      </BeforeHistoryLayout>
+    ) : (
+      profiled
+    );
+  };
+  await act(async () => {
+    view = Renderer.create(renderPanel(), {
+      unstable_isConcurrent: concurrent,
+    } as any);
     await flush();
   });
   await act(flush);
   try {
-    await inspect();
+    await inspect(() => view.update(renderPanel()));
   } finally {
     await act(async () => {
       view.unmount();
@@ -718,6 +745,288 @@ for (const concurrent of [false, true]) {
       );
     });
   });
+}
+
+// Round 32: a previously valid custom month can become future after clock rollback.
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+  for (const outcome of ["success", "failure"] as const) {
+    test(`R32 history (${mode}): clock recovery before the panel layout cannot revive old exports or late ${outcome}`, async () => {
+      const pending = deferredUsage();
+      const recovered = deferredUsage();
+      const validInstant = "2026-11-01T01:00:00Z";
+      let armed = false;
+      let restored = false;
+      let invalidCommitted = false;
+      let oldEpoch = -1;
+      let beforeLayoutEpoch = -1;
+      let invalidCommitEpoch = -1;
+      const phases: string[] = [];
+      let oldExport: () => void = noop;
+      const recoverBeforeLayout = () => {
+        if (!armed || restored) return;
+        restored = true;
+        phases.push("before-layout");
+        beforeLayoutEpoch = historyCache.epoch();
+        // getSnapshotBeforeUpdate precedes the child's layout effect. Restore
+        // the clock now, while the invalid render has not revoked its epoch.
+        now = NativeDate.parse(validInstant);
+        if (outcome === "success") pending.resolve(usage("2026-11", "OLD"));
+        else
+          pending.reject({
+            code: "credentials_invalid",
+            message: "SYNTHETIC old Token",
+          });
+      };
+      const observeCommit = () => {
+        if (
+          !armed ||
+          invalidCommitted ||
+          !text(view.toJSON()).includes("请选择有效历史月份")
+        )
+          return;
+        invalidCommitted = true;
+        phases.push("after-layout");
+        invalidCommitEpoch = historyCache.epoch();
+        // The outer Profiler runs AFTER HistoryPanel's layout effect. Use it
+        // only to inspect the committed invalid render and replay the export;
+        // clock recovery already happened in the snapshot lifecycle above.
+        oldExport();
+      };
+      await fixture(
+        concurrent,
+        async (rerender) => {
+          await click("历史月份");
+          await chooseModel("A-one");
+          oldExport = button("JSON").props.onClick;
+          load = () => pending.promise;
+          await click("重新查询历史");
+          const before = calls.length;
+          oldEpoch = historyCache.epoch();
+          load = () => recovered.promise;
+          armed = true;
+          await act(async () => {
+            now = NativeDate.parse("2026-10-31T15:59:00Z");
+            // Update the parent wrapper as well as the panel so its snapshot
+            // lifecycle definitely runs. No live range entry point runs first.
+            rerender();
+            await flush();
+          });
+          await act(flush);
+          armed = false;
+          assert.equal(
+            restored,
+            true,
+            "the pre-layout clock recovery must run",
+          );
+          assert.equal(
+            invalidCommitted,
+            true,
+            "the invalid render must have committed",
+          );
+          assert.deepEqual(phases, ["before-layout", "after-layout"]);
+          assert.equal(
+            beforeLayoutEpoch,
+            oldEpoch,
+            "clock recovery must precede the panel's layout revocation",
+          );
+          assert.ok(
+            invalidCommitEpoch > oldEpoch,
+            "layout must revoke the observed invalidity even though the clock has recovered",
+          );
+          assert.deepEqual(
+            calls.slice(before),
+            ["2026-11"],
+            "recovery must start a fresh request, never adopt old pending/cache",
+          );
+          assert.equal(blobs.length, 0);
+          assert.equal(text(view.toJSON()).includes("OLD-one"), false);
+          assert.equal(text(view.toJSON()).includes("Token 已失效"), false);
+          assert.deepEqual(metrics(), ["—", "—"]);
+          assert.equal(button("JSON").props.disabled, true);
+          await act(async () => {
+            recovered.resolve(usage("2026-11", "NEW"));
+            await flush();
+          });
+          await act(flush);
+          await act(async () => {
+            oldExport();
+            await flush();
+          });
+          assert.equal(blobs.length, 0);
+          const current = await exportJson();
+          assert.equal(current.daily.length, 2);
+          assert.ok(
+            current.daily.every((row: RawModelUsage) =>
+              row.model.startsWith("NEW-"),
+            ),
+          );
+        },
+        async (month) => usage(month),
+        validInstant,
+        {},
+        observeCommit,
+        recoverBeforeLayout,
+      );
+    });
+  }
+  for (const trigger of [
+    "clock-tick",
+    "shown",
+    "refresh-before-render",
+    "export-before-render",
+    "queued-loader",
+    "late-success",
+    "late-failure",
+  ] as const) {
+    test(`R32 history (${mode}): ${trigger} handles cross-month rollback without throwing or exporting the future month`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          await click("历史月份");
+          const input = () =>
+            view.root.findByProps({ "aria-label": "历史月份" });
+          assert.equal(input().props.value, "2026-11");
+          assert.equal(input().props["aria-invalid"], false);
+          await chooseModel("A-one");
+          const oldExport = button("JSON").props.onClick;
+          const oldRefresh = button("重新查询历史").props.onClick;
+          const pending = deferredUsage();
+          load = () => pending.promise;
+          if (trigger === "late-success" || trigger === "late-failure")
+            await click("重新查询历史");
+          if (trigger === "shown") await visibility(false);
+          const before = calls.length;
+          const rollback = "2026-10-31T15:59:00Z";
+          if (trigger === "clock-tick") await tick(rollback);
+          else if (trigger === "shown") {
+            now = NativeDate.parse(rollback);
+            await visibility(true);
+          } else {
+            await act(async () => {
+              if (trigger === "queued-loader") oldRefresh();
+              now = NativeDate.parse(rollback);
+              if (trigger === "refresh-before-render") oldRefresh();
+              if (trigger === "export-before-render") oldExport();
+              if (trigger === "late-success")
+                pending.resolve(usage("2026-11", "OLD"));
+              if (trigger === "late-failure")
+                pending.reject({
+                  code: "credentials_invalid",
+                  message: "SYNTHETIC old Token",
+                });
+              await flush();
+            });
+            await act(flush);
+          }
+          assert.equal(
+            calls.length,
+            before,
+            "invalid range must not issue another month IPC",
+          );
+          assert.ok(text(view.toJSON()).includes("请选择有效历史月份"));
+          assert.equal(
+            input().props.value,
+            "2026-11",
+            "do not silently replace the user's month",
+          );
+          assert.equal(input().props.max, "2026-10");
+          assert.equal(input().props["aria-invalid"], true);
+          assert.equal(
+            input().props.disabled,
+            false,
+            "the user must be able to repair the selection",
+          );
+          assert.equal(button("本月").props.disabled, false);
+          assert.equal(button("重新查询历史").props.disabled, true);
+          assert.equal(button("JSON").props.disabled, true);
+          assert.equal(button("CSV").props.disabled, true);
+          assert.deepEqual(metrics(), ["—", "—"]);
+          assert.equal(text(view.toJSON()).includes("A-one"), false);
+          assert.equal(text(view.toJSON()).includes("OLD-one"), false);
+          assert.equal(text(view.toJSON()).includes("Token 已失效"), false);
+          await act(async () => {
+            oldExport();
+            oldRefresh();
+            await flush();
+          });
+          assert.equal(calls.length, before);
+          assert.equal(blobs.length, 0);
+          load = async (month) => usage(month, "NEW");
+          await act(async () => {
+            input().props.onChange({ target: { value: "2026-10" } });
+            await flush();
+          });
+          await act(flush);
+          assert.deepEqual(calls.slice(before), ["2026-10"]);
+          assert.equal(input().props.value, "2026-10");
+          assert.equal(input().props["aria-invalid"], false);
+          assert.equal(
+            text(view.toJSON()).includes("请选择有效历史月份"),
+            false,
+          );
+          assert.ok(text(view.toJSON()).includes("NEW-one"));
+          await act(async () => {
+            oldExport();
+            await flush();
+          });
+          assert.equal(
+            blobs.length,
+            0,
+            "legal recovery must not reactivate an old export closure",
+          );
+          const recovered = await exportJson();
+          assert.equal(recovered.daily.length, 2);
+          assert.ok(
+            recovered.daily.every((row: RawModelUsage) =>
+              row.model.startsWith("NEW-"),
+            ),
+          );
+        },
+        async (month) => usage(month),
+        "2026-11-01T01:00:00Z",
+      );
+    });
+  }
+
+  for (const late of ["success", "failure"] as const) {
+    test(`R32 history (${mode}): late ${late} after valid month recovery cannot revive the invalidated request`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          await click("历史月份");
+          const pending = deferredUsage();
+          load = () => pending.promise;
+          await click("重新查询历史");
+          await tick("2026-10-31T15:59:00Z");
+          load = async (month) => usage(month, "NEW");
+          await act(async () => {
+            view.root.findByProps({ "aria-label": "历史月份" }).props.onChange({
+              target: { value: "2026-10" },
+            });
+            await flush();
+          });
+          await act(flush);
+          const current = await exportJson();
+          assert.equal(current.daily.length, 2);
+          await act(async () => {
+            if (late === "success") pending.resolve(usage("2026-11", "OLD"));
+            else
+              pending.reject({
+                code: "credentials_invalid",
+                message: "SYNTHETIC old Token",
+              });
+            await flush();
+          });
+          assert.equal(text(view.toJSON()).includes("OLD-one"), false);
+          assert.equal(text(view.toJSON()).includes("Token 已失效"), false);
+          assert.deepEqual((await exportJson()).daily, current.daily);
+        },
+        async (month) => usage(month),
+        "2026-11-01T01:00:00Z",
+      );
+    });
+  }
 }
 
 // Round 29: cache state is authoritative across selection resets/unmounts.

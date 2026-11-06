@@ -47,6 +47,29 @@ pub(crate) fn confirm_quit(window: WebviewWindow, app: tauri::AppHandle) -> Resu
     Ok(())
 }
 
+/// Read only after the renderer's wake listener is installed. Reading is not
+/// consumption: an unmounted or failed renderer leaves the intent recoverable.
+#[tauri::command]
+pub(crate) fn get_pending_quit_intent(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, String> {
+    require_main(&window)?;
+    app.state::<crate::quit_intent::QuitIntent>().pending()
+}
+
+/// This acknowledges delivery to the draft guard, not permission to exit.
+#[tauri::command]
+pub(crate) fn acknowledge_quit_intent(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    intent: String,
+) -> Result<(), String> {
+    require_main(&window)?;
+    app.state::<crate::quit_intent::QuitIntent>()
+        .acknowledge(&intent)
+}
+
 #[tauri::command]
 pub(crate) fn is_main_window_visible(window: WebviewWindow) -> Result<bool, String> {
     require_main(&window)?;

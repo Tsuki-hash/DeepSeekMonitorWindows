@@ -27,8 +27,10 @@ export function LeavePromptDialog({
   windowVisibilityGate: WindowVisibilityGate;
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
+  const cancelButtonRef = React.useRef<HTMLButtonElement>(null);
   const cancelFirstFocus = React.useRef<() => void>(() => {});
   const returnFocus = React.useRef<() => void>(() => {});
+  const focusDuringSave = React.useRef<() => void>(() => {});
   React.useLayoutEffect(() => {
     const container = containerRef.current;
     const origin = document.activeElement;
@@ -96,6 +98,23 @@ export function LeavePromptDialog({
         origin.focus({ preventScroll: true });
       }
     };
+    focusDuringSave.current = () => {
+      // Chromium 会在当前按钮变为 disabled 时失焦。先把仍属于提示的
+      // 焦点交给始终可用的取消按钮，不等提交后再从 body 猜测恢复目标。
+      // 这是本次明确保存操作的同步交接：用户曾离开再回来也应安全。
+      // 不恢复 owned/旧 epoch，因此首焦点和旧触发器归还仍保持失效。
+      const cancel = cancelButtonRef.current;
+      if (
+        live &&
+        windowVisibilityGate.isVisible() &&
+        document.visibilityState === "visible" &&
+        document.hasFocus?.() !== false &&
+        inside(document.activeElement) &&
+        usable(cancel)
+      ) {
+        cancel.focus({ preventScroll: true });
+      }
+    };
     if (owned) {
       const scheduled = window.requestAnimationFrame(() => {
         // 宿主即使交付已取消的 RAF，也不能恢复其所有权。
@@ -129,10 +148,13 @@ export function LeavePromptDialog({
       window.removeEventListener("blur", revoke);
       cancelFirstFocus.current = () => {};
       returnFocus.current = () => {};
+      focusDuringSave.current = () => {};
     };
   }, [windowVisibilityGate]);
   const decide = (decision: LeaveDecision) => {
+    if (submitting && decision !== "cancel") return;
     cancelFirstFocus.current();
+    if (decision === "save") focusDuringSave.current();
     if (decision === "cancel") returnFocus.current();
     onDecide(decision);
   };
@@ -167,7 +189,11 @@ export function LeavePromptDialog({
           {draftGuardActions.discard}
         </button>
         {/* 取消始终可用：它是用户收回导航请求的唯一出口（复评 T05）。 */}
-        <button className="secondary" onClick={() => decide("cancel")}>
+        <button
+          ref={cancelButtonRef}
+          className="secondary"
+          onClick={() => decide("cancel")}
+        >
           {draftGuardActions.cancel}
         </button>
       </div>

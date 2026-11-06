@@ -1,4 +1,5 @@
 import React from "react";
+import { useQuitInteractionGate } from "../quit-interaction-context";
 import { GlassSettings } from "./GlassSettings";
 import {
   BarChart3,
@@ -24,6 +25,81 @@ import { SettingsSection, Toggle } from "./ui";
 import type { LeaveBlocker } from "../leave-guard";
 import { errorMessage } from "../error-state";
 import { getCommittedConfig } from "../config-store";
+
+/** Native buttons keep focus while a preference write is pending. */
+export function RefreshIntervalChoices({
+  value,
+  busy,
+  onChange,
+}: {
+  value: number | null;
+  busy: boolean;
+  onChange: (seconds: number) => void;
+}) {
+  const interactionGate = useQuitInteractionGate();
+  const blocked = React.useRef(busy);
+  React.useLayoutEffect(() => {
+    // 同步锁覆盖 busy 尚未提交的连击；完成/失败提交后才重新开放。
+    blocked.current = busy;
+  });
+  const choose = (seconds: number) => {
+    if (!interactionGate.allowed() || busy || blocked.current) return false;
+    if (seconds !== value) {
+      blocked.current = true;
+      onChange(seconds);
+    }
+    return true;
+  };
+  return (
+    <div
+      className="segmented"
+      role="radiogroup"
+      aria-label="自动刷新间隔"
+      aria-busy={busy}
+      onKeyDown={(event) => {
+        const delta =
+          event.key === "ArrowRight" || event.key === "ArrowDown"
+            ? 1
+            : event.key === "ArrowLeft" || event.key === "ArrowUp"
+              ? -1
+              : 0;
+        if (delta === 0) return;
+        event.preventDefault();
+        if (busy || blocked.current) return;
+        const buttons = Array.from(
+          event.currentTarget.querySelectorAll<HTMLButtonElement>(
+            "[role='radio']",
+          ),
+        );
+        // 保存失败会回滚选中值，真实焦点却应留在刚操作的按钮。
+        // 下一次方向键从实际焦点出发，不能从已回滚的选中值跳错项。
+        const focused = buttons.indexOf(event.target as HTMLButtonElement);
+        const index =
+          focused >= 0
+            ? focused
+            : refreshOptions.findIndex((option) => option.value === value);
+        const next =
+          (index + delta + refreshOptions.length) % refreshOptions.length;
+        if (choose(refreshOptions[next].value)) buttons[next]?.focus();
+      }}
+    >
+      {refreshOptions.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="radio"
+          aria-checked={value === option.value}
+          aria-disabled={busy}
+          tabIndex={value === option.value ? 0 : -1}
+          className={value === option.value ? "selected" : ""}
+          onClick={() => choose(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // 状态与动作在 useSettingsState（评审 F-09 拆分），本组件只负责视图与文案。
 function SettingsPanel({
@@ -56,6 +132,7 @@ function SettingsPanel({
     blocker: LeaveBlocker | null,
   ) => void | (() => void);
 }) {
+  const interactionGate = useQuitInteractionGate();
   const {
     config,
     configPath,
@@ -88,7 +165,10 @@ function SettingsPanel({
     saveAutostart,
     registerCredentialBlocker,
   } = useSettingsState();
-  const { theme, toggleTheme } = useTheme();
+  const { theme, toggleTheme: changeTheme } = useTheme();
+  const toggleTheme = () => {
+    if (interactionGate.allowed()) changeTheme();
+  };
   const [retrying, setRetrying] = React.useState(false);
   const retryPending = React.useRef(false);
   const [retryError, setRetryError] = React.useState("");
@@ -134,16 +214,19 @@ function SettingsPanel({
       },
       canLeave: () => !dirty(),
       save: async () => {
-        if (!owner.current.active) return false;
+        const allowed = interactionGate.capture();
+        if (!allowed() || !owner.current.active) return false;
         // Freeze the intended submissions for the entire page before the first
         // await. New credentials or alert edits stay unsubmitted and block exit.
         const submissions = parts()
           .filter((part) => part.dirty)
           .map((part) => part.prepareSave?.() ?? part.save);
         for (const submit of submissions) {
-          if (!owner.current.active || !(await submit())) return false;
+          if (!allowed() || !owner.current.active || !(await submit()))
+            return false;
+          if (!allowed()) return false;
         }
-        return owner.current.active && !dirty();
+        return allowed() && owner.current.active && !dirty();
       },
       discard: () => {
         if (!owner.current.active) return;
@@ -158,7 +241,7 @@ function SettingsPanel({
       if (typeof dispose === "function") dispose();
       else onRegisterLeaveBlocker?.(null);
     };
-  }, [registerCredentialBlocker, onRegisterLeaveBlocker]);
+  }, [registerCredentialBlocker, onRegisterLeaveBlocker, interactionGate]);
   const notices = usageNotices(usage ?? null);
   const [healthClock, setHealthClock] = React.useState(Date.now);
   React.useEffect(() => {
@@ -587,51 +670,12 @@ function SettingsPanel({
             </p>
           )}
           {autoRefresh && (
-            <div
-              className="segmented"
-              role="radiogroup"
-              aria-label="自动刷新间隔"
-              onKeyDown={(event) => {
-                // 复评 R17：radiogroup 需要方向键在选项间移动（roving tabindex）。
-                const index = refreshOptions.findIndex(
-                  (option) => option.value === refresh,
-                );
-                const delta =
-                  event.key === "ArrowRight" || event.key === "ArrowDown"
-                    ? 1
-                    : event.key === "ArrowLeft" || event.key === "ArrowUp"
-                      ? -1
-                      : 0;
-                if (delta === 0) return;
-                event.preventDefault();
-                const next =
-                  (index + delta + refreshOptions.length) %
-                  refreshOptions.length;
-                const option = refreshOptions[next];
-                saveRefreshInterval(option.value);
-                // 焦点跟到新选中的项，读屏才会播报。
-                const buttons =
-                  event.currentTarget.querySelectorAll<HTMLButtonElement>(
-                    "[role='radio']",
-                  );
-                buttons[next]?.focus();
-              }}
-            >
-              {refreshOptions.map((option) => (
-                <button
-                  key={option.value}
-                  role="radio"
-                  aria-checked={refresh === option.value}
-                  // 只有选中项进入 Tab 序列，其余用方向键到达。
-                  tabIndex={refresh === option.value ? 0 : -1}
-                  className={refresh === option.value ? "selected" : ""}
-                  onClick={() => saveRefreshInterval(option.value)}
-                  disabled={busy}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
+            <RefreshIntervalChoices
+              value={refresh}
+              busy={busy}
+              // useSettingsState 的同步 preferenceBusy 仍合并提交前的连击。
+              onChange={saveRefreshInterval}
+            />
           )}
           {settingErrors.refresh && (
             <p className="muted" role="alert">

@@ -1,3 +1,5 @@
+import type { QuitIntentMailbox } from "./quit-intent";
+
 export type QuitRequestState = {
   listener: "registering" | "ready" | "failed";
   command: "idle" | "pending" | "failed" | "confirmed";
@@ -25,17 +27,24 @@ export class QuitRequest {
   private readonly confirm: () => Promise<unknown>;
   private readonly navigate: (action: () => void) => void;
   private readonly onChange: (state: QuitRequestState) => void;
+  private readonly lockInteractions: () => () => void;
+  private releaseInteractions: (() => void) | null = null;
+  private readonly mailbox?: QuitIntentMailbox;
 
   constructor(
     listen: (request: () => void) => Promise<Unlisten>,
     confirm: () => Promise<unknown>,
     navigate: (action: () => void) => void,
     onChange: (state: QuitRequestState) => void,
+    lockInteractions: () => () => void = () => () => {},
+    mailbox?: QuitIntentMailbox,
   ) {
     this.listen = listen;
     this.confirm = confirm;
     this.navigate = navigate;
     this.onChange = onChange;
+    this.lockInteractions = lockInteractions;
+    this.mailbox = mailbox;
   }
 
   start() {
@@ -76,6 +85,8 @@ export class QuitRequest {
     this.intent += 1;
     if (this.unlisten) this.release(this.unlisten);
     this.unlisten = null;
+    this.releaseInteractions?.();
+    this.releaseInteractions = null;
   }
 
   private publish(patch: Partial<QuitRequestState>) {
@@ -97,13 +108,45 @@ export class QuitRequest {
   private async register() {
     const registration = ++this.registration;
     this.publish({ listener: "registering" });
+    const current = () =>
+      this.active &&
+      registration === this.registration &&
+      this.state.listener !== "failed";
+    const fail = () => {
+      if (!current()) return;
+      this.publish({ listener: "failed", recovery: true });
+      if (this.unlisten) this.release(this.unlisten);
+      this.unlisten = null;
+    };
+    let installed = false;
+    let wake = false;
+    let reading = false;
+    let read: Promise<void> = Promise.resolve();
+    const drain = () => {
+      wake = true;
+      if (reading) return read;
+      reading = true;
+      read = (async () => {
+        try {
+          while (wake && current()) {
+            wake = false;
+            await this.mailbox?.consume(current, this.requestQuit);
+          }
+        } finally {
+          reading = false;
+        }
+      })();
+      return read;
+    };
     try {
       const off = await this.listen(() => {
-        if (
-          this.active &&
-          registration === this.registration &&
-          this.state.listener !== "failed"
-        ) {
+        if (!current()) return;
+        if (this.mailbox) {
+          // Events are only wakes. Never trust/replay an old event as approval.
+          // Wakes racing an in-flight snapshot force one more native read.
+          wake = true;
+          if (installed) void drain().catch(fail);
+        } else {
           this.requestQuit();
         }
       });
@@ -112,10 +155,13 @@ export class QuitRequest {
         return;
       }
       this.unlisten = off;
+      installed = true;
+      // Subscribe first, then replay: neither side of registration has a gap.
+      if (this.mailbox) await drain();
+      if (!current()) return;
       this.publish({ listener: "ready" });
     } catch {
-      if (!this.active || registration !== this.registration) return;
-      this.publish({ listener: "failed", recovery: true });
+      fail();
     }
   }
 
@@ -126,6 +172,8 @@ export class QuitRequest {
     ) {
       return;
     }
+    // Lock synchronously, before React commits or IPC can deliver a reply.
+    this.releaseInteractions = this.lockInteractions();
     this.publish({ command: "pending" });
     try {
       await this.confirm();
@@ -135,6 +183,8 @@ export class QuitRequest {
       this.publish({ command: "confirmed" });
     } catch {
       if (!this.active || intent !== this.intent) return;
+      this.releaseInteractions?.();
+      this.releaseInteractions = null;
       this.publish({ command: "failed" });
     }
   }

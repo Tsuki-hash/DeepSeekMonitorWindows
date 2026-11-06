@@ -3,6 +3,7 @@ import { todayStr } from "./format";
 import type { UsageResult } from "./types";
 import { RequestGate } from "./request-gate";
 import { historyCache } from "./history-cache";
+import { getConfigSubscriptionReady } from "./config-store";
 
 const usageGate = new RequestGate<UsageResult>();
 export const invalidateUsageRequests = () => {
@@ -11,6 +12,8 @@ export const invalidateUsageRequests = () => {
 };
 
 export const fetchMonthUsage = (month: number, year: number) => {
+  if (!getConfigSubscriptionReady())
+    return Promise.reject(new Error("账户配置同步尚未就绪，请恢复同步后重试"));
   return invoke<UsageResult>("fetch_usage", { month, year });
 };
 export const fetchCurrentUsage = () =>

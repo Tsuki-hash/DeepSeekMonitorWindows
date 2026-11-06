@@ -107,6 +107,25 @@ export function historyWindow(
   return { from, to, months };
 }
 
+/** UI entry point: a changed system date may invalidate an existing selection. */
+export function resolveHistoryWindow(
+  range: HistoryRange,
+  today: string,
+  selectedMonth = today.slice(0, 7),
+): { window: HistoryWindow; error: null } | { window: null; error: string } {
+  try {
+    return { window: historyWindow(range, today, selectedMonth), error: null };
+  } catch {
+    return {
+      window: null,
+      error:
+        range === "custom" && isHistoryDate(today)
+          ? "请选择有效历史月份。系统时间可能已变化，当前选择已保留；请选择不晚于当前月份的月份。"
+          : "当前系统日期无法生成有效历史区间，请检查系统时间后重试。",
+    };
+  }
+}
+
 export function historyDates(from: string, to: string): string[] {
   if (!isHistoryDate(from) || !isHistoryDate(to))
     throw new Error("无效历史区间");

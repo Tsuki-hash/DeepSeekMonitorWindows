@@ -1,4 +1,5 @@
 import React from "react";
+import { useQuitInteractionGate } from "../quit-interaction-context";
 import { invoke } from "@tauri-apps/api/core";
 import { Toggle } from "./ui";
 import { errorMessage } from "../error-state";
@@ -15,6 +16,7 @@ export function AlertSettings({
     blocker: LeaveBlocker | null,
   ) => void | (() => void);
 } = {}) {
+  const interactionGate = useQuitInteractionGate();
   const [status, setStatus] = React.useState<AlertStatus | null>(null);
   const [draft, setDraft] = React.useState<AlertOptions | null>(null);
   const [low, setLow] = React.useState("");
@@ -181,6 +183,7 @@ export function AlertSettings({
     }
   };
   const save = (submitted = { ...live.current }): Promise<boolean> => {
+    if (!interactionGate.allowed()) return Promise.resolve(false);
     const pending = pendingSaves.current.get(submitted.revision);
     if (pending) return pending;
     const saving = saveSnapshot(submitted).finally(() => {
@@ -193,8 +196,10 @@ export function AlertSettings({
   saveRef.current = save;
   React.useLayoutEffect(() => {
     const prepareSave = () => {
+      const allowed = interactionGate.capture();
       const submitted = { ...live.current };
-      return () => saveRef.current(submitted);
+      return () =>
+        allowed() ? saveRef.current(submitted) : Promise.resolve(false);
     };
     const dispose = onRegisterLeaveBlocker?.({
       get dirty() {
@@ -213,9 +218,10 @@ export function AlertSettings({
       if (typeof dispose === "function") dispose();
       else onRegisterLeaveBlocker?.(null);
     };
-  }, [onRegisterLeaveBlocker, dirtyNow, accept]);
+  }, [onRegisterLeaveBlocker, dirtyNow, accept, interactionGate]);
 
   const test = async () => {
+    if (!interactionGate.allowed()) return;
     setBusy(true);
     setError("");
     setMessage("");
@@ -241,6 +247,7 @@ export function AlertSettings({
     }
   };
   const change = (value: Partial<AlertOptions>) => {
+    if (!interactionGate.allowed()) return;
     if (live.current.draft) {
       live.current.revision += 1;
       live.current.draft = { ...live.current.draft, ...value };
@@ -283,6 +290,7 @@ export function AlertSettings({
                   value={low}
                   disabled={busy || !draft.lowBalanceEnabled}
                   onChange={(event) => {
+                    if (!interactionGate.allowed()) return;
                     live.current.revision += 1;
                     live.current.low = event.target.value;
                     setLow(event.target.value);
@@ -313,6 +321,7 @@ export function AlertSettings({
                   value={budget}
                   disabled={busy || !draft.monthlyBudgetEnabled}
                   onChange={(event) => {
+                    if (!interactionGate.allowed()) return;
                     live.current.revision += 1;
                     live.current.budget = event.target.value;
                     setBudget(event.target.value);

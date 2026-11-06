@@ -9,6 +9,7 @@ pub mod deepseek_api;
 pub mod desktop;
 pub mod error;
 pub mod http;
+mod quit_intent;
 pub mod sync_script;
 pub mod sync_session;
 pub mod token_sync;
@@ -44,6 +45,7 @@ pub fn run() {
         .manage(desktop::DesktopState::default())
         .manage(update_check::UpdateCache::default())
         .manage(alerts::AlertRuntime::default())
+        .manage(quit_intent::QuitIntent::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -78,6 +80,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
             commands::confirm_quit,
+            commands::get_pending_quit_intent,
+            commands::acknowledge_quit_intent,
             commands::is_main_window_visible,
             commands::set_panel_mode,
             commands::get_app_config,

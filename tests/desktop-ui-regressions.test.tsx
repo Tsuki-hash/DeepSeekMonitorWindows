@@ -8,8 +8,14 @@ import { DashboardPanel } from "../src/components/DashboardPanel";
 import { HistoryPanel } from "../src/components/HistoryPanel";
 import { AlertSettings } from "../src/components/AlertSettings";
 import { SettingsPanel } from "../src/components/SettingsPanel";
-import { getCommittedConfig, setCommittedConfig } from "../src/config-store";
+import {
+  getCommittedConfig,
+  getConfigSubscriptionReady,
+  setCommittedConfig,
+} from "../src/config-store";
 import { invalidateUsageRequests } from "../src/usage-api";
+import { historyCache } from "../src/history-cache";
+import { todayStr } from "../src/format";
 
 // Synthetic IPC and renderer checks only. They do not measure native Windows
 // events, DOM layout, focus, scrolling, or StrictEffects replay in WebView2.
@@ -49,6 +55,8 @@ g.document = {
   removeEventListener: noop,
   visibilityState: "visible",
   activeElement: null,
+  createElement: () => ({ click: noop, remove: noop }),
+  body: { appendChild: noop },
 };
 g.HTMLElement = class {};
 g.localStorage = {
@@ -221,16 +229,562 @@ function scenario(name, body) {
       timeouts.clear();
       storage.clear();
       attrs.clear();
+      g.__settingsListen = undefined;
       try {
         await body(concurrent);
       } finally {
         if (renderer) await act(async () => renderer.unmount());
         renderer = null;
         await flush();
+        g.__settingsListen = undefined;
       }
     });
   }
 }
+
+// R32: Registration is separate from callback delivery. Events emitted before
+// accept() really are lost, rather than being delivered by an eager fake.
+const accountEventNames = [
+  "usage-token-captured",
+  "usage-token-cleared",
+  "credential-config-changed",
+  "browsing-data-cleared",
+];
+const controlAccountListeners = () => {
+  const registrations: {
+    name: string;
+    callback: (event: { payload: unknown }) => void;
+    accept: () => void;
+    reject: () => void;
+    releases: number;
+  }[] = [];
+  g.__settingsListen = (name, callback) => {
+    const handlers = g.__settingsListeners.get(name) ?? new Set();
+    g.__settingsListeners.set(name, handlers);
+    if (!accountEventNames.includes(name)) {
+      handlers.add(callback);
+      return Promise.resolve(() => handlers.delete(callback));
+    }
+    const pending = deferred();
+    const entry = {
+      name,
+      callback,
+      releases: 0,
+      accept: () => {
+        handlers.add(callback);
+        pending.resolve(() => {
+          entry.releases++;
+          handlers.delete(callback);
+        });
+      },
+      reject: () =>
+        pending.reject(new Error(`synthetic ${name} registration failure`)),
+    };
+    registrations.push(entry);
+    return pending.promise;
+  };
+  return registrations;
+};
+const accountUsage = (account, { month, year }) => {
+  const model = {
+    model: `${account}-model`,
+    groupKey: null,
+    totalTokens: 10,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: 10,
+    otherTokens: 0,
+    cost: 1,
+  };
+  return {
+    schemaVersion: 2,
+    models: [],
+    rawModels: [model],
+    days: [
+      {
+        date: `${year}-${String(month).padStart(2, "0")}-01`,
+        rawModels: [model],
+      },
+    ],
+    monthCost: 1,
+  };
+};
+const settleHistory = async () => {
+  for (let i = 0; i < 12; i++) await flush();
+};
+
+for (const delayedName of accountEventNames) {
+  scenario(
+    `R32: ${delayedName} must be installed before the first config read or account IPC`,
+    async (concurrent) => {
+      const oldConfig = config;
+      setCommittedConfig(oldConfig);
+      const month = todayStr().slice(0, 7);
+      const [year, number] = month.split("-").map(Number);
+      await historyCache.get(month, async () =>
+        accountUsage("A", { month: number, year }),
+      );
+      const registrations = controlAccountListeners();
+      handlers.fetch_usage = (args) => accountUsage("B", args);
+      await mount(<App />, concurrent);
+      assert.equal(registrations.length, 4);
+      await act(async () => {
+        registrations
+          .filter((entry) => entry.name !== delayedName)
+          .forEach((entry) => entry.accept());
+      });
+      await flush();
+      await click(button("历史"));
+      assert.equal(getConfigSubscriptionReady(), false);
+      assert.equal(submitted("get_app_config").length, 0);
+      assert.equal(submitted("fetch_usage").length, 0);
+      assert.equal(submitted("fetch_balance").length, 0);
+      assert.equal(
+        renderer.root.findByType(HistoryPanel).props.configReady,
+        false,
+      );
+      assert.equal(text().includes("A-model"), false);
+      // The backend changed before the missing listener exists. Only the read
+      // after ALL subscriptions are installed can discover this snapshot.
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      await emit(
+        delayedName,
+        delayedName === "usage-token-captured" ? { config } : config,
+      );
+      await act(async () =>
+        registrations.find((entry) => entry.name === delayedName).accept(),
+      );
+      await settleHistory();
+      assert.equal(submitted("get_app_config").length, 1);
+      assert.equal(getCommittedConfig().configRevision, config.configRevision);
+      assert.equal(getConfigSubscriptionReady(), true);
+      assert.ok(text().includes("B-model"));
+      assert.equal(text().includes("A-model"), false);
+    },
+  );
+}
+
+for (const failedName of accountEventNames) {
+  scenario(
+    `R32: ${failedName} registration failure closes queries, releases listeners and safely retries`,
+    async (concurrent) => {
+      const registrations = controlAccountListeners();
+      await mount(<App />, concurrent);
+      const original = registrations.slice();
+      await act(async () => {
+        original.find((entry) => entry.name === failedName).reject();
+      });
+      await flush();
+      assert.ok(text().includes("账户配置同步不可用"));
+      assert.equal(getConfigSubscriptionReady(), false);
+      await act(async () => {
+        original
+          .filter((entry) => entry.name !== failedName)
+          .forEach((entry) => entry.accept());
+      });
+      await flush();
+      for (const entry of original.filter((entry) => entry.name !== failedName))
+        assert.equal(
+          entry.releases,
+          1,
+          "late successful registrations must release after failure",
+        );
+      await click(button("历史"));
+      assert.equal(submitted("get_app_config").length, 0);
+      assert.equal(submitted("fetch_usage").length, 0);
+      assert.equal(submitted("fetch_balance").length, 0);
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      handlers.fetch_usage = (args) => accountUsage("B", args);
+      await click(button("重试账户同步"));
+      const retry = registrations.slice(original.length);
+      assert.equal(retry.length, 4);
+      await act(async () => retry.forEach((entry) => entry.accept()));
+      await settleHistory();
+      assert.equal(getConfigSubscriptionReady(), true);
+      assert.ok(text().includes("B-model"));
+      const accepted = getCommittedConfig();
+      const obsolete = baseConfig({ apiKeyPreview: "sk-…obsolete" });
+      await act(async () => {
+        original.forEach((entry) =>
+          entry.callback({
+            payload:
+              entry.name === "usage-token-captured"
+                ? { config: obsolete }
+                : obsolete,
+          }),
+        );
+      });
+      await flush();
+      assert.equal(
+        getCommittedConfig(),
+        accepted,
+        "disposed callbacks cannot publish even a higher revision",
+      );
+      assert.equal(submitted("get_app_config").length, 1);
+    },
+  );
+}
+
+for (const late of ["success", "failure"]) {
+  scenario(
+    `R32: a newer config event survives the initial read's late ${late} without waiving reconciliation`,
+    async (concurrent) => {
+      const initial = deferred();
+      const oldConfig = config;
+      handlers.get_app_config = () => initial.promise;
+      handlers.fetch_usage = (args) => accountUsage("B", args);
+      await mount(<App />, concurrent);
+      assert.equal(submitted("get_app_config").length, 1);
+      assert.equal(submitted("fetch_usage").length, 0);
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      await emit("credential-config-changed", config);
+      assert.equal(
+        submitted("fetch_usage").length,
+        0,
+        "bootstrap stays closed until reconciliation settles",
+      );
+      await act(async () => {
+        if (late === "success") initial.resolve(oldConfig);
+        else initial.reject(new Error("obsolete read failure"));
+      });
+      await settleHistory();
+      assert.equal(getCommittedConfig().configRevision, config.configRevision);
+      if (late === "failure") {
+        assert.equal(getConfigSubscriptionReady(), false);
+        assert.ok(text().includes("账户配置同步不可用"));
+        assert.equal(submitted("fetch_usage").length, 0);
+        assert.equal(submitted("fetch_balance").length, 0);
+        delete handlers.get_app_config;
+        await click(button("重试账户同步"));
+        await settleHistory();
+      }
+      assert.equal(getConfigSubscriptionReady(), true);
+      await click(button("历史"));
+      await settleHistory();
+      assert.ok(text().includes("B-model"));
+      assert.equal(text().includes("账户配置同步不可用"), false);
+    },
+  );
+}
+
+for (const source of ["event", "write receipt"]) {
+  scenario(
+    `R32: accepted delayed B ${source} cannot discard the initial read of newer C`,
+    async (concurrent) => {
+      const old = config;
+      setCommittedConfig(old);
+      const delayed = baseConfig({ apiKeyPreview: "sk-…B" });
+      config = baseConfig({ apiKeyPreview: "sk-…C" });
+      const reading = deferred();
+      handlers.get_app_config = () => reading.promise;
+      handlers.fetch_usage = (args) => accountUsage("C", args);
+      await mount(<App />, concurrent);
+      assert.equal(submitted("get_app_config").length, 1);
+      if (source === "event") {
+        await emit("credential-config-changed", delayed);
+      } else {
+        // The settings save response publishes through this same store entry,
+        // even when the native change event was emitted before registration.
+        await act(async () => setCommittedConfig(delayed));
+      }
+      assert.equal(getCommittedConfig().configRevision, delayed.configRevision);
+      assert.equal(getConfigSubscriptionReady(), false);
+      assert.equal(submitted("fetch_usage").length, 0);
+      await act(async () => reading.resolve(config));
+      await settleHistory();
+      assert.equal(getCommittedConfig().configRevision, config.configRevision);
+      assert.equal(getCommittedConfig().apiKeyPreview, "sk-…C");
+      assert.equal(getConfigSubscriptionReady(), true);
+      await click(button("历史"));
+      await settleHistory();
+      assert.ok(text().includes("C-model"));
+      assert.equal(text().includes("B-model"), false);
+    },
+  );
+}
+
+for (const invalidRevision of [
+  undefined,
+  NaN,
+  -1,
+  1.5,
+  Number.MAX_SAFE_INTEGER + 1,
+  "3",
+]) {
+  for (const source of ["read", "event"]) {
+    scenario(
+      `R32: incomparable ${String(invalidRevision)} config version from ${source} fails closed and retries`,
+      async (concurrent) => {
+        const old = config;
+        setCommittedConfig(old);
+        const reading = deferred();
+        handlers.get_app_config = () => reading.promise;
+        await mount(<App />, concurrent);
+        const invalid = {
+          ...old,
+          configRevision: invalidRevision,
+          apiKeyPreview: "sk-…invalid",
+        };
+        if (source === "event")
+          await emit("credential-config-changed", invalid);
+        await act(async () =>
+          reading.resolve(source === "read" ? invalid : old),
+        );
+        await flush();
+        assert.equal(
+          getCommittedConfig(),
+          old,
+          "an incomparable snapshot must never poison the store",
+        );
+        assert.equal(getConfigSubscriptionReady(), false);
+        assert.ok(text().includes("账户配置同步不可用"));
+        assert.equal(submitted("fetch_usage").length, 0);
+        assert.equal(submitted("fetch_balance").length, 0);
+        for (const name of accountEventNames)
+          assert.equal(g.__settingsListeners.get(name)?.size ?? 0, 0);
+        config = baseConfig({ apiKeyPreview: "sk-…recovered" });
+        delete handlers.get_app_config;
+        await click(button("重试账户同步"));
+        await settleHistory();
+        assert.equal(getConfigSubscriptionReady(), true);
+        assert.equal(
+          getCommittedConfig().configRevision,
+          config.configRevision,
+        );
+      },
+    );
+  }
+}
+
+scenario(
+  "R32: conflicting equal-version read cannot be masked by a concurrently accepted event",
+  async (concurrent) => {
+    setCommittedConfig(config);
+    const reading = deferred();
+    handlers.get_app_config = () => reading.promise;
+    await mount(<App />, concurrent);
+    const newer = baseConfig({ apiKeyPreview: "sk-…B" });
+    await emit("credential-config-changed", newer);
+    await act(async () =>
+      reading.resolve({ ...newer, apiKeyPreview: "sk-…conflict" }),
+    );
+    await flush();
+    assert.equal(getCommittedConfig(), newer);
+    assert.equal(getConfigSubscriptionReady(), false);
+    assert.ok(text().includes("账户配置同步不可用"));
+    assert.equal(submitted("fetch_usage").length, 0);
+    config = baseConfig({ apiKeyPreview: "sk-…C" });
+    delete handlers.get_app_config;
+    await click(button("重试账户同步"));
+    await settleHistory();
+    assert.equal(getConfigSubscriptionReady(), true);
+    assert.equal(getCommittedConfig().configRevision, config.configRevision);
+  },
+);
+
+for (const event of ["older", "duplicate"]) {
+  scenario(
+    `R32: an ${event} event cannot discard a newer post-registration snapshot`,
+    async (concurrent) => {
+      const old = config;
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      const observed = config;
+      setCommittedConfig(observed);
+      const reading = deferred();
+      handlers.get_app_config = () => reading.promise;
+      await mount(<App />, concurrent);
+      assert.equal(submitted("get_app_config").length, 1);
+      await emit(
+        "credential-config-changed",
+        event === "older" ? old : observed,
+      );
+      const current = baseConfig({ apiKeyPreview: "sk-…C" });
+      await act(async () => reading.resolve(current));
+      await settleHistory();
+      assert.equal(getCommittedConfig().configRevision, current.configRevision);
+      assert.equal(getConfigSubscriptionReady(), true);
+    },
+  );
+}
+
+scenario(
+  "R32: failed initial reconciliation is recoverable and releases all account listeners",
+  async (concurrent) => {
+    const registrations = controlAccountListeners();
+    handlers.get_app_config = () =>
+      Promise.reject(new Error("synthetic initial read failure"));
+    await mount(<App />, concurrent);
+    await act(async () =>
+      registrations.slice().forEach((entry) => entry.accept()),
+    );
+    await flush();
+    assert.equal(getConfigSubscriptionReady(), false);
+    assert.ok(text().includes("账户配置同步不可用"));
+    assert.ok(registrations.every((entry) => entry.releases === 1));
+    assert.equal(submitted("fetch_usage").length, 0);
+    delete handlers.get_app_config;
+    await click(button("重试账户同步"));
+    await act(async () =>
+      registrations.slice(4).forEach((entry) => entry.accept()),
+    );
+    await settleHistory();
+    assert.equal(getConfigSubscriptionReady(), true);
+    assert.equal(dashboard().usageState, "ok");
+  },
+);
+
+scenario(
+  "R32: unmount revokes late registrations and retained native callbacks",
+  async (concurrent) => {
+    const registrations = controlAccountListeners();
+    await mount(<App />, concurrent);
+    const before = getCommittedConfig();
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await act(async () => registrations.forEach((entry) => entry.accept()));
+    await flush();
+    assert.ok(registrations.every((entry) => entry.releases === 1));
+    const obsolete = baseConfig();
+    await act(async () =>
+      registrations.forEach((entry) =>
+        entry.callback({
+          payload:
+            entry.name === "usage-token-captured"
+              ? { config: obsolete }
+              : obsolete,
+        }),
+      ),
+    );
+    assert.equal(getCommittedConfig(), before);
+    assert.equal(getConfigSubscriptionReady(), false);
+    assert.equal(submitted("get_app_config").length, 0);
+    assert.equal(submitted("fetch_usage").length, 0);
+  },
+);
+
+for (const late of ["success", "failure"]) {
+  scenario(
+    `R32: an unmounted owner's initial read ${late} cannot alter its replacement`,
+    async (concurrent) => {
+      const initial = deferred();
+      const oldConfig = config;
+      handlers.get_app_config = () => initial.promise;
+      await mount(<App />, concurrent);
+      await act(async () => renderer.unmount());
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      delete handlers.get_app_config;
+      await mount(<App />, concurrent);
+      const accepted = getCommittedConfig();
+      const before = calls.length;
+      await act(async () => {
+        if (late === "success") initial.resolve(oldConfig);
+        else initial.reject(new Error("obsolete owner read failure"));
+      });
+      await flush();
+      assert.equal(getCommittedConfig(), accepted);
+      assert.equal(getConfigSubscriptionReady(), true);
+      assert.equal(calls.length, before);
+    },
+  );
+}
+
+scenario(
+  "R32: a live account change cannot merge A history with B continuation or export",
+  async (concurrent) => {
+    let account = "A";
+    handlers.fetch_usage = (args) => accountUsage(account, args);
+    const blobs: Blob[] = [];
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = (blob) => {
+      blobs.push(blob);
+      return "blob:synthetic-r32-history";
+    };
+    URL.revokeObjectURL = noop;
+    try {
+      await mount(<App />, concurrent);
+      await click(button("历史"));
+      await click(button("全部"));
+      await settleHistory();
+      assert.ok(text().includes("A-model"));
+      const oldExport = button("JSON").props.onClick;
+      account = "B";
+      config = baseConfig({ apiKeyPreview: "sk-…B" });
+      await emit("credential-config-changed", config);
+      await settleHistory();
+      assert.ok(text().includes("B-model"));
+      assert.equal(text().includes("A-model"), false);
+      await act(async () => oldExport());
+      assert.equal(blobs.length, 0);
+      await click(button("继续加载更早月份 ›"));
+      await settleHistory();
+      await click(button("JSON"));
+      assert.equal(blobs.length, 1);
+      const result = JSON.parse(await blobs[0].text());
+      assert.ok(result.sourceMonthlySnapshots.length > 12);
+      assert.ok(result.daily.length > 0);
+      assert.ok(result.daily.every((row) => row.model === "B-model"));
+      assert.ok(
+        result.sourceMonthlySnapshots.every(
+          (month) =>
+            month.models.length > 0 &&
+            month.models.every((model) => model.model === "B-model"),
+        ),
+      );
+    } finally {
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+    }
+  },
+);
+
+scenario(
+  "R32: losing config-event trust synchronously revokes loaded history and obsolete handlers",
+  async (concurrent) => {
+    const registrations = controlAccountListeners();
+    handlers.fetch_usage = (args) => accountUsage("A", args);
+    await mount(<App />, concurrent);
+    await act(async () =>
+      registrations.slice().forEach((entry) => entry.accept()),
+    );
+    await settleHistory();
+    await click(button("历史"));
+    await settleHistory();
+    assert.ok(text().includes("A-model"));
+    const oldRefresh = renderer.root.findByProps({
+      "aria-label": "重新查询历史",
+    }).props.onClick;
+    const before = submitted("fetch_usage").length;
+    const accepted = getCommittedConfig();
+    await act(async () => {
+      const changed = registrations.find(
+        (entry) => entry.name === "credential-config-changed",
+      );
+      // Same version with different contents violates the backend snapshot
+      // contract. A delivery callback failure must close, not keep stale data.
+      changed.callback({
+        payload: { ...accepted, apiKeyPreview: "inconsistent" },
+      });
+      oldRefresh();
+    });
+    await flush();
+    assert.equal(getConfigSubscriptionReady(), false);
+    assert.equal(submitted("fetch_usage").length, before);
+    assert.equal(text().includes("A-model"), false);
+    assert.ok(text().includes("账户配置同步不可用"));
+    assert.ok(registrations.every((entry) => entry.releases === 1));
+    config = baseConfig({ apiKeyPreview: "sk-…B" });
+    handlers.fetch_usage = (args) => accountUsage("B", args);
+    await click(button("重试账户同步"));
+    await act(async () =>
+      registrations.slice(4).forEach((entry) => entry.accept()),
+    );
+    await settleHistory();
+    assert.ok(text().includes("B-model"));
+    assert.equal(text().includes("A-model"), false);
+  },
+);
 
 scenario(
   "R17: invalid balance refresh keeps the last trusted amount and timestamp until recovery",

@@ -1,4 +1,5 @@
 import React from "react";
+import { useQuitInteractionGate } from "../quit-interaction-context";
 import { invoke } from "@tauri-apps/api/core";
 import { Toggle } from "./ui";
 import { errorMessage } from "../error-state";
@@ -8,6 +9,7 @@ type DesktopOptions = {
   error: string | null;
 };
 export function DesktopSettings() {
+  const interactionGate = useQuitInteractionGate();
   const [options, setOptions] = React.useState<DesktopOptions | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -44,6 +46,7 @@ export function DesktopSettings() {
     };
   }, [reload]);
   const save = async (next: DesktopOptions) => {
+    if (!interactionGate.allowed()) return;
     setBusy(true);
     setError("");
     try {
