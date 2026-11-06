@@ -6,7 +6,7 @@
 use crate::error::ErrorKind;
 use crate::http::http_client;
 use crate::usage::{
-    cost_sum, merge_model_slot, model_slot, token_breakdown, Entry, UsageModelSummary, FLASH_SLOT,
+    merge_model_slot, model_slot, token_breakdown, Entry, UsageModelSummary, FLASH_SLOT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -312,7 +312,7 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             .filter(|m| m.model == model)
             .try_fold(0.0, |total, m| {
                 matched = true;
-                Some(total + cost_sum(&m.usage)?)
+                Some(total + crate::usage::cost_sum_present(&m.usage)?)
             })?;
         matched.then_some(total)
     };
@@ -431,7 +431,9 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             *entry = entry.and_then(|total| {
                 day.data
                     .iter()
-                    .try_fold(0.0, |sum, m| Some(sum + cost_sum(&m.usage)?))
+                    .try_fold(0.0, |sum, m| {
+                        Some(sum + crate::usage::cost_sum_present(&m.usage)?)
+                    })
                     .map(|sum| total + sum)
             });
         }
@@ -490,11 +492,24 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         let mut total = zero();
         let mut flash_other = zero();
         let mut pro_other = zero();
+        // 复评 R10：**先按模型合并当天的 usage 条目，再算一次 breakdown** ——
+        // 与月级（F05）和 raw_models 同一口径。旧实现逐片调用
+        // `token_breakdown` 再累加：一天里同一模型两行
+        //（`PROMPT_TOKEN=100` 与 `HIT=20/MISS=80/RESPONSE=10`）会让首页日总
+        // 推导 210，而历史 raw 得 110 —— 同一份数据在两条通路自相矛盾。
+        let mut merged_daily: std::collections::BTreeMap<&str, Vec<crate::usage::Entry>> =
+            std::collections::BTreeMap::new();
         for model_usage in &day.data {
-            let breakdown = token_breakdown(&model_usage.usage);
+            merged_daily
+                .entry(model_usage.model.as_str())
+                .or_default()
+                .extend(model_usage.usage.iter().cloned());
+        }
+        for (model, usage) in merged_daily {
+            let breakdown = token_breakdown(&usage);
             total = sum_counts(total, breakdown.total);
             // total 覆盖当天全部模型（含未知模型），槽位分摊只作用于已识别的模型
-            if let Some((slot, _)) = model_slot(&model_usage.model) {
+            if let Some((slot, _)) = model_slot(model) {
                 if slot == FLASH_SLOT {
                     flash = sum_counts(flash, breakdown.total);
                     flash_hit = sum_counts(flash_hit, breakdown.cache_hit);
@@ -629,9 +644,9 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             // 空费用组在有数量模型的上下文里不是「显式零」。
             return None;
         }
-        item.total
-            .iter()
-            .try_fold(0.0, |total, m| Some(total + cost_sum(&m.usage)?))
+        item.total.iter().try_fold(0.0, |total, m| {
+            Some(total + crate::usage::cost_sum_present(&m.usage)?)
+        })
     });
 
     let mut warnings = usage_alignment_warnings(amount, cost, &days);
@@ -1623,6 +1638,156 @@ mod tests {
         assert_eq!(
             flash.total_tokens, None,
             "累计溢出必须传播未知，不能 unwrap_or(0) 变成 0"
+        );
+    }
+
+    // ---------- 第八轮复评 R05/R09/R10 ----------
+
+    #[test]
+    fn r05_镜像client不再被静默丢弃且与原生会话隔离() {
+        // 固定引擎的 Claude 解析器会把 cc-mirror 的 variant 作为独立 client 输出。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}
+                ],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(
+            r#"{"entries":[
+                {"client":"claude","sessionId":"s1","model":"deepseek-flash","input":100,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"claude-mirror","sessionId":"s1","model":"deepseek-flash","input":65,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[],"sessions":[]}"#,
+        )
+        .unwrap();
+        let snapshot = crate::local_usage::normalize_report(&report, 1000).unwrap();
+        // 镜像条目必须保留（旧实现被 CLIENTS 严格过滤丢弃）。
+        assert_eq!(snapshot.rows.len(), 2, "镜像 client 不得被静默丢弃");
+        assert!(
+            snapshot.rows.iter().any(|row| row.tool == "claude"),
+            "镜像归类到 claude 槽位"
+        );
+        // 同名 sessionId 的镜像与原生必须是两条独立行（不能合并）。
+        let ids: std::collections::HashSet<_> =
+            snapshot.rows.iter().map(|row| row.id.clone()).collect();
+        assert_eq!(ids.len(), 2, "原生与镜像的同名会话必须隔离");
+        // 不支持的 client 仍被忽略（不被误当镜像）。
+        let unknown: serde_json::Value = serde_json::from_str(
+            r#"{"entries":[{"client":"codex","sessionId":"s9","model":"m","input":10,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0}],"workspaces":[],"sessions":[]}"#,
+        )
+        .unwrap();
+        assert!(crate::local_usage::normalize_report(&unknown, 2000)
+            .unwrap()
+            .rows
+            .is_empty());
+        let _ = build_usage_result(&amount, &cost);
+    }
+
+    #[test]
+    fn r09_有数量但无任何费用值为未知_显式零仍为零() {
+        // 数量侧返回模型 A=100；费用侧 A 的 usage 为空（只有分组没有值）。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}],
+                "days":[]
+            }}}"#,
+        )
+        .unwrap();
+        let empty_usage_cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"m-a","usage":[]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &empty_usage_cost);
+        assert_eq!(
+            result.month_cost, None,
+            "有数量但没有任何费用值时月金额未知（不是 0）"
+        );
+        assert!(
+            result
+                .models
+                .iter()
+                .find(|model| model.key == "other")
+                .is_none_or(|model| model.cost.is_none()),
+            "该模型费用同样未知"
+        );
+
+        // 显式 RESPONSE 费用 0 仍是合法零。
+        let zero_cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"0.0"}]}],
+                "days":[]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &zero_cost);
+        assert_eq!(result.month_cost, Some(0.0), "显式零费用保留为 0");
+    }
+
+    #[test]
+    fn r10_日级同模型分两片_日总与历史raw一致() {
+        // 评审输入：一天同模型两行 PROMPT=100 与 HIT=20/MISS=80/RESPONSE=10。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[{"model":"deepseek-flash","usage":[
+                    {"type":"PROMPT_TOKEN","amount":"100"},
+                    {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"20"},
+                    {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"80"},
+                    {"type":"RESPONSE_TOKEN","amount":"10"}
+                ]}],
+                "days":[{"date":"2026-09-01","data":[
+                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_TOKEN","amount":"100"}]},
+                    {"model":"deepseek-flash","usage":[
+                        {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"20"},
+                        {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"80"},
+                        {"type":"RESPONSE_TOKEN","amount":"10"}
+                    ]}
+                ]}]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[{"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}],
+                "days":[{"date":"2026-09-01","data":[
+                    {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.1"}]}
+                ]}]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let day = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(
+            day.total_tokens,
+            Some(110),
+            "日级必须先按模型合并再算 breakdown（旧实现逐片得 210）"
+        );
+        let raw = crate::usage_history::raw_models(
+            &amount.data.biz_data.days[0].data,
+            &cost.data.biz_data[0].days[0].data,
+        );
+        assert_eq!(
+            raw.iter()
+                .find(|model| model.model == "deepseek-flash")
+                .unwrap()
+                .total_tokens,
+            Some(110),
+            "日总与历史 raw 必须一致"
         );
     }
 

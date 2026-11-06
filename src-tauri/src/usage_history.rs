@@ -1,6 +1,6 @@
 //! Lossless model identity for history/export, alongside the existing dashboard slots.
 use crate::deepseek_api::ModelUsage;
-use crate::usage::{amount, cost_sum, count, model_slot, Entry, MAX_SAFE_COUNT};
+use crate::usage::{amount, count, model_slot, Entry, MAX_SAFE_COUNT};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -41,7 +41,9 @@ pub fn raw_models(amount_rows: &[ModelUsage], cost_rows: &[ModelUsage]) -> Vec<R
     }
     for row in cost_rows {
         let entry = costs.entry(row.model.as_str()).or_insert(Some(0.0));
-        *entry = entry.and_then(|total| cost_sum(&row.usage).map(|value| total + value));
+        *entry = entry.and_then(|total| {
+            crate::usage::cost_sum_present(&row.usage).map(|value| total + value)
+        });
     }
     let names: std::collections::BTreeSet<_> = tokens.keys().chain(costs.keys()).copied().collect();
     names

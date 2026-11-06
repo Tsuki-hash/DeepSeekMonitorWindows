@@ -220,11 +220,15 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
             .push(row);
     }
     let mut changed = false;
-    // 复评 F03：**两阶段**分配，与键的排序无关。
-    // 第一阶段：已存在会话的替换（含缩小释放空间）。这是用户既有记录的
-    // 更新，必须优先 —— 旧实现按 BTreeMap 键序混排，新增条目排在前面时会
-    // 抢占预算，把本可提交的旧更新挤成 `skipped_bytes`。
-    // 第二阶段：在**剩余**预算内接收新会话。
+    // 复评 F03/R08：**三阶段**分配，与键序无关，且增长项不会因排序而丢失。
+    // 旧实现（F03）虽然先处理旧更新，但仍按 BTreeMap 键序单遍遍历：
+    // 预算满时 `a`（增长 100）先被跳过，`z`（缩小 200）后成功 —— 全批其实
+    // 可容纳，`a` 却保留了旧值。现在按 **size delta** 排序：
+    //   阶段 1：缩小/等大的替换（释放预算）；
+    //   阶段 2：增长的替换（此时预算已因缩小而放宽）；
+    //   阶段 3：新增（只用真正剩余的预算）。
+    let mut shrink_or_same: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
+    let mut grow: Vec<(usize, ArchiveEntry, usize)> = Vec::new();
     let mut additions: Vec<ArchiveEntry> = Vec::new();
     for ((source, tool, session), rows) in groups {
         let entry = ArchiveEntry {
@@ -244,40 +248,55 @@ fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<Checkpoi
         if !valid(&entry) {
             return Err("会话留存字段不可用，未改写".into());
         }
-        if let Some(previous) = store
-            .entries
-            .iter_mut()
-            .find(|previous| previous.id == entry.id)
-        {
-            if entry.collected_at < previous.collected_at {
-                return Err("采集时间早于已有留存，未改写；请核对系统时间".into());
-            }
-            if previous.rows == entry.rows
-                && previous.complete == entry.complete
-                && previous.engine_version == entry.engine_version
-                && previous.accounting_utc_offset_seconds == entry.accounting_utc_offset_seconds
-            {
-                outcome.written += 1;
-                continue;
-            }
-            let new_size = entry_size(&entry);
-            let old_size = entry_size(previous);
-            // 替换不改变 JSON 结构开销：体积差 = 新条目 − 旧条目（精确）。
-            // 缩小（或不变）的更新总是允许 —— 它会释放预算给后续条目。
-            if new_size > old_size && store_size + (new_size - old_size) > budget {
-                // 该条自身扩大到超限：跳过并保持旧值，不拖累其他条目。
-                outcome.skipped_bytes += 1;
-                continue;
-            }
-            store_size = store_size + new_size - old_size;
-            *previous = entry;
-            outcome.written += 1;
-            changed = true;
-        } else {
+        let index = store.entries.iter().position(|p| p.id == entry.id);
+        let Some(index) = index else {
             additions.push(entry);
+            continue;
+        };
+        let previous = &store.entries[index];
+        if entry.collected_at < previous.collected_at {
+            return Err("采集时间早于已有留存，未改写；请核对系统时间".into());
+        }
+        if previous.rows == entry.rows
+            && previous.complete == entry.complete
+            && previous.engine_version == entry.engine_version
+            && previous.accounting_utc_offset_seconds == entry.accounting_utc_offset_seconds
+        {
+            outcome.written += 1;
+            continue;
+        }
+        let new_size = entry_size(&entry);
+        let old_size = entry_size(previous);
+        // 替换不改变 JSON 结构开销：体积差 = 新条目 − 旧条目（精确）。
+        if new_size <= old_size {
+            shrink_or_same.push((old_size - new_size, entry, index));
+        } else {
+            grow.push((new_size - old_size, entry, index));
         }
     }
-    // 第二阶段：新增按字节预算逐个接收；条数上限单独计 `skipped`。
+    // 阶段 1：缩小/等大 —— 总是允许，且释放预算给增长项与新增。
+    // 释放多的排前面，让后续增长项更容易被容纳（与键序无关）。
+    shrink_or_same.sort_by_key(|item| std::cmp::Reverse(item.0));
+    for (freed, entry, index) in shrink_or_same {
+        store_size = store_size.saturating_sub(freed);
+        store.entries[index] = entry;
+        outcome.written += 1;
+        changed = true;
+    }
+    // 阶段 2：增长 —— 按增量从小到大尝试，最大化可容纳的旧更新条数。
+    grow.sort_by_key(|item| item.0);
+    for (delta, entry, index) in grow {
+        if store_size + delta > budget {
+            // 该条自身扩大到超限：跳过并保持旧值，不拖累其他条目。
+            outcome.skipped_bytes += 1;
+            continue;
+        }
+        store_size += delta;
+        store.entries[index] = entry;
+        outcome.written += 1;
+        changed = true;
+    }
+    // 阶段 3：新增按字节预算逐个接收；条数上限单独计 `skipped`。
     for entry in additions {
         if store.entries.len() >= MAX_ENTRIES {
             outcome.skipped += 1;
@@ -513,6 +532,56 @@ mod tests {
         );
         assert!(!outcome.failed);
         assert_eq!(outcome.skipped_bytes, 0, "缩小的旧更新不该被跳过");
+    }
+
+    // ---------- 第八轮复评 R08：增长项不能因键序/排序被缩小项挤掉 ----------
+
+    #[test]
+    fn r08_满预算下增长与缩小同时存在_两项都应更新() {
+        // 评审反例：预算已满，`a`（增长）按键序先处理被跳过，`z`（缩小）
+        // 后成功 —— 全批其实可容纳。三阶段（缩小/等大 → 增长 → 新增）
+        // 让缩小先释放预算，增长项随后即可容纳，`skipped_bytes` 应为 0。
+        let _dir = TempConfigDir::new("retention-delta");
+        set_enabled(true).unwrap();
+        checkpoint(&snapshot(1000)).unwrap();
+        // 两个既有会话：一个（claude）本轮增长，一个（opencode）本轮缩小。
+        let first = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"claude","sessionId":"s-grow","workspaceKey":"w1","model":"m","input":10,"output":10,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"opencode","sessionId":"s-shrink","workspaceKey":"w1","model":"LONGPADDINGPADDINGPADDINGPADDINGPADDING","input":10,"output":10,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),
+            1000,
+        )
+        .unwrap();
+        checkpoint_budget(&first, usize::MAX).unwrap();
+        let baseline = fs::read(store_path().unwrap()).unwrap().len();
+        // 下一轮：claude 增长（模型名变长），opencode 缩小（模型名变短）。
+        let next = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"claude","sessionId":"s-grow","workspaceKey":"w1","model":"m","input":11,"output":10,"reasoning":0,"cacheRead":0,"cacheWrite":0},
+                {"client":"opencode","sessionId":"s-shrink","workspaceKey":"w1","model":"s","input":10,"output":10,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),
+            2000,
+        )
+        .unwrap();
+        // 预算保持原文件大小：增长需要空间，只有缩小先释放才够。
+        let outcome = checkpoint_budget(&next, baseline).unwrap();
+        assert_eq!(outcome.written, 2, "两项都应更新：{outcome:?}");
+        assert_eq!(
+            outcome.skipped_bytes, 0,
+            "缩小先释放预算后，增长项不应被跳过：{outcome:?}"
+        );
+        assert!(!outcome.failed);
+        let store = load().unwrap();
+        assert!(store
+            .entries
+            .iter()
+            .any(|entry| entry.rows[0].session_id == "s-grow"
+                && entry.rows[0].model.starts_with("m")));
+        assert!(store
+            .entries
+            .iter()
+            .any(|entry| entry.rows[0].session_id == "s-shrink" && entry.rows[0].model == "s"));
     }
 
     #[test]

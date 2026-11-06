@@ -253,6 +253,26 @@ pub fn cost_sum(usage: &[Entry]) -> Option<f64> {
         .try_fold(0.0, |total, entry| Some(total + amount(&entry.amount)?))
 }
 
+/// 复评 R09：费用求和的**presence 证据**版本。
+///
+/// `cost_sum` 对「只有 REQUEST」或「空 usage」返回 `Some(0.0)` —— 那是从 0
+/// 开始累加得到的零，不是平台声明的零。当数量侧明确返回了模型（有 token），
+/// 而费用侧该模型的 usage 为空时，展示 0 元等于把一个未知值说成「没花钱」。
+///
+/// 返回 `None` 表示**没有任何可用的非 REQUEST 费用值**（未知）；返回
+/// `Some(v)` 表示至少存在一个可解析的费用条目（v 可以是显式 0）。
+pub fn cost_sum_present(usage: &[Entry]) -> Option<f64> {
+    let mut seen = false;
+    let total = usage
+        .iter()
+        .filter(|entry| entry.kind != "REQUEST")
+        .try_fold(0.0, |total, entry| {
+            seen = true;
+            Some(total + amount(&entry.amount)?)
+        })?;
+    seen.then_some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
