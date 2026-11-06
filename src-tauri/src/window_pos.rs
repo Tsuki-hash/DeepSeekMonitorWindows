@@ -92,6 +92,30 @@ pub fn panel_origin(
     )
 }
 
+/// 第五轮复评 N03：把窗口**完整矩形**约束进工作区。
+///
+/// 扩大尺寸（set_panel_mode）与托盘位置恢复都只保证过左上角 —— 右下角
+/// 展开或分辨率/拔屏后恢复时，右/下边界可能超出工作区，右侧与底部控件
+/// 不可见。窗口本身大于工作区时贴靠工作区左上角（宁可小于最小尺寸，
+/// 不可整块不可见）。
+pub fn clamp_origin_into_area(
+    area: WorkArea,
+    panel_width: i32,
+    panel_height: i32,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
+    let mut x = x.max(area.x);
+    let mut y = y.max(area.y);
+    if x + panel_width > area.right() {
+        x = (area.right() - panel_width).max(area.x);
+    }
+    if y + panel_height > area.bottom() {
+        y = (area.bottom() - panel_height).max(area.y);
+    }
+    (x, y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +171,42 @@ mod tests {
         assert!(x >= 0 && y >= 0);
         assert!(x + 356 <= 1920);
         assert!(y + 600 <= 1040);
+    }
+
+    // ---------- 第五轮复评 N03：完整矩形约束 ----------
+
+    #[test]
+    fn n03_右下角展开_完整矩形夹回工作区() {
+        // 评审示例：1920×1040 工作区，窗口停在 (1552,428)，展开为 720×760 ——
+        // 只调尺寸右/下边界会超出 352/148px；夹回后必须完整可见。
+        let (x, y) = clamp_origin_into_area(area(), 720, 760, 1552, 428);
+        assert_eq!(x, 1920 - 720);
+        assert_eq!(y, 1040 - 760);
+    }
+
+    #[test]
+    fn n03_窗口大于工作区_贴靠左上角() {
+        let small = WorkArea {
+            x: 100,
+            y: 100,
+            width: 500,
+            height: 400,
+        };
+        let (x, y) = clamp_origin_into_area(small, 720, 760, 300, 300);
+        assert_eq!((x, y), (100, 100));
+    }
+
+    #[test]
+    fn n03_矩形已在工作区内_位置不动() {
+        let (x, y) = clamp_origin_into_area(area(), 356, 600, 10, 10);
+        assert_eq!((x, y), (10, 10));
+    }
+
+    #[test]
+    fn n03_左上角越界先夹入_再验完整矩形() {
+        // 恢复记录的左上角本身在屏幕外（负坐标屏拔掉后）：先夹入，
+        // 再保证右/下不越界。
+        let (x, y) = clamp_origin_into_area(area(), 356, 600, -800, -500);
+        assert_eq!((x, y), (0, 0));
     }
 }

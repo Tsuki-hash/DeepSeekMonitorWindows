@@ -200,11 +200,30 @@ pub(crate) fn restore_saved_position(window: &WebviewWindow) -> bool {
         return false;
     };
     // 位置的左上角坐标必须仍落在某块显示器内，否则恢复出来的面板可能整个看不见
-    let Ok(Some(_)) = window.monitor_from_point(x as f64, y as f64) else {
+    let Ok(Some(monitor)) = window.monitor_from_point(x as f64, y as f64) else {
         return false;
     };
+    // 复评 N03：恢复必须验证**完整矩形**而不只是左上角 —— 分辨率变化、
+    // 拔屏或展开尺寸下保存的位置会让右/下边界越出工作区。按该显示器的
+    // 工作区把位置夹回，保证整个面板可见。
+    let area = monitor.work_area();
+    let size = window.outer_size().unwrap_or_default();
+    let (clamped_x, clamped_y) = crate::window_pos::clamp_origin_into_area(
+        crate::window_pos::WorkArea {
+            x: area.position.x,
+            y: area.position.y,
+            width: area.size.width as i32,
+            height: area.size.height as i32,
+        },
+        size.width as i32,
+        size.height as i32,
+        x,
+        y,
+    );
     window
-        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .set_position(Position::Physical(PhysicalPosition::new(
+            clamped_x, clamped_y,
+        )))
         .is_ok()
 }
 

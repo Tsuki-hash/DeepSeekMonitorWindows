@@ -350,10 +350,20 @@ pub async fn running_wsl() -> Result<WslStatus, String> {
 
 /// A timed-out filesystem call can continue inside Windows. One permit bounds all
 /// outstanding probes, so repeated refreshes cannot accumulate blocked threads.
-pub async fn probe_home(home: PathBuf) -> Result<PathBuf, String> {
-    probe_path(home, true).await
-}
-pub async fn probe_path(home: PathBuf, directory: bool) -> Result<PathBuf, String> {
+///
+/// 复评 Q07：探测必须在**访问目标之前**实施来源规则。`fs::metadata` 与
+/// `fs::canonicalize` 都会跟随链接访问目标 —— 旧实现先访问再复检，拒绝提示
+/// 出现时目标（网络共享、未运行的 WSL 发行版）可能已被访问过。现在的顺序：
+/// 1. `symlink_metadata` 只看条目本身，不跟随 reparse；
+/// 2. 路径本身或任一父组件是 reparse 点时，先 `read_link` 取目标**文本**
+///    （不访问目标），按入口策略判定，越界立即拒绝；
+/// 3. 通过后才 metadata / canonicalize，并对解析结果重跑
+///    `recheck_resolved_target`。
+pub async fn probe_path(
+    home: PathBuf,
+    directory: bool,
+    origin: SourceOrigin,
+) -> Result<PathBuf, String> {
     static PROBE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let permit = PROBE
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
@@ -364,6 +374,7 @@ pub async fn probe_path(home: PathBuf, directory: bool) -> Result<PathBuf, Strin
         Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            check_link_chain(&home, origin)?;
             let metadata = std::fs::metadata(&home).map_err(|_| "路径不存在或无法访问")?;
             if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
                 return Err(if directory {
@@ -373,12 +384,123 @@ pub async fn probe_path(home: PathBuf, directory: bool) -> Result<PathBuf, Strin
                 }
                 .into());
             }
-            std::fs::canonicalize(home).map_err(|_| "主目录无法解析".into())
+            let canonical =
+                std::fs::canonicalize(&home).map_err(|_| "主目录无法解析".to_string())?;
+            recheck_resolved_target(
+                &home.to_string_lossy(),
+                &canonical,
+                if directory {
+                    ResolvedExpect::Directory
+                } else {
+                    ResolvedExpect::File
+                },
+                origin,
+            )
         }),
     )
     .await
     .map_err(|_| "主目录检查超时")?
     .map_err(|_| "主目录检查失败")?
+}
+
+/// 是否为 reparse 点（符号链接、junction 等名称代理）。
+#[cfg(windows)]
+pub fn is_reparse_entry(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+#[cfg(not(windows))]
+pub fn is_reparse_entry(meta: &std::fs::Metadata) -> bool {
+    meta.is_symlink()
+}
+
+/// 复评 Q07：对路径本身与各级父组件做**不跟随**的 reparse 检查。
+/// 发现链接先取目标文本做策略判定，越界在访问目标之前拒绝。
+fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String> {
+    match origin {
+        SourceOrigin::Native => {
+            // 文本预检：WSL/网络共享/系统目录形态直接拒绝，不做文件系统访问。
+            if is_disallowed_local_target_text(&path.to_string_lossy()) {
+                return Err("路径指向 WSL、网络共享或系统目录，未访问".into());
+            }
+        }
+        SourceOrigin::Wsl => {}
+    }
+    let mut current: Option<PathBuf> = Some(path.to_path_buf());
+    while let Some(item) = current {
+        let meta = std::fs::symlink_metadata(&item).map_err(|_| {
+            if item == path {
+                "路径不存在或无法访问".to_string()
+            } else {
+                format!("路径的上级组件无法检查：{}", item.display())
+            }
+        })?;
+        if is_reparse_entry(&meta) {
+            let target = std::fs::read_link(&item)
+                .map_err(|_| format!("链接目标无法读取：{}", item.display()))?;
+            reject_link_target(&target.to_string_lossy(), origin)?;
+            // 链接已获批准：后续 canonicalize 解析它；更深的父组件位于
+            // 链接目标一侧，由解析后的 recheck 统一判定。
+            return Ok(());
+        }
+        current = item
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+    }
+    Ok(())
+}
+
+/// 复评 Q07：路径**文本**越界判定（不访问文件系统）。
+pub fn is_disallowed_local_target_text(value: &str) -> bool {
+    let normalized = normalize_resolved_str(value);
+    is_wsl_path(&normalized)
+        || is_network_path(&normalized)
+        || is_protected_system_path(&normalized)
+}
+
+/// 复评 Q07：链接目标文本的入口策略判定 —— 只看文本，不访问目标。
+fn reject_link_target(target: &str, origin: SourceOrigin) -> Result<(), String> {
+    match origin {
+        SourceOrigin::Native => {
+            if is_disallowed_local_target_text(target) {
+                return Err("链接目标指向 WSL、网络共享或系统目录，未访问该目标".into());
+            }
+        }
+        SourceOrigin::Wsl => {
+            let normalized = normalize_resolved_str(target);
+            if is_network_path(&normalized) {
+                return Err("链接目标指向网络共享，未访问该目标".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 复评 Q05：解析一个**布局根**用于覆盖登记 —— 不跟随访问越界目标。
+///
+/// 布局根本身可能是 junction（home 标准目录映射到别处）。登记覆盖必须用
+/// **实际被读取的目标**，否则解析后的别名与登记的字面路径对不上，同源
+/// 会被统计两次。步骤：
+/// 1. `symlink_metadata` 不跟随；不是 reparse 点 → 直接 canonicalize；
+/// 2. 是 reparse 点 → `read_link` 取目标文本，先按入口策略判定，越界
+///    直接报错（调用方选择不登记 —— 去重宁可漏判重，不可漏采）；
+/// 3. 通过后 canonicalize 并对解析结果重跑 `recheck_resolved_target`。
+pub fn resolve_layout_root(path: &Path, origin: SourceOrigin) -> Result<PathBuf, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|_| "布局根不可访问")?;
+    if is_reparse_entry(&meta) {
+        let target = std::fs::read_link(path).map_err(|_| "布局根链接无法读取")?;
+        reject_link_target(&target.to_string_lossy(), origin)?;
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| "布局根无法解析")?;
+    recheck_resolved_target(
+        &path.to_string_lossy(),
+        &canonical,
+        ResolvedExpect::Directory,
+        origin,
+    )
+    .map(|_| canonical)
 }
 
 /// 解析后的目标是否需要重新核对来源策略。
@@ -798,5 +920,48 @@ mod tests {
             SourceOrigin::Native
         )
         .is_err());
+    }
+
+    // ---------- 第五轮复评 Q07：目标文本的入口策略判定 ----------
+
+    #[test]
+    fn q07_链接与路径文本判定_覆盖wsl_unc系统目录() {
+        // 文本判定在**任何文件系统访问之前**执行（复评 Q07）。
+        assert!(is_disallowed_local_target_text(
+            r"\\wsl.localhost\Ubuntu\home\user"
+        ));
+        assert!(is_disallowed_local_target_text(r"\\wsl$\Ubuntu\home\user"));
+        assert!(is_disallowed_local_target_text(r"\\server\share\logs"));
+        assert!(is_disallowed_local_target_text(r"C:\Windows\System32"));
+        assert!(is_disallowed_local_target_text(r"\\?\C:\Program Files\App"));
+        assert!(!is_disallowed_local_target_text(r"D:\Logs\Claude"));
+        assert!(!is_disallowed_local_target_text(r"\\?\D:\Logs"));
+        // junction 的 read_link 目标常带扩展前缀：还原后必须能被识别。
+        assert!(is_disallowed_local_target_text(
+            r"\\?\UNC\server\share\logs"
+        ));
+    }
+
+    #[test]
+    fn q07_布局根解析_普通目录返回规范路径() {
+        let base = std::env::temp_dir().join(format!("dsm-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".claude/projects")).unwrap();
+        let resolved = resolve_layout_root(&base.join(".claude/projects"), SourceOrigin::Native);
+        assert!(resolved.is_ok(), "普通布局根应能解析：{:?}", resolved.err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn q07_布局根解析_不存在的根报错不登记() {
+        let missing = std::env::temp_dir().join(format!(
+            "dsm-layout-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(resolve_layout_root(&missing, SourceOrigin::Native).is_err());
     }
 }

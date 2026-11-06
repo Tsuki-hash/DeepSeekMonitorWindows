@@ -385,18 +385,26 @@ pub async fn collect_sources(
     } else {
         None
     };
+    // 第五轮复评 Q06：引擎 settings.json 的扩展根可能指向 WSL —— 状态按需
+    // 读取并记住，避免逐来源重复 spawn wsl.exe。
+    let mut wsl_memo = wsl.clone();
     let mut rows = Vec::new();
     // 复评 T04：记录「哪个来源已占用该物理路径」，提示能说清是谁覆盖了谁。
     // 复评 Q05：键按**解析器作用域**划分 —— home 解析器覆盖全部工具，
     // 单工具路径用自己的解析器；两个不同工具指向同一目录不代表语义相同，
     // 不得互相去重。
     let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    // 复评 Q05：home 来源成功后登记它的**标准布局覆盖根**（canonical）。
-    // junction 把工具标准目录映射到别处时，原始字符串判重不命中，
+    // 复评 Q05：home 来源成功后登记它的**标准布局覆盖根**（逐个解析后的实际
+    // 目标）。junction 把工具标准目录映射到别处时，原始字符串判重不命中，
     // canonical 后与 home 根也不相等 —— 只有把 home 展开成每个工具的
-    // 标准布局根，才能证明「这个工具来源已被 home 覆盖」。
-    let layout_roots: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // 标准布局根并解析实际目标，才能证明「这个工具来源已被 home 覆盖」。
+    // 第五轮复评 Q05：外层键是**工具** —— 一种工具的布局覆盖不得推成
+    // 另一个解析器也已覆盖。
+    let layout_roots: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        >,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // 复评 Q05：home 根本身也是覆盖根（工具路径指向 home 根时同样重复）。
     let home_roots_canonical: std::sync::Arc<
         std::sync::Mutex<std::collections::BTreeMap<String, String>>,
@@ -441,25 +449,16 @@ pub async fn collect_sources(
             let result = tokio::time::timeout(remaining, async {
                 let directory = tool_path
                     .is_none_or(|entry| !matches!(entry.tool.as_str(), "opencode" | "zcode"));
-                let canonical = crate::local_sources::probe_path(home.clone(), directory).await?;
-                // 解析后的目标要重新核对来源策略（评审条件验收：junction/symlink）。
-                // 配置里写的路径通过了校验，但真正读取的是解析后的路径。
-                // 来源种类决定解析后的允许范围：显式 WSL 入口不能被误拒（复评 F15）。
+                // 复评 Q07：来源种类先于任何访问确定。探测在**访问目标之前**
+                // 按入口策略检查链接链 —— 路径本身或父组件是 reparse 点时，
+                // 先用目标文本判定（不访问目标），越界直接拒绝。
                 let origin = if matches!(kind, crate::local_sources::HomeKind::Wsl { .. }) {
                     crate::local_sources::SourceOrigin::Wsl
                 } else {
                     crate::local_sources::SourceOrigin::Native
                 };
-                let canonical = crate::local_sources::recheck_resolved_target(
-                    &home.to_string_lossy(),
-                    &canonical,
-                    if directory {
-                        crate::local_sources::ResolvedExpect::Directory
-                    } else {
-                        crate::local_sources::ResolvedExpect::File
-                    },
-                    origin,
-                )?;
+                let canonical =
+                    crate::local_sources::probe_path(home.clone(), directory, origin).await?;
                 // 复评 T04/Q05：判重键按解析器作用域划分。
                 // - home 来源：`home:{canonical}`（该解析器覆盖全部工具）；
                 // - 单工具来源：`tool:{tool}:{canonical}`（同工具同路径才互斥，
@@ -480,16 +479,21 @@ pub async fn collect_sources(
                         .insert(id.clone(), covering.clone());
                     return Ok(None);
                 }
-                // 复评 Q05：工具来源被某个 home 的标准布局（canonical）覆盖时判重。
+                // 复评 Q05：工具来源被某个 home 的标准布局（已解析的实际根）覆盖时判重。
+                // 只在**同一工具**的登记里查找 —— 一种工具的覆盖不得推成另一解析器。
                 // junction 别名使原始字符串不命中、canonical 又与 home 根不等，
-                // 只有用 home 展开后的布局根才能证明同源。
-                if tool_path.is_some() {
+                // 只有用 home 逐个解析后的布局根才能证明同源。
+                if let Some(entry) = tool_path {
                     let candidate_key = home_key(&canonical.to_string_lossy());
                     let roots = layout_roots.lock().map_err(|_| "采集状态不可用")?;
-                    let hit = roots
-                        .iter()
-                        .find(|(root, _)| crate::local_overlap::key_within(root, &candidate_key))
-                        .map(|(_, label)| label.clone());
+                    let hit = roots.get(&entry.tool).and_then(|per_tool| {
+                        per_tool
+                            .iter()
+                            .find(|(root, _)| {
+                                crate::local_overlap::key_within(root, &candidate_key)
+                            })
+                            .map(|(_, label)| label.clone())
+                    });
                     drop(roots);
                     if let Some(covering) = hit {
                         duplicate_source
@@ -498,12 +502,12 @@ pub async fn collect_sources(
                             .insert(id.clone(), covering);
                         return Ok(None);
                     }
-                    // 工具路径直接指向某个 home 根（或其上层）时同样重复。
+                    // 工具路径**恰好等于**某个已采 home 的根时同样重复。
+                    // 第五轮复评 Q05：只做相等判定 —— home 的默认扫描只覆盖
+                    // 标准布局，home 下的非标准自定义目录不在覆盖范围内，必须
+                    // 照常采集（上一版按「home 的任意后代」判重，造成漏采回归）。
                     let homes = home_roots_canonical.lock().map_err(|_| "采集状态不可用")?;
-                    let hit = homes
-                        .iter()
-                        .find(|(root, _)| crate::local_overlap::key_within(root, &candidate_key))
-                        .map(|(_, label)| label.clone());
+                    let hit = homes.get(&candidate_key).cloned();
                     drop(homes);
                     if let Some(covering) = hit {
                         duplicate_source
@@ -512,6 +516,27 @@ pub async fn collect_sources(
                             .insert(id.clone(), covering);
                         return Ok(None);
                     }
+                }
+                // 复评 Q07：目录来源在启动引擎前审计根内的**文件符号链接** ——
+                // 固定引擎的文件发现会跟随它们读取目标（is_symlink() && is_file()），
+                // 应用无法在引擎内部拦截，只能在启动前拒绝该来源。目录链接不进入
+                // 也不拒绝：引擎的通用遍历不跟随目录链接，标准布局根上的目录链接
+                // 由布局解析按策略单独处理。审计不完整（目录过大/不可读）降级为
+                // 提示，不因预审未完成而拒绝真实数据。
+                let mut audit_note: Option<&'static str> = None;
+                if directory {
+                    match audit_root_for_reparse(&canonical)? {
+                        ReparseAudit::Clean => {}
+                        ReparseAudit::Incomplete(reason) => audit_note = Some(reason),
+                    }
+                }
+                // 复评 Q06：引擎 settings.json 的 extraScanPaths 在采集时直接生效，
+                // 事后提示修不回已发生的读取。启动引擎前对每个扩展根执行与应用
+                // 入口一致的校验，任一不合规立即拒绝该来源（失败关闭）。
+                let validated_roots =
+                    validate_engine_extra_roots(&canonical, &mut wsl_memo).await?;
+                if let Some(reason) = audit_note {
+                    log::warn!("来源 {label} 链接预审未完整：{reason}");
                 }
                 let snapshot = if let Some(entry) = tool_path {
                     // 复评 R03：传校验通过的解析目标，而不是配置里的原路径。
@@ -528,7 +553,7 @@ pub async fn collect_sources(
                 if tool_path.is_none() {
                     let home_key_value = home_key(&canonical.to_string_lossy());
                     if let Ok(mut roots) = home_roots_canonical.lock() {
-                        roots.insert(home_key_value.clone(), label.clone());
+                        roots.insert(home_key_value, label.clone());
                     }
                     if let Ok(mut roots) = layout_roots.lock() {
                         for tool in ["opencode", "claude", "zcode", "hermes", "openclaw", "dsh"] {
@@ -536,24 +561,33 @@ pub async fn collect_sources(
                                 continue;
                             };
                             let layout_path = canonical.join(layout.replace('/', "\\"));
-                            roots.insert(home_key(&layout_path.to_string_lossy()), label.clone());
+                            // 第五轮复评 Q05：逐个布局根按来源策略解析后再登记 ——
+                            // 布局根本身可能是 junction，必须登记**实际被读取**的
+                            // 目标；解析失败或目标越界时不登记（宁可漏判重，
+                            // 不可误抑制真实来源）。
+                            if let Ok(resolved) =
+                                crate::local_sources::resolve_layout_root(&layout_path, origin)
+                            {
+                                roots
+                                    .entry(tool.to_string())
+                                    .or_default()
+                                    .insert(home_key(&resolved.to_string_lossy()), label.clone());
+                            }
                         }
                     }
                 }
-                // 复评 T13：引擎从 `--home` 目录读取 scanner settings.json，
-                // 其 extraScanPaths 可以扩大实际扫描根（已实测）。这里把它
-                // 暴露出来，让用户知道该来源的边界可能超出所选目录。
+                // 复评 T13/第五轮 Q06：settings.json 的扩展根已在启动前校验，
+                // 这里把校验结论写进来源健康信息（采集成功后可见）。
                 if tool_path.is_none() {
-                    let engine_settings = canonical
-                        .join("AppData")
-                        .join("Roaming")
-                        .join("tokscale")
-                        .join("settings.json");
-                    if engine_settings.is_file() {
+                    if let Some(count) = validated_roots {
                         if let Ok(mut map) = engine_settings_notice.lock() {
                             map.insert(
                                 id.clone(),
-                                "该主目录包含采集引擎的 settings.json，引擎可能按其扩展扫描范围",
+                                if count > 0 {
+                                    "该主目录的引擎扩展扫描根已按应用来源策略校验，不合规会拒绝采集"
+                                } else {
+                                    "该主目录包含引擎 settings.json，未配置扩展扫描根"
+                                },
                             );
                         }
                     }
@@ -657,6 +691,133 @@ fn tool_source_id(entry: &crate::local_sources::ToolPath) -> String {
         )
     )
 }
+/// 复评 Q07：来源根内**文件符号链接**预审的结果。
+pub(crate) enum ReparseAudit {
+    /// 未发现文件符号链接。
+    Clean,
+    /// 预审不完整（目录过大/不可读）：降级为提示，不拒绝真实数据。
+    Incomplete(&'static str),
+}
+
+/// 目录条目审计上限：元数据遍历，不含文件内容读取。超过按「预审不完整」
+/// 处理而不是拒绝 —— 引擎本身会枚举同一棵树，不能因预审上限造成漏采。
+const REPARSE_AUDIT_MAX_ENTRIES: usize = 200_000;
+
+/// 复评 Q07：审计来源根内的**文件符号链接**。
+///
+/// 固定引擎的文件发现接受 `is_symlink() && path.is_file()` 并读取目标 ——
+/// 根内一个指向外部的日志文件链接就能把读取范围带出已确认的来源边界，
+/// 且应用无法在引擎内部拦截。这里在启动引擎前用**不跟随**的目录遍历检查；
+/// 发现文件链接（含断链）即拒绝该来源。目录链接不进入：引擎的通用遍历
+/// 不跟随目录链接，标准布局根上的目录链接由 `resolve_layout_root` 按策略
+/// 单独解析登记。
+fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(ReparseAudit::Incomplete("子目录无法读取，链接预审未完整")),
+        };
+        for entry in entries {
+            visited += 1;
+            if visited > REPARSE_AUDIT_MAX_ENTRIES {
+                return Ok(ReparseAudit::Incomplete("目录过大，链接预审未完整"));
+            }
+            let Ok(entry) = entry else {
+                return Ok(ReparseAudit::Incomplete("目录项无法读取，链接预审未完整"));
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return Ok(ReparseAudit::Incomplete(
+                    "目录项类型无法读取，链接预审未完整",
+                ));
+            };
+            if file_type.is_symlink() {
+                if file_type.is_dir() {
+                    // 目录链接：不进入、不拒绝（见函数注释）。
+                    continue;
+                }
+                return Err(format!(
+                    "来源目录内包含文件符号链接（{}），引擎会跟随读取目标，已拒绝该来源",
+                    entry.path().display()
+                ));
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(ReparseAudit::Clean)
+}
+
+/// 复评 Q06：引擎 settings.json 的 extraScanPaths 在采集时**直接生效**，
+/// 事后的提示修不回已经发生的读取。启动引擎前解析同一份配置
+///（`AppData/Roaming/tokscale/settings.json`），对每个扩展根执行与应用
+/// 入口一致的校验：文本种类 → WSL 发行版运行状态 → 链接链 → 解析后目标
+/// → 根内文件链接审计。任一不合规立即拒绝该来源 —— 失败关闭。
+///
+/// 返回 `None` 表示没有 settings.json；`Some(n)` 表示 n 个扩展根全部校验通过。
+async fn validate_engine_extra_roots(
+    home: &Path,
+    wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
+) -> Result<Option<usize>, String> {
+    let config = home
+        .join("AppData")
+        .join("Roaming")
+        .join("tokscale")
+        .join("settings.json");
+    if !config.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read(&config).map_err(|_| "无法读取采集引擎 settings.json")?;
+    if text.len() > 256 * 1024 {
+        return Err("采集引擎 settings.json 超过 256KiB，拒绝采集".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&text).map_err(|_| "采集引擎 settings.json 无法解析".to_string())?;
+    let mut roots: Vec<(String, String)> = Vec::new();
+    if let Some(map) = value
+        .get("scanner")
+        .and_then(|scanner| scanner.get("extraScanPaths"))
+        .and_then(|extra| extra.as_object())
+    {
+        for (tool, list) in map {
+            let Some(list) = list.as_array() else {
+                continue;
+            };
+            for entry in list {
+                if let Some(text) = entry.as_str() {
+                    roots.push((tool.clone(), text.to_string()));
+                }
+            }
+        }
+    }
+    let mut validated = 0usize;
+    for (tool, raw) in roots {
+        let (_, kind) = crate::local_sources::clean_tool_path(&raw)
+            .map_err(|error| format!("引擎扩展扫描根（{tool} → {raw}）不合规：{error}"))?;
+        let root_origin = if matches!(kind, crate::local_sources::HomeKind::Wsl { .. }) {
+            crate::local_sources::SourceOrigin::Wsl
+        } else {
+            crate::local_sources::SourceOrigin::Native
+        };
+        if matches!(root_origin, crate::local_sources::SourceOrigin::Wsl) && wsl.is_none() {
+            *wsl = Some(crate::local_sources::running_wsl().await);
+        }
+        if let Err(error) = source_gate(&kind, wsl) {
+            return Err(format!("引擎扩展扫描根（{tool} → {raw}）不合规：{error}"));
+        }
+        let canonical_extra =
+            crate::local_sources::probe_path(std::path::PathBuf::from(&raw), true, root_origin)
+                .await
+                .map_err(|error| format!("引擎扩展扫描根（{tool} → {raw}）不可用：{error}"))?;
+        audit_root_for_reparse(&canonical_extra)
+            .map_err(|error| format!("引擎扩展扫描根（{tool}）不合规：{error}"))?;
+        validated += 1;
+    }
+    Ok(Some(validated))
+}
+
 fn source_gate(
     kind: &crate::local_sources::HomeKind,
     wsl: &Option<Result<crate::local_sources::WslStatus, String>>,
@@ -716,37 +877,47 @@ async fn run_tool_source(
     }
     Ok(snapshot)
 }
-/// 复评 Q01：把 stderr **完整排空**到子进程退出，避免管道背压阻塞引擎。
+/// 复评 Q01：stderr 必须**持续排空到子进程退出**，避免管道背压阻塞引擎。
 ///
-/// 只保留前 `STDERR_CAPTURE_BYTES` 字节作为日志摘要，超出部分丢弃并在
-/// 返回值里标注截断。旧实现读满 16 KiB 就停止消费：引擎诊断超过这个量时
-/// 会写满管道缓冲并阻塞在 stderr 上，父进程却只等 stdout EOF，
-/// 最终被迫吃完整超时。
+/// 第五轮复评 Q01：上一版 `take(4MiB).read_to_end` 读满即返回并丢弃拥有的
+/// 读端 —— 继续写诊断的子进程可能遇到管道关闭/写阻塞，实现与注释的
+/// 「持续排空」承诺不一致。现在分块循环读到 EOF；内存预算固定为
+/// `STDERR_CAPTURE_BYTES` 摘要 + 8KiB 读块，超出预算的字节**只丢弃并计数**，
+/// 绝不提前关闭读端。异常洪流由外层 30 秒超时兜底（kill_on_drop 回收）。
 const STDERR_CAPTURE_BYTES: usize = 16 * 1024;
 async fn drain_stderr(stderr: impl tokio::io::AsyncRead + Unpin) -> (String, bool) {
     use tokio::io::AsyncReadExt;
-    let mut all = Vec::new();
-    // 读整个流（有上限防御：诊断洪流也不允许无限占用内存）。
-    let mut bounded = stderr.take(4 * 1024 * 1024);
-    if bounded.read_to_end(&mut all).await.is_err() {
-        return ("采集引擎诊断读取失败".to_string(), false);
+    let mut summary: Vec<u8> = Vec::with_capacity(STDERR_CAPTURE_BYTES);
+    let mut discarded: u64 = 0;
+    let mut chunk = [0u8; 8 * 1024];
+    let mut reader = stderr;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break, // EOF：引擎已写完诊断
+            Ok(n) => {
+                if summary.len() < STDERR_CAPTURE_BYTES {
+                    let keep = (STDERR_CAPTURE_BYTES - summary.len()).min(n);
+                    summary.extend_from_slice(&chunk[..keep]);
+                    discarded += (n - keep) as u64;
+                } else {
+                    discarded += n as u64;
+                }
+            }
+            // 读错误无法恢复：交回调用方按失败处理（子进程随后被回收）。
+            Err(_) => return ("采集引擎诊断读取失败".to_string(), true),
+        }
     }
-    if all.len() >= 4 * 1024 * 1024 {
-        return (
-            "采集引擎诊断超过 4MiB，已丢弃；请检查引擎输出是否异常".to_string(),
-            true,
-        );
+    let mut text = String::from_utf8_lossy(&summary).to_string();
+    if discarded > 0 {
+        // 按行边界截断，避免把一行警告切成两半。
+        let mut cut = text.len();
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str(&format!("\n…（后续诊断已截断，丢弃 {discarded} 字节）"));
     }
-    let text = String::from_utf8_lossy(&all).to_string();
-    if text.len() <= STDERR_CAPTURE_BYTES {
-        return (text, false);
-    }
-    // 按行边界截断，避免把一行警告切成两半。
-    let mut cut = STDERR_CAPTURE_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (format!("{}\n…（后续诊断已截断）", &text[..cut]), true)
+    (text, discarded > 0)
 }
 
 async fn run_engine_profile(
@@ -1144,5 +1315,57 @@ mod tests {
         assert!(!serde_json::to_string(&snapshot)
             .unwrap()
             .contains("PRIVATE_TITLE"));
+    }
+
+    // ---------- 第五轮复评 Q01：stderr 持续排空 ----------
+
+    #[tokio::test]
+    async fn q01_stderr小输入完整保留无截断() {
+        let (text, truncated) = drain_stderr(std::io::Cursor::new(b"engine warn".as_slice())).await;
+        assert_eq!(text, "engine warn");
+        assert!(!truncated);
+        let (text, truncated) = drain_stderr(std::io::Cursor::new(&b""[..])).await;
+        assert_eq!(text, "");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn q01_stderr超额只丢弃并计数_读端读到eof() {
+        // 摘要预算 16KiB + 5000 字节：保留前 16KiB，其余只丢弃。
+        // 旧实现 take(4MiB) 读满即返回并丢弃读端 —— 新实现必须消费到 EOF
+        // 并以丢弃计数标注截断，内存占用停在摘要预算附近。
+        let payload = vec![b'x'; STDERR_CAPTURE_BYTES + 5000];
+        let (text, truncated) = drain_stderr(std::io::Cursor::new(payload)).await;
+        assert!(truncated);
+        assert!(text.starts_with('x'), "前缀摘要应保留");
+        assert!(text.contains("丢弃 5000 字节"), "实际输出：{text}");
+        assert!(
+            text.len() < STDERR_CAPTURE_BYTES + 100,
+            "摘要不得膨胀到与全量等长"
+        );
+    }
+
+    // ---------- 第五轮复评 Q07：来源根链接预审 ----------
+
+    #[test]
+    fn q07_来源根审计_普通嵌套目录通过() {
+        let base = std::env::temp_dir().join(format!("dsm-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub/deep")).unwrap();
+        std::fs::write(base.join("a.log"), b"x").unwrap();
+        std::fs::write(base.join("sub/b.log"), b"y").unwrap();
+        let outcome = audit_root_for_reparse(&base);
+        assert!(matches!(outcome, Ok(ReparseAudit::Clean)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn q07_来源根审计_空目录通过且不依赖条目() {
+        let base = std::env::temp_dir().join(format!("dsm-audit-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let outcome = audit_root_for_reparse(&base);
+        assert!(matches!(outcome, Ok(ReparseAudit::Clean)));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

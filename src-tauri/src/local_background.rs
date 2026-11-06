@@ -158,16 +158,15 @@ fn candidates(options: &SourceOptions, home: Option<&Path>) -> Vec<PathBuf> {
 fn watch_roots(paths: &[PathBuf]) -> BTreeMap<PathBuf, bool> {
     let mut roots = BTreeMap::new();
     for requested in paths {
-        let mut path = requested.as_path();
-        while !path.is_dir() {
-            let Some(parent) = path.parent().filter(|p| p.parent().is_some()) else {
-                break;
-            };
-            path = parent;
-        }
-        if !path.is_dir() || path.parent().is_none() {
+        // 复评 Q07：先按文本与**不跟随**的链接信息判定，越界目标在访问前拒绝。
+        // 旧实现先 is_dir()/canonicalize()（都会跟随链接访问目标），
+        // 拒绝提示出现时目标可能已被访问。
+        if crate::local_sources::is_disallowed_local_target_text(&requested.to_string_lossy()) {
             continue;
         }
+        let Some(path) = watch_anchor(requested) else {
+            continue;
+        };
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
@@ -178,13 +177,49 @@ fn watch_roots(paths: &[PathBuf]) -> BTreeMap<PathBuf, bool> {
         if text.starts_with("\\\\?\\UNC\\") {
             continue;
         }
-        let recursive = path == requested;
+        let recursive = requested.as_path() == path;
         roots
             .entry(canonical)
             .and_modify(|r| *r |= recursive)
             .or_insert(recursive);
     }
     roots
+}
+
+/// 找到监听锚点：从请求路径向上找最近的存在目录；遇到 reparse 点先取
+/// 目标文本按策略判定，越界返回 None（不访问目标）。
+/// 与旧 `while !path.is_dir()` 等价的定位行为，但访问前先做策略检查。
+fn watch_anchor(requested: &Path) -> Option<PathBuf> {
+    let mut current: Option<PathBuf> = Some(requested.to_path_buf());
+    while let Some(item) = current {
+        let Ok(meta) = std::fs::symlink_metadata(&item) else {
+            // 不存在或不可访问：向上一级继续找已存在的祖先。
+            current = item
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf);
+            continue;
+        };
+        if crate::local_sources::is_reparse_entry(&meta) {
+            let Ok(target) = std::fs::read_link(&item) else {
+                return None;
+            };
+            if crate::local_sources::is_disallowed_local_target_text(&target.to_string_lossy()) {
+                return None;
+            }
+            // 链接目标获批准：以链接位置为锚点，canonicalize 解析它。
+            return item.parent().is_some().then_some(item);
+        }
+        if meta.is_dir() {
+            // 与旧实现一致：不把盘根当监听锚点。
+            return item.parent().is_some().then_some(item);
+        }
+        current = item
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+    }
+    None
 }
 #[derive(Clone, Default)]
 struct WatchState {

@@ -489,6 +489,41 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
                 }
             }
         }
+        // 复评 N02：逐日比较两侧**实际返回**的模型集合 —— 出现在数组里代表
+        // 平台返回了该模型（显式零与未返回是两种语义）。两侧都有这一天的
+        // 数据但集合不齐时，缺的那一侧汇总置为未知，不把部分和当完整值
+        // 展示；只有一侧返回过这一天时维持既有语义（另一侧本就是未知，
+        // 见复评 F07 的 cost-only / amount-only 日）。
+        let day_amount_models: std::collections::HashSet<&str> = raw_amount_days
+            .get(day.date.as_str())
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .filter(|model| !model.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let day_cost_models: std::collections::HashSet<&str> = raw_cost_days
+            .get(day.date.as_str())
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .filter(|model| !model.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let both_sides_present = amount_dates.contains(day.date.as_str())
+            && raw_cost_days.contains_key(day.date.as_str());
+        let cost_side_incomplete = both_sides_present
+            && day_amount_models
+                .iter()
+                .any(|model| !day_cost_models.contains(model));
+        let count_side_incomplete = both_sides_present
+            && day_cost_models
+                .iter()
+                .any(|model| !day_amount_models.contains(model));
         days.push(UsageDaySummary {
             date: day.date.clone(),
             raw_models: crate::usage_history::raw_models(
@@ -511,8 +546,14 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             pro_response: pro_resp,
             flash_other_tokens: flash_other,
             pro_other_tokens: pro_other,
-            total_tokens: total,
-            total_cost: cost_by_date.get(&day.date).copied().flatten(),
+            // 缺数量的模型让当日 Token 合计未知；缺费用不污染有效 Tokens。
+            total_tokens: if count_side_incomplete { None } else { total },
+            // 缺费用的模型让当日费用合计未知，而不是把已知部分表现成完整值。
+            total_cost: if cost_side_incomplete {
+                None
+            } else {
+                cost_by_date.get(&day.date).copied().flatten()
+            },
         });
     }
 
@@ -1044,6 +1085,128 @@ mod tests {
             }
         }"#;
         serde_json::from_str(json).unwrap()
+    }
+
+    // ---------- 第五轮复评 N02：日级模型集合对齐 ----------
+
+    #[test]
+    fn n02_当日费用缺模型_日费用置未知且数量不受影响() {
+        // 月总额两侧对齐（A、B 都有），但 09-01 当日费用侧缺 B：
+        // 已知的 ¥1 不得被当作当日完整费用展示（缺 ≠ 零）。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                        {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                    ]},
+                    {"date":"2026-09-02","data":[
+                        {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"10.0"}]}
+                    ]}
+                ]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"2.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]}
+                    ]},
+                    {"date":"2026-09-02","data":[
+                        {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"0.0"}]},
+                        {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"0.0"}]}
+                    ]}
+                ]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let day1 = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(day1.total_cost, None, "缺 B 费用时当日费用必须是未知");
+        assert!(
+            day1.total_tokens.is_some(),
+            "数量侧完整时 Tokens 不得被费用缺项污染"
+        );
+        let day2 = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-02")
+            .unwrap();
+        assert!(
+            day2.total_cost.is_some(),
+            "显式 0 表示平台返回了该模型，不算缺失"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("未知")),
+            "日级缺项必须产生可见质量提示：{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn n02_当日数量缺模型_token置未知费用保留() {
+        // 反向：当日费用侧返回 A、B，数量侧只返回 A —— 当日 Token 合计未知，
+        // 费用相对自身侧完整、保持可见（缺数量不补零，也不清掉有效费用）。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"m-a","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}
+                    ]}
+                ]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[
+                    {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                    {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"2.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"m-a","usage":[{"type":"RESPONSE_TOKEN","amount":"0.3"}]},
+                        {"model":"m-b","usage":[{"type":"RESPONSE_TOKEN","amount":"0.4"}]}
+                    ]}
+                ]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let day = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(day.total_tokens, None, "缺 B 的数量时当日 Token 合计未知");
+        assert!(
+            (day.total_cost.unwrap() - 0.7).abs() < 1e-9,
+            "费用侧自身完整时保持可见"
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未知")));
     }
 
     #[test]

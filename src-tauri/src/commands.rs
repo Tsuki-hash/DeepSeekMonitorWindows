@@ -551,16 +551,41 @@ pub(crate) fn set_panel_mode(window: WebviewWindow, mode: PanelMode) -> Result<(
         .map_err(|_| "无法读取显示器信息")?
         .ok_or("无法读取显示器信息")?;
     let scale = monitor.scale_factor();
-    let area = monitor.work_area().size;
-    // 留出边距，避免展开后压到任务栏或超出工作区。
-    let max_width = (area.width as f64 / scale) - 24.0;
-    let max_height = (area.height as f64 / scale) - 24.0;
+    let area = monitor.work_area();
+    // 复评 N03：最小值不得反向突破可用空间 —— 旧实现先 min(max_height) 再
+    // max(480)，高 DPI 小屏幕（逻辑工作区不足 480 高）会把窗口撑出工作区。
+    let max_width = (area.size.width as f64 / scale) - 24.0;
+    let max_height = (area.size.height as f64 / scale) - 24.0;
+    let width = width.min(max_width).max(320.0f64.min(max_width));
+    let height = height.min(max_height).max(480.0f64.min(max_height));
     window
-        .set_size(tauri::LogicalSize::new(
-            width.min(max_width).max(320.0),
-            height.min(max_height).max(480.0),
-        ))
+        .set_size(tauri::LogicalSize::new(width, height))
         .map_err(|_| "调整面板尺寸失败")?;
+    // 复评 N03：扩大尺寸后把**完整矩形**夹回目标显示器的工作区 ——
+    // 右下角展开时只调尺寸会让右/下边界超出屏幕（评审示例：100% 缩放下
+    // 最多右超 352px、下超 148px），右侧与底部控件不可见。
+    let physical_width = (width * scale).round() as i32;
+    let physical_height = (height * scale).round() as i32;
+    let position = window.outer_position().map_err(|_| "无法读取窗口位置")?;
+    let (x, y) = crate::window_pos::clamp_origin_into_area(
+        crate::window_pos::WorkArea {
+            x: area.position.x,
+            y: area.position.y,
+            width: area.size.width as i32,
+            height: area.size.height as i32,
+        },
+        physical_width,
+        physical_height,
+        position.x,
+        position.y,
+    );
+    if x != position.x || y != position.y {
+        window
+            .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+                x, y,
+            )))
+            .map_err(|_| "调整面板位置失败")?;
+    }
     Ok(())
 }
 
