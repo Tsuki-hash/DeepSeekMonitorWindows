@@ -448,11 +448,17 @@ pub async fn collect_sources(
                     return Ok(None);
                 }
                 let snapshot = if let Some(entry) = tool_path {
-                    run_tool_source(path, entry, &profile.join(&id)).await?
+                    // 复评 R03：传校验通过的解析目标，而不是配置里的原路径。
+                    run_tool_source(path, entry, &canonical, &profile.join(&id)).await?
                 } else {
                     run_engine_profile(
                         path,
-                        if is_default { None } else { Some(&home) },
+                        if is_default {
+                            None
+                        } else {
+                            // 主目录来源同样读取解析后的目标。
+                            Some(&canonical)
+                        },
                         &profile.join(&id),
                     )
                     .await?
@@ -564,13 +570,17 @@ fn source_gate(
         },
     }
 }
+/// 复评 R03：`resolved` 是校验通过后的**实际读取目标**（canonical）。
+/// 校验与读取必须用同一个路径，否则校验后替换链接就能让读取落在别处。
 async fn run_tool_source(
     path: &Path,
     entry: &crate::local_sources::ToolPath,
+    resolved: &Path,
     profile: &Path,
 ) -> Result<LocalSnapshot, String> {
+    let target = resolved.to_string_lossy().to_string();
     if entry.tool == "zcode" {
-        return crate::zcode_usage::collect(entry.path.clone().into()).await;
+        return crate::zcode_usage::collect(resolved.to_path_buf()).await;
     }
     // --home loads scanner settings from this app-owned empty home. Never write
     // settings into the user's tool root or copy a live SQLite/WAL database.
@@ -578,10 +588,10 @@ async fn run_tool_source(
     let config = home.join("AppData/Roaming/tokscale");
     std::fs::create_dir_all(&config).map_err(|_| "指定路径的采集设置无法保存")?;
     let settings = if entry.tool == "opencode" {
-        serde_json::json!({"scanner":{"opencodeDbPaths":[entry.path]}})
+        serde_json::json!({"scanner":{"opencodeDbPaths":[target]}})
     } else {
         let mut paths = serde_json::Map::new();
-        paths.insert(entry.tool.clone(), serde_json::json!([entry.path]));
+        paths.insert(entry.tool.clone(), serde_json::json!([target]));
         serde_json::json!({"scanner":{"extraScanPaths": paths}})
     };
     let temporary = config.join(format!("settings.{}.tmp", std::process::id()));

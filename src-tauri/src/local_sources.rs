@@ -404,6 +404,11 @@ pub fn recheck_resolved_target(
             if is_wsl_path(&resolved_text) {
                 return Err("路径解析后指向 WSL 目录，请改用 WSL 入口配置".into());
             }
+            // 复评 R03：本地入口解析到网络共享（UNC）时同样拒绝。
+            // 输入校验只拦了普通 UNC，链接可以把本地路径指到网络位置。
+            if is_network_path(&resolved_text) {
+                return Err("路径解析后指向网络共享，本地入口不支持".into());
+            }
             if is_protected_system_path(&resolved_text) {
                 return Err("路径解析后指向 Windows 系统目录，未读取".into());
             }
@@ -474,6 +479,16 @@ fn is_wsl_path(value: &str) -> bool {
     // value 已由 normalize_resolved_str 规范化（小写、去掉扩展前缀）。
     let lower = value.to_ascii_lowercase();
     lower.starts_with(r"\\wsl$\") || lower.starts_with(r"\\wsl.localhost\")
+}
+
+/// 是否为 UNC 网络路径（`\server\share`），已由 normalize_resolved_str 规范化。
+fn is_network_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("\\\\") {
+        return false;
+    }
+    // WSL 挂载点也是 UNC 形式，但不是网络共享；由 is_wsl_path 单独判定。
+    !is_wsl_path(&lower)
 }
 
 fn is_protected_system_path(value: &str) -> bool {
@@ -735,6 +750,18 @@ mod tests {
         )
         .is_ok());
     }
+    #[test]
+    fn 本地入口解析到网络共享时拒绝_wsl不算网络() {
+        // 复评 R03：输入只拦普通 UNC，链接可把本地路径指到网络位置。
+        assert!(is_network_path(r"\\server\share\logs"));
+        assert!(is_network_path(r"\\10.0.0.5\data"));
+        // WSL 挂载点是 UNC 形式但不是网络共享。
+        assert!(!is_network_path(r"\\wsl$\Ubuntu\home\user"));
+        assert!(!is_network_path(r"\\wsl.localhost\Ubuntu\home\user"));
+        // 普通盘符不是网络路径。
+        assert!(!is_network_path(r"d:\users\a\.claude\projects"));
+    }
+
     #[test]
     fn 解析后类型不符时报错且不静默通过() {
         let dir = crate::test_support::TempConfigDir::new("resolved-target");
