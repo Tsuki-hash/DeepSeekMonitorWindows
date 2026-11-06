@@ -3,7 +3,7 @@
 // Both full gates use this entry point and validate actual assertion completion.
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, posix, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { hasNotRun } from "./run-rust-tests.mjs";
@@ -18,16 +18,54 @@ const args = [
 ];
 export const REQUIRED_VERSION_SUITES = ["filename", "pe-header", "pe-version"];
 
+function validRuntime(runtime) {
+  const version =
+    typeof runtime?.version === "string"
+      ? /^(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?$/.exec(
+          runtime.version,
+        )
+      : null;
+  const path = process.platform === "win32" ? win32 : posix;
+  const executableIsAbsolute =
+    typeof runtime?.executable === "string" &&
+    path.isAbsolute(runtime.executable) &&
+    (process.platform !== "win32" ||
+      /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+[\\/])/.test(
+        runtime.executable,
+      ));
+  return Boolean(
+    runtime?.schemaVersion === 1 &&
+    runtime.source === "$PSVersionTable.PSVersion" &&
+    runtime.executableSource ===
+      "[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName" &&
+    runtime.edition === "Core" &&
+    version &&
+    [runtime.major, runtime.minor, runtime.patch].every(
+      (part, index) =>
+        Number.isSafeInteger(part) && part === Number(version[index + 1]),
+    ) &&
+    runtime.major >= 7 &&
+    executableIsAbsolute,
+  );
+}
+
 function parseExecution(stdout) {
   const rows = [];
   const summaries = [];
+  const runtimes = [];
   let malformed = false;
   for (const line of stdout.split(/\r?\n/)) {
     for (const [prefix, values] of [
+      ["RELEASE_VERSION_RUNTIME ", runtimes],
       ["RELEASE_VERSION_ASSERT ", rows],
       ["RELEASE_VERSION_SUMMARY ", summaries],
     ]) {
       if (!line.startsWith(prefix)) continue;
+      if (
+        prefix === "RELEASE_VERSION_RUNTIME " &&
+        (rows.length || summaries.length)
+      )
+        malformed = true;
       try {
         values.push(JSON.parse(line.slice(prefix.length)));
       } catch {
@@ -38,8 +76,11 @@ function parseExecution(stdout) {
   const summary = summaries[0];
   const passed = rows.filter((row) => row?.status === "PASS").length;
   const failed = rows.filter((row) => row?.status === "FAIL").length;
+  const runtime = runtimes[0] ?? null;
+  const runtimeValid = runtimes.length === 1 && validRuntime(runtime);
   const valid =
     !malformed &&
+    runtimeValid &&
     summaries.length === 1 &&
     rows.length > 0 &&
     rows.every(
@@ -62,7 +103,15 @@ function parseExecution(stdout) {
       .split(/\r?\n/)
       .at(-1)
       .startsWith("RELEASE_VERSION_SUMMARY ");
-  return { rows, summary: summary ?? null, valid, passed, failed };
+  return {
+    rows,
+    summary: summary ?? null,
+    runtime,
+    runtimeValid,
+    valid,
+    passed,
+    failed,
+  };
 }
 
 function evaluate(result) {
@@ -72,6 +121,10 @@ function evaluate(result) {
     executed: execution.rows.filter((row) => row?.suite === suite).length,
   }));
   const reasons = [];
+  if (!execution.runtimeValid)
+    reasons.push(
+      "ERROR: require the executing PowerShell process to report its version >= 7, version source and absolute executable path before assertions.",
+    );
   if (!execution.valid || coverage.some((item) => item.executed === 0))
     reasons.push(
       "ERROR: require sequential assertion rows, nonzero execution in all three suites, and one matching completion summary.",
@@ -95,6 +148,8 @@ function evaluate(result) {
     verdict,
     reasons,
     coverage,
+    runtime: execution.runtime,
+    runtimeValid: execution.runtimeValid,
     assertions: execution.rows,
     summary: execution.summary,
     // These are assertion counts, not test-function or installer-test counts.
@@ -131,7 +186,7 @@ export function runReleaseVersionGate() {
   };
   Object.assign(powershell, evaluate(powershell));
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     scope,
     platform: process.platform,
     arch: process.arch,
@@ -143,12 +198,19 @@ export function runReleaseVersionGate() {
 
 // Recompute from the recorded native exit and unmodified output. Legacy PASS
 // prose, missing logs, stale schemas and declared/tampered counts fail closed.
-export function readReleaseVersionGateLog(path, code) {
+export function readReleaseVersionGateLog(pathOrBytes, code) {
   try {
-    const log = JSON.parse(readFileSync(path, "utf8"));
+    // The release record supplies its already captured bytes: validation and
+    // archival must not read different versions of a mutable temporary file.
+    const bytes = Buffer.isBuffer(pathOrBytes)
+      ? pathOrBytes
+      : readFileSync(pathOrBytes);
+    const log = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
     const result = log.powershell;
     if (
-      log.schemaVersion !== 1 ||
+      log.schemaVersion !== 2 ||
       log.scope !== scope ||
       log.platform !== process.platform ||
       log.arch !== process.arch ||

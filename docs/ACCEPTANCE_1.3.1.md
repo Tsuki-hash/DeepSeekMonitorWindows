@@ -18,12 +18,14 @@
 
 - [ ] 三处应用版本一致为 1.3.1，锁文件与提交对应。
 - [ ] 干净安装依赖后，执行当前 `package.json` 与 `scripts/verify.ps1` 定义的前端类型／单测、组件回归、发行版本纯函数回归、脚本门禁、lint、格式、构建及 Rust 校验。
-- [ ] `npm run verify` 与 `npm run release:record -- ...` 均实际执行 `scripts/run-release-version-tests.mjs`，由其启动 `verify-release-version.static-tests.ps1`；核对三组非零断言、唯一完成汇总及原生退出码 0。缺 pwsh／脚本、非零退出、零断言、旧 PASS 文案或缺证据均不能通过。
-- [ ] 发行记录保留版本纯函数的完整 stdout/stderr、真实 pwsh 退出码、信号／启动错误与 schema v1 日志；表格的入口退出码不冒充原生退出码。纯函数计数以 assertions 标注，不能作为真实安装包或安装升级的验收证据。
+- [ ] `npm run verify` 与 `npm run release:record -- ...` 均实际执行 `scripts/run-release-version-tests.mjs`，由其启动 `verify-release-version.static-tests.ps1`；核对三组非零断言、唯一完成汇总及原生退出码 0。两个 PowerShell 入口要求当前进程为 PowerShell 7+ Core；核对实际断言进程输出的唯一运行时版本、取值来源和可执行文件路径，不能用命令名或另一次版本查询代替。低于 7、版本无法取得、缺 pwsh／脚本、非零退出、零断言、旧 PASS 文案或缺证据均不能通过。
+- [ ] 发行记录保留版本纯函数的完整 stdout/stderr、真实 pwsh 退出码、信号／启动错误、运行时信息与 schema v2 日志；表格的入口退出码不冒充原生退出码。纯函数计数以 assertions 标注，不能作为真实安装包或安装升级的验收证据。
+- [ ] Rust 与版本日志使用同一字节快照校验和归档；缺失／损坏／旧 schema／篡改均为 ERROR。被拒绝文件以明确不可信的完整 Base64 字节、字节数和 SHA-256 留在报告中，不只写“缺失”。缺文件、读失败和零字节文件的记录须可区分。
+- [ ] 只有 `--out` 写入、flush 和逐字节读回成功后才清理已归档且未变化的临时原件。用合成证据检查写入／部分写入／flush／读回失败、stdout-only 和日志读失败时原件保留。以最终退出码及 stderr 确认报告生成状态，不以文件中的 PASS 文案替代；失败保留位置见 stderr。
 - [ ] 依赖审计结果被真实记录；网络错误或无法取得结果不是“无漏洞”。
 - [ ] 测试实际执行数大于零；没有把已移除的 Agent 测试、空集合或跳过计为通过。
 - [ ] 按 [发布门禁说明](RELEASE_GATES_1.3.1.md) 在 Windows 本机运行 Rust 门禁：11 项必需 Windows 测试全部真实完成，schema v3 的逐项覆盖、完成行和总数一致。非 Windows／中文跳过／缺必需项的注入均阻断放行。
-- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle 与 chart-accessibility 五套回归；非零计数不替代 Windows 原生窗口、布局和通知验收。
+- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility 与 history-trend-interactions 六套回归；非零计数不替代 Windows 原生窗口、布局和通知验收。
 - [ ] 开发与打包不运行统计引擎准备，不下载或捆绑该引擎。
 - [ ] 执行 Windows NSIS 打包，并记录实际安装包哈希。构建成功仍不等于安装后可用。
 

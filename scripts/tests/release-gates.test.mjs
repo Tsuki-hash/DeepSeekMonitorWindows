@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -26,12 +28,16 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 const originalSpawn = cp.spawnSync;
 const originalWrite = fs.writeFileSync;
+const originalRead = fs.readFileSync;
+const originalAppend = fs.appendFileSync;
 const scenario = process.env.DSM_GATE_TEST_SCENARIO;
+const reportScenario = process.env.DSM_GATE_TEST_REPORT_FAILURE || scenario;
 const required = ${JSON.stringify(REQUIRED_WINDOWS_TESTS)};
 const versionSuites = ${JSON.stringify(REQUIRED_VERSION_SUITES)};
 Object.defineProperty(process, "platform", { value: scenario.startsWith("non-windows") ? "linux" : "win32" });
 Object.defineProperty(process, "arch", { value: "x64" });
 fs.writeFileSync = (path, data, ...rest) => {
+  const source = String(path).includes("dsm-rust-log-") ? "rust" : String(path).includes("dsm-version-log-") ? "version" : null;
   if (String(path).includes("dsm-rust-log-")) {
     if (scenario === "missing-log") return;
     const log = JSON.parse(data);
@@ -45,6 +51,9 @@ fs.writeFileSync = (path, data, ...rest) => {
     if (scenario === "tampered-output") log.rust.stdout = "";
     if (scenario === "legacy-log") log.schemaVersion = 2;
     data = JSON.stringify(log);
+    if (scenario === "corrupt-log") data = '{"verdict":"PASS",broken\\n</details>\\n# INJECTED_UNTRUSTED_MARKDOWN';
+    if (scenario === "invalid-utf8-log") data = Buffer.from([0x7b, 0xff, 0x00, 0x7d]);
+    if (scenario === "empty-log") data = Buffer.alloc(0);
   }
   if (String(path).includes("dsm-version-log-")) {
     if (scenario === "version-missing-log") return;
@@ -58,10 +67,42 @@ fs.writeFileSync = (path, data, ...rest) => {
     if (scenario === "version-tampered-platform") log.platform = "linux";
     if (scenario === "version-tampered-arch") log.arch = "arm64";
     if (scenario === "version-tampered-scope") log.scope = "installer-acceptance";
-    if (scenario === "version-legacy-log") log.schemaVersion = 0;
+    if (scenario === "version-tampered-runtime") log.powershell.runtime.version = "99.0.0";
+    if (scenario === "version-tampered-runtime-valid") log.powershell.runtimeValid = false;
+    if (scenario === "version-legacy-log") log.schemaVersion = 1;
     data = JSON.stringify(log);
+    if (scenario === "version-corrupt-log") data = '{"verdict":"PASS",broken\\n</details>\\n# INJECTED_UNTRUSTED_MARKDOWN';
+    if (scenario === "version-invalid-utf8-log") data = Buffer.from([0x7b, 0xff, 0x00, 0x7d]);
+    if (scenario === "version-empty-log") data = Buffer.alloc(0);
+  }
+  if (source) originalAppend(process.env.DSM_GATE_TEST_DIR + "/gate-sources.jsonl", JSON.stringify({ source, path: String(path), bytes: Buffer.from(data).toString("base64") }) + "\\n");
+  if (String(path).endsWith("report.md")) {
+    if (reportScenario === "report-write-failure") throw new Error("synthetic report write failure");
+    if (["report-partial-write", "report-truncated-write"].includes(reportScenario)) {
+      originalWrite(path, String(data).slice(0, 80), ...rest);
+      if (reportScenario === "report-partial-write") throw new Error("synthetic partial report write");
+      return;
+    }
+    if (reportScenario === "report-flush-failure") {
+      originalWrite(path, data, ...rest);
+      throw new Error("synthetic flush failure");
+    }
   }
   return originalWrite(path, data, ...rest);
+};
+const changedSources = new Set();
+fs.readFileSync = (path, ...rest) => {
+  if ((scenario === "unreadable-log" && String(path).includes("dsm-rust-log-")) ||
+      (scenario === "version-unreadable-log" && String(path).includes("dsm-version-log-")) ||
+      (reportScenario === "report-readback-failure" && String(path).endsWith("report.md"))) {
+    const error = new Error("synthetic read failure"); error.code = "EACCES"; throw error;
+  }
+  const data = originalRead(path, ...rest);
+  if (scenario === "changed-log-after-snapshot" && String(path).includes("dsm-rust-log-") && !changedSources.has(String(path))) {
+    changedSources.add(String(path));
+    originalWrite(path, "changed after snapshot");
+  }
+  return data;
 };
 const ok = (stdout = "") => ({ status: 0, signal: null, stdout, stderr: "" });
 const libtest = (names, options = {}) => {
@@ -72,6 +113,30 @@ const libtest = (names, options = {}) => {
   return rows + "\\n\\ntest result: " + (failed ? "FAILED" : "ok") + ". " + passed + " passed; " + failed + " failed; " + ignored + " ignored; 0 measured; 0 filtered out; finished in 0.01s\\n";
 };
 const versionEvidence = () => {
+  const runtime = {
+    schemaVersion: 1,
+    source: "$PSVersionTable.PSVersion",
+    version: "7.4.7",
+    major: 7,
+    minor: 4,
+    patch: 7,
+    edition: "Core",
+    executableSource: "[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName",
+    executable: process.platform === "win32" ? "C:/Program Files/PowerShell/7/pwsh.exe" : "/usr/bin/pwsh",
+  };
+  if (scenario === "version-runtime-old") { runtime.version = "6.2.7"; runtime.major = 6; runtime.minor = 2; }
+  if (scenario === "version-runtime-major-mismatch") runtime.major = 6;
+  if (scenario === "version-runtime-version-malformed") runtime.version = "fixture-tool-version";
+  if (scenario === "version-runtime-source") runtime.source = "another pwsh --version";
+  if (scenario === "version-runtime-executable-source") runtime.executableSource = "PATH guess";
+  if (scenario === "version-runtime-executable-missing") delete runtime.executable;
+  if (scenario === "version-runtime-executable-relative") runtime.executable = "pwsh";
+  if (scenario === "version-runtime-executable-root-relative") runtime.executable = "/pwsh.exe";
+  if (scenario === "version-runtime-edition") runtime.edition = "Desktop";
+  let header = "RELEASE_VERSION_RUNTIME " + JSON.stringify(runtime) + "\\n";
+  if (scenario === "version-runtime-malformed") header = "RELEASE_VERSION_RUNTIME {broken}\\n";
+  if (scenario === "version-runtime-missing") header = "";
+  if (scenario === "version-runtime-duplicate") header += header;
   let suites = scenario === "version-missing-suite" ? versionSuites.slice(0, -1) : versionSuites;
   if (scenario === "version-zero-tests") suites = [];
   const rows = suites.map((suite, i) => ({ index: i + 1, suite, label: "synthetic " + suite, status: scenario === "version-failed-assertion" && i === 0 ? "FAIL" : "PASS" }));
@@ -94,6 +159,7 @@ const versionEvidence = () => {
   if (scenario === "version-malformed-summary") text = text.replace(/RELEASE_VERSION_SUMMARY [^\\n]+/, "RELEASE_VERSION_SUMMARY null");
   if (scenario === "version-legacy-output") text = "PASS：纯函数回归完成。未执行发行校验主流程或真实安装验收。\\n";
   if (scenario === "version-no-output") text = "";
+  if (scenario !== "version-no-output") text = scenario === "version-runtime-late" ? text + header : header + text;
   if (scenario === "version-marker") text = "NOT RUN: synthetic missing assertion\\n" + text;
   if (scenario === "version-chinese-skip") text = "跳过：纯函数断言没有执行\\n" + text;
   if (scenario === "crlf") text = text.replaceAll("\\n", "\\r\\n");
@@ -172,9 +238,15 @@ function fixture() {
   return { dir, preload };
 }
 
-function execute(entry, scenario) {
+function execute(
+  entry,
+  scenario,
+  { stdoutOnly = false, reportFailure = "" } = {},
+) {
   const { dir, preload } = fixture();
   try {
+    const temp = join(dir, "temporary gate evidence");
+    mkdirSync(temp);
     const report = join(
       dir,
       entry === "release-record.mjs" ? "report.md" : "gate.json",
@@ -182,19 +254,48 @@ function execute(entry, scenario) {
     const flag = entry === "release-record.mjs" ? "--out" : "--log-file";
     const result = spawnSync(
       process.execPath,
-      [join(dir, "scripts", entry), flag, report],
+      [join(dir, "scripts", entry), ...(stdoutOnly ? [] : [flag, report])],
       {
         encoding: "utf8",
         env: {
           ...process.env,
           NODE_OPTIONS: `--import ${JSON.stringify(pathToFileURL(preload).href)}`,
           DSM_GATE_TEST_SCENARIO: scenario,
+          DSM_GATE_TEST_REPORT_FAILURE: reportFailure,
+          DSM_GATE_TEST_DIR: dir,
+          TMPDIR: temp,
+          TEMP: temp,
+          TMP: temp,
         },
         timeout: 30_000,
       },
     );
     assert.ifError(result.error);
-    return { ...result, report: readFileSync(report, "utf8") };
+    const journal = join(dir, "gate-sources.jsonl");
+    const sources = existsSync(journal)
+      ? readFileSync(journal, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => {
+            const source = JSON.parse(line);
+            return {
+              ...source,
+              retained: existsSync(source.path),
+              remainingBytes: existsSync(source.path)
+                ? readFileSync(source.path).toString("base64")
+                : null,
+            };
+          })
+      : [];
+    return {
+      ...result,
+      report: stdoutOnly
+        ? result.stdout
+        : existsSync(report)
+          ? readFileSync(report, "utf8")
+          : null,
+      sources,
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -271,6 +372,10 @@ for (const scenario of [
   "rust-fail",
   ...errorScenarios,
   "missing-log",
+  "corrupt-log",
+  "invalid-utf8-log",
+  "empty-log",
+  "unreadable-log",
   "tampered-counts",
   "tampered-coverage",
   "tampered-required",
@@ -306,6 +411,139 @@ for (const scenario of [
   });
 }
 
+function archivedSnapshots(report) {
+  return [...report.matchAll(/```json\n([\s\S]*?)\n```/g)]
+    .map((match) => JSON.parse(match[1]))
+    .filter((value) => value.kind === "untrusted-gate-file-snapshot");
+}
+
+for (const [scenario, source] of [
+  ["corrupt-log", "rust"],
+  ["invalid-utf8-log", "rust"],
+  ["empty-log", "rust"],
+  ["legacy-log", "rust"],
+  ["tampered-counts", "rust"],
+  ["tampered-output", "rust"],
+  ["version-corrupt-log", "version"],
+  ["version-invalid-utf8-log", "version"],
+  ["version-empty-log", "version"],
+  ["version-legacy-log", "version"],
+  ["version-tampered-counts", "version"],
+  ["version-tampered-runtime", "version"],
+]) {
+  test(`rejected evidence is archived losslessly as untrusted bytes: ${scenario}`, () => {
+    const result = execute("release-record.mjs", scenario);
+    assert.equal(result.status, 1);
+    const original = result.sources.find((item) => item.source === source);
+    assert.ok(original);
+    const archived = archivedSnapshots(result.report).find(
+      (item) => item.path === original.path,
+    );
+    assert.ok(archived);
+    assert.equal(archived.validation, "rejected");
+    assert.equal(archived.encoding, "base64");
+    assert.equal(archived.bytes, original.bytes);
+    const bytes = Buffer.from(original.bytes, "base64");
+    assert.equal(archived.byteLength, bytes.length);
+    assert.equal(
+      archived.sha256,
+      createHash("sha256").update(bytes).digest("hex"),
+    );
+    assert.equal(original.retained, false);
+    assert.match(result.report, /不可信诊断数据/);
+    assert.doesNotMatch(result.report, /INJECTED_UNTRUSTED_MARKDOWN/);
+    assert.match(
+      result.report,
+      source === "rust"
+        ? /\| cargo test \| ERROR/
+        : /\| 发行版本纯函数回归 \| ERROR/,
+    );
+  });
+}
+
+for (const scenario of ["missing-log", "version-missing-log"]) {
+  test(`missing evidence is distinguished from a rejected file: ${scenario}`, () => {
+    const result = execute("release-record.mjs", scenario);
+    const missing = archivedSnapshots(result.report).find(
+      (item) => item.validation === "missing",
+    );
+    assert.equal(result.status, 1);
+    assert.ok(missing);
+    assert.equal(missing.bytes, null);
+    assert.equal(missing.sha256, null);
+    assert.equal(missing.byteLength, null);
+    assert.match(missing.readError, /ENOENT/);
+  });
+}
+
+for (const scenario of ["unreadable-log", "version-unreadable-log"]) {
+  test(`unreadable evidence remains on disk and cannot pass: ${scenario}`, () => {
+    const result = execute("release-record.mjs", scenario);
+    assert.equal(result.status, 1);
+    const unreadable = archivedSnapshots(result.report).find(
+      (item) => item.validation === "unreadable",
+    );
+    assert.ok(unreadable);
+    assert.equal(unreadable.bytes, null);
+    const original = result.sources.find(
+      (item) => item.path === unreadable.path,
+    );
+    assert.ok(original.retained);
+    assert.equal(original.remainingBytes, original.bytes);
+    assert.ok(result.stderr.includes(original.path));
+  });
+}
+
+for (const reportFailure of [
+  "report-write-failure",
+  "report-partial-write",
+  "report-truncated-write",
+  "report-flush-failure",
+  "report-readback-failure",
+]) {
+  for (const scenario of ["pass", "corrupt-log", "version-legacy-log"]) {
+    test(`failed archival retains both original files: ${reportFailure}/${scenario}`, () => {
+      const result = execute("release-record.mjs", scenario, { reportFailure });
+      assert.equal(result.status, 1);
+      assert.equal(result.sources.length, 2);
+      for (const original of result.sources) {
+        assert.equal(original.retained, true);
+        assert.equal(original.remainingBytes, original.bytes);
+        assert.ok(result.stderr.includes(original.path));
+      }
+      assert.match(result.stderr, /发行记录未可靠保存/);
+    });
+  }
+}
+
+test("stdout alone never authorizes deletion of source evidence", () => {
+  const result = execute("release-record.mjs", "pass", { stdoutOnly: true });
+  assert.equal(result.status, 0);
+  assert.equal(archivedSnapshots(result.report).length, 2);
+  assert.equal(result.sources.length, 2);
+  for (const original of result.sources) {
+    assert.equal(original.retained, true);
+    assert.equal(original.remainingBytes, original.bytes);
+    assert.ok(result.stderr.includes(original.path));
+  }
+});
+
+test("validation uses the archived snapshot and never deletes a changed source", () => {
+  const result = execute("release-record.mjs", "changed-log-after-snapshot");
+  const original = result.sources.find((item) => item.source === "rust");
+  const archived = archivedSnapshots(result.report).find(
+    (item) => item.path === original.path,
+  );
+  assert.equal(archived.validation, "validated");
+  assert.equal(archived.bytes, original.bytes);
+  assert.equal(original.retained, true);
+  assert.equal(
+    Buffer.from(original.remainingBytes, "base64").toString("utf8"),
+    "changed after snapshot",
+  );
+  assert.ok(result.stderr.includes(original.path));
+});
+
 test("release: simulated complete Windows result records full coverage, not installer acceptance", () => {
   const result = execute("release-record.mjs", "pass");
   assert.equal(result.status, 0);
@@ -317,6 +555,10 @@ test("release: simulated complete Windows result records full coverage, not inst
   assert.match(result.report, /FAIL=0；NOT RUN=0/);
   assert.match(result.report, /门禁命令全部通过，但安装包未校验/);
   assert.match(result.report, /"scope": "deepseek-windows-release"/);
+  assert.match(result.report, /"version": "7\.4\.7"/);
+  assert.match(result.report, /"source": "\$PSVersionTable\.PSVersion"/);
+  assert.equal(result.sources.length, 2);
+  assert.ok(result.sources.every((source) => !source.retained));
   for (const name of REQUIRED_WINDOWS_TESTS)
     assert.ok(result.report.includes(name));
 });
@@ -327,8 +569,13 @@ for (const scenario of ["pass", "crlf", "non-windows"]) {
     const log = JSON.parse(result.report);
     assert.equal(result.status, 0);
     assert.equal(log.scope, "release-version-pure-functions");
+    assert.equal(log.schemaVersion, 2);
     assert.equal(log.powershell.code, 0);
     assert.equal(log.powershell.counts.unit, "assertions");
+    assert.equal(log.powershell.runtimeValid, true);
+    assert.equal(log.powershell.runtime.version, "7.4.7");
+    assert.equal(log.powershell.runtime.source, "$PSVersionTable.PSVersion");
+    assert.match(log.powershell.runtime.executable, /pwsh(?:\.exe)?$/);
     assert.equal(
       log.powershell.counts.executed,
       REQUIRED_VERSION_SUITES.length,
@@ -344,6 +591,19 @@ for (const scenario of ["pass", "crlf", "non-windows"]) {
 }
 
 const versionErrorScenarios = [
+  "version-runtime-old",
+  "version-runtime-major-mismatch",
+  "version-runtime-version-malformed",
+  "version-runtime-source",
+  "version-runtime-executable-source",
+  "version-runtime-executable-missing",
+  "version-runtime-executable-relative",
+  "version-runtime-executable-root-relative",
+  "version-runtime-edition",
+  "version-runtime-malformed",
+  "version-runtime-missing",
+  "version-runtime-duplicate",
+  "version-runtime-late",
   "version-tool-error",
   "version-signal",
   "version-no-output",
@@ -399,6 +659,10 @@ for (const [scenario, exitCode] of [
 for (const scenario of [
   ...versionErrorScenarios,
   "version-missing-log",
+  "version-corrupt-log",
+  "version-invalid-utf8-log",
+  "version-empty-log",
+  "version-unreadable-log",
   "version-tampered-counts",
   "version-tampered-output",
   "version-tampered-exit",
@@ -408,6 +672,8 @@ for (const scenario of [
   "version-tampered-platform",
   "version-tampered-arch",
   "version-tampered-scope",
+  "version-tampered-runtime",
+  "version-tampered-runtime-valid",
   "version-legacy-log",
 ]) {
   test(`release requires pure version execution evidence: ${scenario}`, () => {
@@ -451,6 +717,14 @@ test("verify uses the shared Windows gate and mandatory component/fault gates", 
   assert.match(source, /Invoke-Check[^\n]+release-gates\.test\.mjs/);
   assert.doesNotMatch(source, /Invoke-Check 'cargo test' 'cargo'/);
   assert.doesNotMatch(source, /run-integration-tests|local-usage:prepare/);
+  assert.match(source, /^#requires -Version 7\.0/);
+  assert.match(source, /\$runtimeVersion = \$PSVersionTable\.PSVersion/);
+  assert.match(source, /\$runtimeVersion\.Major -lt 7/);
+  assert.match(source, /GetCurrentProcess\(\)\.MainModule\.FileName/);
+  assert.ok(
+    source.indexOf("$runtimeVersion.Major -lt 7") <
+      source.indexOf("Invoke-Check '版本一致性'"),
+  );
 });
 
 test("pure version assertions preserve failure propagation and completion protocol", () => {
@@ -467,6 +741,15 @@ test("pure version assertions preserve failure propagation and completion protoc
     assert.ok(source.includes(`$script:AssertionSuite = '${suite}'`));
   assert.match(source, /Parser\]::ParseFile/);
   assert.match(source, /\$matches\.Count -ne 1/);
+  assert.match(source, /^#requires -Version 7\.0/);
+  assert.match(source, /\$runtimeVersion = \$PSVersionTable\.PSVersion/);
+  assert.match(source, /\$runtimeVersion\.Major -lt 7/);
+  assert.match(source, /GetCurrentProcess\(\)\.MainModule\.FileName/);
+  assert.match(source, /RELEASE_VERSION_RUNTIME \$runtime/);
+  assert.ok(
+    source.indexOf("RELEASE_VERSION_RUNTIME $runtime") <
+      source.indexOf("$script:AssertionCount = 0"),
+  );
 });
 
 test("component runner bundles every retained regression suite and executes all outputs", () => {
@@ -480,6 +763,7 @@ test("component runner bundles every retained regression suite and executes all 
     "usage-fidelity.test",
     "history-lifecycle.test",
     "chart-accessibility.test",
+    "history-trend-interactions.test",
   ]) {
     assert.ok(source.includes(`"${name}"`));
     assert.match(

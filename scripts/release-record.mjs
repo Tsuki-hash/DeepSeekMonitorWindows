@@ -18,7 +18,7 @@ import { spawnSync } from "node:child_process";
 import { hasNotRun, readRustGateLog } from "./run-rust-tests.mjs";
 import { readReleaseVersionGateLog } from "./run-release-version-tests.mjs";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -160,6 +160,66 @@ const versionLogFile = join(
   `dsm-version-log-${process.pid}-${Date.now()}.json`,
 );
 
+// Read bytes independently of trust. Invalid UTF-8/JSON, stale schemas and
+// inconsistent fields must stay available for diagnosis without earning PASS.
+// Both the validator and the lossless archive use this one immutable snapshot.
+const captureGateEvidence = (path, code, validate) => {
+  let bytes;
+  try {
+    bytes = readFileSync(path);
+  } catch (error) {
+    return {
+      path,
+      bytes: null,
+      log: null,
+      state: error.code === "ENOENT" ? "missing" : "unreadable",
+      readError: String(error),
+    };
+  }
+  const log = validate(bytes, code);
+  return {
+    path,
+    bytes,
+    log,
+    state: log ? "validated" : "rejected",
+    readError: null,
+  };
+};
+
+const appendGateEvidence = (lines, evidence) => {
+  if (evidence.log) {
+    lines.push("经本次入口重新校验的结构化证据：", "", "```json");
+    lines.push(JSON.stringify(evidence.log, null, 2), "```", "");
+  } else {
+    lines.push("结构化证据缺失或不一致，拒绝计为通过（ERROR）。", "");
+  }
+  lines.push(
+    "原始文件快照（不可信诊断数据）：Base64 完整保留字节，禁止把其中的 PASS 或字段当作放行结论。SHA-256 仅校验归档完整性，不证明来源真实。",
+    "",
+    "```json",
+  );
+  lines.push(
+    JSON.stringify(
+      {
+        kind: "untrusted-gate-file-snapshot",
+        path: evidence.path,
+        validation: evidence.state,
+        readError: evidence.readError,
+        encoding: "base64",
+        byteLength: evidence.bytes?.length ?? null,
+        sha256: evidence.bytes
+          ? createHash("sha256").update(evidence.bytes).digest("hex")
+          : null,
+        bytes: evidence.bytes?.toString("base64") ?? null,
+      },
+      null,
+      2,
+    ),
+    "```",
+    "",
+  );
+};
+
 /** DeepSeek 门禁清单须与 scripts/verify.ps1 保持一致。 */
 const checks = [
   ["版本一致性", "node", ["scripts/check-version.mjs"], true],
@@ -287,13 +347,15 @@ lines.push("## 工具链");
 lines.push("");
 for (const [label, command, commandArgs] of [
   ["Node", "node", ["--version"]],
-  ["PowerShell", "pwsh", ["--version"]],
   ["npm", "npm", ["--version"]],
   ["Rust", "cargo", ["--version"]],
   ["rustc", "rustc", ["--version"]],
 ]) {
   lines.push(`- ${label}：\`${run(command, commandArgs).stdout.trim()}\``);
 }
+lines.push(
+  "- PowerShell：版本与可执行文件来源取自实际执行纯函数回归的同一进程，见该项完整证据的 powershell.runtime；不以独立 --version 输出代替。",
+);
 lines.push("");
 
 lines.push("## 锁文件摘要");
@@ -320,12 +382,18 @@ lines.push("| 门禁 | 结论 | 退出码 | 用时 | 测试计数 |");
 lines.push("| - | - | - | - | - |");
 for (const [label, command, commandArgs] of checks) {
   const result = run(command, commandArgs);
-  const rustLog =
-    label === "cargo test" ? readRustGateLog(rustLogFile, result.code) : null;
-  const versionLog =
-    label === "发行版本纯函数回归"
-      ? readReleaseVersionGateLog(versionLogFile, result.code)
-      : null;
+  const evidence =
+    label === "cargo test"
+      ? captureGateEvidence(rustLogFile, result.code, readRustGateLog)
+      : label === "发行版本纯函数回归"
+        ? captureGateEvidence(
+            versionLogFile,
+            result.code,
+            readReleaseVersionGateLog,
+          )
+        : null;
+  const rustLog = label === "cargo test" ? evidence.log : null;
+  const versionLog = label === "发行版本纯函数回归" ? evidence.log : null;
   const verdict =
     result.error || result.signal
       ? "ERROR"
@@ -342,6 +410,7 @@ for (const [label, command, commandArgs] of checks) {
     verdict,
     rustLog,
     versionLog,
+    evidence,
   });
   if (verdict === "FAIL" || verdict === "ERROR") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
@@ -381,8 +450,7 @@ for (const {
   commandArgs,
   result,
   verdict,
-  rustLog,
-  versionLog,
+  evidence,
 } of checkResults) {
   lines.push(
     `<details><summary>${label} — ${verdict}（退出码 ${result.code ?? "无退出码"}）</summary>`,
@@ -406,26 +474,12 @@ for (const {
       "Windows 发布覆盖与原始 libtest 证据（rawCounts 仅诊断，不代表通过）：",
     );
     lines.push("");
-    lines.push("```json");
-    lines.push(
-      rustLog
-        ? JSON.stringify(rustLog, null, 2)
-        : "结构化证据缺失或不一致，拒绝计为通过。",
-    );
-    lines.push("```");
-    lines.push("");
+    appendGateEvidence(lines, evidence);
   }
   if (label === "发行版本纯函数回归") {
     lines.push("纯函数断言证据（不读取真实安装包，也不代表安装升级验收）：");
     lines.push("");
-    lines.push("```json");
-    lines.push(
-      versionLog
-        ? JSON.stringify(versionLog, null, 2)
-        : "结构化证据缺失或不一致，拒绝计为通过。",
-    );
-    lines.push("```");
-    lines.push("");
+    appendGateEvidence(lines, evidence);
   }
   lines.push("</details>");
   lines.push("");
@@ -526,18 +580,44 @@ if (failures.length) {
 }
 
 const text = lines.join("\n") + "\n";
+let reportPersisted = false;
 if (out) {
-  writeFileSync(resolve(out), text, "utf8");
-  console.log(resolve(out));
+  try {
+    // Node's required minimum supports flush. Only a completed flush plus an
+    // exact read-back permits cleanup; partial/failed writes retain originals.
+    writeFileSync(resolve(out), text, { encoding: "utf8", flush: true });
+    if (!readFileSync(resolve(out)).equals(Buffer.from(text, "utf8")))
+      throw new Error("发行记录落盘后逐字节核对不一致");
+    reportPersisted = true;
+    console.log(resolve(out));
+  } catch (error) {
+    failures.push("发行记录写入或核对失败");
+    console.error(`发行记录未可靠保存：${String(error)}`);
+  }
 } else {
+  // stdout may be piped, truncated or fail asynchronously. Its delivery is not
+  // durable archival confirmation, so retain every temporary source file.
   console.log(text);
 }
-// 只删除本次运行自己创建的临时门禁日志，不涉及用户配置、缓存或历史。
-for (const logFile of [rustLogFile, versionLogFile]) {
+// Only this run's byte-for-byte archived snapshots may be removed. A rejected
+// log is eligible only because its exact untrusted bytes and hash were saved.
+for (const { evidence } of checkResults) {
+  if (!evidence || evidence.state === "missing") continue;
   try {
-    if (existsSync(logFile)) rmSync(logFile, { force: true });
-  } catch {
-    /* 清理失败不影响结论 */
+    if (
+      reportPersisted &&
+      evidence.bytes !== null &&
+      readFileSync(evidence.path).equals(evidence.bytes)
+    ) {
+      rmSync(evidence.path);
+    } else {
+      console.error(
+        `保留原始门禁日志（未确认完整归档或文件已变化）：${evidence.path}`,
+      );
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      console.error(`原始门禁日志未清理：${evidence.path}；${String(error)}`);
   }
 }
 

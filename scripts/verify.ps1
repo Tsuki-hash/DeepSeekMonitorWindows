@@ -1,3 +1,4 @@
+#requires -Version 7.0
 # 本地一键验证（替代已取消的 GitHub CI）。
 # 用法：pwsh -File scripts/verify.ps1
 # 这是 Windows 发布源码门禁；非 Windows 可运行开发检查，但最终必须 NOT RUN。
@@ -8,6 +9,16 @@
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 $ErrorActionPreference = 'Stop'
+# 校验当前入口进程，不因命令恰好名为 pwsh 就假定满足最低版本。
+$runtimeVersion = $PSVersionTable.PSVersion
+if ($null -eq $runtimeVersion -or $runtimeVersion.Major -lt 7 -or $PSVersionTable.PSEdition -ne 'Core') {
+    throw '本地验证要求当前进程为 PowerShell 7+ Core。'
+}
+$runtimeExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+if ([string]::IsNullOrWhiteSpace($runtimeExecutable) -or -not [System.IO.Path]::IsPathRooted($runtimeExecutable)) {
+    throw '无法获取当前 PowerShell 可执行文件来源。'
+}
+Write-Host "PowerShell runtime: $runtimeVersion; source: PSVersionTable.PSVersion; executable: $runtimeExecutable (current process)"
 Set-Location (Join-Path $PSScriptRoot '..')
 
 # PowerShell 7 默认不把原生命令的非零退出码转为终止错误。

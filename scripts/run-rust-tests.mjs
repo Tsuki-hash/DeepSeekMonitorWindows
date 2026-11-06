@@ -182,9 +182,16 @@ export function runRustGate() {
 
 // Recompute evidence from raw result rows on the same host. Never trust declared
 // PASS, totals, coverage or platform alone, including an older schema's log.
-export function readRustGateLog(path, code) {
+export function readRustGateLog(pathOrBytes, code) {
   try {
-    const log = JSON.parse(readFileSync(path, "utf8"));
+    // Validate the same captured bytes the caller archives, without a second
+    // filesystem read. Existing path-based callers remain supported.
+    const bytes = Buffer.isBuffer(pathOrBytes)
+      ? pathOrBytes
+      : readFileSync(pathOrBytes);
+    const log = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
     if (
       log.schemaVersion !== 3 ||
       log.scope !== "deepseek-windows-release" ||

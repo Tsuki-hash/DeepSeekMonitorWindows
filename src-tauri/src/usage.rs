@@ -8,6 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "decimal_amount.rs"]
+mod decimal_amount;
+pub(crate) use decimal_amount::DecimalAmount;
+
 pub const FLASH_SLOT: &str = "flash";
 pub const PRO_SLOT: &str = "pro";
 /// 前端 JS 安全整数上界；超过它的计数无法在界面里无损表示，按未知处理。
@@ -61,7 +65,23 @@ pub fn amount(value: &str) -> Option<f64> {
         .trim()
         .parse::<f64>()
         .ok()
-        .filter(|value| value.is_finite() && *value >= 0.0 && *value < u64::MAX as f64)
+        .filter(|number| number.is_finite() && *number >= 0.0 && *number < u64::MAX as f64)
+        .filter(|_| !is_negative_amount(value))
+}
+
+/// 先按现有数值语法验证，再使用尾数的非零位作证据，避免 1e-400 下溢
+/// 为 0、-1e-400 下溢为 -0。指数中的数字不是金额非零证据。
+fn nonzero_mantissa(value: &str) -> bool {
+    value
+        .split(['e', 'E'])
+        .next()
+        .unwrap_or(value)
+        .bytes()
+        .any(|digit| matches!(digit, b'1'..=b'9'))
+}
+
+pub(crate) fn is_negative_amount(value: &str) -> bool {
+    value.trim_start().starts_with('-') && nonzero_mantissa(value)
 }
 
 /// R19：某个原始模型是否有实际业务记录，而不只是平台预铺的零/空桶。
@@ -72,7 +92,7 @@ pub fn amount(value: &str) -> Option<f64> {
 pub(crate) fn has_recorded_activity(usage: &[Entry]) -> bool {
     usage
         .iter()
-        .any(|entry| amount(&entry.amount).is_some_and(|value| value > 0.0))
+        .any(|entry| amount(&entry.amount).is_some() && nonzero_mantissa(&entry.amount))
 }
 
 /// 可空计数相加：任一未知即未知，溢出即未知，不把缺失补成零。
@@ -279,9 +299,8 @@ pub fn merge_model_slot(
 /// 否则每月费用会被请求数污染成一个天文数字。
 ///
 /// 任一金额无法解析时整体为 `None`：费用缺失不能折算成 0 元。
-/// 金额用 `f64` 而非整数分：平台返回的就是小数字符串，本应用只做
-/// 展示级汇总（元、两位小数），不做财务入账；改整数分需同步改接口反序列化与前端
-/// 全部 `fmtMoney` 调用链，收益不抵成本。极端量级（>2^53 最小单位）的精度损失可接受。
+/// 保持现有显示/API 的 `f64` 口径，不把亚分金额舍入成整数分。
+/// 预算比较不能使用这个浮点合计，必须走原始十进制的 `budget_cost_total`。
 pub fn cost_sum(usage: &[Entry]) -> Option<f64> {
     // 复评 N16：**每一步**都要检查累计值仍有限 —— 旧实现只校验各输入
     // 有限，1e308 + 1e308 会得到 Infinity 并被当成正常金额展示。
@@ -344,6 +363,39 @@ pub fn cost_total_present(values: impl IntoIterator<Item = Option<f64>>) -> Opti
     seen.then_some(total)
 }
 
+/// R20：预算专用月额，直接从原始金额文本精确相加，不经过显示用 f64。
+/// 同一个原始模型的空/REQUEST 片段不污染有效金额；不同原始模型各自
+/// 必须有金额。任何实际坏金额或精度/累计范围溢出均传播未知，不能忽略。
+pub(crate) fn budget_cost_total<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a [Entry])>,
+) -> Option<DecimalAmount> {
+    let mut grouped: std::collections::BTreeMap<&str, (bool, Option<DecimalAmount>)> =
+        std::collections::BTreeMap::new();
+    for (model, entries) in rows {
+        let (seen, total) = grouped
+            .entry(model)
+            .or_insert_with(|| (false, Some(DecimalAmount::zero())));
+        for entry in entries.iter().filter(|entry| entry.kind != "REQUEST") {
+            *seen = true;
+            *total = total
+                .take()
+                .zip(DecimalAmount::parse(&entry.amount))
+                .and_then(|(total, value)| total.checked_add(&value));
+        }
+    }
+    if grouped.is_empty() {
+        return None;
+    }
+    grouped
+        .into_values()
+        .try_fold(DecimalAmount::zero(), |total, (seen, value)| {
+            if !seen {
+                return None;
+            }
+            total.checked_add(&value?)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +404,41 @@ mod tests {
         Entry {
             kind: kind.to_string(),
             amount: amount.to_string(),
+        }
+    }
+
+    #[test]
+    fn r20_预算精确求和缺金额坏金额合法零及原始模型互不遮盖() {
+        let valid = [entry("RESPONSE_TOKEN", "0.8")];
+        let request = [entry("REQUEST", "100")];
+        let zero = [entry("RESPONSE_TOKEN", "0")];
+        assert_eq!(budget_cost_total([]), None);
+        assert_eq!(
+            budget_cost_total([("a", request.as_slice()), ("a", &[])]),
+            None
+        );
+        assert_eq!(
+            budget_cost_total([("a", zero.as_slice()), ("a", request.as_slice())]),
+            Some(DecimalAmount::zero())
+        );
+        assert_eq!(
+            budget_cost_total([("a", valid.as_slice()), ("b", request.as_slice())]),
+            None
+        );
+        for raw in [
+            "", "invalid", "NaN", "inf", "-1", "-1e-400", "1e40", "1e-4097",
+        ] {
+            let invalid = [entry("RESPONSE_TOKEN", raw)];
+            for fragments in [
+                vec![valid.as_slice(), invalid.as_slice()],
+                vec![invalid.as_slice(), valid.as_slice()],
+            ] {
+                assert_eq!(
+                    budget_cost_total(fragments.into_iter().map(|entries| ("a", entries))),
+                    None,
+                    "坏金额不能被有效片段掩盖：{raw}"
+                );
+            }
         }
     }
 
@@ -365,7 +452,8 @@ mod tests {
             assert!(has_recorded_activity(&[entry(kind, "1")]));
         }
         assert!(has_recorded_activity(&[entry("RESPONSE_TOKEN", "0.00001")]));
-        for value in ["", "invalid", "NaN", "inf", "-1", "1e40"] {
+        assert!(has_recorded_activity(&[entry("RESPONSE_TOKEN", "1e-400")]));
+        for value in ["", "invalid", "NaN", "inf", "-1", "-1e-400", "1e40"] {
             assert!(!has_recorded_activity(&[entry("RESPONSE_TOKEN", value)]));
         }
         let request = [entry("REQUEST", "1"), entry("RESPONSE_TOKEN", "0")];

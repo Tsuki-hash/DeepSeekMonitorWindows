@@ -17,6 +17,7 @@ try {
     "usage-fidelity.test",
     "history-lifecycle.test",
     "chart-accessibility.test",
+    "history-trend-interactions.test",
   ];
   const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({

@@ -388,6 +388,10 @@ pub struct UsageResult {
     pub days: Vec<UsageDaySummary>,
     /// `None` 表示费用接口缺项/无法解析；主面板显示「—」而不是 ¥0.00。
     pub month_cost: Option<f64>,
+    /// R20：只在本次原始响应中生成的预算证据，不写入旧 JSON/前端缓存。
+    /// 不能用显示金额反推；缺失时提醒失败关闭，展示 schema 保持 v2。
+    #[serde(skip)]
+    pub(crate) budget_month_cost: Option<crate::usage::DecimalAmount>,
 }
 
 /// 查询月和请求开始时的 UTC+8 记账日共同限定质量检查范围。
@@ -824,6 +828,16 @@ fn build_usage_result_inner(
     } else {
         None
     };
+    let budget_month_cost = if month_models_aligned {
+        crate::usage::budget_cost_total(
+            cost_total
+                .into_iter()
+                .flat_map(|item| &item.total)
+                .map(|row| (row.model.as_str(), row.usage.as_slice())),
+        )
+    } else {
+        None
+    };
 
     let mut warnings = usage_alignment_warnings(amount, cost, &days, period);
     // R18：模型名对齐不等于月数量完整。先按原始模型收齐全部片段，再检查
@@ -855,6 +869,7 @@ fn build_usage_result_inner(
         models,
         days,
         month_cost,
+        budget_month_cost,
     }
 }
 
@@ -1068,7 +1083,11 @@ fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), St
             .amount
             .parse::<f64>()
             .map_err(|_| "平台返回无法解析的用量数值，请稍后重试")?;
-        if !n.is_finite() || n < 0.0 || n >= u64::MAX as f64 {
+        if !n.is_finite()
+            || n < 0.0
+            || n >= u64::MAX as f64
+            || crate::usage::is_negative_amount(&entry.amount)
+        {
             return Err("平台返回超出范围的用量数值，请稍后重试".into());
         }
     }
@@ -1223,6 +1242,25 @@ mod tests {
 
     const MONTH_COVERAGE_WARNING: &str =
         "本月数量或费用汇总缺少已有日用量的原始模型，请稍后刷新核对";
+
+    #[test]
+    fn r20_十进制预算不放宽生产数值入口_非法费用仍拒绝() {
+        for raw in ["", "invalid", "NaN", "inf", "-1", "-1e-400", "1e40"] {
+            let (amount, mut cost) = complete_month(2026, 11, 1);
+            cost.data.biz_data[0]
+                .total
+                .push(row("deepseek-flash", &[("RESPONSE_TOKEN", raw)]));
+            assert!(validate_usage_entries(&amount, &cost).is_err(), "{raw}");
+            let (amount, mut cost) = complete_month(2026, 11, 1);
+            cost.data.biz_data[0].days[0]
+                .data
+                .push(row("deepseek-flash", &[("RESPONSE_TOKEN", raw)]));
+            assert!(
+                validate_usage_entries(&amount, &cost).is_err(),
+                "日费用同样拒绝：{raw}"
+            );
+        }
+    }
 
     #[test]
     fn r19_双方月汇总共同漏日模型仍告警_保留原月额与日明细() {

@@ -14,6 +14,7 @@
 
 两条完整入口 `npm run verify` 和 `npm run release:record -- ...` 均通过 `scripts/run-release-version-tests.mjs` 调用 `pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1`，无需维护者额外记住单独命令。要求 PowerShell 7+ 可用；缺少 pwsh、脚本或被提取的函数均阻断，不允许跳过后继续报通过。
 
+- `verify.ps1` 和纯函数脚本均有 `#requires -Version 7.0`，并在开始工作前检查当前进程的 `$PSVersionTable.PSVersion` 和 Core edition。纯函数脚本先输出唯一的 `RELEASE_VERSION_RUNTIME`：版本及各数值段、版本来源、当前进程实际可执行文件路径及取值来源。共享入口核对主版本至少为 7、版本文本与数值段一致、来源及路径有效；缺失／损坏／重复／迟到的运行时证据不能通过。取值失败直接阻断，不能只因命令名是 pwsh 就视作 PowerShell 7，也不能用另一个 `pwsh --version` 进程代替。
 - 原脚本仅从 `verify-release.ps1` 的 AST 提取纯函数，对文件名版本、内存 PE 头、合成版本资源三组输入执行断言，不运行发行校验主流程。
 - 每次断言输出一行 `RELEASE_VERSION_ASSERT`，完整结束后输出唯一的 `RELEASE_VERSION_SUMMARY`。共享入口要求顺序编号、三组各有非零执行、计数一致、全部成功和真实退出码 0。零断言、只有汇总、旧的一句 PASS、未完成、重复／损坏的汇总都不能通过。
 - 真实非零退出、启动错误或信号优先于输出里的成功声明；`NOT RUN:` 与旧中文 `跳过：` 在 stdout/stderr 中均被识别，不能降级为 PASS。
@@ -37,12 +38,21 @@
 - `rawCounts` 是 libtest 原始汇总，只供诊断。
 - `counts` 仅在 Windows 发布覆盖完整通过时才可用；其他结论为 null，不以部分和或正常 return 凑通过数。
 - `executed` 是已完成测试函数数，即 passed + failed，不是 assert 表达式数量。ignored 不算执行。
-- 发行记录重新解析原始输出，并核对本机平台、命令、范围、清单、结论与计数。旧 schema、缺日志、篡改／不一致的字段都记为 `ERROR`。完整结构化日志写入发行记录后才清理该次临时日志。
+- 发行记录重新解析原始输出，并核对本机平台、命令、范围、清单、结论与计数。旧 schema、缺日志、损坏 UTF-8／JSON、篡改／不一致的字段都记为 `ERROR`，不以原文件自称的 PASS 放行。
 - 源码门禁、安装包哈希、实际包来源及安装使用验收是不同证据。即使门禁 PASS 且记录哈希，也不能声称安装／升级或全部真机交互已验收。
 
-发行版本共享入口的 `--log-file` 另生成 schema v1 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与三组执行数。发行记录重新解析原始记录并核对结论、命令、退出状态与计数，缺日志、旧 schema 或字段不一致记为 ERROR。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
+发行版本共享入口的 `--log-file` 另生成 schema v2 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与三组执行数，以及 `powershell.runtime` 内同一执行进程的版本和来源。发行记录重新解析原始记录并核对运行时、结论、命令、退出状态与计数，缺日志、旧 schema（含 v1）或字段不一致记为 ERROR。运行时行和完成汇总各自的协议版本仍为 1，不等同于外层日志的 schema v2。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
 
-旧日志保留其原始含义：可阅读旧中文跳过标记作诊断，但不能把旧 schema、旧 PASS 文案或本次执行缺失的证据升级成通过。两类门禁日志都在嵌入完整发行记录后才清理本次临时文件。
+### 原始证据保全与清理条件
+
+- Rust 和版本门禁都先读取完整原始字节，再将同一快照交给校验器。可信结构与原始归档分开，不能校验一次读取、归档另一次读取。
+- 报告中的 `untrusted-gate-file-snapshot` 保存临时路径、读取状态、原始字节数、SHA-256 和完整 Base64 字节。通过校验的日志另展示重新校验后的结构；被拒绝的损坏／旧 schema／篡改日志也保全原始字节，标为 `rejected` 和不可信诊断数据，不渲染其正文为 Markdown，不用其声明恢复 PASS。哈希只证明字节完整性，不证明来源可信。
+- `missing` 与 `unreadable` 分开记录读取错误，无法读取时字节和哈希为 null，不伪造空日志。未读取到的原件不删除。空文件则按零字节完整归档，并保持 ERROR。
+- 仅当指定 `--out`、报告写入与 flush 成功、逐字节读回一致，并确认临时文件仍等于已归档快照时，才清理本次产生的临时日志。有效与被拒绝的原件使用相同保全条件。
+- 写入失败、部分写入、flush 失败、读回失败或内容不一致时退出非零并保留两类原件，stderr 给出位置。只输出到 stdout 时也保留原件，因为输出管道成功不等于可靠落盘；快照读取后发生变化的原件不会清理。
+- 文件中出现 PASS 文案本身不是成功生成报告的证明。必须同时核对本次命令最终退出码和 stderr，失败写入可能留下不完整或尚未确认的报告。维护者应保存明确保留的临时证据，再排查失败原因。
+
+旧日志保留其原始含义：可阅读旧中文跳过标记作诊断，但不能把旧 schema、旧 PASS 文案或本次执行缺失的证据升级成通过。
 
 ## 供维护者执行的命令
 
@@ -52,7 +62,7 @@
 # 只验证门禁的拒绝行为，使用合成进程输出，不证明 DPAPI/Win32 已运行。
 node --test scripts/tests/release-gates.test.mjs
 
-# 包含 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility。
+# 包含 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions。
 # 每个 .tsx 输出为独立 .mjs，再由 node --test 的文件级进程隔离执行。
 npm run test:components
 
@@ -73,6 +83,8 @@ npm run release:record -- --out ..\release-1.3.1.md --installer <实际候选安
 
 门禁脚本回归包含：非 Windows 常规单测、非 Windows 冒充全部 Windows 完成行、中文跳过、英文标记、stderr 标记、混合执行但缺一个必需项、忽略必需项、零测试、全忽略、只有汇总无完成行、总数不符、重复完成行、过滤测试、cargo 失败、工具启动失败、缺日志、旧 schema、篡改计数／清单／平台／架构／范围／命令／原始输出，以及组件门禁失败／零测试／无可解析计数。另保留完整合成成功路径和 Windows CRLF 输出路径。
 
-版本纯函数注入另覆盖：pwsh 不可用、脚本缺失、非零原生退出但输出声称成功、信号中止、空输出、旧 PASS 文案、零断言、仅汇总、缺失／重复／损坏汇总、损坏断言、编号／计数不一致、失败断言但退出 0、缺一组、未完成、只有 stderr 证据、中英文与 stderr 跳过标记、缺日志及篡改计数／退出码／命令／组清单／覆盖／平台／架构／范围／原始输出。合成通过路径验证非 Windows 的纯函数可通过，但整体 Windows 发布仍不得通过。所有新增注入仅已编写，尚未运行。
+版本纯函数注入另覆盖：pwsh 不可用、低于 7、版本与数值段不符、版本文本无法解析、版本／可执行文件来源无效、缺少／相对可执行路径、非 Core、运行时证据缺失／损坏／重复／迟到、脚本缺失、非零原生退出但输出声称成功、信号中止、空输出、旧 PASS 文案、零断言、仅汇总、缺失／重复／损坏汇总、损坏断言、编号／计数不一致、失败断言但退出 0、缺一组、未完成、只有 stderr 证据、中英文与 stderr 跳过标记、缺日志及篡改运行时／计数／退出码／命令／组清单／覆盖／平台／架构／范围／原始输出。合成通过路径验证非 Windows 的纯函数可通过，但整体 Windows 发布仍不得通过。
+
+原件保全注入覆盖两类日志的损坏 JSON、无效 UTF-8、空文件、旧 schema、篡改字段、文件缺失与读取失败；核对 Base64 还原后的每个字节、长度和 SHA-256，拒绝内容不会作为 Markdown 展示。报告完全写入失败／部分写入／静默截断／flush 失败／读回失败分别覆盖有效与被拒绝证据，检查原件仍完整存在。另覆盖仅 stdout 输出保留原件，以及读取快照后文件变化时归档原快照但不清理变化后的文件。所有新增注入仅已编写，尚未运行。
 
 故障注入在临时子进程中模拟平台与工具结果，生产脚本没有跳过平台或覆盖检查的开关。注入测试通过只能证明拒绝逻辑按预期工作，不能计作 Windows 原生覆盖。

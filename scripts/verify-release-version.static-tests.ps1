@@ -1,9 +1,32 @@
+#requires -Version 7.0
 # 独立回归：只从 verify-release.ps1 的 AST 提取纯函数，不运行发行校验主流程、
 # 不启动/安装应用，不构建，不调用 Get-FileHash 或 FileVersionInfo 读取真实安装包。
-# 本文件在第 18/19 轮修改时仅编写/静态审阅，未执行。
+# 本文件在第 18/19/20 轮修改时仅编写/静态审阅，未执行。
 # 用户本机运行：pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+# 在真正执行断言的同一进程取版本，不能用另一个 pwsh --version 代替。
+# 取值失败会终止脚本；没有这条可核对的证据，Node 入口不能放行。
+$runtimeVersion = $PSVersionTable.PSVersion
+if ($null -eq $runtimeVersion -or $runtimeVersion.Major -lt 7 -or $PSVersionTable.PSEdition -ne 'Core') {
+    throw '发行版本纯函数回归要求当前进程为 PowerShell 7+ Core。'
+}
+$runtimeExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+if ([string]::IsNullOrWhiteSpace($runtimeExecutable) -or -not [System.IO.Path]::IsPathRooted($runtimeExecutable)) {
+    throw '无法获取当前 PowerShell 可执行文件来源。'
+}
+$runtime = [ordered]@{
+    schemaVersion = 1
+    source = '$PSVersionTable.PSVersion'
+    version = $runtimeVersion.ToString()
+    major = $runtimeVersion.Major
+    minor = $runtimeVersion.Minor
+    patch = $runtimeVersion.Patch
+    edition = $PSVersionTable.PSEdition
+    executableSource = '[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName'
+    executable = $runtimeExecutable
+} | ConvertTo-Json -Compress
+Write-Host "RELEASE_VERSION_RUNTIME $runtime"
 $script:AssertionCount = 0
 $script:PassedAssertions = 0
 $script:FailedAssertions = 0

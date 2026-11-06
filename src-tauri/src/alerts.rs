@@ -445,10 +445,27 @@ fn budget_sample(data: deepseek_api::UsageResult, options: &AlertOptions) -> (St
         return ("invalid_data".into(), false);
     };
     // 包括日实际模型未被双方月汇总覆盖：保留展示的原月额，不代表可用于预算。
-    if !data.warnings.is_empty() || !month_cost.is_finite() || !(0.0..=1e12).contains(&month_cost) {
+    if !data.warnings.is_empty() || !month_cost.is_finite() || month_cost < 0.0 {
         return ("invalid_data".into(), false);
     }
-    ("ok".into(), month_cost >= options.monthly_budget_cny)
+    // R20：完整显示金额也可能因二进制相加落在等号下方。精确月额必须
+    // 来自本次原始金额，绝不由 month_cost、模型显示和或缓存重建。
+    let Some(exact_cost) = data.budget_month_cost else {
+        return ("invalid_data".into(), false);
+    };
+    let Some(threshold) =
+        crate::usage::DecimalAmount::from_config_number(options.monthly_budget_cny)
+    else {
+        return ("invalid_data".into(), false);
+    };
+    let maximum = crate::usage::DecimalAmount::parse("1000000000000").expect("预算范围常量");
+    if options.monthly_budget_cny <= 0.0
+        || options.monthly_budget_cny > 1_000_000_000.0
+        || exact_cost.cmp(&maximum).is_gt()
+    {
+        return ("invalid_data".into(), false);
+    }
+    ("ok".into(), !exact_cost.cmp(&threshold).is_lt())
 }
 fn outcome<T>(
     result: Option<Result<T, deepseek_api::ApiError>>,
@@ -651,6 +668,332 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 从完整的单日当月响应进入与生产相同的校验/日期质量/预算链路。
+    fn r20_decimal_result(rows: Vec<deepseek_api::ModelUsage>) -> deepseek_api::UsageResult {
+        use deepseek_api::regression_samples::{checked_result, complete_month, period, row};
+        let (mut amount, mut cost) = complete_month(2026, 11, 1);
+        let names: std::collections::BTreeSet<_> =
+            rows.iter().map(|row| row.model.as_str()).collect();
+        if !names.is_empty() {
+            amount.data.biz_data.total = names
+                .into_iter()
+                .map(|model| {
+                    row(
+                        model,
+                        &[
+                            ("PROMPT_CACHE_HIT_TOKEN", "10"),
+                            ("PROMPT_CACHE_MISS_TOKEN", "20"),
+                            ("RESPONSE_TOKEN", "5"),
+                            ("REQUEST", "1"),
+                        ],
+                    )
+                })
+                .collect();
+            amount.data.biz_data.days[0].data = amount.data.biz_data.total.clone();
+        }
+        cost.data.biz_data[0].total = rows.clone();
+        cost.data.biz_data[0].days[0].data = rows;
+        checked_result(&amount, &cost, period(2026, 11, "2026-11-01T04:00:00Z"))
+    }
+
+    #[test]
+    fn r20_预算十进制临界_源金额拆片反序单行及亚分不改变结论() {
+        use deepseek_api::regression_samples::row;
+        let cases: &[(&[&str], f64, bool)] = &[
+            (&["0.799999"], 0.80, false),
+            (&["0.80"], 0.80, true),
+            (&["0.800001"], 0.80, true),
+            (&["0.10", "0.70"], 0.80, true),
+            (&["0.799999", "0.000001"], 0.80, true),
+            (&["0.799999", "0.0000001"], 0.80, false),
+            (&["0.000001", "0.000002"], 0.000003, true),
+            (&["0.000001", "0.0000019"], 0.000003, false),
+            (&["0.79999999999999999999999999999999999999"], 0.80, false),
+            (&["0.80000000000000000000000000000000000001"], 0.80, true),
+            (
+                &[
+                    "0.00000000000000000000000000000000000001",
+                    "0.79999999999999999999999999999999999999",
+                ],
+                0.80,
+                true,
+            ),
+            (&["0"], 0.80, false),
+            (&["999999999999.9999999999", "0.0000000001"], 0.80, true),
+            (&["1000000000000"], 0.80, true),
+            (&["999999999999.1", "0.3", "0.3", "0.3"], 0.80, true),
+        ];
+        for &(fees, threshold, trigger) in cases {
+            for split in [false, true] {
+                for reversed in [false, true] {
+                    let mut entries: Vec<_> = fees
+                        .iter()
+                        .map(|value| ("RESPONSE_TOKEN", *value))
+                        .collect();
+                    if reversed {
+                        entries.reverse();
+                    }
+                    let rows = if split {
+                        let mut rows = vec![
+                            row("deepseek-flash", &[]),
+                            row("deepseek-flash", &[("REQUEST", "7")]),
+                        ];
+                        rows.extend(entries.iter().map(|entry| row("deepseek-flash", &[*entry])));
+                        if reversed {
+                            rows.reverse();
+                        }
+                        rows
+                    } else {
+                        entries.push(("REQUEST", "7"));
+                        vec![row("deepseek-flash", &entries)]
+                    };
+                    let data = r20_decimal_result(rows);
+                    assert!(
+                        data.warnings.is_empty(),
+                        "完整响应不能靠 warnings 拦截：{:?}",
+                        data.warnings
+                    );
+                    if fees == ["0.10", "0.70"] {
+                        assert_eq!(
+                            data.month_cost,
+                            Some(0.7999999999999999),
+                            "保留原有显示合计，预算不能读它"
+                        );
+                        assert_eq!(
+                            data.budget_month_cost,
+                            crate::usage::DecimalAmount::parse("0.8")
+                        );
+                    }
+                    let options = AlertOptions {
+                        monthly_budget_cny: threshold,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        budget_sample(data, &options),
+                        ("ok".into(), trigger),
+                        "{fees:?}, split={split}, reversed={reversed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r20_预算跨原始模型精确求和_显示和旧JSON契约不变() {
+        use deepseek_api::regression_samples::row;
+        for second_model in ["deepseek-v4-flash", "deepseek-v4-pro", "future-model"] {
+            let mut rows = vec![
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "0.10")]),
+                row(second_model, &[("RESPONSE_TOKEN", "0.70")]),
+                row(second_model, &[]),
+                row(second_model, &[("REQUEST", "2")]),
+            ];
+            for _ in 0..2 {
+                let data = r20_decimal_result(rows.clone());
+                assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+                assert_eq!(data.month_cost, Some(0.7999999999999999));
+                assert_eq!(data.raw_models.len(), 2, "原始模型身份不能被预算槽位合并");
+                assert!(data
+                    .raw_models
+                    .iter()
+                    .any(|model| model.model == second_model && model.cost == Some(0.70)));
+                let json = serde_json::to_value(&data).unwrap();
+                let mut keys: Vec<_> = json
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    [
+                        "days",
+                        "modelMappingVersion",
+                        "models",
+                        "monthCost",
+                        "rawModels",
+                        "schemaVersion",
+                        "warnings"
+                    ]
+                );
+                assert_eq!(json["monthCost"], serde_json::json!(0.7999999999999999));
+                let options: AlertOptions =
+                    serde_json::from_str(r#"{"monthlyBudgetCny":0.80}"#).unwrap();
+                let restored: AlertOptions =
+                    serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+                assert_eq!(
+                    budget_sample(data, &restored),
+                    ("ok".into(), true),
+                    "旧配置 JSON 往返后仍包含等号"
+                );
+                rows.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn r20_预算无金额坏精度溢出和缺证据失败关闭_真实零保留() {
+        use deepseek_api::regression_samples::row;
+        let options = AlertOptions {
+            monthly_budget_cny: 0.8,
+            ..Default::default()
+        };
+        for rows in [
+            vec![],
+            vec![row("deepseek-flash", &[])],
+            vec![row("deepseek-flash", &[("REQUEST", "1")])],
+            vec![
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "0.8")]),
+                row("deepseek-v4-flash", &[]),
+            ],
+            vec![row(
+                "deepseek-flash",
+                &[("RESPONSE_TOKEN", "0.8"), ("RESPONSE_TOKEN", "1e-4097")],
+            )],
+            vec![row(
+                "deepseek-flash",
+                &[("RESPONSE_TOKEN", "1000000000000.0000000001")],
+            )],
+            vec![row(
+                "deepseek-flash",
+                &[
+                    ("RESPONSE_TOKEN", "999999999999.9999999999"),
+                    ("RESPONSE_TOKEN", "0.0000000002"),
+                ],
+            )],
+            vec![row(
+                "deepseek-flash",
+                &[("RESPONSE_TOKEN", "10000000000000000000"); 10],
+            )],
+        ] {
+            let mut rows = rows;
+            for _ in 0..2 {
+                assert_eq!(
+                    budget_sample(r20_decimal_result(rows.clone()), &options),
+                    ("invalid_data".into(), false)
+                );
+                rows.reverse();
+            }
+        }
+        let rows = vec![row(
+            "deepseek-flash",
+            &[("RESPONSE_TOKEN", "0"), ("REQUEST", "9")],
+        )];
+        let data = r20_decimal_result(rows);
+        assert_eq!(data.month_cost, Some(0.0));
+        assert!(data.warnings.is_empty());
+        assert_eq!(budget_sample(data, &options), ("ok".into(), false));
+        // 不接收仅携带旧展示值的快照。当前提醒生产入口独立 fetch，不读前端缓存。
+        let mut data =
+            r20_decimal_result(vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0.8")])]);
+        data.budget_month_cost = None;
+        assert_eq!(
+            budget_sample(data, &options),
+            ("invalid_data".into(), false)
+        );
+        for threshold in [f64::NAN, f64::INFINITY, -0.8, 0.0, 1e10] {
+            let data =
+                r20_decimal_result(vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0.8")])]);
+            assert_eq!(
+                budget_sample(
+                    data,
+                    &AlertOptions {
+                        monthly_budget_cny: threshold,
+                        ..Default::default()
+                    }
+                ),
+                ("invalid_data".into(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn r20_预算日期拆片与数量PROMPT去重保持原契约_金额不借用Token规则() {
+        use deepseek_api::regression_samples::{checked_result, complete_month, period, row};
+        let (mut amount, mut cost) = complete_month(2026, 11, 1);
+        amount.data.biz_data.total[0]
+            .usage
+            .push(crate::usage::Entry {
+                kind: "PROMPT_TOKEN".into(),
+                amount: "30".into(),
+            });
+        amount.data.biz_data.days[0].data = amount.data.biz_data.total.clone();
+        // 费用端保持既有“全部非 REQUEST 费用相加”，不能套用数量端的
+        // PROMPT fallback/缓存规则删掉一笔金额。
+        let rows = vec![
+            row("deepseek-flash", &[("PROMPT_TOKEN", "0.1")]),
+            row("deepseek-flash", &[("PROMPT_CACHE_HIT_TOKEN", "0.2")]),
+            row("deepseek-flash", &[("PROMPT_CACHE_MISS_TOKEN", "0.5")]),
+            row("deepseek-flash", &[("REQUEST", "9")]),
+            row("deepseek-flash", &[]),
+        ];
+        cost.data.biz_data[0].total = rows.clone();
+        cost.data.biz_data[0].days = rows
+            .into_iter()
+            .map(|row| deepseek_api::DayUsage {
+                date: "2026-11-01".into(),
+                data: vec![row],
+            })
+            .collect();
+        for _ in 0..2 {
+            let data = checked_result(&amount, &cost, period(2026, 11, "2026-11-01T04:00:00Z"));
+            assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+            assert_eq!(data.models[0].total_tokens, Some(35));
+            assert_eq!(data.raw_models[0].total_tokens, Some(35));
+            assert_eq!(data.days.len(), 1);
+            assert_eq!(data.days[0].total_tokens, Some(35));
+            assert_eq!(
+                data.budget_month_cost,
+                crate::usage::DecimalAmount::parse("0.8")
+            );
+            assert_eq!(
+                budget_sample(
+                    data,
+                    &AlertOptions {
+                        monthly_budget_cny: 0.8,
+                        ..Default::default()
+                    }
+                ),
+                ("ok".into(), true)
+            );
+            cost.data.biz_data[0].total.reverse();
+            cost.data.biz_data[0].days.reverse();
+        }
+    }
+
+    #[test]
+    fn r20_日原始微额非零证据不能被浮点下溢抹掉_月漏模型预算关闭() {
+        use deepseek_api::regression_samples::{
+            append_daily_model, checked_result, complete_month, period,
+        };
+        let (mut amount, mut cost) = complete_month(2026, 11, 1);
+        append_daily_model(
+            &mut amount.data.biz_data.days,
+            "2026-11-01",
+            "tiny-model",
+            &[("RESPONSE_TOKEN", "0")],
+            false,
+        );
+        append_daily_model(
+            &mut cost.data.biz_data[0].days,
+            "2026-11-01",
+            "tiny-model",
+            &[("RESPONSE_TOKEN", "1e-400")],
+            false,
+        );
+        let data = checked_result(&amount, &cost, period(2026, 11, "2026-11-01T04:00:00Z"));
+        assert_eq!(data.month_cost, Some(120.0), "不从日记录补月额");
+        assert!(data
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("汇总缺少已有日用量")));
+        assert_eq!(
+            budget_sample(data, &Default::default()),
+            ("invalid_data".into(), false)
+        );
+    }
 
     #[test]
     fn r19_月汇总共同漏日模型经生产链路预算失败关闭() {
@@ -1642,6 +1985,7 @@ mod tests {
             models: vec![],
             days: vec![],
             month_cost: cost,
+            budget_month_cost: cost.and_then(crate::usage::DecimalAmount::from_config_number),
         };
         assert!(budget_sample(data(Some(100.0), vec![]), &Default::default()).1);
         assert!(!budget_sample(data(Some(99.99), vec![]), &Default::default()).1);
