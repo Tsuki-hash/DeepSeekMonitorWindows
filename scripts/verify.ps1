@@ -53,6 +53,10 @@ else {
 }
 
 # 复评 F19：依赖告警纳入门禁（开发依赖曾出现 high）。
-Invoke-Check '生产依赖安全审计' 'npm' @('audit', '--package-lock-only', '--ignore-scripts', '--omit=dev')
+# 用独立的空 userconfig 隔离开发者个人 .npmrc：某些机器的全局 allow-scripts
+# 设置会让 project-scoped audit 直接报 EALLOWSCRIPTS，那是环境问题而不是项目缺陷。
+$auditConfig = Join-Path ([IO.Path]::GetTempPath()) 'dsm-audit-empty.npmrc'
+if (-not (Test-Path $auditConfig)) { New-Item -ItemType File -Path $auditConfig | Out-Null }
+Invoke-Check '生产依赖安全审计' 'npm' @('audit', '--package-lock-only', '--ignore-scripts', '--omit=dev', "--userconfig=$auditConfig")
 
 Write-Host '全部通过。' -ForegroundColor Green
