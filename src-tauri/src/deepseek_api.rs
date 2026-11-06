@@ -524,6 +524,21 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             && day_cost_models
                 .iter()
                 .any(|model| !day_amount_models.contains(model));
+        // 复评 R07：把缺项按**槽位**传播 —— 费用侧返回、数量侧缺失的模型，
+        // 其所在槽位（flash/pro）当日的分段合计也要置为未知；其他槽位不受
+        // 牵连。否则模型详情图会把这些分段画成真实 0 或部分和（首页读
+        // totalTokens 已由上面的集合比对兜住，详情只读各自分段）。
+        let count_missing_slots: std::collections::HashSet<&str> = if both_sides_present {
+            day_cost_models
+                .iter()
+                .filter(|model| !day_amount_models.contains(*model))
+                .filter_map(|model| crate::usage::model_slot(model).map(|(slot, _)| slot))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let flash_known = !count_missing_slots.contains(crate::usage::FLASH_SLOT);
+        let pro_known = !count_missing_slots.contains(crate::usage::PRO_SLOT);
         days.push(UsageDaySummary {
             date: day.date.clone(),
             raw_models: crate::usage_history::raw_models(
@@ -536,14 +551,14 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             ),
-            flash_tokens: flash,
-            flash_cache_hit: flash_hit,
-            flash_cache_miss: flash_miss,
-            flash_response: flash_resp,
-            pro_tokens: pro,
-            pro_cache_hit: pro_hit,
-            pro_cache_miss: pro_miss,
-            pro_response: pro_resp,
+            flash_tokens: if flash_known { flash } else { None },
+            flash_cache_hit: if flash_known { flash_hit } else { None },
+            flash_cache_miss: if flash_known { flash_miss } else { None },
+            flash_response: if flash_known { flash_resp } else { None },
+            pro_tokens: if pro_known { pro } else { None },
+            pro_cache_hit: if pro_known { pro_hit } else { None },
+            pro_cache_miss: if pro_known { pro_miss } else { None },
+            pro_response: if pro_known { pro_resp } else { None },
             flash_other_tokens: flash_other,
             pro_other_tokens: pro_other,
             // 缺数量的模型让当日 Token 合计未知；缺费用不污染有效 Tokens。
@@ -1207,6 +1222,102 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("未知")));
+    }
+
+    // ---------- 复评 R07：槽位级缺项传播 ----------
+
+    #[test]
+    fn r07_当日缺pro数量_pro分段置未知_flash不受牵连() {
+        // 月总额两侧对齐，09-01 数量侧只有 Flash、费用侧 Flash+Pro：
+        // Pro 分段必须是未知，Flash 有完整数量不受牵连。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"deepseek-v4-pro","usage":[{"type":"RESPONSE_TOKEN","amount":"200.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}
+                    ]}
+                ]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                    {"model":"deepseek-v4-pro","usage":[{"type":"RESPONSE_TOKEN","amount":"2.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                        {"model":"deepseek-v4-pro","usage":[{"type":"RESPONSE_TOKEN","amount":"2.0"}]}
+                    ]}
+                ]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let day = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(day.pro_tokens, None, "Pro 缺数量的当日分段必须未知");
+        assert_eq!(day.total_tokens, None, "当日合计同样缺项");
+        assert!(
+            day.flash_tokens.is_some(),
+            "Flash 数量完整，不得被 Pro 缺项牵连"
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未知")));
+    }
+
+    #[test]
+    fn r07_同槽位别名缺项_分段同样置未知() {
+        // 数量侧只有旧别名 deepseek-flash，费用侧还有 deepseek-v4-flash：
+        // 两者同属 Flash 槽位 —— 已返回别名给出的部分和不能当作槽位完整值。
+        let amount: AmountResp = serde_json::from_str(
+            r#"{"data":{"biz_data":{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]},
+                    {"model":"deepseek-v4-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"50.0"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100.0"}]}
+                    ]}
+                ]
+            }}}"#,
+        )
+        .unwrap();
+        let cost: CostResp = serde_json::from_str(
+            r#"{"data":{"biz_data":[{
+                "total":[
+                    {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                    {"model":"deepseek-v4-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.5"}]}
+                ],
+                "days":[
+                    {"date":"2026-09-01","data":[
+                        {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"1.0"}]},
+                        {"model":"deepseek-v4-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"0.5"}]}
+                    ]}
+                ]
+            }]}}"#,
+        )
+        .unwrap();
+        let result = build_usage_result(&amount, &cost);
+        let day = result
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(day.flash_tokens, None, "Flash 槽位缺别名数量的分段必须未知");
+        assert_eq!(day.total_tokens, None);
     }
 
     #[test]

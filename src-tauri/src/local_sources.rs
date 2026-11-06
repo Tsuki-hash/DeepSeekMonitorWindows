@@ -415,41 +415,86 @@ pub fn is_reparse_entry(meta: &std::fs::Metadata) -> bool {
     meta.is_symlink()
 }
 
-/// 复评 Q07：对路径本身与各级父组件做**不跟随**的 reparse 检查。
-/// 发现链接先取目标文本做策略判定，越界在访问目标之前拒绝。
-fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String> {
-    match origin {
-        SourceOrigin::Native => {
-            // 文本预检：WSL/网络共享/系统目录形态直接拒绝，不做文件系统访问。
-            if is_disallowed_local_target_text(&path.to_string_lossy()) {
-                return Err("路径指向 WSL、网络共享或系统目录，未访问".into());
+/// 链接跳数上限：正常来源不会超过这个深度；防御链接循环。
+const MAX_LINK_HOPS: usize = 8;
+
+/// 复评 R05：从**根到叶**逐组件检查链接链，多跳链接逐跳判定。
+///
+/// `symlink_metadata` 的 no-follow 只保护末端组件 —— 操作系统的路径解析
+/// 仍会跟随中间组件的 reparse 点（`C:\safe\alias\logs` 的第一次元数据查询
+/// 就已经穿过 alias，这不是 TOCTOU 才能触发）。因此按组件顺序检查：经过
+/// 任何 reparse 组件之前，先用 `read_link` 的目标**文本**（相对链接先按
+/// 链接所在目录拼接）判定入口策略；目标获批准后把剩余路径嫁接到目标上
+/// 重新从根扫描（处理 A→B→越界 的多跳）。整条链没有任何 reparse 组件才算
+/// 通过 —— 此后调用方的 `metadata` / `canonicalize` 访问的是已验证的路径。
+pub fn check_link_chain(path: &Path, origin: SourceOrigin) -> Result<(), String> {
+    let mut current = path.to_path_buf();
+    let mut hops = 0usize;
+    loop {
+        match origin {
+            SourceOrigin::Native => {
+                // 文本预检（含嫁接后的路径）：WSL/网络共享/系统目录形态
+                // 直接拒绝，不做文件系统访问。
+                if is_disallowed_local_target_text(&current.to_string_lossy()) {
+                    return Err("路径指向 WSL、网络共享或系统目录，未访问".into());
+                }
             }
+            SourceOrigin::Wsl => {}
         }
-        SourceOrigin::Wsl => {}
-    }
-    let mut current: Option<PathBuf> = Some(path.to_path_buf());
-    while let Some(item) = current {
-        let meta = std::fs::symlink_metadata(&item).map_err(|_| {
-            if item == path {
-                "路径不存在或无法访问".to_string()
-            } else {
-                format!("路径的上级组件无法检查：{}", item.display())
-            }
-        })?;
-        if is_reparse_entry(&meta) {
-            let target = std::fs::read_link(&item)
-                .map_err(|_| format!("链接目标无法读取：{}", item.display()))?;
-            reject_link_target(&target.to_string_lossy(), origin)?;
-            // 链接已获批准：后续 canonicalize 解析它；更深的父组件位于
-            // 链接目标一侧，由解析后的 recheck 统一判定。
+        let Some((link_component, remaining)) = first_reparse_component(&current)? else {
             return Ok(());
+        };
+        hops += 1;
+        if hops > MAX_LINK_HOPS {
+            return Err(format!("链接层级超过 {MAX_LINK_HOPS} 跳，未访问"));
         }
-        current = item
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf);
+        let target = std::fs::read_link(&link_component)
+            .map_err(|_| format!("链接目标无法读取：{}", link_component.display()))?;
+        // 相对链接按链接所在目录解析成文本（仍是文本操作，不访问目标）。
+        let target_path = if target.is_absolute() {
+            target
+        } else {
+            link_component
+                .parent()
+                .map(|parent| parent.join(&target))
+                .unwrap_or(target)
+        };
+        reject_link_target(&target_path.to_string_lossy(), origin)?;
+        // 目标文本获批准：把剩余路径嫁接到目标上继续检查 ——
+        // 目标自身还可能是指向别处的链接。
+        current = if remaining.as_os_str().is_empty() {
+            target_path
+        } else {
+            target_path.join(remaining)
+        };
     }
-    Ok(())
+}
+
+/// 从根到叶找第一个 reparse 组件，返回（链接组件，链接之后的剩余路径）。
+/// 组件按浅到深检查：更浅的组件已确认不是链接，对更深组件的
+/// `symlink_metadata` 不会穿过未判定的链接。
+fn first_reparse_component(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let mut chain: Vec<&Path> = path.ancestors().collect();
+    chain.reverse(); // 浅 → 深
+    for prefix in chain {
+        let meta = match std::fs::symlink_metadata(prefix) {
+            Ok(meta) => meta,
+            // 组件不存在（监听场景允许末端尚未创建）：更深的组件也不可能
+            // 存在，已检查的前缀就是全部可解析范围。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!("路径组件无法检查：{}（{error}）", prefix.display()));
+            }
+        };
+        if is_reparse_entry(&meta) {
+            let remaining = path
+                .strip_prefix(prefix)
+                .unwrap_or_else(|_| Path::new(""))
+                .to_path_buf();
+            return Ok(Some((prefix.to_path_buf(), remaining)));
+        }
+    }
+    Ok(None)
 }
 
 /// 复评 Q07：路径**文本**越界判定（不访问文件系统）。
@@ -461,7 +506,7 @@ pub fn is_disallowed_local_target_text(value: &str) -> bool {
 }
 
 /// 复评 Q07：链接目标文本的入口策略判定 —— 只看文本，不访问目标。
-fn reject_link_target(target: &str, origin: SourceOrigin) -> Result<(), String> {
+pub fn reject_link_target(target: &str, origin: SourceOrigin) -> Result<(), String> {
     match origin {
         SourceOrigin::Native => {
             if is_disallowed_local_target_text(target) {
@@ -478,29 +523,20 @@ fn reject_link_target(target: &str, origin: SourceOrigin) -> Result<(), String> 
     Ok(())
 }
 
-/// 复评 Q05：解析一个**布局根**用于覆盖登记 —— 不跟随访问越界目标。
+/// 复评 Q05/R02：解析一个**布局根**用于覆盖登记 —— 不跟随访问越界目标。
 ///
 /// 布局根本身可能是 junction（home 标准目录映射到别处）。登记覆盖必须用
 /// **实际被读取的目标**，否则解析后的别名与登记的字面路径对不上，同源
-/// 会被统计两次。步骤：
-/// 1. `symlink_metadata` 不跟随；不是 reparse 点 → 直接 canonicalize；
-/// 2. 是 reparse 点 → `read_link` 取目标文本，先按入口策略判定，越界
-///    直接报错（调用方选择不登记 —— 去重宁可漏判重，不可漏采）；
-/// 3. 通过后 canonicalize 并对解析结果重跑 `recheck_resolved_target`。
-pub fn resolve_layout_root(path: &Path, origin: SourceOrigin) -> Result<PathBuf, String> {
-    let meta = std::fs::symlink_metadata(path).map_err(|_| "布局根不可访问")?;
-    if is_reparse_entry(&meta) {
-        let target = std::fs::read_link(path).map_err(|_| "布局根链接无法读取")?;
-        reject_link_target(&target.to_string_lossy(), origin)?;
-    }
+/// 会被统计两次。`check_link_chain` 先从根到叶验证整条链接链（多跳），
+/// 通过后 canonicalize 并对解析结果按 `expect` 重跑 `recheck_resolved_target`。
+pub fn resolve_layout_root(
+    path: &Path,
+    origin: SourceOrigin,
+    expect: ResolvedExpect,
+) -> Result<PathBuf, String> {
+    check_link_chain(path, origin)?;
     let canonical = std::fs::canonicalize(path).map_err(|_| "布局根无法解析")?;
-    recheck_resolved_target(
-        &path.to_string_lossy(),
-        &canonical,
-        ResolvedExpect::Directory,
-        origin,
-    )
-    .map(|_| canonical)
+    recheck_resolved_target(&path.to_string_lossy(), &canonical, expect, origin).map(|_| canonical)
 }
 
 /// 解析后的目标是否需要重新核对来源策略。
@@ -947,7 +983,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("dsm-layout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join(".claude/projects")).unwrap();
-        let resolved = resolve_layout_root(&base.join(".claude/projects"), SourceOrigin::Native);
+        let resolved = resolve_layout_root(
+            &base.join(".claude/projects"),
+            SourceOrigin::Native,
+            ResolvedExpect::Directory,
+        );
         assert!(resolved.is_ok(), "普通布局根应能解析：{:?}", resolved.err());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -962,6 +1002,101 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        assert!(resolve_layout_root(&missing, SourceOrigin::Native).is_err());
+        assert!(
+            resolve_layout_root(&missing, SourceOrigin::Native, ResolvedExpect::Directory).is_err()
+        );
+    }
+
+    // ---------- 第六轮复评 R05：根到叶链接链与多跳 ----------
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// 复评 R05（Windows 实测，junction 不需要特权）：父组件是 junction 时，
+    /// 必须在**访问叶子之前**用链接目标文本判定；叶子在目标侧不存在也一样。
+    #[cfg(windows)]
+    #[test]
+    fn r05_父组件链接指向系统目录_访问前拒绝() {
+        let base = std::env::temp_dir().join(format!("dsm-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let junction = base.join("alias");
+        if !make_junction(&junction, Path::new(r"C:\Windows\System32")) {
+            eprintln!("NOT RUN：当前环境无法创建 junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // 旧实现会先 symlink_metadata(叶子)：叶子经 junction 落到 System32，
+        // 通常不存在 → 报「路径不存在」，但目标已被访问过。
+        // 新实现按根到叶检查，先看到 junction，用目标文本拒绝。
+        let error = check_link_chain(
+            &junction.join("dsm-not-exist").join("logs"),
+            SourceOrigin::Native,
+        )
+        .expect_err("指向系统目录的父链接必须被拒绝");
+        assert!(
+            error.contains("链接目标"),
+            "必须因链接目标策略被拒绝，而不是访问后的路径错误：{error}"
+        );
+        assert!(
+            !error.contains("路径不存在"),
+            "拒绝发生在访问目标之前：{error}"
+        );
+        std::fs::remove_dir(&junction).ok();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 复评 R05：链接目标在允许范围内时链路放行（多跳后仍按策略判定）。
+    #[cfg(windows)]
+    #[test]
+    fn r05_允许范围内的目录链接链放行() {
+        let base = std::env::temp_dir().join(format!("dsm-chain-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        let junction = base.join("alias");
+        if !make_junction(&junction, &base.join("real")) {
+            eprintln!("NOT RUN：当前环境无法创建 junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // 经 junction 的路径：允许目标 → 放行；更深的末端不存在也放行
+        // （监听场景允许祖先目录尚未创建）。
+        assert!(check_link_chain(&junction.join("sub"), SourceOrigin::Native).is_ok());
+        assert!(
+            check_link_chain(&junction.join("missing/leaf"), SourceOrigin::Native).is_ok(),
+            "不存在的末端不是链接，不应被当成越界"
+        );
+        std::fs::remove_dir(&junction).ok();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 复评 R05：链接跳数上限防御循环（A→B→A 的 junction 环）。
+    #[cfg(windows)]
+    #[test]
+    fn r05_链接环不无限递归_有跳数上限() {
+        let base = std::env::temp_dir().join(format!("dsm-chain-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        let link_b = base.join("a/b");
+        if !make_junction(&link_b, &base.join("a")) {
+            eprintln!("NOT RUN：当前环境无法创建 junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // 自我指向的 junction 链：必须终止（要么拒绝，要么放行），不能挂死。
+        let outcome = check_link_chain(&link_b.join("b/b/b"), SourceOrigin::Native);
+        assert!(outcome.is_ok() || outcome.is_err(), "链接环必须有限步终止");
+        std::fs::remove_dir(&link_b).ok();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

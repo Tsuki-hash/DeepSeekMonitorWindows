@@ -167,23 +167,48 @@ pub fn capacity() -> Result<Capacity, String> {
 /// 评审 P2：原实现在满额时**整批**返回错误，连已存在会话这一轮的更新也不落盘。
 /// 新策略是逐条判定：已存在的会话继续更新，新会话在无空间时单独拒绝并计入
 /// `skipped`；已写入的部分照常落盘，用户看到的是明确的部分结果而不是整体失败。
+///
+/// 复评 R09：字节上限（8MiB）同样纳入**条目级**选择 —— 新会话加入后总字节
+/// 超限时，不能再让最终 write 拒绝整批、连带丢掉本可提交的旧会话更新。
+/// 放不下的旧条目更新单独跳过（保持旧值），计 `skipped_bytes`。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointOutcome {
     /// 已写入（含内容未变的跳过写盘）。
     pub written: usize,
-    /// 因容量已满而未新增的会话数。
+    /// 因条数已满而未新增的会话数。
     pub skipped: usize,
+    /// 因字节预算不足而未保存的条目数（旧会话更新或新会话）。
+    pub skipped_bytes: usize,
     /// 写入失败（此时整批不落盘，保持原记录）。
     pub failed: bool,
 }
 
+/// 单条目的序列化体积（复评 R09 的条目级预算依据）。
+/// 序列化失败按最大值处理（会被预算判定拒绝，不会污染存储）。
+fn entry_size(entry: &ArchiveEntry) -> usize {
+    serde_json::to_vec(entry)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
 pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String> {
+    checkpoint_budget(snapshot, MAX_BYTES)
+}
+
+/// `budget` 可注入（测试用小预算验证条目级选择，不必构造 8MiB 级 fixture）。
+fn checkpoint_budget(snapshot: &LocalSnapshot, budget: usize) -> Result<CheckpointOutcome, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
     let mut outcome = CheckpointOutcome::default();
     if !load_enabled()? {
         return Ok(outcome);
     }
     let mut store = load()?;
+    // 复评 R09：以当前文件的**实际序列化体积**为预算基线，逐条目增量更新；
+    // 最终 write 仍做精确字节检查（原子提交语义不变），这里的估算只负责
+    // 把放不下的条目挑出来单独跳过。
+    let mut store_size = serde_json::to_vec(&store)
+        .map_err(|_| "留存数据无法编码")?
+        .len();
     let mut groups: BTreeMap<(&str, &str, &str), Vec<&crate::local_usage::LocalRow>> =
         BTreeMap::new();
     for row in &snapshot.rows {
@@ -227,6 +252,16 @@ pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String>
                 outcome.written += 1;
                 continue;
             }
+            let new_size = entry_size(&entry);
+            let old_size = entry_size(previous);
+            // 替换不改变 JSON 结构开销：体积差 = 新条目 − 旧条目（精确）。
+            if store_size + new_size.saturating_sub(old_size) > budget {
+                // 复评 R09：旧条目自身扩大到超限 —— 该条跳过并保持旧值，
+                // 不拖累本可保存的其他条目。
+                outcome.skipped_bytes += 1;
+                continue;
+            }
+            store_size = store_size + new_size - old_size;
             *previous = entry;
             outcome.written += 1;
         } else if store.entries.len() >= MAX_ENTRIES {
@@ -234,6 +269,15 @@ pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String>
             outcome.skipped += 1;
             continue;
         } else {
+            let new_size = entry_size(&entry);
+            // +1 ≈ JSON 数组追加一个元素的逗号开销；首条追加会高估，方向保守。
+            if store_size + new_size.saturating_add(1) > budget {
+                // 复评 R09：字节预算放不下这条新会话 —— 单独跳过，
+                // 不让最终 write 拒绝整批。
+                outcome.skipped_bytes += 1;
+                continue;
+            }
+            store_size += new_size.saturating_add(1);
             store.entries.push(entry);
             outcome.written += 1;
         }
@@ -241,6 +285,7 @@ pub fn checkpoint(snapshot: &LocalSnapshot) -> Result<CheckpointOutcome, String>
     }
     if changed && write(&store).is_err() {
         // 写盘失败：整批未提交，原记录保留，如实报告。
+        // 复评 R09：条目级预算选择后这里只剩真实 IO 失败或极端漂移。
         outcome.failed = true;
         return Ok(outcome);
     }
@@ -333,6 +378,60 @@ mod tests {
     fn snapshot(at: u64) -> LocalSnapshot {
         crate::local_usage::normalize_report(&serde_json::json!({"entries":[{"client":"opencode","sessionId":"s1","workspaceKey":"w1","model":"deepseek","input":100,"output":20,"reasoning":0,"cacheRead":10,"cacheWrite":0},{"client":"hermes","sessionId":"s2","model":"deepseek","input":null,"output":20}],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),at).unwrap()
     }
+
+    // ---------- 复评 R09：字节预算的条目级选择 ----------
+
+    #[test]
+    fn r09_预算内旧会话更新保留_放不下的新增单独跳过() {
+        let _dir = TempConfigDir::new("retention-budget");
+        set_enabled(true).unwrap();
+        checkpoint(&snapshot(1000)).unwrap();
+        let baseline = fs::read(store_path().unwrap()).unwrap().len();
+        // 收紧预算：只留 1 字节余量 —— 旧会话 s1 的更新（同位数字，体积不变）
+        // 放得下；新会话 s3（整条都要新增）放不下。
+        let budget = baseline + 1;
+        let next = crate::local_usage::normalize_report(
+            &serde_json::json!({"entries":[
+                {"client":"opencode","sessionId":"s1","workspaceKey":"w1","model":"deepseek","input":101,"output":20,"reasoning":0,"cacheRead":10,"cacheWrite":0},
+                {"client":"claude","sessionId":"s3","workspaceKey":"w1","model":"deepseek","input":5,"output":5,"reasoning":0,"cacheRead":0,"cacheWrite":0}
+            ],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),
+            2000,
+        )
+        .unwrap();
+        let outcome = checkpoint_budget(&next, budget).unwrap();
+        assert_eq!(outcome.written, 1, "只有旧会话 s1 的更新被保存");
+        assert_eq!(outcome.skipped_bytes, 1, "放不下的新会话 s3 单独跳过");
+        assert_eq!(outcome.skipped, 0);
+        assert!(!outcome.failed, "条目级选择后不应整批失败");
+        let store = load().unwrap();
+        assert_eq!(
+            store
+                .entries
+                .iter()
+                .find(|entry| entry.rows[0].session_id == "s1")
+                .unwrap()
+                .rows[0]
+                .input,
+            Some(101),
+            "本可提交的旧会话更新必须落盘"
+        );
+        assert!(
+            store
+                .entries
+                .iter()
+                .all(|entry| entry.rows[0].session_id != "s3"),
+            "放不下的新会话不得写入"
+        );
+        // 预算放宽后同一批次可以完整保存：新会话补上。
+        let relaxed = checkpoint_budget(&next, usize::MAX).unwrap();
+        assert_eq!(relaxed.skipped_bytes, 0);
+        assert!(load()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.rows[0].session_id == "s3"));
+    }
+
     #[test]
     fn clear_removes_leftover_tmp_copy() {
         // 复评 T12：写后 rename 失败/中断留下的 `.tmp` 副本必须随清空一并删除，

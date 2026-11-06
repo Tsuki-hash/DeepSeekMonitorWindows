@@ -4,22 +4,73 @@
 //! 会被当成两个不同来源（前者是 home 来源，后者是 tool 来源），各自拿到不同的
 //! sourceId 后直接合并，物理上同一批日志就可能被统计两次。
 //!
-//! 这里只做纯判断：给定主目录来源与单工具路径来源，找出「单工具路径落在某个主目录
-//! 的标准布局内」的组合。采集器据此跳过该来源并给出可解释的状态，而不是静默翻倍。
-//!
 //! 刻意**不**按 sessionId 合并不同来源：不同用户的同名会话必须保持隔离，
 //! 无法证明是同一数据库时只提示、不合并。
+//!
+//! 复评 R02：覆盖判定只承认**本轮成功读取的实际入口**。静态的「先算 overlaps、
+//! 循环最先跳过」已删除 —— covering home 本轮失败/被拒时，用户单独配置的
+//! 单工具来源必须照常采集（它是可用的退路，不能被预先扼杀）。
+
+/// 布局根的种类：目录根按后代包含判重；**精确文件**根只与自身相等判重。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    Directory,
+    File,
+}
 
 /// 每款工具在用户主目录下的标准布局（相对路径，正斜杠分隔）。
-pub fn standard_layout(tool: &str) -> Option<&'static str> {
+///
+/// 复评 R02：必须是**实际被固定引擎读取的入口**，不能用父目录冒充覆盖 ——
+/// ZCode 的默认扫描是 `.zcode/projects` 下的 JSONL 加上精确的
+/// `.zcode/cli/db/db.sqlite`；`.zcode` 下其他自定义库不在默认扫描范围内。
+/// DSH 的真实默认根是 `.dsh/sessions`，OpenClaw 是 `.openclaw/agents`。
+/// Hermes 的上游默认根当前仍按整个 `.hermes` 对待（暂无更细的上游证据）。
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutRoot {
+    pub relative: &'static str,
+    pub kind: LayoutKind,
+}
+
+static OPENCODE_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
+    relative: ".local/share/opencode",
+    kind: LayoutKind::Directory,
+}];
+static CLAUDE_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
+    relative: ".claude/projects",
+    kind: LayoutKind::Directory,
+}];
+static ZCODE_LAYOUTS: &[LayoutRoot] = &[
+    LayoutRoot {
+        relative: ".zcode/projects",
+        kind: LayoutKind::Directory,
+    },
+    LayoutRoot {
+        relative: ".zcode/cli/db/db.sqlite",
+        kind: LayoutKind::File,
+    },
+];
+static HERMES_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
+    relative: ".hermes",
+    kind: LayoutKind::Directory,
+}];
+static OPENCLAW_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
+    relative: ".openclaw/agents",
+    kind: LayoutKind::Directory,
+}];
+static DSH_LAYOUTS: &[LayoutRoot] = &[LayoutRoot {
+    relative: ".dsh/sessions",
+    kind: LayoutKind::Directory,
+}];
+
+pub fn standard_layouts(tool: &str) -> &'static [LayoutRoot] {
     match tool {
-        "opencode" => Some(".local/share/opencode"),
-        "claude" => Some(".claude/projects"),
-        "zcode" => Some(".zcode"),
-        "hermes" => Some(".hermes"),
-        "openclaw" => Some(".openclaw"),
-        "dsh" => Some(".dsh"),
-        _ => None,
+        "opencode" => OPENCODE_LAYOUTS,
+        "claude" => CLAUDE_LAYOUTS,
+        "zcode" => ZCODE_LAYOUTS,
+        "hermes" => HERMES_LAYOUTS,
+        "openclaw" => OPENCLAW_LAYOUTS,
+        "dsh" => DSH_LAYOUTS,
+        _ => &[],
     }
 }
 
@@ -97,46 +148,6 @@ pub fn key_within(root_key: &str, candidate_key: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(separator))
 }
 
-/// 主目录来源的描述：用于判断单工具路径是否已被它覆盖。
-#[derive(Debug, Clone)]
-pub struct HomeRoot {
-    pub id: String,
-    pub path: String,
-}
-
-/// 单工具路径来源。
-#[derive(Debug, Clone)]
-pub struct ToolRoot {
-    pub id: String,
-    pub tool: String,
-    pub path: String,
-}
-
-/// 找出「单工具路径已被某个主目录来源的标准布局覆盖」的组合。
-///
-/// 返回 `(tool_id, home_id)`：调用方把 tool 来源标为 `duplicate` 并说明原因。
-///
-/// **只按标准布局判重**（复评 F03）：主目录来源的引擎只扫描 `standard_layout`
-/// 那一个位置，home 下的其他自定义目录并不在它的覆盖范围内。若把「在 home 下」
-/// 一律当成重复，用户配置的自定义日志目录会被静默跳过、导致漏采。
-pub fn overlapping_tools(homes: &[HomeRoot], tools: &[ToolRoot]) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    for tool in tools {
-        let Some(layout) = standard_layout(&tool.tool) else {
-            continue;
-        };
-        for home in homes {
-            // 唯一判据：单工具路径落在该主目录的**标准布局**内。
-            let layout_root = format!("{}\\{}", normalize(&home.path), normalize(layout));
-            if is_within(&layout_root, &tool.path) {
-                found.push((tool.id.clone(), home.id.clone()));
-                break;
-            }
-        }
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,36 +162,6 @@ mod tests {
             "同前缀的不同目录不能被当成子目录"
         );
         assert!(!is_within("", r"D:\Users\A"));
-    }
-
-    #[test]
-    fn 默认主目录与同一单库被识别为重叠() {
-        let homes = vec![HomeRoot {
-            id: "home-1".into(),
-            path: r"D:\Users\A".into(),
-        }];
-        let tools = vec![ToolRoot {
-            id: "tool-1".into(),
-            tool: "opencode".into(),
-            path: r"D:\Users\A\.local\share\opencode\opencode.db".into(),
-        }];
-        let overlap = overlapping_tools(&homes, &tools);
-        assert_eq!(overlap.len(), 1);
-        assert_eq!(overlap[0], ("tool-1".into(), "home-1".into()));
-    }
-
-    #[test]
-    fn 不同主目录或不同用户的同名会话不合并() {
-        let homes = vec![HomeRoot {
-            id: "home-a".into(),
-            path: r"D:\Users\A".into(),
-        }];
-        let tools = vec![ToolRoot {
-            id: "tool-b".into(),
-            tool: "claude".into(),
-            path: r"D:\Users\B\.claude\projects".into(),
-        }];
-        assert!(overlapping_tools(&homes, &tools).is_empty());
     }
 
     #[test]
@@ -214,87 +195,57 @@ mod tests {
         );
     }
 
+    // ---------- 复评 R02：布局根必须是实际被读取的入口 ----------
+
     #[test]
-    fn wsl大小写不同的两个目录不互相覆盖() {
-        // 复评 T04 回归（误去重 → 漏采）：两个真实不同的 WSL 目录
-        // 不能因为整路径小写而被判 duplicate。
-        let homes = vec![HomeRoot {
-            id: "home-1".into(),
-            path: r"\\wsl.localhost\Ubuntu\home\Alice".into(),
-        }];
-        let tools = vec![ToolRoot {
-            id: "tool-alice".into(),
-            tool: "claude".into(),
-            path: r"\\wsl.localhost\Ubuntu\home\Alice\.claude\projects".into(),
-        }];
-        // Alice 的标准布局应被 home 覆盖（正常判重）。
-        assert_eq!(overlapping_tools(&homes, &tools).len(), 1);
-        let other = vec![ToolRoot {
-            id: "tool-lower".into(),
-            tool: "claude".into(),
-            path: r"\\wsl.localhost\Ubuntu\home\alice\.claude\projects".into(),
-        }];
-        // alice（小写）是另一个目录：不得被 Alice 的 home 覆盖。
+    fn r02_标准布局目录根覆盖其后代_精确文件根只等于自身() {
+        // ZCode 目录根：.zcode/projects 下的内容被 home 覆盖。
+        assert!(is_within(
+            r"D:\Users\A\.zcode\projects",
+            r"D:\Users\A\.zcode\projects\2026-11"
+        ));
+        // 精确数据库根：只有同一路径才算重复。
+        assert!(is_within(
+            r"D:\Users\A\.zcode\cli\db\db.sqlite",
+            r"D:\Users\A\.zcode\cli\db\db.sqlite"
+        ));
         assert!(
-            overlapping_tools(&homes, &other).is_empty(),
-            "不同大小写的 WSL 目录必须照常采集"
+            !is_within(
+                r"D:\Users\A\.zcode\cli\db\db.sqlite",
+                r"D:\Users\A\.zcode\custom.sqlite"
+            ),
+            "自定义库不在精确根内，不得被抑制"
         );
     }
 
     #[test]
-    fn home_下的非标准自定义目录不能被当成重复_否则漏采() {
-        // 复评 F03 回归：主目录引擎只扫 .claude/projects，不扫 custom/claude-logs。
-        let homes = vec![HomeRoot {
-            id: "home-1".into(),
-            path: r"D:\Users\A".into(),
-        }];
-        let custom = vec![ToolRoot {
-            id: "tool-custom".into(),
-            tool: "claude".into(),
-            path: r"D:\Users\A\custom\claude-logs".into(),
-        }];
-        assert!(
-            overlapping_tools(&homes, &custom).is_empty(),
-            "非标准位置的自定义目录必须照常采集，不能被跳过"
-        );
-        // 而标准布局下的同一目录仍应判为重复。
-        let standard = vec![ToolRoot {
-            id: "tool-standard".into(),
-            tool: "claude".into(),
-            path: r"D:\Users\A\.claude\projects".into(),
-        }];
-        assert_eq!(overlapping_tools(&homes, &standard).len(), 1);
+    fn r02_窄化后的布局根不再把父目录当覆盖范围() {
+        // 复评 R02 触发一：`.zcode/custom.sqlite`、`.dsh/custom-logs`、
+        // `.openclaw/custom-logs` 都必须照常采集。
+        let cases: &[(&str, &str, bool)] = &[
+            ("zcode", r"D:\U\.zcode\custom.sqlite", false),
+            ("zcode", r"D:\U\.zcode\projects\s.jsonl", true),
+            ("zcode", r"D:\U\.zcode\cli\db\db.sqlite", true),
+            ("dsh", r"D:\U\.dsh\custom-logs", false),
+            ("dsh", r"D:\U\.dsh\sessions\x", true),
+            ("openclaw", r"D:\U\.openclaw\custom-logs", false),
+            ("openclaw", r"D:\U\.openclaw\agents\y", true),
+        ];
+        for (tool, candidate, expected) in cases {
+            let hit = standard_layouts(tool).iter().any(|root| {
+                let layout_root = format!("{}\\{}", normalize(r"D:\U"), normalize(root.relative));
+                is_within(&layout_root, candidate)
+            });
+            assert_eq!(hit, *expected, "tool={tool} candidate={candidate}");
+        }
     }
 
     #[test]
-    fn 目录别名与复制日志只提示不静默合并() {
-        // 复制到别处的日志不在任何主目录布局内：不能判定为重复。
-        let homes = vec![HomeRoot {
-            id: "home-1".into(),
-            path: r"D:\Users\A".into(),
-        }];
-        let tools = vec![ToolRoot {
-            id: "tool-copy".into(),
-            tool: "claude".into(),
-            path: r"D:\Backups\A-claude-projects".into(),
-        }];
-        assert!(overlapping_tools(&homes, &tools).is_empty());
-    }
-
-    #[test]
-    fn 未适配的工具路径不参与判定() {
-        let homes = vec![HomeRoot {
-            id: "home-1".into(),
-            path: r"D:\Users\A".into(),
-        }];
-        let tools = vec![ToolRoot {
-            id: "tool-x".into(),
-            tool: "unknown".into(),
-            path: r"D:\Users\A\unknown\db".into(),
-        }];
-        assert!(overlapping_tools(&homes, &tools).is_empty());
+    fn r02_未知工具没有布局根() {
+        assert!(standard_layouts("unknown").is_empty());
     }
 }
+
 #[test]
 fn 归一化键的分量级包含检查() {
     use crate::local_sources::home_key;

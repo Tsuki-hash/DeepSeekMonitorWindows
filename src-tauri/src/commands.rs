@@ -478,10 +478,24 @@ pub(crate) async fn collect_local_usage(
             Ok(outcome) if outcome.failed => {
                 Some("留存写入失败，已保存的旧记录未改动；当前统计仍可用".into())
             }
-            Ok(outcome) if outcome.skipped > 0 => Some(format!(
-                "留存已满：{} 条会话继续更新，{} 条新会话未保存；可导出后清理旧留存",
-                outcome.written, outcome.skipped
-            )),
+            Ok(outcome) if outcome.skipped > 0 || outcome.skipped_bytes > 0 => {
+                // 复评 R09：条数满与字节超限分别报告，旧会话更新不再被整批拖累。
+                let mut parts = Vec::new();
+                if outcome.skipped > 0 {
+                    parts.push(format!("{} 条新会话未保存", outcome.skipped));
+                }
+                if outcome.skipped_bytes > 0 {
+                    parts.push(format!(
+                        "{} 条更新因超出字节上限保持旧值",
+                        outcome.skipped_bytes
+                    ));
+                }
+                Some(format!(
+                    "留存容量受限：{} 条会话已更新，{}；可导出后清理旧留存",
+                    outcome.written,
+                    parts.join("，")
+                ))
+            }
             Ok(_) => None,
             Err(error) => Some(error),
         };

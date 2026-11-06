@@ -1,6 +1,6 @@
 //! Opt-in background metadata collection. Filesystem events are hints, never
 //! usage records or deletion proof. One collector serves foreground/background.
-use crate::local_sources::{HomeKind, SourceOptions};
+use crate::local_sources::{HomeKind, SourceOptions, SourceOrigin};
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use std::{
@@ -158,10 +158,10 @@ fn candidates(options: &SourceOptions, home: Option<&Path>) -> Vec<PathBuf> {
 fn watch_roots(paths: &[PathBuf]) -> BTreeMap<PathBuf, bool> {
     let mut roots = BTreeMap::new();
     for requested in paths {
-        // 复评 Q07：先按文本与**不跟随**的链接信息判定，越界目标在访问前拒绝。
-        // 旧实现先 is_dir()/canonicalize()（都会跟随链接访问目标），
-        // 拒绝提示出现时目标可能已被访问。
-        if crate::local_sources::is_disallowed_local_target_text(&requested.to_string_lossy()) {
+        // 复评 Q07/R05：先按文本与**不跟随**的链接链（根到叶逐组件、多跳）
+        // 判定，越界目标在访问前拒绝。旧实现先 is_dir()/canonicalize()
+        //（都会跟随链接访问目标），拒绝提示出现时目标可能已被访问。
+        if crate::local_sources::check_link_chain(requested, SourceOrigin::Native).is_err() {
             continue;
         }
         let Some(path) = watch_anchor(requested) else {
@@ -170,11 +170,10 @@ fn watch_roots(paths: &[PathBuf]) -> BTreeMap<PathBuf, bool> {
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
-        let text = canonical.to_string_lossy();
-        if text.starts_with("\\\\") && !text.starts_with("\\\\?\\") {
-            continue;
-        }
-        if text.starts_with("\\\\?\\UNC\\") {
+        // 复评 R05：canonicalize 解析的是**最终目录** —— 上面按请求文本检查
+        // 过，这里对解析结果再复核一次（WSL/网络/系统目录），防止父级链接把
+        // 监听根落到受保护目录。candidates 只产生 Native 文本来源。
+        if crate::local_sources::is_disallowed_local_target_text(&canonical.to_string_lossy()) {
             continue;
         }
         let recursive = requested.as_path() == path;
@@ -186,11 +185,11 @@ fn watch_roots(paths: &[PathBuf]) -> BTreeMap<PathBuf, bool> {
     roots
 }
 
-/// 找到监听锚点：从请求路径向上找最近的存在目录；遇到 reparse 点先取
-/// 目标文本按策略判定，越界返回 None（不访问目标）。
-/// 与旧 `while !path.is_dir()` 等价的定位行为，但访问前先做策略检查。
+/// 找到监听锚点：从请求路径向上找最近的存在目录。
+/// 链接链已由 `check_link_chain` 从根到叶验证（多跳、不访问越界目标），
+/// 这里只负责定位；盘根仍不作锚点（与旧实现一致）。
 fn watch_anchor(requested: &Path) -> Option<PathBuf> {
-    let mut current: Option<PathBuf> = Some(requested.to_path_buf());
+    let mut current = Some(requested.to_path_buf());
     while let Some(item) = current {
         let Ok(meta) = std::fs::symlink_metadata(&item) else {
             // 不存在或不可访问：向上一级继续找已存在的祖先。
@@ -200,18 +199,9 @@ fn watch_anchor(requested: &Path) -> Option<PathBuf> {
                 .map(Path::to_path_buf);
             continue;
         };
-        if crate::local_sources::is_reparse_entry(&meta) {
-            let Ok(target) = std::fs::read_link(&item) else {
-                return None;
-            };
-            if crate::local_sources::is_disallowed_local_target_text(&target.to_string_lossy()) {
-                return None;
-            }
-            // 链接目标获批准：以链接位置为锚点，canonicalize 解析它。
-            return item.parent().is_some().then_some(item);
-        }
-        if meta.is_dir() {
-            // 与旧实现一致：不把盘根当监听锚点。
+        if meta.is_dir() || crate::local_sources::is_reparse_entry(&meta) {
+            // 目录（或目录链接）作为锚点；链接的解析与越界判定已在
+            // check_link_chain 完成，canonicalize 解析的是获批准的目标。
             return item.parent().is_some().then_some(item);
         }
         current = item

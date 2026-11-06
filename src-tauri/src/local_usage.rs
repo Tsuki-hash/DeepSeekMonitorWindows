@@ -347,36 +347,11 @@ pub async fn collect_sources(
         candidates.push((id, label, entry.path.clone().into(), kind, false));
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    // 来源重叠检测（评审 P1）：默认主目录与「指向同一批日志」的单工具路径
-    // 各自有不同的 sourceId，若直接合并会让同一份记录被统计两次。
-    // 这里在采集前先算出被覆盖的工具来源，采到时跳过并给出可解释状态。
-    let home_roots: Vec<crate::local_overlap::HomeRoot> = candidates
-        .iter()
-        .filter(|(id, _, _, _, _)| {
-            // 只有「主目录」来源参与重叠判定；单工具路径不覆盖别人。
-            !options
-                .tool_paths
-                .iter()
-                .any(|entry| tool_source_id(entry) == *id)
-        })
-        .map(|(id, _, home, _, _)| crate::local_overlap::HomeRoot {
-            id: id.clone(),
-            path: home.to_string_lossy().to_string(),
-        })
-        .collect();
-    let tool_roots: Vec<crate::local_overlap::ToolRoot> = options
-        .tool_paths
-        .iter()
-        .map(|entry| crate::local_overlap::ToolRoot {
-            id: tool_source_id(entry),
-            tool: entry.tool.clone(),
-            path: entry.path.clone(),
-        })
-        .collect();
-    let overlaps: std::collections::BTreeMap<String, String> =
-        crate::local_overlap::overlapping_tools(&home_roots, &tool_roots)
-            .into_iter()
-            .collect();
+    // 复评 R02：删除「采集前先算 overlaps、循环无条件跳过」的先验判重 ——
+    // covering home 本轮失败/被拒时，用户单独配置的单工具来源必须照常采集
+    // （它是可用的退路）。判重只承认**本轮成功读取的实际入口**：home 成功
+    // 后才登记其标准布局覆盖根（见下方 layout_roots），后续工具来源据此判重。
+    // 候选顺序保证 home 先于单工具路径处理，登记一定发生在判定之前。
     let wsl = if candidates
         .iter()
         .any(|(_, _, _, kind, _)| matches!(kind, HomeKind::Wsl { .. }))
@@ -422,19 +397,7 @@ pub async fn collect_sources(
         let mut state = "ok";
         let mut message = None;
         let gate = source_gate(&kind, &wsl);
-        if let Some(covered_by) = overlaps.get(&id) {
-            // 已被某个主目录来源的标准布局覆盖：跳过采集，明确告知用户，
-            // 而不是静默重复统计。
-            state = "duplicate";
-            message = Some(format!(
-                "已被主目录来源 {} 的标准布局覆盖，未重复采集",
-                home_roots
-                    .iter()
-                    .find(|home| home.id == *covered_by)
-                    .map(|home| home.path.as_str())
-                    .unwrap_or("同一主目录")
-            ));
-        } else if let Err(error) = gate {
+        if let Err(error) = gate {
             state = "unavailable";
             message = Some(error);
         } else if deadline <= tokio::time::Instant::now() {
@@ -517,27 +480,32 @@ pub async fn collect_sources(
                         return Ok(None);
                     }
                 }
-                // 复评 Q07：目录来源在启动引擎前审计根内的**文件符号链接** ——
+                // 复评 Q07/R04：启动引擎前审计**实际扫描根**内的文件符号链接 ——
                 // 固定引擎的文件发现会跟随它们读取目标（is_symlink() && is_file()），
-                // 应用无法在引擎内部拦截，只能在启动前拒绝该来源。目录链接不进入
-                // 也不拒绝：引擎的通用遍历不跟随目录链接，标准布局根上的目录链接
-                // 由布局解析按策略单独处理。审计不完整（目录过大/不可读）降级为
-                // 提示，不因预审未完成而拒绝真实数据。
+                // 应用无法在引擎内部拦截。home 来源只审计六款工具的标准布局根
+                //（复评 R04：不再递归整个 home —— 无关目录里的链接不应拒绝
+                // 全部工具的采集）；单工具目录来源审计它自己。目录链接不进入
+                // 也不拒绝（R04：以链接类型区分，不再误拒目录链接）。
+                // 预审不完整（目录过大/不可读，复评 R06）按未验证状态处理：
+                // 继续采集但把结论写进来源健康信息，不冒充已校验。
                 let mut audit_note: Option<&'static str> = None;
                 if directory {
-                    match audit_root_for_reparse(&canonical)? {
+                    let audit = if tool_path.is_none() {
+                        audit_home_layout_roots(&canonical, origin)?
+                    } else {
+                        audit_root_for_reparse(&canonical)?
+                    };
+                    match audit {
                         ReparseAudit::Clean => {}
                         ReparseAudit::Incomplete(reason) => audit_note = Some(reason),
                     }
                 }
-                // 复评 Q06：引擎 settings.json 的 extraScanPaths 在采集时直接生效，
-                // 事后提示修不回已发生的读取。启动引擎前对每个扩展根执行与应用
-                // 入口一致的校验，任一不合规立即拒绝该来源（失败关闭）。
+                // 复评 Q06/R03：引擎 settings.json 的 extraScanPaths 与
+                // opencodeDbPaths（含备用配置文件）在采集时直接生效，事后提示
+                // 修不回已发生的读取。启动引擎前对每个扩展根执行与应用入口
+                // 一致的校验，任一不合规立即拒绝该来源（失败关闭）。
                 let validated_roots =
                     validate_engine_extra_roots(&canonical, &mut wsl_memo).await?;
-                if let Some(reason) = audit_note {
-                    log::warn!("来源 {label} 链接预审未完整：{reason}");
-                }
                 let snapshot = if let Some(entry) = tool_path {
                     // 复评 R03：传校验通过的解析目标，而不是配置里的原路径。
                     run_tool_source(path, entry, &canonical, &profile.join(&id)).await?
@@ -549,7 +517,8 @@ pub async fn collect_sources(
                     run_engine_profile(path, Some(&canonical), &profile.join(&id)).await?
                 };
                 seen.insert(key, label.clone());
-                // 复评 Q05：home 来源成功后登记它的覆盖根，供后续工具来源判重。
+                // 复评 Q05/R02：home 来源**本轮成功**后登记它的覆盖根，供后续
+                // 工具来源判重 —— 失败的 home 不登记，单工具来源可以照常采集。
                 if tool_path.is_none() {
                     let home_key_value = home_key(&canonical.to_string_lossy());
                     if let Ok(mut roots) = home_roots_canonical.lock() {
@@ -557,36 +526,56 @@ pub async fn collect_sources(
                     }
                     if let Ok(mut roots) = layout_roots.lock() {
                         for tool in ["opencode", "claude", "zcode", "hermes", "openclaw", "dsh"] {
-                            let Some(layout) = crate::local_overlap::standard_layout(tool) else {
-                                continue;
-                            };
-                            let layout_path = canonical.join(layout.replace('/', "\\"));
-                            // 第五轮复评 Q05：逐个布局根按来源策略解析后再登记 ——
-                            // 布局根本身可能是 junction，必须登记**实际被读取**的
-                            // 目标；解析失败或目标越界时不登记（宁可漏判重，
-                            // 不可误抑制真实来源）。
-                            if let Ok(resolved) =
-                                crate::local_sources::resolve_layout_root(&layout_path, origin)
-                            {
-                                roots
-                                    .entry(tool.to_string())
-                                    .or_default()
-                                    .insert(home_key(&resolved.to_string_lossy()), label.clone());
+                            for layout in crate::local_overlap::standard_layouts(tool) {
+                                let layout_path =
+                                    canonical.join(layout.relative.replace('/', "\\"));
+                                // 第五轮复评 Q05：逐个布局根按来源策略解析后再登记 ——
+                                // 布局根本身可能是 junction，必须登记**实际被读取**的
+                                // 目标；解析失败或目标越界时不登记（宁可漏判重，
+                                // 不可误抑制真实来源）。文件根（ZCode 精确数据库）
+                                // 按文件语义解析与登记。
+                                let resolved = match layout.kind {
+                                    crate::local_overlap::LayoutKind::Directory => {
+                                        crate::local_sources::resolve_layout_root(
+                                            &layout_path,
+                                            origin,
+                                            crate::local_sources::ResolvedExpect::Directory,
+                                        )
+                                    }
+                                    crate::local_overlap::LayoutKind::File => {
+                                        crate::local_sources::resolve_layout_root(
+                                            &layout_path,
+                                            origin,
+                                            crate::local_sources::ResolvedExpect::File,
+                                        )
+                                    }
+                                };
+                                if let Ok(resolved) = resolved {
+                                    roots.entry(tool.to_string()).or_default().insert(
+                                        home_key(&resolved.to_string_lossy()),
+                                        label.clone(),
+                                    );
+                                }
                             }
                         }
                     }
                 }
-                // 复评 T13/第五轮 Q06：settings.json 的扩展根已在启动前校验，
-                // 这里把校验结论写进来源健康信息（采集成功后可见）。
-                if tool_path.is_none() {
-                    if let Some(count) = validated_roots {
-                        if let Ok(mut map) = engine_settings_notice.lock() {
+                // 复评 T13/Q06/R06：settings 扩展根校验结论与链接预审结论都
+                // 写进来源健康信息（采集成功后可见），不只在日志里。
+                if let Ok(mut map) = engine_settings_notice.lock() {
+                    if let Some(reason) = audit_note {
+                        map.insert(
+                            id.clone(),
+                            reason, // 形如「…链接预审未完整」，按未验证状态披露
+                        );
+                    } else if tool_path.is_none() {
+                        if let Some(count) = validated_roots {
                             map.insert(
                                 id.clone(),
                                 if count > 0 {
-                                    "该主目录的引擎扩展扫描根已按应用来源策略校验，不合规会拒绝采集"
+                                    "该主目录的引擎扩展根已按应用来源策略校验，不合规会拒绝采集"
                                 } else {
-                                    "该主目录包含引擎 settings.json，未配置扩展扫描根"
+                                    "该主目录包含引擎 settings.json，未配置扩展根"
                                 },
                             );
                         }
@@ -703,14 +692,37 @@ pub(crate) enum ReparseAudit {
 /// 处理而不是拒绝 —— 引擎本身会枚举同一棵树，不能因预审上限造成漏采。
 const REPARSE_AUDIT_MAX_ENTRIES: usize = 200_000;
 
+/// 复评 R04：Rust 的 `FileType::is_symlink` / `is_dir` / `is_file` **互斥** ——
+/// 目录符号链接 `is_symlink()` 为 true 时 `is_dir()` 必为 false，不能再用
+/// `is_dir()` 区分目录链接（上一版因此把目录链接当文件链接误拒整个来源）。
+///
+/// 判定必须覆盖 Windows 上两种目录名称代理：
+/// - 目录符号链接（`IO_REPARSE_TAG_SYMLINK` + 目录标志）；
+/// - **junction**（`IO_REPARSE_TAG_MOUNT_POINT`）—— `FileTypeExt::is_symlink_dir()`
+///   只认 symlink 标签，对 junction 返回 false，会把常见的 junction 误判成
+///   文件链接并拒绝整个来源。
+///
+/// 用 `symlink_metadata` 的目录属性位（不跟随）同时覆盖两者。
+#[cfg(windows)]
+fn is_dir_link(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+}
+/// 非 Windows 平台上没有不跟随的类型位可区分目录链接：保守按文件链接处理
+/// （拒绝），不为判定而访问链接目标。产品路径仅 Windows。
+#[cfg(not(windows))]
+fn is_dir_link(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// 复评 Q07：审计来源根内的**文件符号链接**。
 ///
 /// 固定引擎的文件发现接受 `is_symlink() && path.is_file()` 并读取目标 ——
 /// 根内一个指向外部的日志文件链接就能把读取范围带出已确认的来源边界，
 /// 且应用无法在引擎内部拦截。这里在启动引擎前用**不跟随**的目录遍历检查；
 /// 发现文件链接（含断链）即拒绝该来源。目录链接不进入：引擎的通用遍历
-/// 不跟随目录链接，标准布局根上的目录链接由 `resolve_layout_root` 按策略
-/// 单独解析登记。
+/// 不跟随目录链接，标准布局根上的目录链接由布局解析按策略单独解析登记。
 fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
@@ -733,8 +745,12 @@ fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
                 ));
             };
             if file_type.is_symlink() {
-                if file_type.is_dir() {
-                    // 目录链接：不进入、不拒绝（见函数注释）。
+                // `file_type` 不含目录属性位，重新取不跟随的元数据判定目录链接。
+                let is_directory_link = std::fs::symlink_metadata(entry.path())
+                    .map(|meta| is_dir_link(&meta))
+                    .unwrap_or(false);
+                if is_directory_link {
+                    // 目录链接 / junction：不进入、不拒绝（见函数注释）。
                     continue;
                 }
                 return Err(format!(
@@ -750,72 +766,230 @@ fn audit_root_for_reparse(root: &Path) -> Result<ReparseAudit, String> {
     Ok(ReparseAudit::Clean)
 }
 
-/// 复评 Q06：引擎 settings.json 的 extraScanPaths 在采集时**直接生效**，
-/// 事后的提示修不回已经发生的读取。启动引擎前解析同一份配置
-///（`AppData/Roaming/tokscale/settings.json`），对每个扩展根执行与应用
-/// 入口一致的校验：文本种类 → WSL 发行版运行状态 → 链接链 → 解析后目标
-/// → 根内文件链接审计。任一不合规立即拒绝该来源 —— 失败关闭。
+/// 复评 R04：home 来源的链接预审只覆盖**实际扫描根** —— 六款工具的标准
+/// 布局根（R02 窄化后的多根）。无关目录里的链接不再拒绝整个 home。
+/// 布局根本身是目录链接时按策略解析（junction 到允许目标是既有语义），
+/// 解析后审计其内容；布局根的链接目标越界 = 引擎会读到越界数据，直接拒绝。
+fn audit_home_layout_roots(
+    home: &Path,
+    origin: crate::local_sources::SourceOrigin,
+) -> Result<ReparseAudit, String> {
+    let mut incomplete: Option<&'static str> = None;
+    for tool in ["opencode", "claude", "zcode", "hermes", "openclaw", "dsh"] {
+        for layout in crate::local_overlap::standard_layouts(tool) {
+            if layout.kind != crate::local_overlap::LayoutKind::Directory {
+                // 精确文件根（ZCode 精确数据库）没有目录内容可审计；
+                // 文件本身由探测与解析后复核检查。
+                continue;
+            }
+            let path = home.join(layout.relative.replace('/', "\\"));
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    incomplete = Some(incomplete.unwrap_or("布局根状态不可读取，链接预审未完整"));
+                    continue;
+                }
+            };
+            let resolved = if crate::local_sources::is_reparse_entry(&meta) {
+                let target = match std::fs::read_link(&path) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        incomplete =
+                            Some(incomplete.unwrap_or("布局根链接无法读取，链接预审未完整"));
+                        continue;
+                    }
+                };
+                // 目标文本先判策略（不访问目标）；越界 = 引擎会读到越界数据。
+                let absolute = if target.is_absolute() {
+                    target
+                } else {
+                    path.parent()
+                        .map(|parent| parent.join(&target))
+                        .unwrap_or(target)
+                };
+                if let Err(error) =
+                    crate::local_sources::reject_link_target(&absolute.to_string_lossy(), origin)
+                {
+                    return Err(format!(
+                        "标准布局根（{}）链接目标越界：{error}",
+                        path.display()
+                    ));
+                }
+                match std::fs::canonicalize(&path) {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        incomplete = Some(incomplete.unwrap_or("布局根无法解析，链接预审未完整"));
+                        continue;
+                    }
+                }
+            } else {
+                match std::fs::canonicalize(&path) {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        incomplete = Some(incomplete.unwrap_or("布局根无法解析，链接预审未完整"));
+                        continue;
+                    }
+                }
+            };
+            let resolved = crate::local_sources::recheck_resolved_target(
+                &path.to_string_lossy(),
+                &resolved,
+                crate::local_sources::ResolvedExpect::Directory,
+                origin,
+            )
+            .map_err(|error| format!("标准布局根（{}）解析后越界：{error}", path.display()))?;
+            match audit_root_for_reparse(&resolved) {
+                Ok(ReparseAudit::Clean) => {}
+                Ok(ReparseAudit::Incomplete(reason)) => {
+                    incomplete = Some(incomplete.unwrap_or(reason));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(match incomplete {
+        Some(reason) => ReparseAudit::Incomplete(reason),
+        None => ReparseAudit::Clean,
+    })
+}
+
+/// 复评 Q06/R03：引擎 settings 的 extraScanPaths 与 opencodeDbPaths（含
+/// 备用配置文件）在采集时**直接生效**，事后的提示修不回已经发生的读取。
+/// 启动引擎前解析所有配置文件，对每个扩展根执行与应用入口一致的校验：
+/// 文本种类 → WSL 发行版运行状态 → 链接链（不访问越界目标）→ 解析后目标
+/// → 目录根内文件链接审计。任一不合规立即拒绝该来源 —— 失败关闭。
 ///
-/// 返回 `None` 表示没有 settings.json；`Some(n)` 表示 n 个扩展根全部校验通过。
+/// 返回 `None` 表示主/备配置都不存在；`Some(n)` 表示 n 个扩展根全部校验通过。
 async fn validate_engine_extra_roots(
     home: &Path,
     wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
 ) -> Result<Option<usize>, String> {
-    let config = home
-        .join("AppData")
-        .join("Roaming")
-        .join("tokscale")
-        .join("settings.json");
-    if !config.is_file() {
+    // 复评 R03：上游 load_for_home_override 在主配置读取失败时**无条件**回退
+    // 到 Library/Application Support 路径（无平台条件）。两处都校验：
+    // 只存在备用文件时，它就是引擎实际读取的配置，不能漏。
+    let mut configs: Vec<std::path::PathBuf> = Vec::new();
+    for relative in [
+        ["AppData", "Roaming", "tokscale", "settings.json"].as_slice(),
+        [
+            "Library",
+            "Application Support",
+            "tokscale",
+            "settings.json",
+        ]
+        .as_slice(),
+    ] {
+        let path = relative
+            .iter()
+            .fold(home.to_path_buf(), |base, part| base.join(part));
+        if path.is_file() {
+            configs.push(path);
+        }
+    }
+    if configs.is_empty() {
         return Ok(None);
     }
-    let text = std::fs::read(&config).map_err(|_| "无法读取采集引擎 settings.json")?;
-    if text.len() > 256 * 1024 {
-        return Err("采集引擎 settings.json 超过 256KiB，拒绝采集".into());
+    let mut validated = 0usize;
+    for config in configs {
+        let text = std::fs::read(&config).map_err(|_| "无法读取采集引擎 settings.json")?;
+        if text.len() > 256 * 1024 {
+            return Err("采集引擎 settings.json 超过 256KiB，拒绝采集".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&text)
+            .map_err(|_| "采集引擎 settings.json 无法解析".to_string())?;
+        // 复评 R03：两个来源字段统一解析；形态非法时失败关闭。
+        for (tool, raw, directory) in engine_config_roots(&value)? {
+            validate_engine_root(&tool, &raw, directory, wsl).await?;
+            validated += 1;
+        }
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&text).map_err(|_| "采集引擎 settings.json 无法解析".to_string())?;
-    let mut roots: Vec<(String, String)> = Vec::new();
-    if let Some(map) = value
-        .get("scanner")
-        .and_then(|scanner| scanner.get("extraScanPaths"))
-        .and_then(|extra| extra.as_object())
-    {
+    Ok(Some(validated))
+}
+
+/// 复评 R03：从引擎 settings.json 提取**全部**实际来源声明。
+///
+/// 返回 `(tool, path, 是否目录)`：
+/// - `scanner.extraScanPaths`：按工具分桶的目录根列表；
+/// - `scanner.opencodeDbPaths`：OpenCode 的数据库文件列表（上游会
+///   `is_file`/`canonicalize` 后并入解析列表，应用的 --client 固定包含
+///   opencode，因此该字段可达）。
+///
+/// 字段存在但形态非法（不是数组、含非字符串项）时返回错误 —— 宁可拒绝
+/// 采集，也不能留下未经校验的来源。
+fn engine_config_roots(value: &serde_json::Value) -> Result<Vec<(String, String, bool)>, String> {
+    let mut roots = Vec::new();
+    let scanner = value.get("scanner");
+    if let Some(extra) = scanner.and_then(|scanner| scanner.get("extraScanPaths")) {
+        let Some(map) = extra.as_object() else {
+            return Err("引擎 settings.json 的 extraScanPaths 无法解析，拒绝采集".into());
+        };
         for (tool, list) in map {
             let Some(list) = list.as_array() else {
-                continue;
+                return Err(format!(
+                    "引擎 settings.json 的 extraScanPaths[{tool}] 无法解析，拒绝采集"
+                ));
             };
             for entry in list {
-                if let Some(text) = entry.as_str() {
-                    roots.push((tool.clone(), text.to_string()));
-                }
+                let Some(raw) = entry.as_str() else {
+                    return Err(format!(
+                        "引擎 settings.json 的 extraScanPaths[{tool}] 含非字符串项，拒绝采集"
+                    ));
+                };
+                roots.push((tool.clone(), raw.to_string(), true));
             }
         }
     }
-    let mut validated = 0usize;
-    for (tool, raw) in roots {
-        let (_, kind) = crate::local_sources::clean_tool_path(&raw)
-            .map_err(|error| format!("引擎扩展扫描根（{tool} → {raw}）不合规：{error}"))?;
-        let root_origin = if matches!(kind, crate::local_sources::HomeKind::Wsl { .. }) {
-            crate::local_sources::SourceOrigin::Wsl
-        } else {
-            crate::local_sources::SourceOrigin::Native
+    if let Some(db_paths) = scanner.and_then(|scanner| scanner.get("opencodeDbPaths")) {
+        let Some(list) = db_paths.as_array() else {
+            return Err("引擎 settings.json 的 opencodeDbPaths 无法解析，拒绝采集".into());
         };
-        if matches!(root_origin, crate::local_sources::SourceOrigin::Wsl) && wsl.is_none() {
-            *wsl = Some(crate::local_sources::running_wsl().await);
+        for entry in list {
+            let Some(raw) = entry.as_str() else {
+                return Err("引擎 settings.json 的 opencodeDbPaths 含非字符串项，拒绝采集".into());
+            };
+            roots.push(("opencode".to_string(), raw.to_string(), false));
         }
-        if let Err(error) = source_gate(&kind, wsl) {
-            return Err(format!("引擎扩展扫描根（{tool} → {raw}）不合规：{error}"));
-        }
-        let canonical_extra =
-            crate::local_sources::probe_path(std::path::PathBuf::from(&raw), true, root_origin)
-                .await
-                .map_err(|error| format!("引擎扩展扫描根（{tool} → {raw}）不可用：{error}"))?;
-        audit_root_for_reparse(&canonical_extra)
-            .map_err(|error| format!("引擎扩展扫描根（{tool}）不合规：{error}"))?;
-        validated += 1;
     }
-    Ok(Some(validated))
+    Ok(roots)
+}
+
+/// 校验一个引擎配置声明的根（复评 R03/R06）。
+/// 目录根做文件链接审计；预审不完整=未验证，失败关闭，不计入「已校验」。
+async fn validate_engine_root(
+    tool: &str,
+    raw: &str,
+    directory: bool,
+    wsl: &mut Option<Result<crate::local_sources::WslStatus, String>>,
+) -> Result<(), String> {
+    let reject = |error: String| format!("引擎扩展根（{tool} → {raw}）不合规：{error}");
+    let (_, kind) = crate::local_sources::clean_tool_path(raw).map_err(reject)?;
+    let origin = if matches!(kind, crate::local_sources::HomeKind::Wsl { .. }) {
+        crate::local_sources::SourceOrigin::Wsl
+    } else {
+        crate::local_sources::SourceOrigin::Native
+    };
+    if matches!(origin, crate::local_sources::SourceOrigin::Wsl) && wsl.is_none() {
+        *wsl = Some(crate::local_sources::running_wsl().await);
+    }
+    if let Err(error) = source_gate(&kind, wsl) {
+        return Err(reject(error));
+    }
+    let canonical =
+        crate::local_sources::probe_path(std::path::PathBuf::from(raw), directory, origin)
+            .await
+            .map_err(|error| format!("引擎扩展根（{tool} → {raw}）不可用：{error}"))?;
+    if directory {
+        match audit_root_for_reparse(&canonical) {
+            Ok(ReparseAudit::Clean) => {}
+            Ok(ReparseAudit::Incomplete(_)) => {
+                return Err(reject(
+                    "链接预审未完整，无法确认根内没有越界文件链接".into(),
+                ));
+            }
+            Err(error) => return Err(reject(error)),
+        }
+    }
+    Ok(())
 }
 
 fn source_gate(
@@ -1367,5 +1541,159 @@ mod tests {
         let outcome = audit_root_for_reparse(&base);
         assert!(matches!(outcome, Ok(ReparseAudit::Clean)));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------- 第六轮复评 R04：目录链接不得被误当成文件链接 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn r04_目录链接不被拒绝_文件链接仍拒绝() {
+        let base = std::env::temp_dir().join(format!("dsm-audit-link-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("real-dir")).unwrap();
+        std::fs::write(base.join("real.log"), b"x").unwrap();
+        // 目录链接：引擎的通用遍历不跟随目录链接 → 不该拒绝整个来源。
+        std::os::unix::fs::symlink(base.join("real-dir"), base.join("dir-link")).unwrap();
+        assert!(
+            matches!(audit_root_for_reparse(&base), Ok(ReparseAudit::Clean)),
+            "目录链接不得导致整个来源被拒"
+        );
+        // 文件链接：引擎会跟随读取目标 → 必须拒绝。
+        std::os::unix::fs::symlink(base.join("real.log"), base.join("file-link.log")).unwrap();
+        assert!(audit_root_for_reparse(&base).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------- 第六轮复评 R03：settings 两个来源字段都被提取 ----------
+
+    /// 复评 R04：Windows 原生符号链接场景。没有创建权限时明确记为跳过，
+    ///(不能把「没跑」当成通过 —— 真机验收仍待补)。
+    #[cfg(windows)]
+    #[test]
+    fn r04_目录链接不被拒绝_文件链接仍拒绝_windows() {
+        let base = std::env::temp_dir().join(format!("dsm-audit-wlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real-dir")).unwrap();
+        std::fs::write(base.join("real.log"), b"x").unwrap();
+        // junction：普通用户即可创建，是最常见的目录名称代理。
+        let junction = base.join("dir-junction");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(base.join("real-dir"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if made {
+            // 前提锁定：junction 在 std 里同样算 `is_symlink()`（名称代理）。
+            // 若这条不成立，审计会走「普通目录」分支并进入目标 —— 那才是
+            // 真正的越界，必须先被这个断言抓到。
+            let meta = std::fs::symlink_metadata(&junction).unwrap();
+            assert!(
+                meta.file_type().is_symlink(),
+                "junction 必须被识别为链接，否则审计会进入目标目录"
+            );
+            assert!(is_dir_link(&meta), "junction 必须被判为目录链接");
+            assert!(
+                matches!(audit_root_for_reparse(&base), Ok(ReparseAudit::Clean)),
+                "junction 是目录名称代理：引擎不跟随，不得拒绝整个来源"
+            );
+            std::fs::remove_dir(&junction).ok();
+        } else {
+            eprintln!("NOT RUN：当前环境无法创建 junction");
+        }
+        // 目录符号链接需要创建符号链接权限，没有权限时明确跳过。
+        let dir_link = base.join("dir-link");
+        match std::os::windows::fs::symlink_dir(base.join("real-dir"), &dir_link) {
+            Ok(()) => {
+                assert!(
+                    matches!(audit_root_for_reparse(&base), Ok(ReparseAudit::Clean)),
+                    "目录符号链接：引擎的通用遍历不跟随，不得拒绝整个来源"
+                );
+                std::fs::remove_dir(&dir_link).ok();
+            }
+            Err(error) => {
+                eprintln!("NOT RUN：当前环境无法创建目录符号链接（{error}）");
+            }
+        }
+        let file_link = base.join("file-link.log");
+        match std::os::windows::fs::symlink_file(base.join("real.log"), &file_link) {
+            Ok(()) => {
+                assert!(
+                    audit_root_for_reparse(&base).is_err(),
+                    "文件链接：引擎会跟随读取目标，必须拒绝"
+                );
+                std::fs::remove_file(&file_link).ok();
+            }
+            Err(error) => {
+                eprintln!("NOT RUN：当前环境无法创建文件符号链接（{error}）");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn r03_settings解析覆盖两个字段与目录文件语义() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"scanner":{
+                "extraScanPaths":{"claude":["D:\\Logs\\Claude"],"dsh":["D:\\Logs\\Dsh"]},
+                "opencodeDbPaths":["D:\\Db\\opencode.db","D:\\Db\\other.db"]
+            }}"#,
+        )
+        .unwrap();
+        let roots = engine_config_roots(&value).unwrap();
+        assert_eq!(roots.len(), 4, "两个 extra 目录 + 两个 opencode 数据库");
+        assert!(roots
+            .iter()
+            .any(|(tool, path, dir)| tool == "claude" && path.ends_with("Claude") && *dir));
+        assert!(roots
+            .iter()
+            .any(|(tool, path, dir)| tool == "opencode" && path.ends_with("opencode.db") && !*dir));
+    }
+
+    #[test]
+    fn r03_settings字段形态非法时失败关闭() {
+        // extraScanPaths 不是对象。
+        let bad_extra: serde_json::Value =
+            serde_json::from_str(r#"{"scanner":{"extraScanPaths":["x"]}}"#).unwrap();
+        assert!(engine_config_roots(&bad_extra).is_err());
+        // 某工具的值不是数组。
+        let bad_list: serde_json::Value =
+            serde_json::from_str(r#"{"scanner":{"extraScanPaths":{"claude":"x"}}}"#).unwrap();
+        assert!(engine_config_roots(&bad_list).is_err());
+        // opencodeDbPaths 不是数组。
+        let bad_db: serde_json::Value =
+            serde_json::from_str(r#"{"scanner":{"opencodeDbPaths":"D:\\db"}}"#).unwrap();
+        assert!(engine_config_roots(&bad_db).is_err());
+        // opencodeDbPaths 含非字符串项。
+        let bad_item: serde_json::Value =
+            serde_json::from_str(r#"{"scanner":{"opencodeDbPaths":[1]}}"#).unwrap();
+        assert!(engine_config_roots(&bad_item).is_err());
+        // 没有 scanner 字段：没有扩展来源。
+        let empty: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(engine_config_roots(&empty).unwrap().is_empty());
+    }
+
+    // ---------- 第六轮复评 R02/R04：home 预审只覆盖真实扫描根 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn r04_home预审忽略无关目录链接_只审布局根() {
+        let home = std::env::temp_dir().join(format!("dsm-home-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // 标准布局根内有普通日志。
+        std::fs::create_dir_all(home.join(".claude/projects/s1")).unwrap();
+        std::fs::write(home.join(".claude/projects/s1/a.jsonl"), b"{}").unwrap();
+        // home 里与采集无关的目录含目录链接（复评 R04：不得拒绝整个 home）。
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::os::unix::fs::symlink(&home, home.join("projects/loop")).unwrap();
+        let outcome = audit_home_layout_roots(&home, crate::local_sources::SourceOrigin::Native);
+        assert!(
+            matches!(outcome, Ok(ReparseAudit::Clean)),
+            "无关目录里的目录链接不应拒绝 home：{:?}",
+            outcome.err()
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

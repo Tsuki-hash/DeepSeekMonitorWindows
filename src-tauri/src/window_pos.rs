@@ -94,9 +94,7 @@ pub fn panel_origin(
 
 /// 第五轮复评 N03：把窗口**完整矩形**约束进工作区。
 ///
-/// 扩大尺寸（set_panel_mode）与托盘位置恢复都只保证过左上角 —— 右下角
-/// 展开或分辨率/拔屏后恢复时，右/下边界可能超出工作区，右侧与底部控件
-/// 不可见。窗口本身大于工作区时贴靠工作区左上角（宁可小于最小尺寸，
+/// 窗口本身大于工作区时贴靠工作区左上角（宁可小于最小尺寸，
 /// 不可整块不可见）。
 pub fn clamp_origin_into_area(
     area: WorkArea,
@@ -114,6 +112,31 @@ pub fn clamp_origin_into_area(
         y = (area.bottom() - panel_height).max(area.y);
     }
     (x, y)
+}
+
+/// 第六轮复评 R08：把已有窗口尺寸限制到目标工作区，再计算位置。
+///
+/// 恢复入口必须处理「当前窗口比新工作区更大」的情况；只夹左上角仍会让
+/// 右/下边界不可见。返回的尺寸是物理像素，至少为 1，避免 OS 拒绝零尺寸。
+pub fn clamp_size_into_area(area: WorkArea, width: u32, height: u32, margin: i32) -> (u32, u32) {
+    let available_width = (area.width - margin.saturating_mul(2)).max(1) as u32;
+    let available_height = (area.height - margin.saturating_mul(2)).max(1) as u32;
+    (width.min(available_width), height.min(available_height))
+}
+
+/// 复评 N03/R08：给定已夹入的尺寸后，把窗口完整矩形夹回工作区。
+/// 窗口仍大于工作区时贴靠左上角；正常尺寸不会越界。
+pub fn clamp_window_into_area(
+    area: WorkArea,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    margin: i32,
+) -> (u32, u32, i32, i32) {
+    let (width, height) = clamp_size_into_area(area, width, height, margin);
+    let (x, y) = clamp_origin_into_area(area, width as i32, height as i32, x, y);
+    (width, height, x, y)
 }
 
 #[cfg(test)]
@@ -208,5 +231,51 @@ mod tests {
         // 再保证右/下不越界。
         let (x, y) = clamp_origin_into_area(area(), 356, 600, -800, -500);
         assert_eq!((x, y), (0, 0));
+    }
+
+    // ---------- 第六轮复评 R08：恢复入口的尺寸与位置都受限 ----------
+
+    #[test]
+    fn r08_小工作区恢复时先缩小尺寸_完整矩形在区内() {
+        // 评审示例：窗口 720×760 恢复到 500×400 的工作区。
+        let small = WorkArea {
+            x: 0,
+            y: 0,
+            width: 500,
+            height: 400,
+        };
+        let (width, height, x, y) = clamp_window_into_area(small, 720, 760, 10, 10, 12);
+        assert_eq!(width, 500 - 24, "宽度先缩到工作区扣边距");
+        assert_eq!(height, 400 - 24, "高度先缩到工作区扣边距");
+        assert!(
+            x >= small.x && x + width as i32 <= small.right(),
+            "完整矩形必须水平落在工作区内"
+        );
+        assert!(
+            y >= small.y && y + height as i32 <= small.bottom(),
+            "完整矩形必须垂直落在工作区内"
+        );
+    }
+
+    #[test]
+    fn r08_正常尺寸恢复不被放大_位置夹取生效() {
+        let (width, height, x, y) = clamp_window_into_area(area(), 720, 760, 1552, 428, 12);
+        assert_eq!((width, height), (720, 760), "能容纳时保持原尺寸");
+        assert!(x + width as i32 <= 1920);
+        assert!(y + height as i32 <= 1040);
+    }
+
+    #[test]
+    fn r08_负坐标显示器工作区_尺寸与位置都按该区约束() {
+        let left_screen = WorkArea {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1080,
+        };
+        let (width, height, x, y) = clamp_window_into_area(left_screen, 720, 760, -300, 900, 12);
+        assert_eq!((width, height), (720, 760));
+        assert!(x >= -1920 && x + width as i32 <= 0);
+        assert!(y >= -200 && y + height as i32 <= 880);
     }
 }
