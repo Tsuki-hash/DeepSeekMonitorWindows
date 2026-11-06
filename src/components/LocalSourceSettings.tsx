@@ -8,10 +8,17 @@ import type { SourceOptions, WslStatus, ToolPath } from "../local-sources";
 export function LocalSourceSettings({
   onSaved,
   onDirtyChanged,
+  onSaveRequested,
 }: {
   onSaved: () => void;
   /** 把「有未保存修改」上报给父级，用于离开前拦截（评审 P2）。 */
   onDirtyChanged?: (dirty: boolean) => void;
+  /**
+   * 把「保存」动作交给父级调用（复评 F09）：
+   * 全局离开拦截的「保存并离开」需要真的保存成功后再离开。
+   * 返回值表示是否保存成功。
+   */
+  onSaveRequested?: (save: () => Promise<boolean>) => void;
 }) {
   const [options, setOptions] = React.useState<SourceOptions | null>(null);
   const [includeDefault, setIncludeDefault] = React.useState(true);
@@ -60,7 +67,7 @@ export function LocalSourceSettings({
     onDirtyChanged?.(Boolean(dirty));
   }, [dirty, onDirtyChanged]);
   React.useEffect(() => () => onDirtyChanged?.(false), [onDirtyChanged]);
-  const save = async (reset = false) => {
+  const save = async (reset = false): Promise<boolean> => {
     setError("");
     setMessage("");
     let next: SourceOptions;
@@ -70,7 +77,7 @@ export function LocalSourceSettings({
         : sourceOptions(includeDefault, homes, toolPaths);
     } catch (failure) {
       setError(errorMessage(failure));
-      return;
+      return false;
     }
     setBusy(true);
     const sequence = ++owner.current.sequence;
@@ -82,14 +89,26 @@ export function LocalSourceSettings({
         accept(value);
         setMessage("目录已保存，旧采集已作废");
         onSaved();
+        return true;
       }
+      // 组件已卸载或被更新的操作替代：不算成功。
+      return false;
     } catch (failure) {
       if (owner.current.active && sequence === owner.current.sequence)
         setError(errorMessage(failure));
+      return false;
     } finally {
       if (owner.current.active) setBusy(false);
     }
   };
+
+  // 把保存动作登记给父级，供全局「保存并离开」调用。
+  // 用 ref 转发：save 每次渲染都是新函数，直接放进依赖会反复登记。
+  const saveRef = React.useRef(save);
+  saveRef.current = save;
+  React.useEffect(() => {
+    onSaveRequested?.(() => saveRef.current());
+  }, [onSaveRequested]);
   const listWsl = async () => {
     setBusy(true);
     setError("");

@@ -33,7 +33,21 @@ const tokens = (value: number | null) =>
 const speed = (value: number | null) =>
   value == null ? "—" : `${value.toFixed(1)} tok/s`;
 
-export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
+export function LocalUsagePanel({
+  onBack,
+  onRegisterLeaveBlocker,
+}: {
+  onBack: () => void;
+  /** 把草稿状态登记到 App 级拦截器（复评 F09：主导航也要被拦）。 */
+  onRegisterLeaveBlocker?: (
+    blocker: {
+      dirty: boolean;
+      subject: string;
+      save: () => Promise<boolean>;
+      discard: () => void;
+    } | null,
+  ) => void;
+}) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [workspace, setWorkspace] = React.useState<
     "stats" | "data" | "settings"
@@ -64,6 +78,8 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
     "manual" | "retention" | null
   >(null);
   const control = React.useRef({ sequence: 0, inFlight: false });
+  // 目录设置的保存动作由子组件登记，供全局「保存并离开」调用。
+  const saveSourceRef = React.useRef<(() => Promise<boolean>) | null>(null);
   const tracker = React.useRef(new LocalRateTracker());
   const background = React.useRef(false);
   // 后台采集开关同时驱动「留存说明」的措辞，避免文案与实际行为矛盾（评审 P2）。
@@ -235,6 +251,25 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
     if (shouldBlockLeave(sourceDirty)) setPendingLeave(() => action);
     else action();
   };
+  // 把草稿状态登记到 App 级拦截器：底部主导航、返回按钮都走同一条出口。
+  React.useEffect(() => {
+    onRegisterLeaveBlocker?.(
+      sourceDirty
+        ? {
+            dirty: true,
+            subject: "采集目录",
+            save: async () => (await saveSourceRef.current?.()) ?? false,
+            discard: () => {
+              setSourceDirty(false);
+              setPendingLeave(null);
+              // 让子组件重新从后端读取，等于放弃草稿。
+              setSourceRevision((value) => value + 1);
+            },
+          }
+        : null,
+    );
+    return () => onRegisterLeaveBlocker?.(null);
+  }, [onRegisterLeaveBlocker, sourceDirty]);
   const back = () => {
     if (workspace !== "stats") guarded(() => setWorkspace("stats"));
     else if (session != null) setSession(null);
@@ -537,8 +572,15 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
               <button
                 className="secondary"
                 onClick={() => {
-                  setPendingLeave(null);
-                  setWorkspace("settings");
+                  const action = pendingLeave;
+                  // 复评 F09：先真的保存，成功后才执行原本的离开动作。
+                  void (async () => {
+                    const saved = await saveSourceRef.current?.();
+                    if (!saved) return; // 保存失败：留在当前页，草稿保留
+                    setSourceDirty(false);
+                    setPendingLeave(null);
+                    action?.();
+                  })();
                 }}
               >
                 {draftGuardActions.save}
@@ -566,6 +608,9 @@ export function LocalUsagePanel({ onBack }: { onBack: () => void }) {
         <div hidden={workspace !== "settings"}>
           <LocalSourceSettings
             onDirtyChanged={setSourceDirty}
+            onSaveRequested={(save) => {
+              saveSourceRef.current = save;
+            }}
             onSaved={() => {
               control.current.sequence++;
               tracker.current.reset();

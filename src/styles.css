@@ -2586,11 +2586,11 @@ button:disabled:hover {
   background: var(--control-hover);
 }
 .with-navigation > .dashboard-panel {
-  overflow-y: auto;
-  scrollbar-width: thin;
+  /* 滚动交给内层 .dashboard-scroll：面板本身保持固定高度，导航行不被挤走。 */
+  overflow: hidden;
   gap: 7px;
 }
-.with-navigation > .dashboard-panel > * {
+.with-navigation > .dashboard-panel > .dashboard-scroll > * {
   flex-shrink: 0;
 }
 .with-navigation > .dashboard-panel .chart-card {
@@ -2977,4 +2977,92 @@ button:disabled:hover {
   color: var(--text-faint);
   font-size: 11px;
   line-height: 1.45;
+}
+
+/* 首页内部滚动区（复评 F04）：引导卡与数据同处一列，避免 stage 多出第三个网格子项。
+   面板本身不再裁掉底部内容，导航行高度保持 48px 不变。 */
+.dashboard-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  padding-bottom: 2px;
+}
+.dashboard-panel {
+  padding-bottom: 0;
+}
+
+/* 阅读模式（复评 F11）：原生窗口放大后，布局必须跟着放宽，
+   否则窗口变大而内容仍被 356px 面板夹住，等于没有阅读区。
+   紧凑模式保持原来的 356×600。 */
+.stage.mode-expanded {
+  align-items: start center;
+}
+.stage.mode-expanded > .panel,
+.stage.mode-expanded > .settings-panel {
+  width: min(720px, 100vw);
+  height: min(712px, 100vh);
+}
+.stage.mode-expanded.with-navigation {
+  grid-template-rows: minmax(0, 1fr) 48px;
+  height: min(760px, 100vh);
+}
+.stage.mode-expanded.with-navigation > .panel {
+  width: min(720px, 100vw);
+  height: 100%;
+}
+.stage.mode-expanded .primary-navigation {
+  width: min(720px, 100vw);
+}
+/* 展开后历史与 Agent 的分组列表可排成两列，减少长页面滚动。 */
+.stage.mode-expanded .local-group-list,
+.stage.mode-expanded .history-models {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+/* 小工作区：宽度不足时退回单列，避免内容被压扁。 */
+@media (max-width: 560px) {
+  .stage.mode-expanded .local-group-list,
+  .stage.mode-expanded .history-models {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 可信状态的补充原因：说明「为什么不完整」，紧跟在摘要下方。 */
+.source-trust-reason {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--orange-ink);
+}
+@media (forced-colors: active) {
+  .source-trust-reason {
+    color: CanvasText;
+  }
+}
+
+/* 全局离开拦截提示（复评 F09）：覆盖在导航上方，不遮挡主要内容。 */
+.leave-guard {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: end;
+  justify-self: center;
+  width: min(356px, 100vw);
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-control);
+  background: var(--card-bottom);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  z-index: 20;
+}
+.stage.mode-expanded .leave-guard {
+  width: min(720px, 100vw);
+}
+.leave-guard p {
+  margin: 0 0 8px;
 }
