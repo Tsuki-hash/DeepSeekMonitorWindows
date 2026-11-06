@@ -17,6 +17,7 @@ import { HistoryPanel } from "../src/components/HistoryPanel";
 import { ModelDetailPanel } from "../src/components/ModelDetailPanel";
 import { historyCache } from "../src/history-cache";
 import { useLeaveGuard } from "../src/leave-guard";
+import { USAGE_SYNC_RECONCILE_MS } from "../src/usage-sync-reconcile";
 
 // Synthetic values only. No credentials are written to storage, fixtures, or logs.
 // The renderer honors the StrictMode wrapper but does not replay StrictEffects.
@@ -27,14 +28,19 @@ g.IS_REACT_ACT_ENVIRONMENT = true;
 const noop = () => {};
 let frameId = 0;
 const frames = new Map<number, () => void>();
+const timeouts = new Map<number, { callback: () => void; delay: number }>();
 const focus: string[] = [];
 const storage = new Map<string, string>();
 const attrs = new Map<string, string>();
 g.window = {
   setInterval: () => ++frameId,
   clearInterval: noop,
-  setTimeout: () => ++frameId,
-  clearTimeout: noop,
+  setTimeout: (callback, delay) => {
+    const id = ++frameId;
+    timeouts.set(id, { callback, delay });
+    return id;
+  },
+  clearTimeout: (id) => timeouts.delete(id),
   requestAnimationFrame: (fn) => {
     const id = ++frameId;
     frames.set(id, fn);
@@ -307,6 +313,8 @@ function scenario(name, body) {
       storage.clear();
       focus.length = 0;
       frames.clear();
+      timeouts.clear();
+      g.__settingsListen = undefined;
       try {
         await body(concurrent);
         assert.equal(
@@ -3318,3 +3326,378 @@ scenario(
     assert.equal(submitted("save_usage_token").length, 0);
   },
 );
+
+// R34: drive the real hook's timer, not an imitation of its ownership checks.
+// These remain synthetic React/IPC tests, not Windows event-delivery validation.
+const reconcileSync = async () => {
+  const pending = [...timeouts].filter(
+    ([, timer]) => timer.delay === USAGE_SYNC_RECONCILE_MS,
+  );
+  assert.equal(
+    pending.length,
+    1,
+    "One settings reconciliation owns the next tick",
+  );
+  const [id, timer] = pending[0];
+  timeouts.delete(id);
+  await act(async () => timer.callback());
+  await flush();
+};
+const nativeSyncFixture = () => {
+  let snapshot = syncStatus();
+  handlers.get_usage_sync_status = () => snapshot;
+  handlers.start_usage_sync = (args) => {
+    snapshot = syncStatus(args.requestId, true);
+    return { ...snapshot, synced: false };
+  };
+  return {
+    current: () => snapshot,
+    end: () => {
+      snapshot = { ...snapshot, active: false };
+      return snapshot;
+    },
+  };
+};
+
+scenario(
+  "R34 lost capture event reconciles terminal status and config without consuming drafts",
+  async (concurrent) => {
+    const native = nativeSyncFixture();
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_UNSUBMITTED_TOKEN"));
+    await act(async () => state.startUsageSync());
+    await flush();
+    const saved = nextCredentialConfig("usageToken", true);
+    config = saved;
+    await act(async () => setCommittedConfig(saved)); // The generic config event arrived.
+    assert.equal(state.usageSyncing, true);
+    native.end(); // No capture or ended event is delivered.
+    const before = submitted("get_app_config").length;
+    await reconcileSync();
+    assert.equal(state.usageSyncing, false);
+    assert.equal(submitted("get_app_config").length, before + 1);
+    assert.equal(state.config.usageTokenConfigured, true);
+    assert.match(state.usageStatus, /同步已结束，当前配置已核对/);
+    assert.equal(state.usageToken, "SYNTHETIC_UNSUBMITTED_TOKEN");
+    assert.equal(submitted("start_usage_sync").length, 1);
+    assert.equal(submitted("save_usage_token").length, 0);
+    const status = state.usageStatus;
+    await emit("usage-sync-ended", native.current());
+    await emit("usage-sync-ended", native.current());
+    assert.equal(
+      state.usageStatus,
+      status,
+      "Duplicate late ended events do not turn reconciliation into failure",
+    );
+  },
+);
+
+scenario(
+  "R34 unrelated configured changes cannot claim an active login succeeded",
+  async (concurrent) => {
+    const native = nativeSyncFixture();
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    await flush();
+    config = nextCredentialConfig("usageToken", true);
+    await act(async () => setCommittedConfig(config));
+    await reconcileSync();
+    assert.equal(state.usageSyncing, true);
+    assert.match(state.usageStatus, /等待网页登录/);
+    native.end(); // Lost close/timeout event, with no Token commit by this session.
+    await reconcileSync();
+    assert.equal(state.usageSyncing, false);
+    assert.doesNotMatch(
+      state.usageStatus,
+      /验证通过|同步成功|同步完成|未获取到/,
+    );
+    assert.match(state.usageStatus, /同步已结束/);
+  },
+);
+
+for (const phase of ["status", "config"] as const) {
+  scenario(
+    `R34 slow ${phase} read cannot finish or publish into a newer web login`,
+    async (concurrent) => {
+      const native = nativeSyncFixture();
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      await flush();
+      const old = native.end();
+      const delayed = deferred();
+      const staleConfig = { ...config };
+      if (phase === "status")
+        handlers.get_usage_sync_status = () => delayed.promise;
+      else handlers.get_app_config = () => delayed.promise;
+      await reconcileSync();
+      assert.equal(
+        timeouts.size,
+        0,
+        "No parallel status loop while the previous read is pending",
+      );
+      await act(async () => state.startUsageSync());
+      await flush();
+      const waiting = state.usageStatus;
+      const committed = getCommittedConfig();
+      const configReads = submitted("get_app_config").length;
+      await finish(delayed, phase === "status" ? old : staleConfig);
+      assert.equal(state.usageSyncing, true);
+      assert.equal(state.usageStatus, waiting);
+      assert.equal(getCommittedConfig(), committed);
+      if (phase === "status")
+        assert.equal(submitted("get_app_config").length, configReads);
+      handlers.get_usage_sync_status = () => native.current();
+      handlers.get_app_config = () => config;
+      await reconcileSync();
+      assert.equal(state.usageSyncing, true);
+    },
+  );
+}
+
+scenario(
+  "R34 cancel wins against an in-flight active status read",
+  async (concurrent) => {
+    const native = nativeSyncFixture();
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    await flush();
+    const stale = native.current();
+    const reading = deferred();
+    handlers.get_usage_sync_status = () => reading.promise;
+    await reconcileSync();
+    handlers.cancel_usage_sync = () => native.end();
+    await act(async () => state.cancelUsageSync());
+    await flush();
+    assert.equal(state.usageSyncing, false);
+    const status = state.usageStatus;
+    assert.match(status, /已取消同步/);
+    await finish(reading, stale);
+    assert.equal(state.usageSyncing, false);
+    assert.equal(state.usageStatus, status);
+    assert.equal(timeouts.size, 0);
+  },
+);
+
+scenario(
+  "R34 cancel no-op waits for the older status read then obtains a fresh terminal receipt",
+  async (concurrent) => {
+    const native = nativeSyncFixture();
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    await flush();
+    const stale = native.current();
+    const reading = deferred();
+    let reads = 0;
+    handlers.get_usage_sync_status = () =>
+      ++reads === 1 ? reading.promise : native.current();
+    await reconcileSync();
+    native.end();
+    handlers.cancel_usage_sync = () => null;
+    await act(async () => state.cancelUsageSync());
+    await flush();
+    assert.equal(
+      reads,
+      1,
+      "Cancel must not issue a parallel read or reuse the old snapshot",
+    );
+    await finish(reading, stale);
+    assert.equal(reads, 2);
+    assert.equal(state.usageSyncing, false);
+    assert.doesNotMatch(state.usageStatus, /已取消同步|原 Token 未更改/);
+  },
+);
+
+for (const phase of ["status", "config"] as const) {
+  scenario(
+    `R34 failed terminal ${phase} read retries without another user action`,
+    async (concurrent) => {
+      const native = nativeSyncFixture();
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      await flush();
+      native.end();
+      const command =
+        phase === "status" ? "get_usage_sync_status" : "get_app_config";
+      handlers[command] = () =>
+        Promise.reject(new Error(`Synthetic ${phase} read failure`));
+      await reconcileSync();
+      assert.equal(state.usageSyncing, true);
+      assert.match(state.usageStatus, /核对失败，将自动重试/);
+      handlers[command] = () =>
+        phase === "status" ? native.current() : config;
+      await reconcileSync();
+      assert.equal(state.usageSyncing, false);
+      assert.doesNotMatch(state.usageStatus, /核对失败/);
+    },
+  );
+}
+
+scenario(
+  "R34 failed capture subscription recovers independently while status reconciliation remains available",
+  async (concurrent) => {
+    const attempts = new Map<string, number>();
+    g.__settingsListen = (name, callback) => {
+      attempts.set(name, (attempts.get(name) ?? 0) + 1);
+      if (name === "usage-token-captured" && attempts.get(name) === 1)
+        return Promise.reject(
+          new Error("Synthetic capture subscription failure"),
+        );
+      const listeners = g.__settingsListeners.get(name) ?? new Set();
+      g.__settingsListeners.set(name, listeners);
+      listeners.add(callback);
+      return Promise.resolve(() => listeners.delete(callback));
+    };
+    const native = nativeSyncFixture();
+    await mount(<Probe />, concurrent);
+    assert.match(state.usageStatus, /同步通知连接失败/);
+    await act(async () => state.startUsageSync());
+    await flush();
+    native.end();
+    await reconcileSync();
+    assert.equal(attempts.get("usage-token-captured"), 2);
+    assert.equal(attempts.get("usage-sync-started"), 1);
+    assert.equal(attempts.get("usage-sync-ended"), 1);
+    assert.equal(state.usageSyncing, false);
+    assert.doesNotMatch(state.usageStatus, /连接失败/);
+  },
+);
+
+for (const outcome of ["resolve", "reject"] as const) {
+  scenario(
+    `R34 unmount revokes a late status ${outcome} and remount restores native terminal state`,
+    async (concurrent) => {
+      const native = nativeSyncFixture();
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      await flush();
+      const reading = deferred();
+      handlers.get_usage_sync_status = () => reading.promise;
+      await reconcileSync();
+      const configReads = submitted("get_app_config").length;
+      await act(async () => renderer.unmount());
+      renderer = null;
+      native.end();
+      if (outcome === "resolve") await finish(reading, native.current());
+      else
+        await act(async () =>
+          reading.reject(new Error("Synthetic abandoned read failure")),
+        );
+      await flush();
+      assert.equal(submitted("get_app_config").length, configReads);
+      assert.equal(timeouts.size, 0);
+      handlers.get_usage_sync_status = () => native.current();
+      await mount(<Probe />, concurrent);
+      assert.equal(state.usageSyncing, false);
+    },
+  );
+}
+
+for (const action of [
+  "clearUsageToken",
+  "forgetUsageSession",
+  "edit",
+] as const) {
+  for (const outcome of ["resolve", "reject"] as const) {
+    scenario(
+      `R34 terminal config read late ${outcome} preserves ${action} and newer drafts`,
+      async (concurrent) => {
+        const native = nativeSyncFixture();
+        await mount(<Probe />, concurrent);
+        await act(async () => state.startUsageSync());
+        await flush();
+        const stale = { ...getCommittedConfig() };
+        native.end();
+        const reading = deferred();
+        handlers.get_app_config = () => reading.promise;
+        const readsBefore = submitted("get_app_config").length;
+        await reconcileSync();
+        assert.equal(submitted("get_app_config").length, readsBefore + 1);
+        assert.equal(
+          timeouts.size,
+          0,
+          "The terminal config read is already in flight",
+        );
+
+        const changing = deferred();
+        const command =
+          action === "clearUsageToken"
+            ? "clear_usage_token"
+            : "forget_usage_session";
+        if (action !== "edit") {
+          handlers[command] = () => changing.promise;
+          await act(async () => state[action]());
+          await flush();
+          assert.equal(submitted(command).length, 1);
+          assert.equal(state.usageSyncing, false);
+        }
+        // Both drafts are newer than the login and any clear/forget submission.
+        await act(async () => {
+          state.setApiKey("SYNTHETIC_NEW_KEY_DRAFT");
+          state.setUsageToken("SYNTHETIC_NEW_TOKEN_DRAFT");
+        });
+        if (action !== "edit") {
+          config = nextCredentialConfig("usageToken", false);
+          await finish(changing, config);
+          assert.equal(state.config.usageTokenConfigured, false);
+          assert.ok(state.config.usageTokenRevision > stale.usageTokenRevision);
+          if (action === "forgetUsageSession")
+            assert.equal(usageSessionCleanup.snapshot.phase, "succeeded");
+        }
+        const committed = getCommittedConfig();
+        const accountRevision = committed.usageTokenRevision;
+        const keyRevision = committed.apiKeyRevision;
+        const feedback = state.usageStatus;
+        if (outcome === "resolve") await finish(reading, stale);
+        else {
+          await act(async () =>
+            reading.reject(new Error("Synthetic old terminal config failure")),
+          );
+          await flush();
+        }
+        assert.equal(getCommittedConfig(), committed);
+        assert.equal(state.config.usageTokenRevision, accountRevision);
+        assert.equal(state.config.apiKeyRevision, keyRevision);
+        assert.equal(state.usageToken, "SYNTHETIC_NEW_TOKEN_DRAFT");
+        assert.equal(state.apiKey, "SYNTHETIC_NEW_KEY_DRAFT");
+        assert.doesNotMatch(
+          state.usageStatus,
+          /同步已结束|同步已被替代|同步成功|验证通过/,
+        );
+        assert.equal(submitted("start_usage_sync").length, 1);
+        assert.equal(submitted("save_usage_token").length, 0);
+        assert.equal(submitted("save_api_key").length, 0);
+
+        if (action !== "edit") {
+          assert.equal(state.usageSyncing, false);
+          assert.equal(
+            state.usageStatus,
+            feedback,
+            "A revoked read cannot replace clear/forget feedback",
+          );
+          assert.equal(submitted(command).length, 1);
+          assert.equal(timeouts.size, 0);
+        } else if (outcome === "resolve") {
+          assert.equal(state.usageSyncing, false);
+          assert.equal(
+            state.usageStatus,
+            feedback,
+            "The old login feedback does not own new edits",
+          );
+        } else {
+          // Editing revokes draft feedback, not the still-owned status check.
+          // A genuine read failure remains visible and retryable without saving drafts.
+          assert.equal(state.usageSyncing, true);
+          assert.ok(state.usageStatus.startsWith(feedback));
+          assert.match(state.usageStatus, /核对失败，将自动重试/);
+          handlers.get_app_config = () => config;
+          await reconcileSync();
+          assert.equal(state.usageSyncing, false);
+          assert.equal(state.usageStatus, feedback);
+          assert.equal(state.usageToken, "SYNTHETIC_NEW_TOKEN_DRAFT");
+          assert.equal(state.apiKey, "SYNTHETIC_NEW_KEY_DRAFT");
+          assert.equal(getCommittedConfig(), committed);
+        }
+      },
+    );
+  }
+}

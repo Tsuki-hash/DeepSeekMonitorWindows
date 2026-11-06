@@ -4,7 +4,7 @@ use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -93,12 +93,21 @@ fn identity(kind: Kind, credential: &str, threshold: f64, month: (u32, u32)) -> 
 struct Receipt {
     attempted_at: u64,
     submitted: bool,
+    // Retention order is independent of wall time and cooldown. Zero denotes
+    // a legacy receipt whose relative position is established on the next write.
+    #[serde(default)]
+    write_order: u64,
     // Preserve the real attempt and result. This separate, backwards-compatible
     // anchor bounds cooldown after a persisted wall-clock timestamp is in future.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cooldown_started_at: Option<u64>,
 }
 impl Receipt {
+    fn same_attempt(&self, other: &Self) -> bool {
+        self.attempted_at == other.attempted_at
+            && self.submitted == other.submitted
+            && self.cooldown_started_at == other.cooldown_started_at
+    }
     fn cooldown_seconds(&self, kind: Kind) -> u64 {
         if kind == Kind::Test {
             60
@@ -128,14 +137,54 @@ impl Ledger {
         now >= receipt.cooldown_start()
             && now - receipt.cooldown_start() >= receipt.cooldown_seconds(kind)
     }
+    #[cfg(test)]
     fn record(&mut self, key: String, now: u64, submitted: bool) {
-        self.receipts
-            .retain(|_, r| now < r.attempted_at || now - r.attempted_at < 90 * 86400);
+        self.record_protected(key, now, submitted, &BTreeSet::new());
+    }
+    fn record_protected(
+        &mut self,
+        key: String,
+        now: u64,
+        submitted: bool,
+        protected: &BTreeSet<String>,
+    ) {
+        // A wall-clock jump must not delete another active channel's success or
+        // cooldown. The 128-entry bound replaces wall-based 90-day pruning.
+        // Migrate old receipts (unknown write order) ahead of new writes. On
+        // counter exhaustion compact the bounded order without changing facts,
+        // calibrated anchors, or the runtime monotonic cooldown identity.
+        if self
+            .receipts
+            .values()
+            .any(|receipt| receipt.write_order == 0)
+            || self
+                .receipts
+                .values()
+                .any(|receipt| receipt.write_order == u64::MAX)
+        {
+            let mut ordered: Vec<_> = self
+                .receipts
+                .iter()
+                .map(|(key, receipt)| (receipt.write_order, receipt.attempted_at, key.clone()))
+                .collect();
+            ordered.sort();
+            for (index, (_, _, key)) in ordered.into_iter().enumerate() {
+                self.receipts.get_mut(&key).unwrap().write_order = index as u64 + 1;
+            }
+        }
+        let write_order = self
+            .receipts
+            .values()
+            .map(|receipt| receipt.write_order)
+            .max()
+            .unwrap_or(0)
+            + 1;
         self.receipts.insert(
             key.clone(),
             Receipt {
                 attempted_at: now,
                 submitted,
+                write_order,
                 cooldown_started_at: None,
             },
         );
@@ -143,13 +192,14 @@ impl Ledger {
             let oldest = self
                 .receipts
                 .iter()
-                // After wall-clock rollback, the just-recorded attempt can
-                // have the smallest timestamp. Never evict its own protection
-                // before sending or before persisting the success receipt.
-                .filter(|(candidate, _)| *candidate != &key)
-                .min_by_key(|(_, r)| r.attempted_at)
+                // Both current channels remain newer than legacy/future facts,
+                // rather than repeatedly evicting one another after rollback.
+                .filter(|(candidate, _)| *candidate != &key && !protected.contains(*candidate))
+                .min_by_key(|(_, receipt)| receipt.write_order)
                 .map(|(k, _)| k.clone())
-                .unwrap();
+                // Production protects at most three configured identities and
+                // the current write, so an over-capacity ledger has a victim.
+                .expect("bounded active receipt identities leave an eviction candidate");
             self.receipts.remove(&oldest);
         }
     }
@@ -232,6 +282,7 @@ pub struct AlertRuntime(Mutex<Runtime>);
 struct Runtime {
     ledger: Option<Ledger>,
     receipt_cooldowns: BTreeMap<String, ReceiptCooldown>,
+    protected_receipts: BTreeSet<String>,
     balance: Poll,
     budget: Poll,
     balance_state: String,
@@ -247,6 +298,37 @@ struct ReceiptCooldown {
     until: Instant,
 }
 impl Runtime {
+    fn protect_current_receipts(&mut self, config: &config::StoredConfig, month: (u32, u32)) {
+        let mut protected = BTreeSet::new();
+        protected.insert(identity(Kind::Test, "", 0.0, (0, 0)));
+        if config.alerts.enabled {
+            if config.alerts.low_balance_enabled {
+                if let Some(key) = config.api_key.as_deref().filter(|key| !key.is_empty()) {
+                    protected.insert(identity(
+                        Kind::Balance,
+                        key,
+                        config.alerts.low_balance_cny,
+                        (0, 0),
+                    ));
+                }
+            }
+            if config.alerts.monthly_budget_enabled {
+                if let Some(token) = config
+                    .usage_token
+                    .as_deref()
+                    .filter(|token| !token.is_empty())
+                {
+                    protected.insert(identity(
+                        Kind::Budget,
+                        token,
+                        config.alerts.monthly_budget_cny,
+                        month,
+                    ));
+                }
+            }
+        }
+        self.protected_receipts = protected;
+    }
     fn receipt_clock_notice(&self, now: Instant) -> Option<String> {
         self.receipt_cooldowns
             .values()
@@ -423,7 +505,12 @@ fn submit(
     key: String,
     kind: Kind,
     now: u64,
+    current: &config::StoredConfig,
 ) -> Result<bool, String> {
+    // All native submission callers hold the matching current-config guard.
+    // Pin both enabled channels BEFORE the first write, including after restart
+    // or switching back to a previously-notified account/threshold.
+    state.protect_current_receipts(current, crate::usage_watcher::cst_month(SystemTime::now()));
     submit_with(
         state,
         key,
@@ -492,7 +579,7 @@ fn receipt_allows(
     let existing = state
         .receipt_cooldowns
         .get(key)
-        .filter(|cached| cached.receipt == receipt && cached.kind == kind)
+        .filter(|cached| cached.receipt.same_attempt(&receipt) && cached.kind == kind)
         .map(|cached| cached.until);
     if now < receipt.cooldown_start() {
         receipt.cooldown_started_at = Some(now);
@@ -539,18 +626,19 @@ fn attempt_submission(
     }
     // Persist an attempted submission first: a crash cannot cause an immediate duplicate.
     let mut next = state.ledger.as_ref().unwrap().clone();
-    next.record(key.clone(), now, false);
+    next.record_protected(key.clone(), now, false, &state.protected_receipts);
     persist(&next)?;
     state.ledger = Some(next);
     state.remember_receipt(&key, kind, monotonic);
     let body=match kind {Kind::Balance=>"账户余额已达到提醒线，请打开面板查看最新余额。",Kind::Budget=>"平台本月费用已达到预算提醒线，请打开用量页核对。统计按北京时间自然月，提醒不会阻止消费。",Kind::Test=>"这是一条测试通知，没有查询账户余额或用量。"};
     send(body)?;
     state.last_notification_at = Some(now * 1000);
-    state
-        .ledger
-        .as_mut()
-        .unwrap()
-        .record(key.clone(), now, true);
+    state.ledger.as_mut().unwrap().record_protected(
+        key.clone(),
+        now,
+        true,
+        &state.protected_receipts,
+    );
     state.remember_receipt(&key, kind, monotonic);
     persist(state.ledger.as_ref().unwrap())
         .map_err(|_| "通知已提交系统，但去重回执保存失败；请检查本地配置目录")?;
@@ -570,6 +658,7 @@ pub fn test_notification(app: &tauri::AppHandle) -> Result<(), String> {
             identity(Kind::Test, "", 0.0, (0, 0)),
             Kind::Test,
             now_seconds(),
+            config,
         )? {
             return Err("测试通知请间隔至少60秒".into());
         }
@@ -772,6 +861,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
                     ),
                     Kind::Balance,
                     now,
+                    current,
                 );
             }
         }
@@ -792,6 +882,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
                     ),
                     Kind::Budget,
                     now,
+                    current,
                 );
             }
         }
@@ -826,6 +917,314 @@ mod tests {
     fn test_instant(seconds: u64) -> Instant {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         *START.get_or_init(Instant::now) + Duration::from_secs(seconds)
+    }
+
+    fn r34_config() -> config::StoredConfig {
+        let mut config = config::StoredConfig::with_defaults();
+        config.api_key = Some("active-key".into());
+        config.usage_token = Some("active-token".into());
+        config.alerts.enabled = true;
+        config.alerts.low_balance_enabled = true;
+        config.alerts.monthly_budget_enabled = true;
+        config
+    }
+
+    fn r34_legacy_future_ledger() -> Ledger {
+        let mut ledger = Ledger::default();
+        for index in 0..128 {
+            ledger.record(
+                identity(Kind::Budget, &format!("old-{index}"), 100.0, (11, 2026)),
+                1_000_000 + index,
+                true,
+            );
+        }
+        let mut old_json = serde_json::to_value(&ledger).unwrap();
+        for receipt in old_json["receipts"].as_object_mut().unwrap().values_mut() {
+            receipt.as_object_mut().unwrap().remove("writeOrder");
+        }
+        serde_json::from_value(old_json).unwrap()
+    }
+
+    #[test]
+    fn r34_both_current_channels_survive_full_future_ledger_and_restart() {
+        let _dir = crate::test_support::TempConfigDir::new("r34-alert-two-channels");
+        let config = r34_config();
+        let month = (10, 2026);
+        let balance = identity(
+            Kind::Balance,
+            "active-key",
+            config.alerts.low_balance_cny,
+            month,
+        );
+        let budget = identity(
+            Kind::Budget,
+            "active-token",
+            config.alerts.monthly_budget_cny,
+            month,
+        );
+        for reverse in [false, true] {
+            persist_ledger(&r34_legacy_future_ledger()).unwrap();
+            let mut state = Runtime::default();
+            state.protect_current_receipts(&config, month);
+            let channels = if reverse {
+                [
+                    (Kind::Budget, budget.clone()),
+                    (Kind::Balance, balance.clone()),
+                ]
+            } else {
+                [
+                    (Kind::Balance, balance.clone()),
+                    (Kind::Budget, budget.clone()),
+                ]
+            };
+            for (kind, key) in &channels {
+                assert!(submit_with_clock(
+                    &mut state,
+                    key.clone(),
+                    *kind,
+                    1_000,
+                    test_instant(0),
+                    |_| Ok(()),
+                    persist_ledger,
+                )
+                .unwrap());
+            }
+            let persisted = load_ledger().unwrap();
+            assert_eq!(persisted.receipts.len(), 128);
+            assert!(persisted.receipts[&balance].submitted);
+            assert!(persisted.receipts[&budget].submitted);
+            assert!(persisted
+                .receipts
+                .values()
+                .all(|receipt| receipt.write_order > 0));
+            for restarted in [false, true] {
+                if restarted {
+                    state = Runtime::default();
+                    state.protect_current_receipts(&config, month);
+                }
+                for tick in 1..=3 {
+                    for (kind, key) in &channels {
+                        assert!(!submit_with_clock(
+                            &mut state,
+                            key.clone(),
+                            *kind,
+                            1_000 + tick * 300,
+                            test_instant(tick * 300),
+                            |_| panic!(
+                                "alternating channels must not evict each other's protection"
+                            ),
+                            |_| panic!("normal suppression must not write"),
+                        )
+                        .unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r34_unrelated_write_after_90_day_forward_jump_preserves_other_channel() {
+        let _dir = crate::test_support::TempConfigDir::new("r34-alert-wall-pruning");
+        let config = r34_config();
+        let month = (10, 2026);
+        for kind in [Kind::Balance, Kind::Budget] {
+            let key = if kind == Kind::Balance {
+                identity(kind, "active-key", config.alerts.low_balance_cny, month)
+            } else {
+                identity(
+                    kind,
+                    "active-token",
+                    config.alerts.monthly_budget_cny,
+                    month,
+                )
+            };
+            let mut state = Runtime {
+                ledger: Some(Ledger::default()),
+                ..Default::default()
+            };
+            state.protect_current_receipts(&config, month);
+            assert!(submit_with_clock(
+                &mut state,
+                key.clone(),
+                kind,
+                1_000,
+                test_instant(0),
+                |_| Ok(()),
+                persist_ledger,
+            )
+            .unwrap());
+            assert!(submit_with_clock(
+                &mut state,
+                identity(Kind::Test, "", 0.0, (0, 0)),
+                Kind::Test,
+                1_000 + 91 * 86_400,
+                test_instant(1),
+                |_| Ok(()),
+                persist_ledger,
+            )
+            .unwrap());
+            assert!(state.ledger.as_ref().unwrap().receipts.contains_key(&key));
+            assert!(state.receipt_cooldowns.contains_key(&key));
+            assert!(!submit_with_clock(
+                &mut state,
+                key.clone(),
+                kind,
+                1_001,
+                test_instant(300),
+                |_| panic!("another key's write cannot bypass cooldown or budget deduplication"),
+                |_| panic!("the retained fact should suppress without a write"),
+            )
+            .unwrap());
+            let mut restarted = Runtime::default();
+            restarted.protect_current_receipts(&config, month);
+            assert!(!submit_with_clock(
+                &mut restarted,
+                key,
+                kind,
+                1_001,
+                test_instant(300),
+                |_| panic!("the same protection must survive disk reload"),
+                |_| panic!("reload should not need a new attempt"),
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn r34_capacity_evicts_old_inactive_facts_but_pins_older_active_budget() {
+        let _dir = crate::test_support::TempConfigDir::new("r34-alert-active-eviction");
+        let config = r34_config();
+        let month = (10, 2026);
+        let expired = identity(Kind::Balance, "inactive-account", 10.0, month);
+        let budget = identity(
+            Kind::Budget,
+            "active-token",
+            config.alerts.monthly_budget_cny,
+            month,
+        );
+        let balance = identity(
+            Kind::Balance,
+            "active-key",
+            config.alerts.low_balance_cny,
+            month,
+        );
+        let mut ledger = Ledger::default();
+        ledger.record(expired.clone(), 1, false);
+        ledger.record(budget.clone(), 2, true);
+        for index in 0..126 {
+            ledger.record(
+                identity(Kind::Balance, &format!("inactive-{index}"), 10.0, month),
+                1_000_000 + index,
+                true,
+            );
+        }
+        let mut state = Runtime {
+            ledger: Some(ledger),
+            ..Default::default()
+        };
+        state.protect_current_receipts(&config, month);
+        assert_eq!(state.protected_receipts.len(), 3);
+        assert!(submit_with_clock(
+            &mut state,
+            balance,
+            Kind::Balance,
+            100_000_000,
+            test_instant(0),
+            |_| Ok(()),
+            persist_ledger,
+        )
+        .unwrap());
+        assert!(submit_with_clock(
+            &mut state,
+            identity(Kind::Test, "", 0.0, (0, 0)),
+            Kind::Test,
+            100_000_001,
+            test_instant(1),
+            |_| Ok(()),
+            persist_ledger,
+        )
+        .unwrap());
+        let persisted = load_ledger().unwrap();
+        assert_eq!(persisted.receipts.len(), 128);
+        assert!(
+            !persisted.receipts.contains_key(&expired),
+            "an expired inactive oldest entry is evictable",
+        );
+        assert!(
+            persisted.receipts[&budget].submitted,
+            "active budget may be old but is still binding",
+        );
+        let mut restarted = Runtime::default();
+        restarted.protect_current_receipts(&config, month);
+        assert!(!submit_with_clock(
+            &mut restarted,
+            budget,
+            Kind::Budget,
+            3,
+            test_instant(2),
+            |_| panic!("clock rollback and capacity must not erase the active budget receipt"),
+            |_| panic!("successful budget fact is not a cooldown"),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn r34_order_migration_and_compaction_preserve_calibration_and_runtime_deadline() {
+        let _dir = crate::test_support::TempConfigDir::new("r34-alert-order-compaction");
+        let config = r34_config();
+        let month = (10, 2026);
+        let balance = identity(
+            Kind::Balance,
+            "active-key",
+            config.alerts.low_balance_cny,
+            month,
+        );
+        let mut ledger = Ledger::default();
+        ledger.record(balance.clone(), 1_000, true);
+        let receipt = ledger.receipts.get_mut(&balance).unwrap();
+        receipt.cooldown_started_at = Some(900);
+        // Both a missing old-schema order and an exhausted new-schema order
+        // require metadata-only renumbering before the next persisted write.
+        for order in [0, u64::MAX] {
+            ledger.receipts.get_mut(&balance).unwrap().write_order = order;
+            let mut state = Runtime {
+                ledger: Some(ledger.clone()),
+                ..Default::default()
+            };
+            state.protect_current_receipts(&config, month);
+            state.remember_receipt(&balance, Kind::Balance, test_instant(0));
+            assert!(submit_with_clock(
+                &mut state,
+                identity(Kind::Test, "", 0.0, (0, 0)),
+                Kind::Test,
+                1_000_000,
+                test_instant(1),
+                |_| Ok(()),
+                persist_ledger,
+            )
+            .unwrap());
+            let preserved = state.ledger.as_ref().unwrap().receipts[&balance].clone();
+            assert_eq!(preserved.attempted_at, 1_000);
+            assert_eq!(preserved.cooldown_started_at, Some(900));
+            assert!(preserved.submitted);
+            assert!(preserved.write_order > 0 && preserved.write_order < u64::MAX);
+            assert!(!submit_with_clock(
+                &mut state,
+                balance.clone(),
+                Kind::Balance,
+                1_000_000,
+                test_instant(2),
+                |_| panic!("metadata compaction must not replace the running Instant cooldown"),
+                |_| panic!("unchanged attempt should not write"),
+            )
+            .unwrap());
+            let persisted = load_ledger().unwrap();
+            assert_eq!(persisted.receipts[&balance], preserved);
+            assert!(persisted
+                .receipts
+                .values()
+                .all(|receipt| receipt.write_order > 0));
+        }
     }
 
     #[test]

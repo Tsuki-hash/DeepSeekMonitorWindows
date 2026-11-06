@@ -1106,6 +1106,238 @@ scenario(
     }),
 );
 
+function onlyTimer(delay: number) {
+  const matches = [...timers.values()].filter((timer) => timer.delay === delay);
+  assert.equal(matches.length, 1, `Expected one owned ${delay}ms timer`);
+  return matches[0];
+}
+
+for (const code of [
+  "credentials_invalid",
+  "not_configured",
+  "rate_limited",
+  "unavailable",
+  "config_read_error",
+  "encryption_unavailable",
+  "cancelled",
+] as const) {
+  scenario(`R34 previous-month ${code} propagates`, (concurrent) =>
+    atMonthStart(async () => {
+      const previous = deferred<UsageResult>();
+      const failure = {
+        code,
+        message: `Synthetic previous-month ${code}`,
+        credential: "usage_token",
+        retryable: code === "rate_limited" || code === "unavailable",
+      };
+      usageRead = (month) =>
+        month === "2026-10" ? previous.promise : Promise.resolve(sampleUsage());
+      await mount(concurrent);
+      const request = fetchCurrentUsage();
+      const rejection = request.then(
+        () => assert.fail("A channel failure must not become partial success"),
+        (error) => error,
+      );
+      await acceptBoth();
+      await change(() => previous.reject(failure));
+      assert.equal(
+        await rejection,
+        failure,
+        "Preserve the exact structured IPC error",
+      );
+      const props = renderer.root.findByType(DashboardPanel).props;
+      assert.equal(props.usage, null);
+      assert.equal(props.usageUpdatedAt, null);
+      assert.equal(props.usageError, failure.message);
+      assert.equal(
+        props.usageState,
+        code === "not_configured" ? "nokey" : "error",
+      );
+      assert.deepEqual(usageCalls, ["2026-11", "2026-10"]);
+      if (code === "credentials_invalid" || code === "not_configured") {
+        const paused = onlyTimer(300_000);
+        await change(() => paused.callback());
+        assert.deepEqual(
+          usageCalls,
+          ["2026-11", "2026-10"],
+          "A paused usage channel must not call IPC when its probe timer runs",
+        );
+        onlyTimer(300_000);
+      } else if (failure.retryable) {
+        onlyTimer(120_000);
+      }
+    }),
+  );
+}
+
+scenario("R34 previous-month 401 clears old data", (concurrent) =>
+  atMonthStart(async () => {
+    await mount(concurrent);
+    await acceptBoth();
+    assert.equal(
+      renderer.root.findByType(DashboardPanel).props.usage.monthCost,
+      1,
+    );
+    const failure = {
+      code: "credentials_invalid",
+      message: "Synthetic token rejection after current-month success",
+      retryable: false,
+    };
+    usageRead = (month) =>
+      month === "2026-10"
+        ? Promise.reject(failure)
+        : Promise.resolve({ ...sampleUsage(), monthCost: 99 });
+    await change(() =>
+      renderer.root.findByType(DashboardPanel).props.onRefresh(),
+    );
+    const props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(props.usageState, "error");
+    assert.equal(props.usageError, failure.message);
+    assert.equal(
+      props.usage,
+      null,
+      "Neither the retained nor partial new snapshot stays usable",
+    );
+    assert.equal(props.usageUpdatedAt, null);
+    const before = usageCalls.length;
+    await change(() => onlyTimer(300_000).callback());
+    assert.equal(usageCalls.length, before);
+  }),
+);
+
+scenario("R34 previous-month 429 backs off until recovery", (concurrent) =>
+  atMonthStart(async () => {
+    await mount(concurrent);
+    await acceptBoth();
+    const old = renderer.root.findByType(DashboardPanel).props;
+    const failure = {
+      code: "rate_limited",
+      message: "Synthetic previous-month rate limit",
+      retryable: true,
+    };
+    usageRead = (month) =>
+      month === "2026-10"
+        ? Promise.reject(failure)
+        : Promise.resolve({ ...sampleUsage(), monthCost: 99 });
+    await change(() =>
+      renderer.root.findByType(DashboardPanel).props.onRefresh(),
+    );
+    let props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(
+      props.usageState,
+      "ok",
+      "A retained snapshot remains displayable as stale",
+    );
+    assert.equal(props.usageError, failure.message);
+    assert.equal(
+      props.usage,
+      old.usage,
+      "The new current-month-only result is not committed",
+    );
+    assert.equal(props.usageUpdatedAt, old.usageUpdatedAt);
+    assert.equal(usageCalls.length, 4);
+    await change(() => onlyTimer(120_000).callback());
+    assert.equal(usageCalls.length, 6);
+    onlyTimer(240_000);
+    props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(props.usage, old.usage);
+    assert.equal(props.usageError, failure.message);
+    usageRead = async () => ({ ...sampleUsage(), monthCost: 22 });
+    await change(() => onlyTimer(240_000).callback());
+    props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(usageCalls.length, 8);
+    assert.equal(props.usage.monthCost, 22);
+    assert.equal(props.usageState, "ok");
+    assert.equal(props.usageError, "");
+    assert.equal(
+      scheduled().length,
+      2,
+      "Recovery restores both base schedules",
+    );
+    assert.equal(
+      [...timers.values()].some((timer) => timer.delay === 240_000),
+      false,
+    );
+  }),
+);
+
+scenario("R34 old-account 429 cannot affect new success", (concurrent) =>
+  atMonthStart(async () => {
+    const previous = deferred<UsageResult>();
+    let previousReads = 0;
+    usageRead = (month) => {
+      if (month === "2026-10" && ++previousReads === 1) return previous.promise;
+      return Promise.resolve({ ...sampleUsage(), monthCost: 22 });
+    };
+    await mount(concurrent);
+    await acceptBoth();
+    const old = fetchCurrentUsage();
+    const revoked = assert.rejects(() => old, /替代/);
+    await change(() => {
+      config = {
+        ...config,
+        configRevision: ++revision,
+        usageTokenRevision: revision,
+      };
+      setCommittedConfig(config);
+    });
+    assert.equal(
+      renderer.root.findByType(DashboardPanel).props.usage.monthCost,
+      22,
+    );
+    await change(() =>
+      previous.reject({
+        code: "rate_limited",
+        message: "Old account 429",
+        retryable: true,
+      }),
+    );
+    await revoked;
+    const props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(props.usage.monthCost, 22);
+    assert.equal(props.usageError, "");
+    assert.equal(props.usageState, "ok");
+    assert.deepEqual(usageCalls, ["2026-11", "2026-10", "2026-11", "2026-10"]);
+    assert.equal(scheduled().length, 2);
+    assert.equal(
+      [...timers.values()].some((timer) => timer.delay === 120_000),
+      false,
+    );
+  }),
+);
+
+scenario("R34 invalid month data preserves partial success", (concurrent) =>
+  atMonthStart(async () => {
+    usageRead = (month) =>
+      month === "2026-10"
+        ? Promise.reject({
+            code: "invalid_data",
+            // A structured month error must not become auth failure by text.
+            message: "Synthetic Token count has invalid month data",
+            retryable: false,
+          })
+        : Promise.resolve(sampleUsage());
+    await mount(concurrent);
+    await acceptBoth();
+    const props = renderer.root.findByType(DashboardPanel).props;
+    assert.equal(props.usageState, "ok");
+    assert.equal(props.usageError, "");
+    assert.equal(props.usage.monthCost, 1);
+    assert.deepEqual(props.usage.unavailableDates, [
+      "2026-10-31",
+      "2026-10-30",
+      "2026-10-29",
+      "2026-10-28",
+      "2026-10-27",
+    ]);
+    assert.deepEqual(props.usage.warnings, [
+      "上月数据暂未获取，缺失日期标为未知",
+    ]);
+    assert.deepEqual(usageCalls, ["2026-11", "2026-10"]);
+    assert.equal(scheduled().length, 2);
+  }),
+);
+
 // Source contracts complement the synthetic IPC rejection scenarios above.
 // They do not execute Rust, create a native window or validate browser layout.
 test("R29 native visibility error contract", () => {

@@ -19,6 +19,7 @@ import {
   UsageSyncOwner,
   UsageSyncRequests,
 } from "./usage-sync-owner";
+import { UsageSyncReconciler } from "./usage-sync-reconcile";
 import { errorMessage } from "./error-state";
 import type { LeaveBlocker } from "./leave-guard";
 import { CredentialDraft } from "./credential-draft";
@@ -237,9 +238,31 @@ export function useSettingsState(): SettingsState {
     tokenFeedback.current.edit();
     setUsageStatus(tokenFeedback.current.status);
   }, [clearUsageTokenDraft]);
-  const [usageSyncing, setUsageSyncing] = React.useState(false);
+  const [usageSyncing, setUsageSyncingState] = React.useState(false);
+  const syncing = React.useRef(false);
+  const syncReconciler = React.useRef<UsageSyncReconciler | null>(null);
+  const [syncListenerError, setSyncListenerError] = React.useState(false);
+  const [syncReadError, setSyncReadError] = React.useState("");
+  const setUsageSyncing = React.useCallback((active: boolean) => {
+    const changed = syncing.current !== active;
+    syncing.current = active;
+    setUsageSyncingState(active);
+    if (active && changed) syncReconciler.current?.request();
+  }, []);
   const syncRequestId = React.useRef(0);
+  const syncCancelPending = React.useRef<number | null>(null);
   const syncOwner = React.useRef(new UsageSyncOwner());
+  // Explicit cancellation also reads status. Serialize it behind an older read,
+  // then issue a fresh read; never reuse a pre-cancel active snapshot.
+  const syncStatusRead = React.useRef<Promise<unknown>>(Promise.resolve());
+  const readSyncStatus = React.useCallback((current: () => boolean) => {
+    const reading = syncStatusRead.current.then(() => {
+      if (!current()) throw new Error("同步状态读取已撤销");
+      return invoke<UsageSyncStatus>("get_usage_sync_status");
+    });
+    syncStatusRead.current = reading.catch(() => undefined);
+    return reading;
+  }, []);
   const syncFeedbackOwner = React.useRef<{
     requestId: string;
     feedback: UsageTokenFeedbackOwner;
@@ -340,75 +363,151 @@ export function useSettingsState(): SettingsState {
   React.useEffect(() => {
     const current = capturePage();
     let eventRevision = 0;
-    const requests = [
-      listen<UsageSyncStatus>("usage-sync-started", ({ payload }) => {
-        eventRevision += 1;
-        if (!current() || !syncOwner.current.accept(payload)) return;
-        setUsageSyncing(payload.active && payload.kind === "web");
-      }),
-      listen<UsageTokenCaptured>("usage-token-captured", ({ payload }) => {
-        eventRevision += 1;
-        // Persisted credentials still belong to the app, regardless of page/session.
-        setCommittedConfig(payload.config);
-        if (!current() || !syncOwner.current.accept(payload)) return;
-        syncRequestId.current += 1;
-        setUsageSyncing(false);
-        const owner = syncFeedbackOwner.current;
-        if (owner?.requestId === payload.requestId) {
-          owner.suppressEndedFeedback = true;
-          tokenFeedback.current.update(
-            owner.feedback,
-            tokenDraft.current.revision,
-            null,
-            true,
-            "sync",
-          );
-        }
-        setUsageStatus(tokenFeedback.current.status);
-      }),
-      listen<UsageSyncStatus>("usage-sync-ended", ({ payload }) => {
-        eventRevision += 1;
-        if (!current() || !syncOwner.current.accept(payload)) return;
-        setUsageSyncing(false);
-        const owner = syncFeedbackOwner.current;
-        // Event delivery may trail the cancel receipt or a successful capture.
-        // Duplicate terminal events do not replace feedback or cancel its read.
+    const reconciler = new UsageSyncReconciler({
+      subscriptions: [
+        (subscribed) =>
+          listen<UsageSyncStatus>("usage-sync-started", ({ payload }) => {
+            if (!current() || !subscribed()) return;
+            eventRevision += 1;
+            if (!syncOwner.current.accept(payload)) return;
+            setUsageSyncing(payload.active && payload.kind === "web");
+          }),
+        (subscribed) =>
+          listen<UsageTokenCaptured>("usage-token-captured", ({ payload }) => {
+            if (!current() || !subscribed()) return;
+            eventRevision += 1;
+            // A live listener may receive another session's accepted commit.
+            // Credentials are global; only matching progress belongs to this page.
+            setCommittedConfig(payload.config);
+            if (!syncOwner.current.accept(payload)) return;
+            syncRequestId.current += 1;
+            setUsageSyncing(false);
+            const owner = syncFeedbackOwner.current;
+            if (owner?.requestId === payload.requestId) {
+              owner.suppressEndedFeedback = true;
+              tokenFeedback.current.update(
+                owner.feedback,
+                tokenDraft.current.revision,
+                null,
+                true,
+                "sync",
+              );
+            }
+            setUsageStatus(tokenFeedback.current.status);
+          }),
+        (subscribed) =>
+          listen<UsageSyncStatus>("usage-sync-ended", ({ payload }) => {
+            if (!current() || !subscribed()) return;
+            eventRevision += 1;
+            if (!syncOwner.current.accept(payload)) return;
+            setUsageSyncing(false);
+            const owner = syncFeedbackOwner.current;
+            // Duplicate terminal events cannot replace an accepted receipt.
+            if (
+              payload.kind === "web" &&
+              owner?.requestId === payload.requestId &&
+              owner.suppressEndedFeedback
+            )
+              return;
+            syncRequestId.current += 1;
+            if (payload.kind === "web") {
+              if (owner?.requestId === payload.requestId)
+                tokenFeedback.current.update(
+                  owner.feedback,
+                  tokenDraft.current.revision,
+                  "未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。",
+                  true,
+                  "sync",
+                );
+              setUsageStatus(tokenFeedback.current.status);
+              setShowManualPaste(true);
+            }
+          }),
+      ],
+      needed: () => current() && syncing.current,
+      listenerError: (failed) => {
+        if (current()) setSyncListenerError(failed);
+      },
+      readError: (error) => {
+        if (current())
+          setSyncReadError(error === null ? "" : errorMessage(error));
+      },
+      clock: {
+        setTimeout: (callback, delay) => window.setTimeout(callback, delay),
+        clearTimeout: (timer) => window.clearTimeout(timer),
+      },
+      reconcile: async (mounted) => {
+        const startedAt = syncRequestId.current;
+        const requestId = syncOwner.current.requestId;
+        const generation = syncOwner.current.generation;
+        // A local start with no native receipt is not owned by an older status.
+        // Manual saves and completed local actions do not need web-login polling.
         if (
-          payload.kind === "web" &&
-          owner?.requestId === payload.requestId &&
-          owner.suppressEndedFeedback
+          syncCancelPending.current === startedAt ||
+          (requestId && (!syncing.current || generation === null))
         )
           return;
-        syncRequestId.current += 1;
-        if (payload.kind === "web") {
-          if (owner?.requestId === payload.requestId)
-            tokenFeedback.current.update(
-              owner.feedback,
-              tokenDraft.current.revision,
-              "未获取到用量 Token。可再次点击同步，或使用方式二手动粘贴。",
-              true,
-              "sync",
-            );
-          setUsageStatus(tokenFeedback.current.status);
-          setShowManualPaste(true);
-        }
-      }),
-    ];
-    // Subscribe first, then restore backend state on remount. A local action or
-    // accepted terminal event supersedes this read, just like config reads.
-    const startedAt = syncRequestId.current;
-    const feedback = tokenFeedback.current.capture(tokenDraft.current.revision);
-    void Promise.all(requests)
-      .then(async () => {
-        while (current() && startedAt === syncRequestId.current) {
+        const ownsRead = () =>
+          mounted() &&
+          current() &&
+          startedAt === syncRequestId.current &&
+          requestId === syncOwner.current.requestId &&
+          generation === syncOwner.current.generation;
+        const feedback = tokenFeedback.current.capture(
+          tokenDraft.current.revision,
+        );
+        while (ownsRead()) {
           const eventsAtStart = eventRevision;
-          const snapshot = await invoke<UsageSyncStatus>(
-            "get_usage_sync_status",
-          );
-          if (!current() || startedAt !== syncRequestId.current) return;
+          let snapshot: UsageSyncStatus;
+          try {
+            snapshot = await readSyncStatus(ownsRead);
+          } catch (error) {
+            if (ownsRead()) throw error;
+            return;
+          }
+          if (!ownsRead()) return;
           // A terminal event can arrive before a remounted page knows its owner.
           // Re-read instead of resurrecting the pre-event active snapshot.
           if (eventsAtStart !== eventRevision) continue;
+          if (requestId) {
+            const matches =
+              snapshot.requestId === requestId &&
+              snapshot.generation === generation &&
+              snapshot.kind === "web";
+            if (matches && snapshot.active) return;
+            // A matching inactive receipt (or native replacement) ends waiting,
+            // but status has no success reason. Re-read config and report only
+            // the facts, never infer this session succeeded from configured=true.
+            const revision = getCommitRevision();
+            let latest: AppConfig;
+            try {
+              latest = await invoke<AppConfig>("get_app_config");
+            } catch (error) {
+              if (ownsRead() && eventsAtStart === eventRevision) throw error;
+              return;
+            }
+            if (!ownsRead()) return;
+            if (eventsAtStart !== eventRevision) continue;
+            applyReadConfig(latest, revision);
+            syncOwner.current.finish(requestId);
+            syncRequestId.current += 1;
+            setUsageSyncing(false);
+            const owner = syncFeedbackOwner.current;
+            if (owner?.requestId === requestId) {
+              owner.suppressEndedFeedback = true;
+              tokenFeedback.current.update(
+                owner.feedback,
+                tokenDraft.current.revision,
+                matches
+                  ? "同步已结束，当前配置已核对。"
+                  : "同步已被替代，当前配置已核对。",
+                true,
+                "sync",
+              );
+            }
+            setUsageStatus(tokenFeedback.current.status);
+            return;
+          }
           syncOwner.current.restore(snapshot);
           setUsageSyncing(snapshot.active && snapshot.kind === "web");
           if (
@@ -431,13 +530,15 @@ export function useSettingsState(): SettingsState {
           }
           return;
         }
-      })
-      .catch(() => undefined);
+      },
+    });
+    syncReconciler.current = reconciler;
+    reconciler.start();
     return () => {
-      for (const request of requests)
-        void request.then((unlisten) => unlisten()).catch(() => undefined);
+      reconciler.dispose();
+      if (syncReconciler.current === reconciler) syncReconciler.current = null;
     };
-  }, [capturePage, tokenDraft]);
+  }, [capturePage, tokenDraft, readSyncStatus, setUsageSyncing]);
 
   const pasteApiKey = React.useCallback(async () => {
     const allowed = interactionGate.capture();
@@ -741,14 +842,19 @@ export function useSettingsState(): SettingsState {
         );
         setUsageStatus(tokenFeedback.current.status);
       });
-  }, [capturePage, tokenDraft, interactionGate]);
+  }, [capturePage, tokenDraft, interactionGate, setUsageSyncing]);
 
   const cancelUsageSync = React.useCallback(() => {
     const current = capturePage();
     const owner = syncOwner.current;
     const requestId = owner.requestId;
     if (!current() || !requestId) return;
-    ++syncRequestId.current; // Invalidate the old start response immediately.
+    const sequence = ++syncRequestId.current; // Revoke old start and status reads.
+    syncCancelPending.current = sequence;
+    const ownsCancellation = () =>
+      current() &&
+      sequence === syncRequestId.current &&
+      syncOwner.current.owns(requestId);
     const feedback = tokenFeedback.current.begin(
       tokenDraft.current.revision,
       "正在取消同步…",
@@ -765,22 +871,25 @@ export function useSettingsState(): SettingsState {
       generation: owner.generation,
     })
       .then(async (ended) => {
-        if (!current() || !syncOwner.current.owns(requestId)) return;
+        if (!ownsCancellation()) return;
         if (!ended) {
           // The request may already have captured a Token. A no-op is not a
           // cancellation receipt and cannot promise that the old Token is unchanged.
           const startedAt = getCommitRevision();
           const [snapshot, latestConfig] = await Promise.all([
-            invoke<UsageSyncStatus>("get_usage_sync_status"),
+            readSyncStatus(ownsCancellation),
             invoke<AppConfig>("get_app_config"),
           ]);
+          if (!ownsCancellation()) return;
           applyReadConfig(latestConfig, startedAt);
-          if (!current() || !syncOwner.current.owns(requestId)) return;
           syncOwner.current.restore(snapshot);
           setUsageSyncing(snapshot.active && snapshot.kind === "web");
           if (snapshot.active && snapshot.kind === "web") {
-            if (syncFeedbackOwner.current?.feedback === feedback)
-              syncFeedbackOwner.current.suppressEndedFeedback = false;
+            if (snapshot.requestId)
+              syncFeedbackOwner.current = {
+                requestId: snapshot.requestId,
+                feedback,
+              };
             tokenFeedback.current.update(
               feedback,
               tokenDraft.current.revision,
@@ -813,7 +922,7 @@ export function useSettingsState(): SettingsState {
         setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (current() && syncOwner.current.owns(requestId)) {
+        if (ownsCancellation()) {
           if (syncFeedbackOwner.current?.feedback === feedback)
             syncFeedbackOwner.current.suppressEndedFeedback = false;
           tokenFeedback.current.update(
@@ -825,8 +934,14 @@ export function useSettingsState(): SettingsState {
           );
           setUsageStatus(tokenFeedback.current.status);
         }
+      })
+      .finally(() => {
+        if (syncCancelPending.current === sequence) {
+          syncCancelPending.current = null;
+          if (current() && syncing.current) syncReconciler.current?.request();
+        }
       });
-  }, [capturePage, tokenDraft]);
+  }, [capturePage, tokenDraft, readSyncStatus, setUsageSyncing]);
   const tokenSaves = React.useRef(
     new Map<
       number,
@@ -928,7 +1043,7 @@ export function useSettingsState(): SettingsState {
       });
       return saving;
     },
-    [commitUsageToken, tokenDraft, interactionGate],
+    [commitUsageToken, tokenDraft, interactionGate, setUsageSyncing],
   );
   const saveUsageToken = React.useCallback(
     () => saveTokenSnapshot(tokenDraft.current.snapshot()),
@@ -986,7 +1101,7 @@ export function useSettingsState(): SettingsState {
       .finally(() => {
         if (current()) setBusy(false);
       });
-  }, [tokenDraft, commitUsageToken]);
+  }, [tokenDraft, commitUsageToken, setUsageSyncing]);
 
   // Privacy results belong to an app-lifetime operation. Only its original
   // page/draft owner may consume a candidate, but every later page sees results.
@@ -1037,7 +1152,7 @@ export function useSettingsState(): SettingsState {
       .finally(() => {
         if (current()) setBusy(false);
       });
-  }, [tokenDraft, commitUsageToken]);
+  }, [tokenDraft, commitUsageToken, setUsageSyncing]);
 
   React.useEffect(() => {
     const cleared = listen<AppConfig>("usage-token-cleared", (event) => {
@@ -1244,7 +1359,15 @@ export function useSettingsState(): SettingsState {
     refresh,
     autoRefresh,
     autostart,
-    usageStatus,
+    usageStatus: [
+      usageStatus,
+      syncListenerError
+        ? "同步通知连接失败，正在重连；同步状态会自动核对。"
+        : "",
+      syncReadError ? `同步状态核对失败，将自动重试：${syncReadError}` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
     settingErrors,
     usageSyncing,
     showManualPaste,

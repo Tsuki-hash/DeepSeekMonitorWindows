@@ -6,6 +6,17 @@ import { historyCache } from "./history-cache";
 import { getConfigSubscriptionReady } from "./config-store";
 
 const usageGate = new RequestGate<UsageResult>();
+// These failures affect the account/channel, not just one month's chart data.
+// Preserve the original IPC error so App can pause, back off or show recovery.
+const channelFailureCodes = new Set([
+  "not_configured",
+  "credentials_invalid",
+  "rate_limited",
+  "config_read_error",
+  "encryption_unavailable",
+  "cancelled",
+  "unavailable",
+]);
 export const invalidateUsageRequests = () => {
   usageGate.invalidate();
   historyCache.invalidate();
@@ -52,10 +63,20 @@ export const fetchCurrentUsage = () =>
         ...current,
         days: [...previousUsage.days, ...current.days],
       };
-    } catch {
+    } catch (error) {
       // Revoked ownership/readiness is cancellation, not a partial-data result.
       // Checking again also covers a previous-month rejection after revocation.
       assertAvailable();
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        typeof error.code === "string" &&
+        channelFailureCodes.has(error.code)
+      )
+        throw error;
+      // Invalid/unknown month data still leaves the current month usable.
+      // Do not infer account failure from display text such as "Token count".
       const now = new Date(`${date}T00:00:00Z`);
       const unavailableDates = Array.from({ length: 7 }, (_, i) =>
         new Date(now.getTime() - i * 86400_000).toISOString().slice(0, 10),
