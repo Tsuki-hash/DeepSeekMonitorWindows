@@ -2687,7 +2687,9 @@ button:disabled:hover {
 }
 
 /* 首页内部滚动区（复评 F04）：引导卡与数据同处一列，避免 stage 多出第三个网格子项。
-   面板本身不再裁掉底部内容，导航行高度保持 48px 不变。 */
+   面板本身不再裁掉底部内容，导航行高度保持 48px 不变。
+   滚动条隐藏但滚动保留：Chromium 默认条在窄面板里既粗又抢眼，
+   与设置页那套 6px 圆角细条也不一致；内容溢出时仍有滚轮/触控板/键盘可达。 */
 .dashboard-scroll {
   display: flex;
   flex-direction: column;
@@ -2696,8 +2698,12 @@ button:disabled:hover {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-width: thin;
+  scrollbar-width: none;
   padding-bottom: 2px;
+}
+.dashboard-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 .dashboard-panel {
   padding-bottom: 0;
