@@ -626,17 +626,22 @@ mod tests {
         assert!(reread.auto_refresh_enabled && reread.autostart);
     }
 
-    /// 是否具备 DPAPI 能力。非 Windows 或 DPAPI 调用失败时为 false，
-    /// 此时加密相关断言自动跳过（回退明文是设计上允许的行为）。
-    fn dpapi_available() -> bool {
-        credentials::encrypt("probe").is_some()
+    /// 非 Windows 时明确跳过加密相关断言（复评 F16：不能把「加密失败」当成跳过）。
+    fn require_windows_encryption() -> bool {
+        cfg!(windows)
     }
 
     #[test]
     fn 落盘的凭据是密文_不是明文() {
-        if !dpapi_available() {
+        if !require_windows_encryption() {
+            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
+        // Windows 上加密必须真的可用：失败即失败，不静默跳过。
+        assert!(
+            credentials::encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用，落盘加密无法工作"
+        );
         // M-1 的核心断言：文件内容里不能出现明文凭据。
         let _dir = TempConfigDir::new("m1_ciphertext_on_disk");
         let secret = "sk-verysecretvalue123456";
@@ -658,9 +663,15 @@ mod tests {
 
     #[test]
     fn 明文旧配置_读取后自动迁移为密文() {
-        if !dpapi_available() {
+        if !require_windows_encryption() {
+            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
+        // Windows 上加密必须真的可用：失败即失败，不静默跳过。
+        assert!(
+            credentials::encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用，落盘加密无法工作"
+        );
         // 迁移路径：v1.2.1 写出的文件是明文且 version 为 0。
         // 读取时既要能正常用，也要顺手把落盘内容换成密文。
         let _dir = TempConfigDir::new("m1_migration");
@@ -690,9 +701,15 @@ mod tests {
 
     #[test]
     fn 已加密配置_重复读取不改变内容() {
-        if !dpapi_available() {
+        if !require_windows_encryption() {
+            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
+        // Windows 上加密必须真的可用：失败即失败，不静默跳过。
+        assert!(
+            credentials::encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用，落盘加密无法工作"
+        );
         // 迁移必须是幂等的：第二次读取不应再次回写（否则每次启动都写一次盘）。
         let _dir = TempConfigDir::new("m1_idempotent");
         let config = StoredConfig {
@@ -713,9 +730,15 @@ mod tests {
 
     #[test]
     fn 解不开的密文_凭据置空_其余字段保留() {
-        if !dpapi_available() {
+        if !require_windows_encryption() {
+            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
+        // Windows 上加密必须真的可用：失败即失败，不静默跳过。
+        assert!(
+            credentials::encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用，落盘加密无法工作"
+        );
         // 模拟「config.json 从另一台机器拷贝过来」：密文格式正确但本机 DPAPI 解不开。
         // 期望：凭据字段清空（让界面回到「未配置」提示重填），
         // 但刷新间隔等非凭据设置必须原样保留。

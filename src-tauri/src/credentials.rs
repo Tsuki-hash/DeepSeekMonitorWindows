@@ -146,16 +146,33 @@ mod platform {
 mod tests {
     use super::*;
 
-    /// DPAPI 在当前进程可用。Windows 上的普通单测进程即可调用（不需要 Tauri 运行时）。
-    fn platform_supports_dpapi() -> bool {
-        cfg!(windows) && encrypt("probe").is_some()
+    /// 是否在 Windows 上运行。
+    ///
+    /// 复评 F16：原实现用 `cfg!(windows) && encrypt("probe").is_some()` 决定是否跳过，
+    /// 于是 Windows 上 DPAPI 真的坏掉时测试会「静默 return」，测试框架仍记为通过。
+    /// 现在区分两件事：平台是否支持（编译期决定），以及加密是否真的可用（必须断言）。
+    fn on_windows() -> bool {
+        cfg!(windows)
+    }
+
+    /// 非 Windows 平台明确跳过，并在测试名里体现「未在真实加密环境验证」。
+    macro_rules! require_windows {
+        () => {
+            if !on_windows() {
+                eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
+                return;
+            }
+        };
     }
 
     #[test]
     fn 密文带前缀_明文不带() {
-        if !platform_supports_dpapi() {
-            return;
-        }
+        require_windows!();
+        // Windows 上加密必须真的可用：失败即测试失败，不允许静默通过。
+        assert!(
+            encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用：安全存储无法工作，测试必须失败而不是跳过"
+        );
         let cipher = encrypt("sk-secret").unwrap();
         assert!(is_ciphertext(&cipher));
         assert!(!is_ciphertext("sk-secret"));
@@ -164,9 +181,12 @@ mod tests {
 
     #[test]
     fn 加密后能原样解回() {
-        if !platform_supports_dpapi() {
-            return;
-        }
+        require_windows!();
+        // Windows 上加密必须真的可用：失败即测试失败，不允许静默通过。
+        assert!(
+            encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用：安全存储无法工作，测试必须失败而不是跳过"
+        );
         for plain in ["sk-abcdefghijklmnop", "含中文的凭据", "", "a"] {
             let cipher = encrypt(plain).unwrap();
             let back = decrypt(&cipher).unwrap().unwrap();
@@ -176,9 +196,12 @@ mod tests {
 
     #[test]
     fn 密文里不出现明文() {
-        if !platform_supports_dpapi() {
-            return;
-        }
+        require_windows!();
+        // Windows 上加密必须真的可用：失败即测试失败，不允许静默通过。
+        assert!(
+            encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用：安全存储无法工作，测试必须失败而不是跳过"
+        );
         let plain = "sk-verysecretvalue123456";
         let cipher = encrypt(plain).unwrap();
         assert!(!cipher.contains(plain), "密文不应包含明文");
@@ -186,9 +209,12 @@ mod tests {
 
     #[test]
     fn 同一明文两次加密_密文不同() {
-        if !platform_supports_dpapi() {
-            return;
-        }
+        require_windows!();
+        // Windows 上加密必须真的可用：失败即测试失败，不允许静默通过。
+        assert!(
+            encrypt("probe").is_some(),
+            "Windows 上 DPAPI 不可用：安全存储无法工作，测试必须失败而不是跳过"
+        );
         // DPAPI 每次调用使用新的随机会话密钥，因此密文必然不同。
         // 这也意味着不能靠比较密文判断凭据是否变化。
         let a = encrypt("sk-same").unwrap();
