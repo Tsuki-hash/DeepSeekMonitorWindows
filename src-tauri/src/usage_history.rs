@@ -1,6 +1,6 @@
 //! Lossless model identity for history/export, alongside the existing dashboard slots.
 use crate::deepseek_api::ModelUsage;
-use crate::usage::{amount, count, model_slot, Entry, MAX_SAFE_COUNT};
+use crate::usage::{invalid_token_counts, model_slot, token_breakdown};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -17,17 +17,6 @@ pub struct RawModelUsage {
     pub other_tokens: Option<u64>,
     pub cost: Option<f64>,
     pub data_warning: Option<String>,
-}
-
-fn sum(entries: &[Entry], include: impl Fn(&str) -> bool) -> Option<u64> {
-    entries
-        .iter()
-        .filter(|entry| include(&entry.kind))
-        .try_fold(0u64, |total, entry| {
-            total
-                .checked_add(count(&entry.amount)?)
-                .filter(|value| *value <= MAX_SAFE_COUNT)
-        })
 }
 
 pub fn raw_models(amount_rows: &[ModelUsage], cost_rows: &[ModelUsage]) -> Vec<RawModelUsage> {
@@ -51,44 +40,19 @@ pub fn raw_models(amount_rows: &[ModelUsage], cost_rows: &[ModelUsage]) -> Vec<R
         .map(|model| {
             let entries = tokens.get(model);
             let values = entries.map(Vec::as_slice).unwrap_or(&[]);
-            let present = |kind: &str| entries.is_some_and(|e| e.iter().any(|x| x.kind == kind));
-            let has_tokens = entries.is_some_and(|e| e.iter().any(|x| x.kind != "REQUEST"));
-            let request = sum(values, |kind| kind == "REQUEST");
-            let hit = sum(values, |kind| kind == "PROMPT_CACHE_HIT_TOKEN");
-            let miss = sum(values, |kind| kind == "PROMPT_CACHE_MISS_TOKEN");
-            let response = sum(values, |kind| kind == "RESPONSE_TOKEN");
-            // Preserve the dashboard's zero-detail PROMPT_TOKEN fallback, but invalid
-            // cache detail stays unknown and cannot be replaced by a prompt total.
-            let prompt_fallback = hit == Some(0) && miss == Some(0);
-            let other = sum(values, |kind| match kind {
-                "REQUEST"
-                | "PROMPT_CACHE_HIT_TOKEN"
-                | "PROMPT_CACHE_MISS_TOKEN"
-                | "RESPONSE_TOKEN" => false,
-                "PROMPT_TOKEN" => prompt_fallback,
-                _ => true,
-            });
-            let total = [hit, miss, response, other]
-                .into_iter()
-                .try_fold(0u64, |total, value| {
-                    total
-                        .checked_add(value?)
-                        .filter(|value| *value <= MAX_SAFE_COUNT)
-                });
-            let invalid = values.iter().any(|entry| count(&entry.amount).is_none())
-                || values.iter().any(|entry| amount(&entry.amount).is_none())
-                || [request, hit, miss, response, other, total]
-                    .iter()
-                    .any(Option::is_none);
+            // 首页与历史共用同一解析器；字段缺失、显式零、非法/溢出以及
+            // PROMPT fallback 都只有一个口径，不能各自把缺项补成零。
+            let breakdown = token_breakdown(values);
+            let invalid = invalid_token_counts(values, &breakdown);
             RawModelUsage {
                 model: model.to_owned(),
                 group_key: model_slot(model).map(|(key, _)| key.to_owned()),
-                total_tokens: has_tokens.then_some(total).flatten(),
-                request_count: present("REQUEST").then_some(request).flatten(),
-                cache_hit_tokens: present("PROMPT_CACHE_HIT_TOKEN").then_some(hit).flatten(),
-                cache_miss_tokens: present("PROMPT_CACHE_MISS_TOKEN").then_some(miss).flatten(),
-                response_tokens: present("RESPONSE_TOKEN").then_some(response).flatten(),
-                other_tokens: has_tokens.then_some(other).flatten(),
+                total_tokens: breakdown.total,
+                request_count: breakdown.request,
+                cache_hit_tokens: breakdown.cache_hit,
+                cache_miss_tokens: breakdown.cache_miss,
+                response_tokens: breakdown.response,
+                other_tokens: breakdown.other,
                 cost: costs.get(model).copied().flatten(),
                 data_warning: invalid
                     .then(|| "平台 Token 计数异常，受影响的历史字段保留为未知".into()),

@@ -21,6 +21,9 @@ export function AlertSettings({
   const [budget, setBudget] = React.useState("");
   const [open, setOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  // 读取故障与验证/保存/测试通知错误各有所有者。轮询恢复只清读取故障，
+  // 不能清掉仍待用户处理的保存失败，也不能要求用户丢弃草稿才能恢复。
+  const [readError, setReadError] = React.useState("");
   const [error, setError] = React.useState("");
   const [message, setMessage] = React.useState("");
   // 复评 F07：**读取代际与写操作所有权分开**。
@@ -82,15 +85,17 @@ export function AlertSettings({
           control.current.active &&
           sequence === control.current.readSequence &&
           writeAtStart === control.current.writeSequence
-        )
+        ) {
           accept(value, reset);
+          setReadError("");
+        }
       } catch (failure) {
         if (
           control.current.active &&
           sequence === control.current.readSequence &&
           writeAtStart === control.current.writeSequence
         )
-          setError(errorMessage(failure));
+          setReadError(errorMessage(failure));
       }
     },
     [accept],
@@ -151,6 +156,8 @@ export function AlertSettings({
       ) {
         // A later edit, including ABA, is a new draft even if text is equal.
         accept(value, live.current.revision === revision);
+        // 保存回执是新的可信状态；放弃草稿仅恢复旧基线，不走此清错路径。
+        setReadError("");
         setMessage("提醒设置已保存");
         return !dirtyNow();
       }
@@ -346,7 +353,12 @@ export function AlertSettings({
           {error}
         </p>
       )}
-      {!draft && error && (
+      {readError && (
+        <p className="data-error" role="alert">
+          {readError}
+        </p>
+      )}
+      {!draft && readError && (
         <button className="secondary" onClick={() => void reload(true)}>
           重新读取设置
         </button>
@@ -394,7 +406,8 @@ export function AlertSettings({
       <details className="alert-explanation">
         <summary>提醒说明</summary>
         <p className="muted">
-          只用成功且有效的最新查询触发提醒；失败时逐步退避至30分钟，凭据失效暂停该项。预算按 DeepSeek 平台东八区自然月费用判断，提醒不会阻止消费。
+          只用成功且有效的最新查询触发提醒；失败时逐步退避至30分钟，凭据失效暂停该项。预算按
+          DeepSeek 平台东八区自然月费用判断，提醒不会阻止消费。
         </p>
         <p className="muted">
           余额Key与用量Token的账户尚未自动匹配，两项独立判断。Windows通知显示由系统设置控制；测试通知不受本应用夜间时段限制，至少间隔60秒。

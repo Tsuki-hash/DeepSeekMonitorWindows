@@ -350,6 +350,7 @@ pub(crate) async fn save_usage_token(
     app: tauri::AppHandle,
     usage_token: String,
     request_id: String,
+    superseded_request_ids: Vec<String>,
 ) -> Result<AppConfig, CommandError> {
     require_main(&window)?;
     let value = usage_token.trim().to_string();
@@ -358,6 +359,7 @@ pub(crate) async fn save_usage_token(
     }
     let status = app.state::<SyncSession>().begin_usage(
         request_id,
+        &superseded_request_ids,
         crate::sync_session::UsageSyncKind::Manual,
         || {
             if let Some(login) = app.get_webview_window("login-sync") {
@@ -385,17 +387,20 @@ pub(crate) async fn save_usage_token(
 pub(crate) fn clear_usage_token(
     window: WebviewWindow,
     app: tauri::AppHandle,
+    cancelled_request_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
     require_main(&window)?;
-    let config = app.state::<SyncSession>().cancel(|| {
-        if let Some(login) = app.get_webview_window("login-sync") {
-            let _ = login.close();
-        }
-        to_app_config(edit_config(|config| {
-            config.usage_token = None;
-            Ok(())
-        })?)
-    })?;
+    let config = app
+        .state::<SyncSession>()
+        .clear_usage(&cancelled_request_ids, || {
+            if let Some(login) = app.get_webview_window("login-sync") {
+                let _ = login.close();
+            }
+            to_app_config(edit_config(|config| {
+                config.usage_token = None;
+                Ok(())
+            })?)
+        })?;
     let _ = app.emit("credential-config-changed", &config);
     Ok(config)
 }
@@ -408,11 +413,13 @@ pub(crate) fn cancel_usage_sync(
     generation: Option<u64>,
 ) -> Result<Option<crate::sync_session::UsageSyncStatus>, String> {
     require_main(&window)?;
-    let ended = app.state::<SyncSession>().cancel_usage(&request_id, generation, || {
-        if let Some(login) = app.get_webview_window("login-sync") {
-            let _ = login.close();
-        }
-    });
+    let ended = app
+        .state::<SyncSession>()
+        .cancel_usage(&request_id, generation, || {
+            if let Some(login) = app.get_webview_window("login-sync") {
+                let _ = login.close();
+            }
+        });
     if let Some(ended) = &ended {
         let _ = app.emit("usage-sync-ended", ended);
     }
@@ -432,17 +439,20 @@ pub(crate) fn get_usage_sync_status(
 pub(crate) async fn forget_usage_session(
     window: WebviewWindow,
     app: tauri::AppHandle,
+    cancelled_request_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
     require_main(&window)?;
-    let config = app.state::<SyncSession>().start_clear(|| {
-        if let Some(login) = app.get_webview_window("login-sync") {
-            login.close().map_err(|e| e.to_string())?;
-        }
-        to_app_config(edit_config(|stored| {
-            stored.usage_token = None;
-            Ok(())
-        })?)
-    })?;
+    let config = app
+        .state::<SyncSession>()
+        .start_clear(&cancelled_request_ids, || {
+            if let Some(login) = app.get_webview_window("login-sync") {
+                login.close().map_err(|e| e.to_string())?;
+            }
+            to_app_config(edit_config(|stored| {
+                stored.usage_token = None;
+                Ok(())
+            })?)
+        })?;
     let _ = app.emit("usage-token-cleared", &config);
     crate::browsing_data::clear(&window).await?;
     Ok(config)
@@ -475,6 +485,7 @@ pub(crate) async fn start_usage_sync(
     window: WebviewWindow,
     app: tauri::AppHandle,
     request_id: String,
+    superseded_request_ids: Vec<String>,
 ) -> Result<UsageSyncStarted, String> {
     if window.label() != "main" {
         return Err("非法调用方".to_string());
@@ -482,6 +493,7 @@ pub(crate) async fn start_usage_sync(
     let session = app.state::<SyncSession>();
     let mut status = session.begin_usage(
         request_id,
+        &superseded_request_ids,
         crate::sync_session::UsageSyncKind::Web,
         || {
             if let Some(stale) = app.get_webview_window("login-sync") {
@@ -501,7 +513,10 @@ pub(crate) async fn start_usage_sync(
             return Err(error);
         }
         status.active = false;
-        return Ok(UsageSyncStarted { status, synced: true });
+        return Ok(UsageSyncStarted {
+            status,
+            synced: true,
+        });
     }
 
     // 建窗和取消也共用会话锁，防止慢预扫描在取消后重新弹窗。
@@ -511,7 +526,10 @@ pub(crate) async fn start_usage_sync(
         return Err(error);
     }
     spawn_title_watcher(app.clone(), generation);
-    Ok(UsageSyncStarted { status, synced: false })
+    Ok(UsageSyncStarted {
+        status,
+        synced: false,
+    })
 }
 
 #[derive(serde::Serialize)]

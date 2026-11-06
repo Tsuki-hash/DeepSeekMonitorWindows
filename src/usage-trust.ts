@@ -4,6 +4,12 @@
 // 忽略了 usage.warnings；且普通刷新失败时状态仍是 ok、旧快照照常显示，
 // 摘要却宣称「完整」。这里把「完整性」「陈旧」「最后成功」分开计算。
 
+import {
+  accountingDateKey,
+  chartPointFromDay,
+  missingUsageDates,
+  recentUsageDays,
+} from "./format.ts";
 import type { UsageResult } from "./types";
 
 export type Completeness = "complete" | "partial" | "unknown";
@@ -22,12 +28,27 @@ export type UsageTrust = {
 export function usageCompleteness(
   usage: UsageResult | null,
   hasError: boolean,
+  now: Date = new Date(),
 ): Completeness {
   if (!usage) return "unknown";
   // 有质量警告或缺失日期时，即使本次请求成功也只是「部分」。
   if (usage.warnings?.length) return "partial";
   if (usage.unavailableDates?.length) return "partial";
   if (usage.monthCost == null) return "partial";
+  if (missingUsageDates(usage, now).length) return "partial";
+  const days = recentUsageDays(
+    usage.days,
+    Math.max(7, Number(accountingDateKey(now).slice(8))),
+    usage.unavailableDates,
+    now,
+    usage.accountingDate,
+  );
+  if (
+    days.some(
+      (day) => day.totalCost == null || chartPointFromDay(day).unavailable,
+    )
+  )
+    return "partial";
   // 本次请求失败：数据是否完整无从判断（旧快照可能已经不完整）。
   if (hasError) return "unknown";
   return "complete";
@@ -43,12 +64,13 @@ export function usageTrust(input: {
   currentMonth: string;
   /** 最后成功时间格式化后的文本。 */
   lastSuccessText: string | null;
+  now?: Date;
 }): UsageTrust {
   const { usage, state, error, snapshotMonth, currentMonth, lastSuccessText } =
     input;
   // 「有数据但本次失败」：保留旧值，必须标旧。
   const stale = Boolean(usage && (state === "error" || error));
-  const completeness = usageCompleteness(usage, Boolean(error));
+  const completeness = usageCompleteness(usage, Boolean(error), input.now);
   const reason = (() => {
     if (!usage) return null;
     if (usage.warnings?.length) return usage.warnings[0];
@@ -56,6 +78,9 @@ export function usageTrust(input: {
       return `${usage.unavailableDates.length} 个日期未取得，不代表零用量`;
     }
     if (usage.monthCost == null) return "本月费用未取得";
+    const missing = missingUsageDates(usage, input.now);
+    if (missing.length) return `${missing.length} 个日期未取得，不代表零用量`;
+    if (completeness === "partial") return "部分日期的用量或费用未取得";
     return null;
   })();
   return {

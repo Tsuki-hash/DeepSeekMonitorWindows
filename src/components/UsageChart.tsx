@@ -1,6 +1,11 @@
 import React from "react";
 import { BarChart3 } from "lucide-react";
-import { chartPointFromDay, fmtTokensShort, recentUsageDays } from "../format";
+import {
+  chartPointFromDay,
+  chartTotal,
+  fmtTokensShort,
+  recentUsageDays,
+} from "../format";
 import type { LoadState, UsageResult } from "../types";
 import { updateTime } from "../data-display";
 import { usageNotices } from "../usage-notices";
@@ -23,16 +28,23 @@ function UsageChart({
   onDataStatus?: () => void;
   onHistory?: () => void;
 }) {
-  const days = recentUsageDays(usage?.days ?? [], 7, usage?.unavailableDates);
+  const now = new Date();
+  const days = recentUsageDays(
+    usage?.days ?? [],
+    7,
+    usage?.unavailableDates,
+    now,
+    usage?.accountingDate,
+  );
   // all：合计含未识别模型（差额并入 other），避免按日图静默丢量
   const points = days.map((day) => chartPointFromDay(day, "all"));
-  const notices = usageNotices(usage);
+  const notices = usageNotices(usage, now);
   const hasOther = points.some((point) => point.other > 0);
   const sumHit = points.reduce((sum, point) => sum + point.hit, 0);
   const sumMiss = points.reduce((sum, point) => sum + point.miss, 0);
-  const sumTotal = points.reduce((sum, point) => sum + point.total, 0);
+  const sumTotal = chartTotal(points);
   const hitRate =
-    sumHit + sumMiss > 0
+    sumTotal != null && sumHit + sumMiss > 0
       ? ((sumHit / (sumHit + sumMiss)) * 100).toFixed(0)
       : "—";
   const placeholder =
@@ -54,7 +66,13 @@ function UsageChart({
           onClick={onHistory}
         >
           <BarChart3 size={16} className="brand-blue" />
-          <span title={`输入缓存命中率 ${hitRate}%（命中 / 已知输入）`}>
+          <span
+            title={
+              hitRate === "—"
+                ? "输入缓存命中率未取得"
+                : `输入缓存命中率 ${hitRate}%（命中 / 已知输入）`
+            }
+          >
             近7日 Tokens ›
           </span>
         </button>
@@ -63,13 +81,13 @@ function UsageChart({
             <button className="data-status-link" onClick={onDataStatus}>
               更新失败 ›
             </button>
-          ) : notices.length > 0 ? (
+          ) : notices.length > 0 || (state === "ok" && sumTotal == null) ? (
             <button className="data-status-link" onClick={onDataStatus}>
               数据待核对 ›
             </button>
           ) : state === "ok" ? (
             <>
-              {fmtTokensShort(sumTotal)} ·{" "}
+              {sumTotal == null ? "—" : fmtTokensShort(sumTotal)} ·{" "}
               <button
                 className="data-status-link"
                 onClick={onDataStatus}

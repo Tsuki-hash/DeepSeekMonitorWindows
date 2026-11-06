@@ -45,11 +45,20 @@ function ModelDetailPanel({
   const totalText =
     data?.totalTokens != null ? fmtTokensShort(data.totalTokens) : "—";
 
-  const days = recentUsageDays(usage?.days ?? [], 7, usage?.unavailableDates);
+  const now = new Date();
+  const days = recentUsageDays(
+    usage?.days ?? [],
+    7,
+    usage?.unavailableDates,
+    now,
+    usage?.accountingDate,
+  );
   const points = days.map((day) =>
     chartPointFromDay(day, isFlash ? "flash" : isOther ? "other" : "pro"),
   );
-  const notices = usageNotices(usage);
+  const notices = usageNotices(usage, now);
+  const hasUnknown =
+    usageState === "ok" && points.some((point) => point.unavailable);
   const hasOther = points.some((point) => point.other > 0);
   const rangeText =
     points.length > 0
@@ -102,12 +111,13 @@ function ModelDetailPanel({
             <h2>按日 Token 消耗</h2>
             <span>{rangeText}</span>
             {(notices.length > 0 ||
+              hasUnknown ||
               (usageError && usageState !== "nokey") ||
               updatedAt) && (
               <button className="data-status-link" onClick={onDataStatus}>
                 {usageError
                   ? "更新失败 ›"
-                  : notices.length
+                  : notices.length || hasUnknown
                     ? "数据待核对 ›"
                     : `${updateTime(updatedAt)} 更新 ›`}
               </button>

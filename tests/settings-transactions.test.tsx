@@ -64,10 +64,15 @@ let handlers = {};
 let fixtureRevision = 0;
 let fixtureSyncGeneration = 0;
 const syncStatus = (requestId = null, active = false, kind = "web") => ({
-  generation: ++fixtureSyncGeneration, requestId, active, kind,
+  generation: ++fixtureSyncGeneration,
+  requestId,
+  active,
+  kind,
 });
 const capturedPayload = (config, status = syncStatus("old-captured")) => ({
-  ...status, active: false, config,
+  ...status,
+  active: false,
+  config,
 });
 const baseConfig = (over = {}) => ({
   configRevision: ++fixtureRevision,
@@ -1161,7 +1166,9 @@ scenario(
     assert.equal(panel("onboarding"), 0);
     await finish(pending, config);
     assert.equal(panel("onboarding"), 1);
-    const tasks = renderer.root.findAllByProps({ className: "onboarding-task" });
+    const tasks = renderer.root.findAllByProps({
+      className: "onboarding-task",
+    });
     assert.equal(tasks.length, 2);
     assert.ok(tasks.some((node) => textOf(node).includes("只看余额")));
     await click(tasks.find((node) => textOf(node).includes("平台消费与历史")));
@@ -1193,127 +1200,155 @@ scenario(
   },
 );
 
+scenario(
+  "N09: settings only displays the accepted snapshot on an equal-version conflict",
+  async (concurrent) => {
+    const trusted = config;
+    setCommittedConfig(trusted);
+    handlers.get_app_config = () => ({ ...trusted, apiKeyConfigured: false });
+    await mount(<Probe />, concurrent);
+    assert.equal(getCommittedConfig(), trusted);
+    assert.equal(state.config, trusted);
+    assert.match(state.status, /配置版本/);
+  },
+);
 
-scenario("N09: settings only displays the accepted snapshot on an equal-version conflict", async (concurrent) => {
-  const trusted = config;
-  setCommittedConfig(trusted);
-  handlers.get_app_config = () => ({ ...trusted, apiKeyConfigured: false });
-  await mount(<Probe />, concurrent);
-  assert.equal(getCommittedConfig(), trusted);
-  assert.equal(state.config, trusted);
-  assert.match(state.status, /配置版本/);
-});
+scenario(
+  "N09: unavailable disk snapshot clears dashboard data and disables settings preferences",
+  async (concurrent) => {
+    await mount(<App />, concurrent);
+    const unavailable = baseConfig({
+      apiKeyConfigured: false,
+      apiKeyPreview: null,
+      usageTokenConfigured: false,
+      configReadError: "Synthetic unreadable configuration",
+    });
+    config = unavailable;
+    await emit("credential-config-changed", unavailable);
+    assert.equal(dashboard().balance, null);
+    assert.equal(dashboard().usage, null);
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await mount(<Probe />, concurrent);
+    assert.equal(state.refresh, null);
+    assert.equal(state.autoRefresh, null);
+    assert.equal(state.autostart, null);
+    assert.equal(state.config, unavailable);
+  },
+);
 
-scenario("N09: unavailable disk snapshot clears dashboard data and disables settings preferences", async (concurrent) => {
-  await mount(<App />, concurrent);
-  const unavailable = baseConfig({
-    apiKeyConfigured: false, apiKeyPreview: null, usageTokenConfigured: false,
-    configReadError: "Synthetic unreadable configuration",
-  });
-  config = unavailable;
-  await emit("credential-config-changed", unavailable);
-  assert.equal(dashboard().balance, null);
-  assert.equal(dashboard().usage, null);
-  assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
-  await act(async () => renderer.unmount());
-  renderer = null;
-  await mount(<Probe />, concurrent);
-  assert.equal(state.refresh, null);
-  assert.equal(state.autoRefresh, null);
-  assert.equal(state.autostart, null);
-  assert.equal(state.config, unavailable);
-});
+scenario(
+  "N10: manual failure stops old web progress immediately and ignores its late start",
+  async (concurrent) => {
+    const web = deferred();
+    const manualSave = deferred();
+    handlers.start_usage_sync = () => web.promise;
+    handlers.save_usage_token = () => manualSave.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    const oldRequest = submitted("start_usage_sync").at(-1).args.requestId;
+    await act(async () => state.setUsageToken("SYNTHETIC_INVALID_TOKEN"));
+    let saving;
+    await act(async () => {
+      saving = state.saveUsageToken();
+    });
+    assert.equal(state.usageSyncing, false);
+    await finish(web, { ...syncStatus(oldRequest, true), synced: false });
+    assert.equal(state.usageSyncing, false);
+    await act(async () =>
+      manualSave.reject(new Error("Synthetic verification failed")),
+    );
+    assert.equal(await saving, false);
+    assert.equal(state.busy, false);
+    assert.equal(state.usageSyncing, false);
+    assert.equal(state.config.usageTokenConfigured, true);
+    assert.equal(state.usageToken, "SYNTHETIC_INVALID_TOKEN");
+  },
+);
 
-scenario("N10: manual failure stops old web progress immediately and ignores its late start", async (concurrent) => {
-  const web = deferred();
-  const manualSave = deferred();
-  handlers.start_usage_sync = () => web.promise;
-  handlers.save_usage_token = () => manualSave.promise;
-  await mount(<Probe />, concurrent);
-  await act(async () => state.startUsageSync());
-  const oldRequest = submitted("start_usage_sync").at(-1).args.requestId;
-  await act(async () => state.setUsageToken("SYNTHETIC_INVALID_TOKEN"));
-  let saving;
-  await act(async () => { saving = state.saveUsageToken(); });
-  assert.equal(state.usageSyncing, false);
-  await finish(web, { ...syncStatus(oldRequest, true), synced: false });
-  assert.equal(state.usageSyncing, false);
-  await act(async () => manualSave.reject(new Error("Synthetic verification failed")));
-  assert.equal(await saving, false);
-  assert.equal(state.busy, false);
-  assert.equal(state.usageSyncing, false);
-  assert.equal(state.config.usageTokenConfigured, true);
-  assert.equal(state.usageToken, "SYNTHETIC_INVALID_TOKEN");
-});
+scenario(
+  "N10: first delayed capture and ended events cannot stop a new session after remount",
+  async (concurrent) => {
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    const firstRequest = submitted("start_usage_sync").at(-1).args.requestId;
+    const oldSession = syncStatus(firstRequest, false);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    const waitingStatus = state.usageStatus;
+    const captured = nextCredentialConfig("usageToken", true);
+    await emit("usage-token-captured", capturedPayload(captured, oldSession));
+    await emit("usage-sync-ended", oldSession);
+    assert.equal(getCommittedConfig(), captured);
+    assert.equal(state.usageSyncing, true);
+    assert.equal(state.usageStatus, waitingStatus);
+  },
+);
 
-scenario("N10: first delayed capture and ended events cannot stop a new session after remount", async (concurrent) => {
-  await mount(<Probe />, concurrent);
-  await act(async () => state.startUsageSync());
-  const firstRequest = submitted("start_usage_sync").at(-1).args.requestId;
-  const oldSession = syncStatus(firstRequest, false);
-  await act(async () => renderer.unmount());
-  renderer = null;
-  await mount(<Probe />, concurrent);
-  await act(async () => state.startUsageSync());
-  const waitingStatus = state.usageStatus;
-  const captured = nextCredentialConfig("usageToken", true);
-  await emit("usage-token-captured", capturedPayload(captured, oldSession));
-  await emit("usage-sync-ended", oldSession);
-  assert.equal(getCommittedConfig(), captured);
-  assert.equal(state.usageSyncing, true);
-  assert.equal(state.usageStatus, waitingStatus);
-});
+scenario(
+  "N10: old manual failure and old cancel reply leave newer web progress intact",
+  async (concurrent) => {
+    const pending = deferred();
+    handlers.save_usage_token = () => pending.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN"));
+    let saving;
+    await act(async () => {
+      saving = state.saveUsageToken();
+    });
+    const manualRequest = submitted("save_usage_token").at(-1).args.requestId;
+    await act(async () => state.startUsageSync());
+    await emit("usage-sync-ended", syncStatus(manualRequest, false, "manual"));
+    await act(async () => pending.reject(new Error("Synthetic old failure")));
+    assert.equal(await saving, false);
+    assert.equal(state.usageSyncing, true);
+    const cancel = deferred();
+    handlers.cancel_usage_sync = () => cancel.promise;
+    await act(async () => state.cancelUsageSync());
+    const cancelled = submitted("cancel_usage_sync").at(-1).args;
+    await act(async () => state.startUsageSync());
+    await finish(cancel, { ...cancelled, active: false, kind: "web" });
+    assert.equal(state.usageSyncing, true);
+  },
+);
 
-scenario("N10: old manual failure and old cancel reply leave newer web progress intact", async (concurrent) => {
-  const pending = deferred();
-  handlers.save_usage_token = () => pending.promise;
-  await mount(<Probe />, concurrent);
-  await act(async () => state.setUsageToken("SYNTHETIC_TOKEN"));
-  let saving;
-  await act(async () => { saving = state.saveUsageToken(); });
-  const manualRequest = submitted("save_usage_token").at(-1).args.requestId;
-  await act(async () => state.startUsageSync());
-  await emit("usage-sync-ended", syncStatus(manualRequest, false, "manual"));
-  await act(async () => pending.reject(new Error("Synthetic old failure")));
-  assert.equal(await saving, false);
-  assert.equal(state.usageSyncing, true);
-  const cancel = deferred();
-  handlers.cancel_usage_sync = () => cancel.promise;
-  await act(async () => state.cancelUsageSync());
-  const cancelled = submitted("cancel_usage_sync").at(-1).args;
-  await act(async () => state.startUsageSync());
-  await finish(cancel, { ...cancelled, active: false, kind: "web" });
-  assert.equal(state.usageSyncing, true);
-});
+scenario(
+  "N10: cancel no-op after capture re-reads saved state instead of claiming old Token unchanged",
+  async (concurrent) => {
+    await mount(<Probe />, concurrent);
+    await act(async () => state.startUsageSync());
+    const request = submitted("start_usage_sync").at(-1).args.requestId;
+    const saved = nextCredentialConfig("usageToken", true);
+    config = saved;
+    handlers.cancel_usage_sync = () => null;
+    handlers.get_usage_sync_status = () => syncStatus(request, false);
+    await act(async () => state.cancelUsageSync());
+    await flush();
+    assert.deepEqual(getCommittedConfig(), saved);
+    assert.equal(state.usageSyncing, false);
+    assert.doesNotMatch(state.usageStatus, /原 Token 未更改|已取消/);
+  },
+);
 
-scenario("N10: cancel no-op after capture re-reads saved state instead of claiming old Token unchanged", async (concurrent) => {
-  await mount(<Probe />, concurrent);
-  await act(async () => state.startUsageSync());
-  const request = submitted("start_usage_sync").at(-1).args.requestId;
-  const saved = nextCredentialConfig("usageToken", true);
-  config = saved;
-  handlers.cancel_usage_sync = () => null;
-  handlers.get_usage_sync_status = () => syncStatus(request, false);
-  await act(async () => state.cancelUsageSync());
-  await flush();
-  assert.deepEqual(getCommittedConfig(), saved);
-  assert.equal(state.usageSyncing, false);
-  assert.doesNotMatch(state.usageStatus, /原 Token 未更改|已取消/);
-});
-
-scenario("N10: remount status read crossing terminal event re-reads instead of reviving login", async (concurrent) => {
-  const reading = deferred();
-  const first = syncStatus("previous-page", true);
-  const terminal = { ...first, active: false };
-  let reads = 0;
-  handlers.get_usage_sync_status = () => ++reads === 1 ? reading.promise : terminal;
-  await mount(<Probe />, concurrent);
-  await emit("usage-sync-ended", terminal);
-  await finish(reading, first);
-  assert.equal(reads, 2);
-  assert.equal(state.usageSyncing, false);
-});
-
+scenario(
+  "N10: remount status read crossing terminal event re-reads instead of reviving login",
+  async (concurrent) => {
+    const reading = deferred();
+    const first = syncStatus("previous-page", true);
+    const terminal = { ...first, active: false };
+    let reads = 0;
+    handlers.get_usage_sync_status = () =>
+      ++reads === 1 ? reading.promise : terminal;
+    await mount(<Probe />, concurrent);
+    await emit("usage-sync-ended", terminal);
+    await finish(reading, first);
+    assert.equal(reads, 2);
+    assert.equal(state.usageSyncing, false);
+  },
+);
 
 for (const [command, action, value, field] of [
   ["save_refresh_interval", "saveRefreshInterval", 300, "refresh"],
@@ -1321,25 +1356,189 @@ for (const [command, action, value, field] of [
   ["save_autostart", "saveAutostart", true, "autostart"],
 ]) {
   for (const succeeds of [false, true]) {
-    scenario(`N09: late ${command} ${succeeds ? "success" : "failure"} cannot re-enable untrusted controls`, async (concurrent) => {
-      const pending = deferred();
-      handlers[command] = () => pending.promise;
-      await mount(<Probe />, concurrent);
-      const oldSuccess = baseConfig();
-      await act(async () => state[action](value));
-      const unavailable = baseConfig({
-        apiKeyConfigured: false, apiKeyPreview: null, usageTokenConfigured: false,
-        configReadError: "Synthetic unreadable configuration",
-      });
-      await act(async () => setCommittedConfig(unavailable));
-      assert.equal(state[field], null);
-      if (succeeds) await finish(pending, oldSuccess);
-      else await act(async () => pending.reject(new Error("Synthetic disk failure")));
-      await flush();
-      assert.equal(state.refresh, null);
-      assert.equal(state.autoRefresh, null);
-      assert.equal(state.autostart, null);
-      assert.equal(getCommittedConfig(), unavailable);
-    });
+    scenario(
+      `N09: late ${command} ${succeeds ? "success" : "failure"} cannot re-enable untrusted controls`,
+      async (concurrent) => {
+        const pending = deferred();
+        handlers[command] = () => pending.promise;
+        await mount(<Probe />, concurrent);
+        const oldSuccess = baseConfig();
+        await act(async () => state[action](value));
+        const unavailable = baseConfig({
+          apiKeyConfigured: false,
+          apiKeyPreview: null,
+          usageTokenConfigured: false,
+          configReadError: "Synthetic unreadable configuration",
+        });
+        await act(async () => setCommittedConfig(unavailable));
+        assert.equal(state[field], null);
+        if (succeeds) await finish(pending, oldSuccess);
+        else
+          await act(async () =>
+            pending.reject(new Error("Synthetic disk failure")),
+          );
+        await flush();
+        assert.equal(state.refresh, null);
+        assert.equal(state.autoRefresh, null);
+        assert.equal(state.autostart, null);
+        assert.equal(getCommittedConfig(), unavailable);
+      },
+    );
   }
 }
+
+// R14-02: the deferred IPC boundary deliberately leaves old starts unresolved.
+// Rust SyncSession tests cover backend admission/commit permutations; these
+// tests verify the real hook sends their identities and preserves UI ownership.
+for (const [command, action] of [
+  ["clear_usage_token", "clearUsageToken"],
+  ["forget_usage_session", "forgetUsageSession"],
+]) {
+  scenario(
+    `R14-02: ${command} revokes pending starts across remount and lets new explicit login reuse retained intent`,
+    async (concurrent) => {
+      const oldWeb = deferred();
+      const oldManual = deferred();
+      const clearing = deferred();
+      handlers.start_usage_sync = () => oldWeb.promise;
+      handlers.save_usage_token = () => oldManual.promise;
+      handlers[command] = () => clearing.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      const webRequest = submitted("start_usage_sync").at(-1).args.requestId;
+      await act(async () => state.setUsageToken("SYNTHETIC_MANUAL_TOKEN"));
+      let saving;
+      await act(async () => {
+        saving = state.saveUsageToken();
+      });
+      const manualArgs = submitted("save_usage_token").at(-1).args;
+      assert.ok(manualArgs.supersededRequestIds.includes(webRequest));
+      await act(async () => renderer.unmount());
+      renderer = null;
+      await mount(<Probe />, concurrent);
+      await act(async () => state[action]());
+      const clearArgs = submitted(command).at(-1).args;
+      assert.ok(clearArgs.cancelledRequestIds.includes(webRequest));
+      assert.ok(clearArgs.cancelledRequestIds.includes(manualArgs.requestId));
+
+      // Even after a page change enables its controls, a fresh login waits for
+      // the older clear to settle instead of being accidentally closed by it.
+      await act(async () => renderer.unmount());
+      renderer = null;
+      await mount(<Probe />, concurrent);
+      const nextWeb = deferred();
+      handlers.start_usage_sync = () => nextWeb.promise;
+      const callsBeforeNew = submitted("start_usage_sync").length;
+      await act(async () => state.startUsageSync());
+      assert.equal(submitted("start_usage_sync").length, callsBeforeNew);
+      const cleared = nextCredentialConfig("usageToken", false);
+      config = cleared;
+      await finish(clearing, cleared);
+      assert.equal(submitted("start_usage_sync").length, callsBeforeNew + 1);
+      const nextRequest = submitted("start_usage_sync").at(-1).args.requestId;
+      assert.equal(clearArgs.cancelledRequestIds.includes(nextRequest), false);
+      assert.equal(getCommittedConfig().usageTokenConfigured, false);
+      assert.equal(state.usageSyncing, true);
+
+      // Old starts rejected by Rust can finish in either order, but may not end
+      // the new owner or restore the cleared global configuration.
+      await act(async () =>
+        oldManual.reject(new Error("Synthetic superseded manual request")),
+      );
+      await act(async () =>
+        oldWeb.reject(new Error("Synthetic cancelled queued login")),
+      );
+      assert.equal(await saving, false);
+      await emit("usage-sync-ended", syncStatus(webRequest, false));
+      assert.equal(state.usageSyncing, true);
+      assert.equal(getCommittedConfig().usageTokenConfigured, false);
+      const newStatus = syncStatus(nextRequest, true);
+      await finish(nextWeb, { ...newStatus, synced: false });
+      const captured = nextCredentialConfig("usageToken", true);
+      config = captured;
+      await emit("usage-token-captured", capturedPayload(captured, newStatus));
+      assert.equal(state.usageSyncing, false);
+      assert.equal(getCommittedConfig(), captured);
+      assert.match(state.usageStatus, /已配置/);
+    },
+  );
+}
+
+for (const manualSucceeds of [false, true]) {
+  scenario(
+    `R14-02: manual replacement ${manualSucceeds ? "success" : "failure"} revokes a web start before backend admission`,
+    async (concurrent) => {
+      const oldWeb = deferred();
+      const manual = deferred();
+      handlers.start_usage_sync = () => oldWeb.promise;
+      handlers.save_usage_token = () => manual.promise;
+      await mount(<Probe />, concurrent);
+      await act(async () => state.startUsageSync());
+      const oldRequest = submitted("start_usage_sync").at(-1).args.requestId;
+      await act(async () => state.setUsageToken("SYNTHETIC_NEW_TOKEN"));
+      let saving;
+      await act(async () => {
+        saving = state.saveUsageToken();
+      });
+      const replacement = submitted("save_usage_token").at(-1).args;
+      assert.ok(replacement.supersededRequestIds.includes(oldRequest));
+      const before = getCommittedConfig();
+      if (manualSucceeds) {
+        config = nextCredentialConfig("usageToken", true);
+        await finish(manual, config);
+      } else {
+        await act(async () =>
+          manual.reject(new Error("Synthetic manual verification failure")),
+        );
+      }
+      assert.equal(await saving, manualSucceeds);
+      const displayed = state.usageStatus;
+      await act(async () =>
+        oldWeb.reject(
+          new Error("Synthetic stale start rejected before cache scan"),
+        ),
+      );
+      await emit("usage-sync-ended", syncStatus(oldRequest, false));
+      assert.equal(state.usageSyncing, false);
+      assert.equal(state.usageStatus, displayed);
+      assert.equal(getCommittedConfig(), manualSucceeds ? config : before);
+    },
+  );
+}
+
+scenario(
+  "R14-02: failed Token clear reports the error and does not claim success",
+  async (concurrent) => {
+    const oldWeb = deferred();
+    const clearing = deferred();
+    handlers.start_usage_sync = () => oldWeb.promise;
+    handlers.clear_usage_token = () => clearing.promise;
+    await mount(<Probe />, concurrent);
+    const before = getCommittedConfig();
+    await act(async () => state.startUsageSync());
+    const oldRequest = submitted("start_usage_sync").at(-1).args.requestId;
+    await act(async () => state.clearUsageToken());
+    assert.ok(
+      submitted("clear_usage_token")
+        .at(-1)
+        .args.cancelledRequestIds.includes(oldRequest),
+    );
+    await act(async () =>
+      clearing.reject(new Error("Synthetic clear disk failure")),
+    );
+    await act(async () =>
+      oldWeb.reject(new Error("Synthetic cancelled queued request")),
+    );
+    assert.equal(getCommittedConfig(), before);
+    assert.equal(state.busy, false);
+    assert.equal(state.usageSyncing, false);
+    assert.match(state.usageStatus, /Synthetic clear disk failure/);
+    assert.doesNotMatch(state.usageStatus, /已清除/);
+    handlers.start_usage_sync = (args) => ({
+      ...syncStatus(args.requestId, true),
+      synced: false,
+    });
+    await act(async () => state.startUsageSync());
+    assert.equal(state.usageSyncing, true);
+  },
+);

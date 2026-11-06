@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { currentUsageSnapshot } from "./usage-snapshot.ts";
-import { accountingDateKey, emptyUsageDay } from "./format.ts";
+import { accountingDateKey } from "./format.ts";
 import type { UsageResult } from "./types";
 const snapshot: UsageResult = {
   accountingDate: "2026-09-30",
@@ -67,7 +67,34 @@ test("快照的未来零占位不能覆盖未知日期", () => {
   const prior = {
     ...snapshot,
     accountingDate: "2026-09-28",
-    days: [emptyUsageDay("2026-09-29"), emptyUsageDay("2026-09-30")],
+    days: ["2026-09-29", "2026-09-30"].map((date) => ({
+      date,
+      flashTokens: 0,
+      flashCacheHit: 0,
+      flashCacheMiss: 0,
+      flashResponse: 0,
+      proTokens: 0,
+      proCacheHit: 0,
+      proCacheMiss: 0,
+      proResponse: 0,
+      flashOtherTokens: 0,
+      proOtherTokens: 0,
+      totalTokens: 0,
+      totalCost: 0,
+      rawModels: [
+        {
+          model: "deepseek-flash",
+          groupKey: "flash",
+          totalTokens: 0,
+          requestCount: 0,
+          cacheHitTokens: 0,
+          cacheMissTokens: 0,
+          responseTokens: 0,
+          otherTokens: 0,
+          cost: 0,
+        },
+      ],
+    })),
   };
   const retained = currentUsageSnapshot(prior, "2026-09-30");
   assert.ok(retained);

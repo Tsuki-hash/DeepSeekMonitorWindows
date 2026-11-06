@@ -26,7 +26,7 @@ pub struct Entry {
 /// 兼容仍被路由到 V4.1 Flash，因此迁移期内平台可能同时返回新旧名字，必须归并到同一槽位。
 /// `deepseek-v4-pro`（V4 Pro）继续作为独立模型提供，单独占 pro 槽位。
 ///
-/// 返回 `(槽位 key, 界面显示名)`；未知模型返回 `None`（调用方打 warn 并跳过）。
+/// 返回 `(槽位 key, 界面显示名)`；未知模型返回 `None`（调用方保留在「其他」）。
 pub fn model_slot(model: &str) -> Option<(&'static str, &'static str)> {
     match model {
         "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp" => {
@@ -86,12 +86,13 @@ pub struct TokenBreakdown {
 /// 把一组原始条目归并成结构化的 token 明细。
 ///
 /// `PROMPT_TOKEN` 表示输入总量，缓存命中 + 未命中通常就是输入总量。若两者并存还累加
-/// 会把输入量算两遍。**定稿口径（保守）**：有缓存明细时不用 `PROMPT_TOKEN` 兜底；
-/// 只有平台只给了 `PROMPT_TOKEN` 时才计入 total。与明细数值不一致时打 warn 便于排障，
+/// 会把输入量算两遍。**定稿口径（保守）**：存在非零缓存明细时不再叠加
+/// `PROMPT_TOKEN`；明细未出现或全部明确为零时允许输入总量兜底。与明细不一致时打 warn，
 /// 不改变归并规则。该规则由单测锁定，改动前先改测试。
 pub fn token_breakdown(usage: &[Entry]) -> TokenBreakdown {
-    // 每个分段各自记录「是否出现过无法解析的数值」：一个字段坏掉只让该字段为未知，
-    // 有效兄弟字段仍保留（与 usage_history 的逐字段规则一致）。
+    // 累加器中的 0 只是加法单位元，不代表平台返回了该字段。
+    // 最后按字段存在性输出 None；总 Tokens 单独按实际 token 条目与 PROMPT
+    // fallback 规则归并，不因 REQUEST 等无关字段缺失而丢掉有效计数。
     let mut result = TokenBreakdown {
         total: Some(0),
         request: Some(0),
@@ -131,16 +132,13 @@ pub fn token_breakdown(usage: &[Entry]) -> TokenBreakdown {
             }
         }
     }
-    // 「缓存明细缺失」与「缓存明细为零」是两回事：前者不能用 PROMPT_TOKEN 兜底，
-    // 否则解析失败的明细会被伪装成一次正常归并。
+    // 此处仍是累加器：未出现的明细按加法单位元参与 fallback 判断；
+    // 已出现但非法的明细为 None，不能被 PROMPT_TOKEN 掩盖。
     let detailed = result.cache_hit.is_some() && result.cache_miss.is_some();
     let known_hit = result.cache_hit.unwrap_or(0);
     let known_miss = result.cache_miss.unwrap_or(0);
-    // 复评 F05：只有 REQUEST 没有任何 token 种类时，total 不是「0」而是**未知**
-    //（有请求数据不等于 token 明确为零）。与 usage_history 的 has_tokens 规则一致。
-
     if !detailed {
-        // 明细缺失：总量与「未归类」都无法完整重建，保留其余有效分段。
+        // 明细存在但非法：总量与「未归类」无法完整重建，保留其余有效分段。
         result.total = None;
         result.other = None;
     } else if prompt_valid && known_hit == 0 && known_miss == 0 {
@@ -168,15 +166,42 @@ pub fn token_breakdown(usage: &[Entry]) -> TokenBreakdown {
         result.total = None;
         result.other = None;
     }
-    // 复评 F05：有条目但**全是 REQUEST**（没有任何 token 种类）时，total 不是
-    // 「0」而是**未知**（有请求数据不等于 token 明确为零）。
-    // 空输入仍保持全零 —— 没有条目就是没有用量，这是既有语义。
-    let request_only = !usage.is_empty() && !usage.iter().any(|entry| entry.kind != "REQUEST");
-    if request_only {
+    // 没有 token 条目（包括空 usage）不能证明平台明确返回零。
+    if !usage.iter().any(|entry| entry.kind != "REQUEST") {
         result.total = None;
         result.other = None;
     }
+    // R14-08：只有出现过且全部合法的原始字段才可显示数字。多别名归并时
+    // add(None, Some(n)) 会传播未知，不能把一个别名的已知值冒充完整槽位值。
+    let present = |kind: &str| usage.iter().any(|entry| entry.kind == kind);
+    result.request = present("REQUEST").then_some(result.request).flatten();
+    result.cache_hit = present("PROMPT_CACHE_HIT_TOKEN")
+        .then_some(result.cache_hit)
+        .flatten();
+    result.cache_miss = present("PROMPT_CACHE_MISS_TOKEN")
+        .then_some(result.cache_miss)
+        .flatten();
+    result.response = present("RESPONSE_TOKEN")
+        .then_some(result.response)
+        .flatten();
     result
+}
+
+/// 缺字段与坏字段分开：缺项保持 None，但不虚构「计数异常」质量警告。
+/// 与历史共用该判断，合法拆片合并后的完整计数不会被误报。
+pub fn invalid_token_counts(usage: &[Entry], breakdown: &TokenBreakdown) -> bool {
+    let present = |kind: &str| usage.iter().any(|entry| entry.kind == kind);
+    usage.iter().any(|entry| count(&entry.amount).is_none())
+        || [
+            ("REQUEST", breakdown.request),
+            ("PROMPT_CACHE_HIT_TOKEN", breakdown.cache_hit),
+            ("PROMPT_CACHE_MISS_TOKEN", breakdown.cache_miss),
+            ("RESPONSE_TOKEN", breakdown.response),
+        ]
+        .into_iter()
+        .any(|(kind, value)| present(kind) && value.is_none())
+        || (usage.iter().any(|entry| entry.kind != "REQUEST")
+            && (breakdown.total.is_none() || breakdown.other.is_none()))
 }
 
 #[derive(Debug, Serialize)]
@@ -380,8 +405,8 @@ mod tests {
         let b = token_breakdown(&[entry("PROMPT_TOKEN", "800.0")]);
         assert_eq!(b.total, Some(800));
         assert_eq!(b.other, Some(800));
-        assert_eq!(b.cache_hit, Some(0));
-        assert_eq!(b.cache_miss, Some(0));
+        assert_eq!(b.cache_hit, None);
+        assert_eq!(b.cache_miss, None);
     }
 
     #[test]
@@ -405,15 +430,15 @@ mod tests {
 
     #[test]
     fn 只有命中明细_无未命中时_也算有明细() {
-        // 边界：未出现 MISS 条目视为该分段为零（平台省略即零），
-        // 因此仍按明细口径，不用 PROMPT_TOKEN 兜底。
+        // HIT 已出现非零时不再叠加 PROMPT_TOKEN，但未出现的 MISS 仍未知，
+        // 不能据此展示 100% 命中率。
         let b = token_breakdown(&[
             entry("PROMPT_TOKEN", "999.0"),
             entry("PROMPT_CACHE_HIT_TOKEN", "10.0"),
         ]);
         assert_eq!(b.total, Some(10));
         assert_eq!(b.cache_hit, Some(10));
-        assert_eq!(b.cache_miss, Some(0));
+        assert_eq!(b.cache_miss, None);
     }
 
     #[test]
@@ -424,7 +449,7 @@ mod tests {
         ]);
         assert_eq!(b.total, Some(10));
         assert_eq!(b.cache_miss, Some(10));
-        assert_eq!(b.cache_hit, Some(0));
+        assert_eq!(b.cache_hit, None);
     }
 
     #[test]
@@ -440,11 +465,48 @@ mod tests {
     }
 
     #[test]
-    fn 空输入_全零() {
+    fn 空输入_未取得而非显式零() {
         let empty = token_breakdown(&[]);
-        assert_eq!(empty.total, Some(0));
-        assert_eq!(empty.request, Some(0));
-        assert_eq!(empty.cache_hit, Some(0));
+        assert_eq!(empty, TokenBreakdown::default());
+        assert!(!invalid_token_counts(&[], &empty));
+    }
+
+    #[test]
+    fn r14_08_字段缺失与显式零分开_有效兄弟保留() {
+        for (request, expected) in [(None, None), (Some("0"), Some(0)), (Some("2"), Some(2))] {
+            let mut entries = vec![entry("RESPONSE_TOKEN", "100")];
+            if let Some(value) = request {
+                entries.push(entry("REQUEST", value));
+            }
+            let breakdown = token_breakdown(&entries);
+            assert_eq!(breakdown.request, expected);
+            assert_eq!(breakdown.response, Some(100));
+            assert_eq!(breakdown.total, Some(100));
+            assert_eq!(breakdown.cache_hit, None);
+            assert_eq!(breakdown.cache_miss, None);
+            assert!(!invalid_token_counts(&entries, &breakdown));
+        }
+        let hit_only = token_breakdown(&[entry("PROMPT_CACHE_HIT_TOKEN", "100")]);
+        assert_eq!(hit_only.cache_hit, Some(100));
+        assert_eq!(hit_only.cache_miss, None);
+        let zero_miss = token_breakdown(&[
+            entry("PROMPT_CACHE_HIT_TOKEN", "100"),
+            entry("PROMPT_CACHE_MISS_TOKEN", "0"),
+        ]);
+        assert_eq!(zero_miss.cache_miss, Some(0));
+        assert_eq!(zero_miss.total, Some(100));
+    }
+
+    #[test]
+    fn r14_08_别名缺字段不能把已知部分和当完整计数() {
+        let known = token_breakdown(&[entry("REQUEST", "2"), entry("RESPONSE_TOKEN", "10")]);
+        let missing = token_breakdown(&[entry("RESPONSE_TOKEN", "20")]);
+        let first = merge_model_slot(None, FLASH_SLOT, "Flash", &known, Some(1.0));
+        let merged = merge_model_slot(Some(first), FLASH_SLOT, "Flash", &missing, Some(2.0));
+        assert_eq!(merged.request_count, None);
+        assert_eq!(merged.response_tokens, Some(30));
+        assert_eq!(merged.total_tokens, Some(30));
+        assert_eq!(merged.cost, Some(3.0));
     }
 
     // ---------- merge_model_slot ----------

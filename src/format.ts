@@ -83,25 +83,38 @@ export const addDays = (date: Date, offset: number) => {
   return next;
 };
 
-/** 空的一天。用于把接口没返回的日期补成零值，保证柱状图始终 7 根。 */
+/** 空的一天。用于把接口没返回的日期标成未知，保证柱状图始终 7 根。 */
 export const emptyUsageDay = (date: string): UsageDay => ({
   date,
-  flashTokens: 0,
-  flashCacheHit: 0,
-  flashCacheMiss: 0,
-  flashResponse: 0,
-  proTokens: 0,
-  proCacheHit: 0,
-  proCacheMiss: 0,
-  proResponse: 0,
-  flashOtherTokens: 0,
-  proOtherTokens: 0,
-  totalTokens: 0,
-  totalCost: 0,
+  unavailable: true,
+  rawModels: [],
+  flashTokens: null,
+  flashCacheHit: null,
+  flashCacheMiss: null,
+  flashResponse: null,
+  proTokens: null,
+  proCacheHit: null,
+  proCacheMiss: null,
+  proResponse: null,
+  flashOtherTokens: null,
+  proOtherTokens: null,
+  totalTokens: null,
+  totalCost: null,
 });
 
+/** 与历史导出一致：空 data / 缺少原始模型行不构成已返回日期。 */
+export const hasReturnedUsageDay = (
+  day: UsageDay,
+  unavailableDates: string[] = [],
+  sourceAsOfDate?: string,
+): boolean =>
+  !day.unavailable &&
+  !unavailableDates.includes(day.date) &&
+  (!sourceAsOfDate || day.date <= sourceAsOfDate) &&
+  Boolean(day.rawModels?.length);
+
 /**
- * 取最近 `count` 天（含今天）的用量，接口没给的日期补零。
+ * 取最近 `count` 天（含今天）的用量，接口没给的日期补为未知。
  *
  * 两个刻意的取舍：
  * 1. 过滤掉 `date > today` 的条目——接口在月初可能返回整月（含未来日期）的占位行，
@@ -117,22 +130,26 @@ export const recentUsageDays = (
   count = 7,
   unavailableDates: string[] = [],
   now: Date = new Date(),
+  sourceAsOfDate?: string,
 ): UsageDay[] => {
   const today = accountingDateKey(now);
   const source = new Map(
-    days.filter((day) => day.date <= today).map((day) => [day.date, day]),
+    days
+      .filter(
+        (day) =>
+          day.date <= today && (!sourceAsOfDate || day.date <= sourceAsOfDate),
+      )
+      .map((day) => [day.date, day]),
   );
   const anchor = new Date(`${today}T00:00:00Z`);
   return Array.from({ length: count }, (_, index) => {
     const date = new Date(anchor.getTime() + (index - count + 1) * 86400_000)
       .toISOString()
       .slice(0, 10);
-    return (
-      source.get(date) ?? {
-        ...emptyUsageDay(date),
-        unavailable: unavailableDates.includes(date),
-      }
-    );
+    const day = source.get(date);
+    return day && hasReturnedUsageDay(day, unavailableDates, sourceAsOfDate)
+      ? day
+      : emptyUsageDay(date);
   });
 };
 
@@ -200,6 +217,16 @@ export const chartPointFromDay = (
     other: 0,
     total: 0,
   };
+  if (!hasReturnedUsageDay(day)) return unknown;
+  // 非空原始行里的未知计数也不能被旧版聚合零掩盖。
+  if (
+    day.rawModels!.some(
+      (model) =>
+        (scope === "all" || scope === "other" || model.groupKey === scope) &&
+        model.totalTokens == null,
+    )
+  )
+    return unknown;
   const hit = sumKnown(
     scope === "flash"
       ? [day.flashCacheHit]
@@ -273,3 +300,27 @@ export const chartPointFromDay = (
     unavailable: day.unavailable,
   };
 };
+
+/** 近 N 日存在未知柱时，不把已返回记录之和冒充完整总量。 */
+export const chartTotal = (points: ChartPoint[]): number | null =>
+  points.some((point) => point.unavailable)
+    ? null
+    : points.reduce((sum, point) => sum + point.total, 0);
+
+/** 当前月及近7日的源日期覆盖，统一用于状态与图表提示。 */
+export function missingUsageDates(
+  usage: import("./types").UsageResult,
+  now: Date = new Date(),
+): string[] {
+  const today = accountingDateKey(now);
+  const count = Math.max(7, Number(today.slice(8)));
+  return recentUsageDays(
+    usage.days,
+    count,
+    usage.unavailableDates,
+    now,
+    usage.accountingDate,
+  )
+    .filter((day) => !hasReturnedUsageDay(day))
+    .map((day) => day.date);
+}

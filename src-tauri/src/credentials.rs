@@ -159,7 +159,7 @@ mod tests {
     macro_rules! require_windows {
         () => {
             if !on_windows() {
-                eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
+                eprintln!("NOT RUN: DPAPI 仅在 Windows 可用，本测试未验证真实加密");
                 return;
             }
         };

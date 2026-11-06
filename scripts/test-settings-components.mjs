@@ -11,10 +11,16 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // Keep output beside node_modules so Node resolves the pinned React renderer.
 const directory = mkdtempSync(join(root, ".settings-components-"));
 try {
-  const outfile = join(directory, "settings.test.mjs");
+  const entries = [
+    "settings-transactions.test",
+    "desktop-ui-regressions.test",
+    "usage-fidelity.test",
+  ];
+  const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({
-    entryPoints: [join(root, "tests/settings-transactions.test.tsx")],
-    outfile,
+    entryPoints: entries.map((name) => join(root, `tests/${name}.tsx`)),
+    outdir: directory,
+    outExtension: { ".js": ".mjs" },
     bundle: true,
     platform: "node",
     format: "esm",
@@ -36,7 +42,7 @@ try {
       },
     ],
   });
-  const result = spawnSync(process.execPath, ["--test", outfile], {
+  const result = spawnSync(process.execPath, ["--test", ...outfiles], {
     cwd: root,
     stdio: "inherit",
   });

@@ -160,6 +160,8 @@ npm run tauri:build
 
 `verify` requires PowerShell 7+. The current scripts define its exact steps. The source no longer downloads or bundles a multi-tool statistics engine. After building an installer, use the [acceptance checklist](docs/ACCEPTANCE_1.3.1.md) to check installation, upgrades, tray behavior, login, credentials and data boundaries. Static review, old-version test results or matching version numbers cannot replace that acceptance.
 
+The Rust release gate requires complete mandatory coverage on a Windows host. Non-Windows development runs are explicitly `NOT RUN`, never release passes. See the [release gate evidence guide](docs/RELEASE_GATES_1.3.1.md) for required tests, counts and recording commands.
+
 `src/` contains the frontend, `src-tauri/src/` the backend, `scripts/` local verification/release tools, and `docs/` upgrade/acceptance notes. Requests live in `deepseek_api.rs`; usage rules in `usage.rs` / `usage_history.rs`; login synchronization in `token_sync.rs` / `sync_session.rs`; credentials and configuration in `credentials.rs` / `config.rs`.
 
 ## Origin, license and disclaimer

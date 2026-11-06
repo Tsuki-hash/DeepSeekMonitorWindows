@@ -124,7 +124,8 @@ const testCounts = (text) => {
 
 const formatCounts = (counts) => {
   if (!counts.parseable) return "不可解析（原始输出见下）";
-  return `tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
+  const executed = counts.executed ?? counts.passed + counts.failed;
+  return `tests=${counts.tests} executed=${executed} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
 };
 
 // 复评 Q08：git 成败只按退出码判断 —— 干净 `status --porcelain` 的正确结果
@@ -201,7 +202,21 @@ const classify = (label, result) => {
   if (result.error || result.signal) return "ERROR";
   if (label === "cargo test" && result.code === 2) return "NOT RUN";
   if (!result.ok) return "FAIL";
-  if (hasNotRun(`${result.stdout}\n${result.stderr}`)) return "NOT RUN";
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (hasNotRun(output)) return "NOT RUN";
+  if (["前端测试", "组件测试", "门禁故障注入测试"].includes(label)) {
+    const counts = testCounts(output);
+    if (
+      !counts.parseable ||
+      !Number.isSafeInteger(counts.tests) ||
+      counts.tests === 0 ||
+      counts.passed === 0 ||
+      counts.failed > 0 ||
+      counts.tests !== counts.passed + counts.failed + counts.ignored
+    )
+      return "ERROR";
+    if (counts.ignored > 0) return "NOT RUN";
+  }
   return "PASS";
 };
 
@@ -209,6 +224,9 @@ const lines = [];
 lines.push(`# 发版证据记录 v${version}`);
 lines.push("");
 lines.push(`生成时间：${new Date().toISOString()}`);
+lines.push(
+  `运行平台：${process.platform}/${process.arch}；发布必需平台：Windows MSVC。`,
+);
 lines.push("");
 lines.push("## 提交与工作区");
 lines.push("");
@@ -295,7 +313,7 @@ for (const [label, command, commandArgs] of checks) {
     label === "cargo test"
       ? (rustLog?.verdict ?? "ERROR")
       : classify(label, result);
-  checkResults.push({ label, command, commandArgs, result, verdict });
+  checkResults.push({ label, command, commandArgs, result, verdict, rustLog });
   if (verdict === "FAIL" || verdict === "ERROR") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
   const unknownCounts = {
@@ -326,7 +344,14 @@ lines.push("### 完整输出");
 lines.push("");
 lines.push("> 审计需要原始 stdout/stderr，不截断；成功命令的 stderr 也保留。");
 lines.push("");
-for (const { label, command, commandArgs, result, verdict } of checkResults) {
+for (const {
+  label,
+  command,
+  commandArgs,
+  result,
+  verdict,
+  rustLog,
+} of checkResults) {
   lines.push(
     `<details><summary>${label} — ${verdict}（退出码 ${result.code}）</summary>`,
   );
@@ -341,6 +366,20 @@ for (const { label, command, commandArgs, result, verdict } of checkResults) {
   lines.push(result.stderr.trim() || "(stderr 为空)");
   lines.push("```");
   lines.push("");
+  if (label === "cargo test") {
+    lines.push(
+      "Windows 发布覆盖与原始 libtest 证据（rawCounts 仅诊断，不代表通过）：",
+    );
+    lines.push("");
+    lines.push("```json");
+    lines.push(
+      rustLog
+        ? JSON.stringify(rustLog, null, 2)
+        : "结构化证据缺失或不一致，拒绝计为通过。",
+    );
+    lines.push("```");
+    lines.push("");
+  }
   lines.push("</details>");
   lines.push("");
 }
@@ -402,6 +441,12 @@ lines.push(
   "- 本次范围仅含 DeepSeek 账户余额、消费与用量、历史、提醒及桌面集成。",
 );
 lines.push(
+  "- Rust 发布门禁必须在 Windows 本机用明确 MSVC 目标执行；逐项验证 DPAPI、迁移、同秘密重加密语义身份、凭据提交版本和缓存监听。非 Windows、跳过、过滤或缺失必需测试均不构成发布 PASS。",
+);
+lines.push(
+  "- executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。NOT RUN 的原始 passed 不纳入可信通过计数。",
+);
+lines.push(
   "- 多工具 Agent 统计已移除：引擎集成、WSL/SQLite 工具扫描与目录链接能力探针不再执行，不计为 PASS 或 NOT RUN。",
 );
 lines.push("");
@@ -423,7 +468,7 @@ if (failures.length) {
   );
 } else if (notRun.length) {
   lines.push(
-    `⚠ 发布不放行：${notRun.join("、")} 为 NOT RUN。开发门禁可接受，发版不可。`,
+    `⚠ 发布不放行：${notRun.join("、")} 为 NOT RUN。仅供开发诊断，发版不可。`,
   );
 } else if (installerStatus !== "hashed") {
   lines.push(

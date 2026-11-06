@@ -1,3 +1,4 @@
+import { hasReturnedUsageDay } from "./format.ts";
 import type { RawModelUsage, UsageResult } from "./types";
 export type HistoryRange = "month" | "previous" | "30days" | "custom" | "all";
 export type HistoryWindow = { from: string; to: string; months: string[] };
@@ -99,9 +100,16 @@ export function buildHistory(
         day.unavailable
       )
         continue;
-      if (!day.rawModels) continue;
-      if (day.rawModels.length) returned.add(day.date);
-      for (const model of day.rawModels)
+      if (
+        !hasReturnedUsageDay(
+          day,
+          month.usage.unavailableDates,
+          month.usage.accountingDate,
+        )
+      )
+        continue;
+      returned.add(day.date);
+      for (const model of day.rawModels!)
         rows.set(`${day.date}\0${model.model}`, { date: day.date, model });
     }
   }

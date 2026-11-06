@@ -163,6 +163,9 @@ function App() {
   const balanceGate = React.useRef(new RequestGate<BalanceData>());
   const loadBalance = React.useCallback(
     (silent = false) => {
+      // 配置不可读不是「尚未配置」。错误快照拥有账户状态，重读恢复前
+      // 不再让手动刷新、托盘唤出或调度器覆盖这个错误与撤销结果。
+      if (getCommittedConfig()?.configReadError) return Promise.resolve();
       const requestId = ++balanceRequestId.current;
       const credentialRevision = getCommittedConfig()?.apiKeyRevision;
       if (silent) {
@@ -231,6 +234,7 @@ function App() {
   const usageSnapshot = React.useRef<UsageResult | null>(null);
   const loadUsage = React.useCallback(
     (silent = false) => {
+      if (getCommittedConfig()?.configReadError) return Promise.resolve();
       const requestId = ++usageRequestId.current;
       const retained = currentUsageSnapshot(usageSnapshot.current, todayStr());
       usageSnapshot.current = retained;
@@ -314,6 +318,7 @@ function App() {
   const [configSnapshot, setConfigSnapshot] = React.useState<{
     apiKeyConfigured: boolean;
     usageTokenConfigured: boolean;
+    configReadError: string | null;
   } | null>(null);
 
   // Application ownership is independent of the settings page. Every committed
@@ -327,20 +332,66 @@ function App() {
       if (!next) return;
       const previous = observedCredentials.current;
       const receipt = getValidatedBalance();
+      // 恢复为可信空配置时，两个 configured 值甚至凭据版本可能未变，
+      // 仍须清掉故障并重新计算引导，不能依赖凭据布尔值变化。
+      const trustChanged =
+        Boolean(previous?.configReadError) !== Boolean(next.configReadError);
       const keyChanged =
-        !previous || previous.apiKeyRevision !== next.apiKeyRevision;
+        !previous ||
+        trustChanged ||
+        previous.apiKeyRevision !== next.apiKeyRevision;
       const tokenChanged =
-        !previous || previous.usageTokenRevision !== next.usageTokenRevision;
+        !previous ||
+        trustChanged ||
+        previous.usageTokenRevision !== next.usageTokenRevision;
       const balanceReceived =
         receipt !== null && receipt !== observedBalance.current;
       observedCredentials.current = next;
       observedBalance.current = receipt;
       setRefreshIntervalSeconds(next.refreshIntervalSeconds || 60);
-      setAutoRefreshEnabled(next.autoRefreshEnabled);
+      setAutoRefreshEnabled(!next.configReadError && next.autoRefreshEnabled);
       setConfigSnapshot({
         apiKeyConfigured: next.apiKeyConfigured,
         usageTokenConfigured: next.usageTokenConfigured,
+        configReadError: next.configReadError || null,
       });
+      if (next.configReadError) {
+        // 必须先撤销两个通道及托盘，再显示根因。拒绝迟到的成功与失败，
+        // 不把读取失败解释成首次安装，也不恢复任何旧账户快照。
+        balanceRequestId.current += 1;
+        balanceGate.current.invalidate();
+        usageRequestId.current += 1;
+        invalidateUsageRequests();
+        availableSnapshot.current = { balance: false, usage: false };
+        usageSnapshot.current = null;
+        setBalance(null);
+        setBalanceUpdatedAt(null);
+        setBalanceCredentialValid(false);
+        setUsage(null);
+        setUsageUpdatedAt(null);
+        trayPublisher.current?.update({
+          total: null,
+          currency: null,
+          stale: false,
+        });
+        for (const channel of ["balance", "usage"] as const) {
+          applyChannel(
+            channel,
+            onCredentialChanged(
+              channels.current[channel],
+              false,
+              refreshIntervalRef.current,
+            ),
+          );
+        }
+        setBalanceError(next.configReadError);
+        setBalanceErrorCode("config_read_error");
+        setBalanceState("error");
+        setUsageError(next.configReadError);
+        setUsageErrorCode("config_read_error");
+        setUsageState("error");
+        return;
+      }
       if (keyChanged || balanceReceived) {
         if (keyChanged) {
           balanceRequestId.current += 1;
@@ -509,6 +560,7 @@ function App() {
   // 配置尚未读取完成时不展示引导，避免把老用户当新手（复评 F12）。
   const showOnboarding =
     configSnapshot !== null &&
+    !configSnapshot.configReadError &&
     shouldShowOnboarding({
       apiKeyConfigured: configSnapshot.apiKeyConfigured,
       usageTokenConfigured: configSnapshot.usageTokenConfigured,
@@ -626,9 +678,12 @@ function App() {
     const acceptConfig = (event: { payload: AppConfig }) => {
       setCommittedConfig(event.payload);
     };
-    const captured = listen<UsageTokenCaptured>("usage-token-captured", ({ payload }) => {
-      setCommittedConfig(payload.config);
-    });
+    const captured = listen<UsageTokenCaptured>(
+      "usage-token-captured",
+      ({ payload }) => {
+        setCommittedConfig(payload.config);
+      },
+    );
     const cleared = listen<AppConfig>("usage-token-cleared", acceptConfig);
     const changed = listen<AppConfig>(
       "credential-config-changed",
@@ -704,7 +759,32 @@ function App() {
         <>
           <DashboardPanel
             onboarding={
-              showOnboarding ? (
+              configSnapshot?.configReadError ? (
+                <section className="config-read-error" role="alert">
+                  <strong>配置读取失败</strong>
+                  <p>{configSnapshot.configReadError}</p>
+                  <p className="muted">
+                    暂时无法确认已保存的账户配置，旧账户数据已停止显示。修复配置后可重新读取。
+                  </p>
+                  <div className="disclosure-actions">
+                    <button
+                      className="secondary"
+                      onClick={() => {
+                        setSettingsTarget(null);
+                        setView("settings");
+                      }}
+                    >
+                      打开设置
+                    </button>
+                    <button
+                      className="primary"
+                      onClick={() => void reloadConfig()}
+                    >
+                      重新读取配置
+                    </button>
+                  </div>
+                </section>
+              ) : showOnboarding ? (
                 <OnboardingPanel
                   tasks={onboardingTasks({
                     apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,

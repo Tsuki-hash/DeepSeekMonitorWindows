@@ -160,6 +160,8 @@ npm run tauri:build
 
 `verify` 需要 PowerShell 7+；具体步骤以当前仓库脚本为准。源码不再下载或打包多工具统计引擎。安装包生成后，还需按 [验收清单](docs/ACCEPTANCE_1.3.1.md) 检查实际安装、升级、托盘、登录、凭据和数据边界。静态阅读、旧版本测试记录或版本号一致，都不能代替这些验收。
 
+`run-rust-tests.mjs` 与发行记录的发布级通过必须来自 Windows 本机的完整必需覆盖；非 Windows 开发运行明确返回 `NOT RUN`，不能作为发版通过。精确覆盖、计数及记录命令见 [发布门禁说明](docs/RELEASE_GATES_1.3.1.md)。
+
 主要目录：`src/` 为前端，`src-tauri/src/` 为后端，`scripts/` 为本机校验与发版工具，`docs/` 为升级和验收说明。余额／平台请求在 `deepseek_api.rs`，用量规则在 `usage.rs` / `usage_history.rs`，登录同步在 `token_sync.rs` / `sync_session.rs`，凭据与配置在 `credentials.rs` / `config.rs`。
 
 ## 来源、许可与免责声明

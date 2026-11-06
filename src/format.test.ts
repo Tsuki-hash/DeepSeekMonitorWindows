@@ -13,6 +13,8 @@ import {
   addDays,
   accountingDateKey,
   chartPointFromDay,
+  chartTotal,
+  missingUsageDates,
   currencySymbol,
   dateKey,
   emptyUsageDay,
@@ -28,11 +30,39 @@ import {
   type UsageDay,
 } from "./format.ts";
 
-const day = (date: string, totalTokens: number, totalCost = 0): UsageDay => ({
-  ...emptyUsageDay(date),
+const returnedDay = (
+  date: string,
+  totalTokens = 0,
+  totalCost = 0,
+): UsageDay => ({
+  date,
+  flashTokens: totalTokens,
+  flashCacheHit: 0,
+  flashCacheMiss: 0,
+  flashResponse: 0,
+  proTokens: 0,
+  proCacheHit: 0,
+  proCacheMiss: 0,
+  proResponse: 0,
+  flashOtherTokens: 0,
+  proOtherTokens: 0,
   totalTokens,
   totalCost,
+  rawModels: [
+    {
+      model: "deepseek-flash",
+      groupKey: "flash",
+      totalTokens,
+      requestCount: 0,
+      cacheHitTokens: 0,
+      cacheMissTokens: 0,
+      responseTokens: 0,
+      otherTokens: 0,
+      cost: totalCost,
+    },
+  ],
 });
+const day = returnedDay;
 
 // ---------- fmtTokensShort ----------
 
@@ -125,7 +155,7 @@ test("recentUsageDays：未获取日期为未知，已获取无用量日期为�
   const result = recentUsageDays([], 7, [businessDate(FIXED_NOW)], FIXED_NOW);
   assert.equal(result[6].unavailable, true);
   assert.equal(chartPointFromDay(result[6]).unavailable, true);
-  assert.equal(result[5].unavailable, false);
+  assert.equal(result[5].unavailable, true);
 });
 
 test("addDays：跨月与跨年", () => {
@@ -184,19 +214,19 @@ test("recentUsageDays：固定返回 7 天且按时间升序", () => {
   assert.equal(dates[6], businessDate(FIXED_NOW), "最后一天必须是记账日今天");
 });
 
-test("recentUsageDays：接口没返回的日期补零", () => {
+test("recentUsageDays：接口没返回的日期补为未知", () => {
   const today = businessDate(FIXED_NOW);
   const yesterday = businessShift(FIXED_NOW, -1);
   const result = recentUsageDays([day(yesterday, 1000)], 7, [], FIXED_NOW);
   assert.equal(result[6].date, today);
   const filled = result.find((item) => item.date === yesterday);
   assert.equal(filled?.totalTokens, 1000);
-  // 其余 6 天必须是零值，而不是 undefined
+  // 其余 6 天没有源行，必须未知而不是零
   for (const item of result) {
     if (item.date === yesterday) continue;
-    assert.equal(item.totalTokens, 0);
-    assert.equal(item.flashTokens, 0);
-    assert.equal(item.totalCost, 0);
+    assert.equal(item.totalTokens, null);
+    assert.equal(item.flashTokens, null);
+    assert.equal(item.totalCost, null);
   }
 });
 
@@ -294,7 +324,7 @@ test("recentUsageDays：月末、年末与闰日窗口", () => {
 
 test("chartPointFromDay：all 用 totalTokens 吞掉未识别模型差额", () => {
   const sample: UsageDay = {
-    ...emptyUsageDay("2026-09-11"),
+    ...returnedDay("2026-09-11"),
     flashCacheHit: 100,
     flashCacheMiss: 200,
     flashResponse: 50,
@@ -316,7 +346,7 @@ test("chartPointFromDay：all 用 totalTokens 吞掉未识别模型差额", () =
 
 test("chartPointFromDay：all 在 totalTokens 缺失时退回分段和", () => {
   const sample: UsageDay = {
-    ...emptyUsageDay("2026-09-11"),
+    ...returnedDay("2026-09-11"),
     flashCacheHit: 10,
     flashOtherTokens: 5,
     totalTokens: 0,
@@ -341,7 +371,7 @@ test("nextLoadStateAfterError：silent 保留 ok，否则标 error/nokey", () =>
 
 test("chartPointFromDay：单模型不含未识别模型差额", () => {
   const sample: UsageDay = {
-    ...emptyUsageDay("2026-09-11"),
+    ...returnedDay("2026-09-11"),
     flashCacheHit: 100,
     flashResponse: 20,
     proCacheMiss: 999,
@@ -356,7 +386,7 @@ test("chartPointFromDay：单模型不含未识别模型差额", () => {
 
 test("chartPointFromDay：other 档只含未接入模型量（合计 − flash − pro）", () => {
   const sample: UsageDay = {
-    ...emptyUsageDay("2026-09-11"),
+    ...returnedDay("2026-09-11"),
     flashTokens: 100,
     flashCacheHit: 60,
     flashCacheMiss: 40,
@@ -376,7 +406,7 @@ test("chartPointFromDay：other 档只含未接入模型量（合计 − flash �
 test("chartPointFromDay：other 档在合计小于已知模型时夹到 0", () => {
   // 防御：接口口径异常时不应出现负数柱高
   const sample: UsageDay = {
-    ...emptyUsageDay("2026-09-11"),
+    ...returnedDay("2026-09-11"),
     flashTokens: 100,
     totalTokens: 50,
   };
@@ -390,4 +420,103 @@ test("大额货币展示保持紧凑，普通金额保留分位与币种", () =>
   assert.equal(fmtMoneyDisplay(9999.99, "$"), "$9999.99");
   assert.equal(fmtMoneyDisplay(12345678.9), "¥12.3M");
   assert.equal(fmtMoneyDisplay(1234567890123.45), "¥1.2T");
+});
+
+test("R14-06：11月10日仅返回9日，无 unavailableDates 也不能补实测零", () => {
+  const now = new Date("2026-11-09T16:00:00Z");
+  const source = [returnedDay("2026-11-09", 100, 0.5)];
+  const days = recentUsageDays(source, 7, [], now);
+  assert.equal(days[6].date, "2026-11-10");
+  assert.deepEqual(days[6], emptyUsageDay("2026-11-10"));
+  for (const scope of ["all", "flash", "pro", "other"] as const)
+    assert.equal(chartPointFromDay(days[6], scope).unavailable, true);
+  assert.equal(chartTotal(days.map((day) => chartPointFromDay(day))), null);
+  assert.equal(source[0].totalTokens, 100);
+});
+
+test("R14-06：非空显式零与空 data、旧版聚合零严格区分", () => {
+  const now = new Date("2026-11-10T02:00:00Z");
+  const zero = returnedDay("2026-11-10");
+  assert.equal(chartPointFromDay(zero).total, 0);
+  assert.equal(Boolean(chartPointFromDay(zero).unavailable), false);
+  assert.equal(chartTotal([chartPointFromDay(zero)]), 0);
+  for (const rawModels of [[], undefined]) {
+    const unknown = recentUsageDays([{ ...zero, rawModels }], 1, [], now)[0];
+    assert.equal(unknown.totalTokens, null);
+    assert.equal(unknown.totalCost, null);
+    assert.equal(chartPointFromDay({ ...zero, rawModels }).unavailable, true);
+  }
+  assert.equal(
+    chartPointFromDay({
+      ...zero,
+      rawModels: [{ ...zero.rawModels![0], totalTokens: null }],
+    }).unavailable,
+    true,
+  );
+});
+
+test("R14-06：已返回行也不能覆盖请求失败和源快照未来日期", () => {
+  const now = new Date("2026-11-01T02:00:00Z");
+  const days = recentUsageDays(
+    [
+      returnedDay("2026-10-31"),
+      returnedDay("2026-11-01"),
+      returnedDay("2026-11-02"),
+    ],
+    7,
+    ["2026-10-31"],
+    now,
+    "2026-10-31",
+  );
+  assert.equal(days[5].unavailable, true);
+  assert.equal(days[6].unavailable, true);
+  assert.equal(
+    days.some((day) => day.date === "2026-11-02"),
+    false,
+  );
+  const usage = {
+    days,
+    models: [],
+    monthCost: 0,
+    accountingDate: "2026-10-31",
+  };
+  assert.ok(missingUsageDates(usage, now).includes("2026-11-01"));
+});
+
+test("R14-08：HIT存在但MISS缺失时柱和近7日合计保持未知", () => {
+  const partial = {
+    ...returnedDay("2026-11-10", 100),
+    flashCacheHit: 100,
+    flashCacheMiss: null,
+  };
+  for (const scope of ["all", "flash"] as const) {
+    const point = chartPointFromDay(partial, scope);
+    assert.equal(point.unavailable, true);
+    assert.equal(chartTotal([point]), null);
+  }
+});
+
+test("R14-08：Pro未知不能污染完整Flash，all与差额other仍未知", () => {
+  const completeFlash = returnedDay("2026-11-10", 100);
+  completeFlash.flashCacheHit = 100;
+  const partial: UsageDay = {
+    ...completeFlash,
+    rawModels: [
+      completeFlash.rawModels![0],
+      {
+        ...completeFlash.rawModels![0],
+        model: "deepseek-pro",
+        groupKey: "pro",
+        totalTokens: null,
+      },
+    ],
+    proCacheMiss: null,
+    proTokens: null,
+    totalTokens: null,
+  };
+  const flash = chartPointFromDay(partial, "flash");
+  assert.equal(Boolean(flash.unavailable), false);
+  assert.equal(flash.total, 100);
+  for (const scope of ["all", "pro", "other"] as const)
+    assert.equal(chartPointFromDay(partial, scope).unavailable, true);
 });

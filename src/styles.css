@@ -281,9 +281,28 @@ button {
   width: 100vw;
   height: 100vh;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   place-items: start center;
   overflow: hidden;
   background: transparent;
+}
+
+/* 主内容与离开提示明确共享第一格，提示不得产生隐式行挤走设置表单。 */
+.stage > .panel,
+.stage > .settings-panel {
+  grid-area: 1 / 1;
+}
+
+.config-read-error {
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-control);
+  background: var(--card-bottom);
+  overflow-wrap: anywhere;
+}
+.config-read-error p {
+  margin: 8px 0;
 }
 
 .panel,
@@ -2314,6 +2333,7 @@ button:disabled:hover {
   padding-bottom: 10px;
 }
 .primary-navigation {
+  grid-area: 2 / 1;
   width: min(356px, 100vw);
   height: 48px;
   display: flex;

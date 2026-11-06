@@ -779,6 +779,71 @@ mod tests {
         );
     }
     #[test]
+    fn r14_07_合法模型拆片与单行一致_贯通预算判定且不放宽缺项检查() {
+        let entry = |kind: &str, value: &str| serde_json::json!({"type":kind,"amount":value});
+        let complete = vec![
+            entry("PROMPT_CACHE_HIT_TOKEN", "10"),
+            entry("PROMPT_CACHE_MISS_TOKEN", "20"),
+            entry("RESPONSE_TOKEN", "5"),
+            entry("REQUEST", "1"),
+        ];
+        let single = serde_json::json!([{"model":"deepseek-flash","usage":complete.clone()}]);
+        let split = serde_json::json!([
+            {"model":"deepseek-flash","usage":[complete[0].clone()]},
+            {"model":"deepseek-flash","usage":complete[1..].to_vec()}
+        ]);
+        let result = |rows: serde_json::Value, costs: serde_json::Value| {
+            let amount = serde_json::from_value(serde_json::json!({
+                "data":{"biz_data":{"total":rows,"days":[]}}
+            }))
+            .unwrap();
+            let cost = serde_json::from_value(serde_json::json!({
+                "data":{"biz_data":[{"total":costs,"days":[]}]}
+            }))
+            .unwrap();
+            deepseek_api::build_usage_result(&amount, &cost)
+        };
+        let known_cost = serde_json::json!([{"model":"deepseek-flash","usage":[entry("RESPONSE_TOKEN", "120")]}]);
+        for rows in [single, split.clone()] {
+            for (threshold, trigger) in [(100.0, true), (120.0, true), (121.0, false)] {
+                let data = result(rows.clone(), known_cost.clone());
+                assert_eq!(data.models[0].total_tokens, Some(35));
+                assert_eq!(data.month_cost, Some(120.0));
+                assert!(
+                    data.warnings.is_empty(),
+                    "合法拆片无假警告：{:?}",
+                    data.warnings
+                );
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(budget_sample(data, &options), ("ok".into(), trigger));
+            }
+        }
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!([{"model":"deepseek-flash","usage":[]}]),
+            serde_json::json!([{"model":"deepseek-flash","usage":[entry("RESPONSE_TOKEN", "NaN")]}]),
+            serde_json::json!([
+                {"model":"deepseek-flash","usage":[entry("RESPONSE_TOKEN", "120")]},
+                {"model":"missing-count-model","usage":[entry("RESPONSE_TOKEN", "1")]}
+            ]),
+        ];
+        for costs in cases {
+            assert_eq!(
+                budget_sample(result(split.clone(), costs), &Default::default()),
+                ("invalid_data".into(), false)
+            );
+        }
+        // 非法计数仍由质量警告拒绝，修复集合对齐不是清空所有警告。
+        let invalid_count = serde_json::json!([{"model":"deepseek-flash","usage":[entry("RESPONSE_TOKEN", "1.5")]}]);
+        assert_eq!(
+            budget_sample(result(invalid_count, known_cost), &Default::default()),
+            ("invalid_data".into(), false)
+        );
+    }
+    #[test]
     fn 去重文件实际往返与损坏拒绝_不发送系统通知() {
         let _dir = crate::test_support::TempConfigDir::new("alert-ledger");
         let mut ledger = load_ledger().unwrap();

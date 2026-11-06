@@ -9,7 +9,6 @@
 
 use crate::credentials;
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 use std::{
     fs,
     path::PathBuf,
@@ -19,6 +18,7 @@ use std::{
     },
     thread::ThreadId,
 };
+use tauri::Emitter;
 
 /// 进程内配置读改写锁。多个 command 并发 save 时 last-write-wins 会丢字段，
 /// 用一把全局锁把「读 → 改 → 写」串行化。锁的是本进程；跨进程写同一 config.json
@@ -322,9 +322,8 @@ fn observe_snapshot(
     let semantic = semantic_config(config);
     let mut observed = observed_config().lock().unwrap_or_else(|e| e.into_inner());
     let previous = observed.as_ref().filter(|previous| previous.path == path);
-    let changed = previous.is_some_and(|previous| {
-        previous.present != present || previous.config != semantic
-    });
+    let changed =
+        previous.is_some_and(|previous| previous.present != present || previous.config != semantic);
     if changed || force_commit {
         let next = CONFIG_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
         if previous.is_some_and(|previous| previous.config.api_key != semantic.api_key)
@@ -341,7 +340,11 @@ fn observe_snapshot(
     if let Some(kind) = validated {
         credential_counter(kind).fetch_add(1, Ordering::SeqCst);
     }
-    *observed = Some(ObservedConfig { path, present, config: semantic });
+    *observed = Some(ObservedConfig {
+        path,
+        present,
+        config: semantic,
+    });
     drop(observed);
     stamp_snapshot(config);
     if changed || force_commit {
@@ -397,9 +400,9 @@ fn read_effective_config_unlocked() -> Result<StoredConfig, String> {
         // Migration changes the disk representation, not semantic identity. Publish
         // exactly once below, including independently changed Key/Token generations.
         if write_stored_config_with(&config, encrypt_credentials).is_err() {
-            config.config_warnings.push(
-                "旧配置凭据尚未成功加密，请检查 Windows 加密服务并重新保存".into(),
-            );
+            config
+                .config_warnings
+                .push("旧配置凭据尚未成功加密，请检查 Windows 加密服务并重新保存".into());
         }
     }
     observe_snapshot(&mut config, true, false, None);
@@ -412,7 +415,9 @@ fn read_effective_config_unlocked() -> Result<StoredConfig, String> {
 fn decrypt_credentials(config: &mut StoredConfig) -> Result<bool, String> {
     let mut migrated = false;
     for field in [&mut config.api_key, &mut config.usage_token] {
-        let Some(stored) = field.as_ref() else { continue };
+        let Some(stored) = field.as_ref() else {
+            continue;
+        };
         if stored.is_empty() || !credentials::is_ciphertext(stored) {
             migrated |= !stored.is_empty();
             continue;
@@ -766,7 +771,7 @@ mod tests {
     #[test]
     fn 落盘的凭据是密文_不是明文() {
         if !require_windows_encryption() {
-            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
+            eprintln!("NOT RUN: DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
         // Windows 上加密必须真的可用：失败即失败，不静默跳过。
@@ -796,7 +801,7 @@ mod tests {
     #[test]
     fn 明文旧配置_读取后自动迁移为密文() {
         if !require_windows_encryption() {
-            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
+            eprintln!("NOT RUN: DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
         // Windows 上加密必须真的可用：失败即失败，不静默跳过。
@@ -834,7 +839,7 @@ mod tests {
     #[test]
     fn 已加密配置_重复读取不改变内容() {
         if !require_windows_encryption() {
-            eprintln!("跳过：DPAPI 仅在 Windows 可用，本测试未验证真实加密");
+            eprintln!("NOT RUN: DPAPI 仅在 Windows 可用，本测试未验证真实加密");
             return;
         }
         // Windows 上加密必须真的可用：失败即失败，不静默跳过。
@@ -870,17 +875,24 @@ mod tests {
         let public = read_app_config().unwrap();
         assert!(!public.api_key_configured && !public.usage_token_configured);
         assert!(public.config_read_error.is_some());
-        assert!(!serde_json::to_string(&public).unwrap().contains("SYNTHETIC"));
+        assert!(!serde_json::to_string(&public)
+            .unwrap()
+            .contains("SYNTHETIC"));
         assert!(edit_config(|_| panic!("unreadable credentials must block writes")).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     fn write_synthetic_plaintext(key: &str, token: &str, interval: u64) {
-        fs::write(config_path().unwrap(), serde_json::to_vec(&serde_json::json!({
-            "api_key": key,
-            "usage_token": token,
-            "refresh_interval_seconds": interval,
-        })).unwrap()).unwrap();
+        fs::write(
+            config_path().unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "api_key": key,
+                "usage_token": token,
+                "refresh_interval_seconds": interval,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -889,14 +901,20 @@ mod tests {
         write_synthetic_plaintext("SYNTHETIC_KEY_A", "SYNTHETIC_TOKEN_A", 300);
         let before = revision();
         let first = read_stored_config().unwrap();
-        assert_eq!(first.config_revision, before, "initial migration is not a new identity");
+        assert_eq!(
+            first.config_revision, before,
+            "initial migration is not a new identity"
+        );
         fs::remove_file(config_path().unwrap()).unwrap();
         let missing = read_stored_config().unwrap();
         assert!(missing.config_revision > first.config_revision);
         assert!(missing.api_key_revision > first.api_key_revision);
         assert!(missing.usage_token_revision > first.usage_token_revision);
         assert!(missing.api_key.is_none() && missing.usage_token.is_none());
-        assert_eq!(read_stored_config().unwrap().config_revision, missing.config_revision);
+        assert_eq!(
+            read_stored_config().unwrap().config_revision,
+            missing.config_revision
+        );
     }
 
     #[test]
@@ -918,12 +936,17 @@ mod tests {
             assert!(changed.is_err());
         }
         let second = read_stored_config().unwrap();
-        assert_eq!(api_key_preview(first.api_key.as_deref().unwrap()),
-                   api_key_preview(second.api_key.as_deref().unwrap()));
+        assert_eq!(
+            api_key_preview(first.api_key.as_deref().unwrap()),
+            api_key_preview(second.api_key.as_deref().unwrap())
+        );
         assert!(second.api_key_revision > first.api_key_revision);
         assert_eq!(second.usage_token_revision, first.usage_token_revision);
         assert!(second.config_revision > first.config_revision);
-        assert_eq!(to_app_config(first.clone()).unwrap().config_revision, first.config_revision);
+        assert_eq!(
+            to_app_config(first.clone()).unwrap().config_revision,
+            first.config_revision
+        );
     }
 
     #[test]
@@ -938,7 +961,10 @@ mod tests {
         assert!(!revoked.api_key_configured && !revoked.usage_token_configured);
         assert!(revoked.api_key_revision > first.api_key_revision);
         assert!(revoked.usage_token_revision > first.usage_token_revision);
-        assert_eq!(read_app_config().unwrap().config_revision, revoked.config_revision);
+        assert_eq!(
+            read_app_config().unwrap().config_revision,
+            revoked.config_revision
+        );
         assert!(edit_config(|_| panic!("corrupt source must not be overwritten")).is_err());
         assert_eq!(fs::read(config_path().unwrap()).unwrap(), corrupt);
         write_synthetic_plaintext("SYNTHETIC_KEY", "SYNTHETIC_TOKEN", 60);
@@ -946,7 +972,9 @@ mod tests {
         assert!(recovered.config_read_error.is_none());
         assert!(recovered.api_key_revision > revoked.api_key_revision);
         assert!(recovered.usage_token_revision > revoked.usage_token_revision);
-        assert!(!serde_json::to_string(&revoked).unwrap().contains("SYNTHETIC"));
+        assert!(!serde_json::to_string(&revoked)
+            .unwrap()
+            .contains("SYNTHETIC"));
     }
 
     #[cfg(windows)]
@@ -956,9 +984,14 @@ mod tests {
         let secret = "SYNTHETIC_SAME_SECRET";
         let write_cipher = || {
             let encrypted = credentials::encrypt(secret).expect("Windows DPAPI must be available");
-            fs::write(config_path().unwrap(), serde_json::to_vec(&serde_json::json!({
-                "version": 1, "api_key": encrypted,
-            })).unwrap()).unwrap();
+            fs::write(
+                config_path().unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "api_key": encrypted,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         };
         write_cipher();
         let first = read_stored_config().unwrap();

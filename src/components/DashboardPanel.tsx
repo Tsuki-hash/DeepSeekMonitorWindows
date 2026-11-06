@@ -1,6 +1,6 @@
 import React from "react";
 import { RefreshCw, Settings, Shirt, X } from "lucide-react";
-import { todayStr } from "../format";
+import { todayStr, hasReturnedUsageDay } from "../format";
 import type { BalanceData, LoadState, ModelName, UsageResult } from "../types";
 import { useTheme } from "../theme";
 import { BrandIcon } from "./BrandIcon";
@@ -57,15 +57,20 @@ function DashboardPanel({
     other?.totalTokens ?? 0,
     1,
   );
-  const today = usage?.days.find((day) => day.date === todayStr()) ?? null;
+  const currentDate = todayStr();
+  const today = usage?.days.find((day) => day.date === currentDate) ?? null;
   // 费用为 null 表示「未取得」，与真实的 ¥0.00 必须区分开。
   const todayCost =
-    usageState === "ok" && today ? (today.totalCost ?? null) : null;
+    usageState === "ok" &&
+    today &&
+    hasReturnedUsageDay(today, usage?.unavailableDates, usage?.accountingDate)
+      ? (today.totalCost ?? null)
+      : null;
   const monthCost =
     usageState === "ok" && usage ? (usage.monthCost ?? null) : null;
   // 快照所属记账月：与当前记账月不同时，卡片标题不能再说「本月」。
   const snapshotMonth = usage?.accountingDate?.slice(0, 7) ?? null;
-  const currentMonth = todayStr().slice(0, 7);
+  const currentMonth = currentDate.slice(0, 7);
   const monthLabel =
     snapshotMonth && snapshotMonth !== currentMonth ? "上期消费" : "本月消费";
   // 来源与可信状态摘要（复评 F08）：完整性由警告、缺失日期、缺失费用共同推导，

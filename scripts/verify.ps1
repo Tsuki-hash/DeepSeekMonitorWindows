@@ -1,5 +1,6 @@
 # 本地一键验证（替代已取消的 GitHub CI）。
 # 用法：pwsh -File scripts/verify.ps1
+# 这是 Windows 发布源码门禁；非 Windows 可运行开发检查，但最终必须 NOT RUN。
 # 需要：PowerShell 7+（pwsh）、Node 22.6+、Rust 1.88+ MSVC 工具链。
 # Windows PowerShell 5.1 不支持本脚本的调用方式，请安装 PowerShell 7。
 
@@ -41,7 +42,8 @@ Invoke-Check 'cargo fmt' 'cargo' @('fmt', '--manifest-path', 'src-tauri/Cargo.to
 
 Invoke-Check 'cargo clippy' 'cargo' @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
 
-# 与发行记录共用真实执行数与结构化结论，缺失或未执行场景必须非零。
+# 与发行记录共用 Windows 平台与必需测试清单、逐项完成行及真实执行数。
+# 非 Windows 即使 cargo 成功也返回 2 / NOT RUN，不得降级为绿色通过。
 Invoke-Check 'cargo test' 'node' @('scripts/run-rust-tests.mjs') -ScenarioGate
 
 # Agent 统计已移除：引擎集成和工具目录链接探针不再属于产品验收范围，
@@ -53,4 +55,4 @@ Write-Host '已移除的 Agent 引擎集成与工具目录探针不计入本次�
 # 会让 `npm audit` 报 EALLOWSCRIPTS（环境问题，不是依赖问题）。
 Invoke-Check '生产依赖安全审计' 'node' @('scripts/audit-dependencies.mjs')
 
-Write-Host 'DeepSeek 源码门禁全部通过；安装升级与真机使用仍需验收。' -ForegroundColor Green
+Write-Host 'Windows DeepSeek 源码门禁全部通过；安装升级与真机使用仍需验收。' -ForegroundColor Green

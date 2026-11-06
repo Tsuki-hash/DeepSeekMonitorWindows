@@ -44,6 +44,22 @@ pub fn run() {
         .manage(desktop::DesktopState::default())
         .manage(update_check::UpdateCache::default())
         .manage(alerts::AlertRuntime::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    // Alt+F4 / 系统关闭与面板 X 一样只隐藏。先阻止销毁，
+                    // 即使隐藏失败也保留 WebView、当前视图和未保存草稿。
+                    // 登录子窗仍走自身的关闭流程；confirm_quit 的 app.exit(0)
+                    // 是进程退出，不通过这里重复请求关闭窗口。
+                    api.prevent_close();
+                    if let Some(main) = window.app_handle().get_webview_window("main") {
+                        if let Err(error) = tray::hide_main_window_inner(&main) {
+                            log::warn!("隐藏主窗口失败：{error}");
+                        }
+                    }
+                }
+            }
+        })
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()

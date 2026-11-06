@@ -471,13 +471,9 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
     let mut models = Vec::new();
     models.extend(flash_sum);
     models.extend(pro_sum);
-    // 本月没有未知模型时不出「其他」行，避免常态下多一行空白。
-    // 判定用「有 token 或有费用」；两者都未知时不凭空生成空行。
-    if let Some(other) = other_sum
-        .filter(|sum| sum.total_tokens.unwrap_or(0) > 0 || sum.cost.is_some_and(|cost| cost != 0.0))
-    {
-        models.push(other);
-    }
+    // R14-09：平台一旦返回未知模型就保留入口，包括请求非零而 Token/费用
+    // 为零、部分未知以及明确全零。没有未知模型时 other_sum 自然为 None。
+    models.extend(other_sum);
 
     // 按日费用：任一模型的金额无法解析就让该日为未知，不丢半个数字。
     let mut cost_by_date: std::collections::HashMap<String, Option<f64>> =
@@ -555,7 +551,7 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
         .map(|day| day.date.as_str())
         .collect();
     for day in &daily_source {
-        let count_known = amount_dates.contains(day.date.as_str());
+        let count_known = amount_dates.contains(day.date.as_str()) && !day.data.is_empty();
         let zero = || if count_known { Some(0u64) } else { None };
         let mut flash = zero();
         let mut flash_hit = zero();
@@ -676,7 +672,7 @@ pub fn build_usage_result(amount: &AmountResp, cost: &CostResp) -> UsageResult {
             // 缺数量的模型让当日 Token 合计未知；缺费用不污染有效 Tokens。
             total_tokens: if count_side_incomplete { None } else { total },
             // 缺费用的模型让当日费用合计未知，而不是把已知部分表现成完整值。
-            total_cost: if cost_side_incomplete {
+            total_cost: if cost_side_incomplete || day_cost_models.is_empty() {
                 None
             } else {
                 cost_by_date.get(&day.date).copied().flatten()
@@ -803,9 +799,9 @@ fn usage_alignment_warnings(
         .map(|item| item.days.iter().map(|day| day.date.as_str()).collect())
         .unwrap_or_default();
 
-    let models_mismatch = !amount_models.is_subset(&cost_models)
-        || !cost_models.is_subset(&amount_models)
-        || amount.data.biz_data.total.len() != cost_models.len();
+    // R14-07：同模型允许拆成多行。比较原始模型 ID 的去重集合，不能把
+    // 数量原始行数与费用模型数混比，误阻止已对齐数据的预算提醒。
+    let models_mismatch = amount_models != cost_models;
     // 日期只有一侧存在，或某天算不出费用/数量，都算不齐。
     let dates_mismatch = !amount_dates.is_subset(&cost_dates)
         || !cost_dates.is_subset(&amount_dates)
@@ -919,6 +915,167 @@ fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同一合成响应同时经过月槽位、日汇总和原始模型三条展示路径。
+    fn r14_response(amount_rows: serde_json::Value, cost_rows: serde_json::Value) -> UsageResult {
+        let amount: AmountResp = serde_json::from_value(serde_json::json!({
+            "data": {"biz_data": {
+                "total": amount_rows.clone(),
+                "days": [{"date": "2026-11-10", "data": amount_rows}]
+            }}
+        }))
+        .unwrap();
+        let cost: CostResp = serde_json::from_value(serde_json::json!({
+            "data": {"biz_data": [{
+                "total": cost_rows.clone(),
+                "days": [{"date": "2026-11-10", "data": cost_rows}]
+            }]}
+        }))
+        .unwrap();
+        build_usage_result(&amount, &cost)
+    }
+
+    #[test]
+    fn r14_06_空data日不是显式零_有原始零记录才是零() {
+        let missing = r14_response(serde_json::json!([]), serde_json::json!([]));
+        let day = &missing.days[0];
+        assert!(day.raw_models.is_empty());
+        assert_eq!(day.total_tokens, None);
+        assert_eq!(day.total_cost, None);
+        assert_eq!(day.flash_cache_hit, None);
+        let zero = r14_response(
+            serde_json::json!([{"model":"deepseek-flash","usage":[
+                {"type":"REQUEST","amount":"0"},
+                {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"0"},
+                {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"0"},
+                {"type":"RESPONSE_TOKEN","amount":"0"}
+            ]}]),
+            serde_json::json!([{"model":"deepseek-flash","usage":[
+                {"type":"RESPONSE_TOKEN","amount":"0"}
+            ]}]),
+        );
+        let day = &zero.days[0];
+        assert_eq!(day.raw_models.len(), 1);
+        assert_eq!(day.total_tokens, Some(0));
+        assert_eq!(day.total_cost, Some(0.0));
+        assert_eq!(day.flash_cache_hit, Some(0));
+        assert!(zero.warnings.is_empty());
+    }
+
+    #[test]
+    fn r14_08_请求缺失零与非零在月日历史中一致() {
+        for (request, expected) in [(None, None), (Some("0"), Some(0)), (Some("2"), Some(2))] {
+            let mut entries = vec![serde_json::json!({"type":"RESPONSE_TOKEN","amount":"100"})];
+            if let Some(value) = request {
+                entries.push(serde_json::json!({"type":"REQUEST","amount":value}));
+            }
+            let result = r14_response(
+                serde_json::json!([{"model":"deepseek-flash","usage":entries}]),
+                serde_json::json!([{"model":"deepseek-flash","usage":[
+                    {"type":"RESPONSE_TOKEN","amount":"1"}
+                ]}]),
+            );
+            assert_eq!(result.models[0].request_count, expected);
+            assert_eq!(result.models[0].cache_hit_tokens, None);
+            assert_eq!(result.models[0].cache_miss_tokens, None);
+            assert_eq!(result.models[0].response_tokens, Some(100));
+            assert_eq!(result.models[0].total_tokens, Some(100));
+            assert_eq!(result.days[0].flash_response, Some(100));
+            assert_eq!(result.days[0].flash_cache_hit, None);
+            assert_eq!(result.days[0].flash_cache_miss, None);
+            for raw in [&result.raw_models[0], &result.days[0].raw_models[0]] {
+                assert_eq!(raw.request_count, expected);
+                assert_eq!(raw.response_tokens, Some(100));
+                assert_eq!(raw.cache_hit_tokens, None);
+                assert_eq!(raw.cache_miss_tokens, None);
+                assert_eq!(raw.cost, Some(1.0));
+                assert!(raw.data_warning.is_none(), "缺字段不是非法数值");
+            }
+        }
+    }
+
+    #[test]
+    fn r14_08_别名缺请求或缓存字段不输出部分和() {
+        let result = r14_response(
+            serde_json::json!([
+                {"model":"deepseek-flash","usage":[
+                    {"type":"REQUEST","amount":"2"},
+                    {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"100"},
+                    {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"0"},
+                    {"type":"RESPONSE_TOKEN","amount":"10"}
+                ]},
+                {"model":"deepseek-v4-flash","usage":[
+                    {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"20"},
+                    {"type":"RESPONSE_TOKEN","amount":"5"}
+                ]}
+            ]),
+            serde_json::json!([
+                {"model":"deepseek-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"1"}]},
+                {"model":"deepseek-v4-flash","usage":[{"type":"RESPONSE_TOKEN","amount":"2"}]}
+            ]),
+        );
+        let slot = &result.models[0];
+        assert_eq!(slot.request_count, None);
+        assert_eq!(slot.cache_miss_tokens, None);
+        assert_eq!(slot.cache_hit_tokens, Some(120));
+        assert_eq!(slot.response_tokens, Some(15));
+        assert_eq!(slot.total_tokens, Some(135));
+        assert_eq!(slot.cost, Some(3.0));
+        assert_eq!(result.days[0].flash_cache_miss, None);
+        assert_eq!(result.days[0].flash_cache_hit, Some(120));
+        for raw in [&result.raw_models, &result.days[0].raw_models] {
+            assert_eq!(raw[0].request_count, Some(2));
+            assert_eq!(raw[0].cache_miss_tokens, Some(0));
+            assert_eq!(raw[1].request_count, None);
+            assert_eq!(raw[1].cache_miss_tokens, None);
+        }
+    }
+
+    #[test]
+    fn r14_09_未知模型有请求或未知字段或全零均保留入口() {
+        let zero_tokens = serde_json::json!([
+            {"type":"PROMPT_CACHE_HIT_TOKEN","amount":"0"},
+            {"type":"PROMPT_CACHE_MISS_TOKEN","amount":"0"},
+            {"type":"RESPONSE_TOKEN","amount":"0"}
+        ]);
+        for (request, include_tokens, include_cost) in [
+            (Some("2"), true, true),
+            (Some("2"), false, true),
+            (None, false, false),
+            (Some("0"), true, true),
+        ] {
+            let mut entries = if include_tokens {
+                zero_tokens.as_array().unwrap().clone()
+            } else {
+                vec![]
+            };
+            if let Some(value) = request {
+                entries.push(serde_json::json!({"type":"REQUEST","amount":value}));
+            }
+            let costs = if include_cost {
+                serde_json::json!([{"model":"future-model","usage":[{"type":"RESPONSE_TOKEN","amount":"0"}]}])
+            } else {
+                serde_json::json!([])
+            };
+            let result = r14_response(
+                serde_json::json!([{"model":"future-model","usage":entries}]),
+                costs,
+            );
+            let other = result
+                .models
+                .iter()
+                .find(|model| model.key == "other")
+                .expect("未知模型入口不得被过滤");
+            assert_eq!(
+                other.request_count,
+                request.map(|value| value.parse::<u64>().unwrap())
+            );
+            assert_eq!(other.total_tokens, include_tokens.then_some(0));
+            assert_eq!(other.cost, include_cost.then_some(0.0));
+            assert_eq!(result.raw_models[0].model, "future-model");
+            assert_eq!(result.days[0].raw_models[0].model, "future-model");
+        }
+    }
 
     #[test]
     fn 费用重复条目累加_同模型多数量条目不重复收费() {
@@ -1900,7 +2057,11 @@ mod tests {
         assert_eq!(flash.name, "V4.1 Flash");
         assert_eq!(flash.cache_hit_tokens, Some(110));
         assert_eq!(flash.response_tokens, Some(30));
-        assert_eq!(flash.request_count, Some(3));
+        assert_eq!(flash.request_count, None, "别名缺请求字段不能展示部分和 3");
+        assert_eq!(
+            flash.cache_miss_tokens, None,
+            "别名缺 MISS 不能展示部分和 50"
+        );
         // 0.10 + 0.20（REQUEST 不计费用）只覆盖 deepseek-flash；
         // 同槽位的 deepseek-v4-flash 没有费用条目，槽位费用因此未知（复评 F06）。
         assert_eq!(flash.cost, None, "别名缺费用时不能显示部分金额");
