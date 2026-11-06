@@ -260,9 +260,10 @@ export function LocalUsagePanel({
             subject: "采集目录",
             save: async () => (await saveSourceRef.current?.()) ?? false,
             discard: () => {
+              // 复评 R07：只清父级 dirty 不够 —— 子组件仍保留修改且不会重新上报。
+              // 递增 revision 并递增 key 让子组件**重新挂载**，从后端重读已保存值。
               setSourceDirty(false);
               setPendingLeave(null);
-              // 让子组件重新从后端读取，等于放弃草稿。
               setSourceRevision((value) => value + 1);
             },
           }
@@ -591,6 +592,8 @@ export function LocalUsagePanel({
                   const action = pendingLeave;
                   setPendingLeave(null);
                   setSourceDirty(false);
+                  // 复评 R07：放弃必须让子组件重挂载并重读已保存值。
+                  setSourceRevision((value) => value + 1);
                   action();
                 }}
               >
@@ -607,6 +610,7 @@ export function LocalUsagePanel({
         )}
         <div hidden={workspace !== "settings"}>
           <LocalSourceSettings
+            key={`sources-${sourceRevision}`}
             onDirtyChanged={setSourceDirty}
             onSaveRequested={(save) => {
               saveSourceRef.current = save;
@@ -723,10 +727,13 @@ export function LocalUsagePanel({
             }
             disabled={!enabled || busy || changing}
             onOpen={(mode) => {
-              control.current.sequence++;
-              tracker.current.reset();
-              setBusy(false);
-              setArchiveView(mode);
+              // 复评 R06：归档入口同样会卸载采集设置组件，必须走草稿守卫。
+              guarded(() => {
+                control.current.sequence++;
+                tracker.current.reset();
+                setBusy(false);
+                setArchiveView(mode);
+              });
             }}
           />
         </div>
