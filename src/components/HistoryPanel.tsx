@@ -3,6 +3,7 @@ import { HistoryTrend } from "./HistoryTrend";
 import { ArrowLeft, Download, RefreshCw } from "lucide-react";
 import { todayStr, fmtTokensShort, fmtMoneyDisplay, mmdd } from "../format";
 import { historyDateLabel } from "../history-date-label";
+import { mergeHistoryMonths } from "../history-merge";
 import { updateTime, snapshotAge } from "../data-display";
 import { fetchMonthUsage } from "../usage-api";
 import { historyCache } from "../history-cache";
@@ -40,9 +41,15 @@ const dateLabel = (date: string, from: string, to: string) =>
 export function HistoryPanel({
   onBack,
   onLocalUsage,
+  onConfigureUsage,
+  usageTokenConfigured = true,
 }: {
   onBack: () => void;
   onLocalUsage?: () => void;
+  /** 直接打开并定位到用量 Token 设置（复评 F10：不能只回首页）。 */
+  onConfigureUsage?: () => void;
+  /** 真实配置状态：区分「首次配置」与「凭据失效」，不能默认当成失效。 */
+  usageTokenConfigured?: boolean;
 }) {
   const [range, setRange] = React.useState<HistoryRange>("month");
   const [selectedMonth, setSelectedMonth] = React.useState(
@@ -92,7 +99,7 @@ export function HistoryPanel({
       const window = historyWindow(range, date, selectedMonth);
       // 三种模式：
       // - 默认：`all` 只请求最近一批；其他区间请求整个窗口。
-      // - `monthsOnly`：只重试失败月份。
+      // - `monthsOnly`：只重试失败月份（保留其他成功月份）。
       // - `older=true`：把已加载范围再往前扩一批。
       let targets: string[];
       if (monthsOnly) {
@@ -107,29 +114,48 @@ export function HistoryPanel({
       } else {
         targets = window.months;
       }
-      // 未加载月份 = 窗口内**早于本次已覆盖范围**的月份。
-      // 已加载的月份（含本次目标与之前批次）都不算未加载；只有还没查过的更早月份才算。
-      const requested = new Set(targets);
-      // 本次请求**计划**覆盖到的最早月份；若中途因鉴权/限流停止，
-      // 实际覆盖范围会回退到「已成功加载的最早月份」（见下方 unloaded 重算）。
-      const plannedFrom = monthsOnly
-        ? loadedFrom.current
-        : (targets[0] ?? null);
-      const unloadedFor = (coveredFrom: string | null) =>
-        window.months.filter(
-          (month) =>
-            !requested.has(month) && coveredFrom != null && month < coveredFrom,
-        );
-      const unloaded = unloadedFor(plannedFrom);
+      // 本次请求之前已成功取得的月份：重试与继续加载都要保留它们。
+      const previousMonths = snapshotRef.current?.months ?? [];
+      const attempted: string[] = [];
+      const successful: HistorySnapshot["months"] = [];
+      const failedMonths: string[] = [];
+      // 统一的收尾：按月份合并（区分 attempted/successful/failed/unloaded），
+      // 正常结束与提前停止走同一条边界计算（复评 F02）。
+      const commit = (stopText?: string) => {
+        const merged = mergeHistoryMonths({
+          windowMonths: window.months,
+          planned: targets,
+          attempted,
+          successful,
+          previous: previousMonths,
+          failed: failedMonths,
+        });
+        if (merged.coveredFrom && range === "all") {
+          // 边界取实际成功的月份：失败的月份不能被当成已覆盖。
+          const previousFrom = loadedFrom.current;
+          loadedFrom.current =
+            previousFrom != null && previousFrom < merged.coveredFrom
+              ? previousFrom
+              : merged.coveredFrom;
+        }
+        if (successful.length || previousMonths.length) {
+          snapshotEpoch.current = requestedEpoch;
+          setSnapshot(
+            buildHistory(window, merged.months, failedMonths, merged.unloaded),
+          );
+        }
+        setFailed(failedMonths);
+        if (stopText) {
+          setRecovery(stopText as never);
+        } else if (failedMonths.length) {
+          setRecovery("partial");
+          setError(`${failedMonths.length}个月份未取得，未返回日期标为未知。`);
+        }
+      };
       setBusy(true);
       setError("");
       setRecovery(null);
       setExportStatus("");
-      // 继续加载更早月份时，保留已加载的月份，只追加新结果。
-      const kept =
-        older && snapshotRef.current ? snapshotRef.current.months : [];
-      const successful: HistorySnapshot["months"] = [...kept];
-      const failed: string[] = [];
       setProgress({ done: 0, total: targets.length });
       for (const month of [...targets].reverse()) {
         if (
@@ -137,6 +163,7 @@ export function HistoryPanel({
           requestedEpoch !== historyCache.epoch()
         )
           return;
+        attempted.push(month);
         const [year, number] = month.split("-").map(Number);
         try {
           successful.push(
@@ -148,32 +175,20 @@ export function HistoryPanel({
           );
         } catch (failure) {
           const classified = classifyHistoryFailure(failure, month);
-          const outcome = historyFailureOutcome(classified, [...failed, month]);
-          failed.push(month);
+          const outcome = historyFailureOutcome(
+            classified,
+            [...failedMonths, month],
+            usageTokenConfigured,
+          );
+          failedMonths.push(month);
           // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
           if (!outcome.continue) {
             setProgress({
-              done: successful.length + failed.length,
+              done: attempted.length,
               total: targets.length,
             });
-            if (successful.length) {
-              snapshotEpoch.current = requestedEpoch;
-              // 提前停止时，实际覆盖范围比计划小：未查的月份必须继续算「未加载」。
-              const actualFrom = successful
-                .map((month) => month.month)
-                .sort()[0];
-              setSnapshot(
-                buildHistory(
-                  window,
-                  [...successful],
-                  [...failed],
-                  unloadedFor(actualFrom ?? null),
-                ),
-              );
-            }
-            setFailed(failed);
-            setRecovery(outcome.recovery);
             setError(outcome.text);
+            commit(outcome.recovery);
             setBusy(false);
             return;
           }
@@ -183,31 +198,14 @@ export function HistoryPanel({
           requestedEpoch !== historyCache.epoch()
         )
           return;
-        setProgress({
-          done: successful.length + failed.length,
-          total: targets.length,
-        });
-        if (successful.length) {
-          snapshotEpoch.current = requestedEpoch;
-          setSnapshot(
-            buildHistory(window, [...successful], [...failed], unloaded),
-          );
-        }
+        setProgress({ done: attempted.length, total: targets.length });
+        // 每个成功月份都增量合并，用户在等待时就能看到已取得的部分。
+        commit();
       }
-      // 记录本次已加载到的最早月份，供「继续加载更早月份」使用。
-      // 用实际成功的月份而不是计划目标：若最早就那个月失败，边界应停在它之后。
-      if (!monthsOnly && range === "all" && successful.length) {
-        loadedFrom.current = successful.map((month) => month.month).sort()[0];
-      }
-      setFailed(failed);
-      if (failed.length) {
-        setRecovery("partial");
-        setError(`${failed.length}个月份未取得，未返回日期标为未知。`);
-      }
-
+      commit();
       setBusy(false);
     },
-    [range, date, selectedMonth],
+    [range, date, selectedMonth, usageTokenConfigured],
   );
   React.useEffect(() => {
     setSnapshot(null);
@@ -442,16 +440,16 @@ export function HistoryPanel({
             {recovery === "relogin" && (
               <button
                 className="secondary"
-                onClick={() => {
-                  // 重新登录入口在设置页；这里只提示去向，不在此处重复实现同步。
-                  onBack();
-                }}
+                onClick={() => (onConfigureUsage ?? onBack)()}
               >
                 去设置页重新同步 Token
               </button>
             )}
             {recovery === "configure" && (
-              <button className="secondary" onClick={onBack}>
+              <button
+                className="secondary"
+                onClick={() => (onConfigureUsage ?? onBack)()}
+              >
                 去设置页配置用量 Token
               </button>
             )}
