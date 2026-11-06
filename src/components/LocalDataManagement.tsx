@@ -8,9 +8,12 @@ export type LocalDataOverview = {
   usageTokenConfigured: boolean;
   localEnabled: boolean;
   localCollecting: boolean;
-  archiveEntries: number;
-  retentionEntries: number;
-  retentionBytes: number;
+  /** null 表示读取失败：磁盘数据可能仍在，不能显示成 0 条。 */
+  archiveEntries: number | null;
+  archiveError?: string | null;
+  retentionEntries: number | null;
+  retentionBytes: number | null;
+  retentionError?: string | null;
   /** null 表示读取失败或超出预算：显示「未知」，不能显示 0 KiB。 */
   engineCacheBytes: number | null;
   engineCacheMayHoldTitles: boolean;
@@ -18,6 +21,8 @@ export type LocalDataOverview = {
 
 const kib = (bytes: number | null) =>
   bytes == null ? "未知" : `${(bytes / 1024).toFixed(0)} KiB`;
+const countText = (value: number | null, unit: string) =>
+  value == null ? "未知（无法读取）" : `${value} ${unit}`;
 
 /**
  * 统一的本机数据管理入口。
@@ -104,7 +109,7 @@ export function LocalDataManagement({
           </li>
           <li>
             <strong>手动快照</strong>
-            <span>{overview.archiveEntries} 条</span>
+            <span>{countText(overview.archiveEntries, "条")}</span>
             <small>
               默认不含完整路径；在「数据 · 查看历史归档」导出或清空。
             </small>
@@ -112,7 +117,8 @@ export function LocalDataManagement({
           <li>
             <strong>自动留存</strong>
             <span>
-              {overview.retentionEntries} 条 · {kib(overview.retentionBytes)}
+              {countText(overview.retentionEntries, "条")} ·{" "}
+              {kib(overview.retentionBytes)}
             </span>
             <small>
               关闭留存不会删除已有记录；清空后若留存仍开启，新采集会重新产生记录。
@@ -162,6 +168,14 @@ export function LocalDataManagement({
         <ShieldCheck size={13} aria-hidden="true" />{" "}
         只删除本应用数据，不删除原工具日志， 也不承诺取证级安全擦除。
       </p>
+      {(overview?.archiveError || overview?.retentionError) && (
+        <p className="data-error" role="alert">
+          {overview.archiveError && `手动快照：${overview.archiveError}`}
+          {overview.archiveError && overview.retentionError ? "；" : ""}
+          {overview.retentionError && `自动留存：${overview.retentionError}`}
+          。数据可能仍在磁盘上，可用下方清理入口重置。
+        </p>
+      )}
       {message && <p role="status">{message}</p>}
       {error && (
         <p className="data-error" role="alert">
