@@ -35,21 +35,27 @@ Invoke-Check 'cargo clippy' 'cargo' @('clippy', '--manifest-path', 'src-tauri/Ca
 
 Invoke-Check 'cargo test' 'cargo' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--lib')
 
-# 复评 F20：ignored 集成测试默认不跑，不能把「跳过」当成「通过」。
-# 退出码约定：0=通过，2=未运行（缺合成目录），其他=失败。
-# 「未运行」不阻断普通开发门禁，但会打印明确警告，且发版记录会据此判定证据不足。
+# 复评 F20/T02：ignored 集成测试默认不跑，不能把「跳过」当成「通过」。
+# 集成入口退出码：0=全部执行且通过，1=有用例失败，2=存在 NOT RUN，
+# 3=配置或 fixture 错误，4=工具执行错误（结论未知）。
+# NOT RUN 不阻断普通开发门禁，但最终结论必须是「不完整」，不得使用「全部通过」。
 Write-Host '==> 引擎集成测试（显式 ignored）' -ForegroundColor Cyan
 & node @('scripts/run-integration-tests.mjs')
 $integrationExit = $LASTEXITCODE
+$gateIncomplete = $false
 if ($integrationExit -eq 0) {
     Write-Host '集成测试通过。' -ForegroundColor Green
 }
 elseif ($integrationExit -eq 2) {
-    Write-Host '集成测试未完整运行：存在 NOT RUN 项（合成 fixture 覆盖不足）。' -ForegroundColor Yellow
+    Write-Host '集成测试未完整运行：存在 NOT RUN 项。' -ForegroundColor Yellow
     Write-Host '   本次门禁不包含完整引擎集成证据；发版前必须补齐，不能记为通过。' -ForegroundColor Yellow
+    $gateIncomplete = $true
 }
 elseif ($integrationExit -eq 3) {
     throw '集成测试配置或 fixture 错误（退出码 3）：请先修正 fixture，不能当作产品失败或通过。'
+}
+elseif ($integrationExit -eq 4) {
+    throw '集成测试工具执行错误（退出码 4）：结论未知，不能当作通过。'
 }
 else {
     throw "引擎集成测试失败（退出码 $integrationExit）"
@@ -60,4 +66,10 @@ else {
 # 会让 `npm audit` 报 EALLOWSCRIPTS（环境问题，不是依赖问题）。
 Invoke-Check '生产依赖安全审计' 'node' @('scripts/audit-dependencies.mjs')
 
-Write-Host '全部通过。' -ForegroundColor Green
+# 复评 T02：有 NOT RUN 时最终措辞必须是「不完整」，
+# 不得让「全部通过」盖过缺失的集成证据。
+if ($gateIncomplete) {
+    Write-Host '门禁通过但不完整：存在 NOT RUN 的集成用例（详见上方黄色提示）。' -ForegroundColor Yellow
+} else {
+    Write-Host '全部通过。' -ForegroundColor Green
+}
