@@ -40,7 +40,7 @@ function DashboardPanel({
   onClose: () => void;
   onSettings: () => void;
   onDataStatus?: () => void;
-  onDetail: (model: ModelName) => void;
+  onDetail: (model: ModelName, trigger?: HTMLButtonElement) => void;
   onHistory: () => void;
   /** 首次引导内容：放在面板内部，避免成为 stage 的第三个网格子项（复评 F04）。 */
   onboarding?: React.ReactNode;
@@ -151,14 +151,14 @@ function DashboardPanel({
             data={flash}
             maxTokens={maxTokens}
             state={usageState}
-            onClick={() => onDetail("flash")}
+            onClick={(event) => onDetail("flash", event?.currentTarget)}
           />
           <UsageRow
             modelKey="pro"
             data={pro}
             maxTokens={maxTokens}
             state={usageState}
-            onClick={() => onDetail("pro")}
+            onClick={(event) => onDetail("pro", event?.currentTarget)}
           />
           {other && (
             <UsageRow
@@ -166,7 +166,7 @@ function DashboardPanel({
               data={other}
               maxTokens={maxTokens}
               state={usageState}
-              onClick={() => onDetail("other")}
+              onClick={(event) => onDetail("other", event?.currentTarget)}
             />
           )}
         </div>

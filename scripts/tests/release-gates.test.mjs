@@ -1273,6 +1273,7 @@ test("component runner bundles every retained regression suite and executes all 
     "chart-accessibility.test",
     "history-trend-interactions.test",
     "month-accessibility.test",
+    "return-focus.test",
   ]) {
     assert.ok(source.includes(`"${name}"`));
     assert.match(

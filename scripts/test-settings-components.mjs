@@ -19,6 +19,7 @@ try {
     "chart-accessibility.test",
     "history-trend-interactions.test",
     "month-accessibility.test",
+    "return-focus.test",
   ];
   const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({

@@ -15,7 +15,7 @@ function UsageRow({
   data: UsageModel | null;
   maxTokens: number;
   state: LoadState;
-  onClick: () => void;
+  onClick: React.MouseEventHandler<HTMLButtonElement>;
 }) {
   const isFlash = modelKey === "flash";
   const isOther = modelKey === "other";
@@ -64,6 +64,7 @@ function UsageRow({
     <button
       type="button"
       className="card usage-row"
+      data-usage-model={modelKey}
       onClick={onClick}
       aria-describedby={monthDescriptionId}
     >

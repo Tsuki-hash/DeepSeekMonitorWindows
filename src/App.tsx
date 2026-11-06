@@ -54,12 +54,74 @@ import {
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
+type DetailFocusOrigin = {
+  model: ModelName;
+  navigationId: number;
+  accountEpoch: number;
+};
+type ViewFocusRequest = {
+  navigationId: number;
+  view: ViewName;
+  activeElement: Element | null;
+  origin: DetailFocusOrigin | null;
+};
+
 function App() {
   // 复评 R16：设置页需要定位到用量 Token 区块时由这里指定。
   const [settingsTarget, setSettingsTarget] = React.useState<
     "usageToken" | "dataNotices" | null
   >(null);
-  const [view, setView] = React.useState<ViewName>("dashboard");
+  // 页面与导航代际一起提交，不能让旧 RAF 误认并发渲染中的新页面。
+  const [page, setPage] = React.useState<{
+    view: ViewName;
+    navigationId: number;
+  }>({ view: "dashboard", navigationId: 0 });
+  const { view } = page;
+  const stageRef = React.useRef<HTMLDivElement>(null);
+  const committedPage = React.useRef(page);
+  const navigationId = React.useRef(0);
+  const focusFrame = React.useRef<number | null>(null);
+  const focusRequest = React.useRef<ViewFocusRequest | null>(null);
+  const detailFocusOrigin = React.useRef<DetailFocusOrigin | null>(null);
+  const accountFocusEpoch = React.useRef(0);
+  const [committedAccountFocusEpoch, setAccountFocusEpoch] = React.useState(0);
+  const visibleForFocus = React.useRef(true);
+  const windowVisibilityRevision = React.useRef(0);
+  const cancelFocusFrame = React.useCallback(() => {
+    if (focusFrame.current !== null) {
+      window.cancelAnimationFrame(focusFrame.current);
+      focusFrame.current = null;
+    }
+  }, []);
+  const cancelViewFocus = React.useCallback(() => {
+    cancelFocusFrame();
+    focusRequest.current = null;
+  }, [cancelFocusFrame]);
+  const invalidateAccountFocus = React.useCallback(() => {
+    // 失效后又恢复为同一凭据，也不能复活先前账户状态的入口。
+    const nextEpoch = ++accountFocusEpoch.current;
+    detailFocusOrigin.current = null;
+    if (focusRequest.current) focusRequest.current.origin = null;
+    // 保留当前导航的标题回退，但必须等账户更新真正提交后再执行。
+    cancelFocusFrame();
+    setAccountFocusEpoch(nextEpoch);
+  }, [cancelFocusFrame]);
+  const setView = React.useCallback(
+    (nextView: ViewName, origin: DetailFocusOrigin | null = null) => {
+      cancelViewFocus();
+      const nextId = ++navigationId.current;
+      focusRequest.current = {
+        navigationId: nextId,
+        view: nextView,
+        activeElement: document.activeElement,
+        origin,
+      };
+      detailFocusOrigin.current = null;
+      setPage({ view: nextView, navigationId: nextId });
+      return nextId;
+    },
+    [cancelViewFocus],
+  );
   // 全局离开拦截（复评 F09）：任何导航出口都先问 blocker，草稿不再被静默丢弃。
   const { blocker: leaveBlocker, register: registerLeaveBlocker } =
     useLeaveGuard();
@@ -151,6 +213,9 @@ function App() {
   });
   const applyChannel = React.useCallback(
     (name: "balance" | "usage", next: ChannelState) => {
+      if (channels.current[name].paused !== next.paused) {
+        invalidateAccountFocus();
+      }
       channels.current[name] = next;
       // 只递增本通道的版本：另一通道的 timer 与截止时间保持不变。
       setChannelRevision((value) => ({
@@ -158,7 +223,7 @@ function App() {
         [name]: value[name] + 1,
       }));
     },
-    [],
+    [invalidateAccountFocus],
   );
   const balanceGate = React.useRef(new RequestGate<BalanceData>());
   const loadBalance = React.useCallback(
@@ -329,8 +394,12 @@ function App() {
   React.useEffect(() => {
     const synchronize = () => {
       const next = getCommittedConfig();
-      if (!next) return;
       const previous = observedCredentials.current;
+      if (!next) {
+        if (previous) invalidateAccountFocus();
+        observedCredentials.current = null;
+        return;
+      }
       const receipt = getValidatedBalance();
       // 恢复为可信空配置时，两个 configured 值甚至凭据版本可能未变，
       // 仍须清掉故障并重新计算引导，不能依赖凭据布尔值变化。
@@ -344,6 +413,15 @@ function App() {
         !previous ||
         trustChanged ||
         previous.usageTokenRevision !== next.usageTokenRevision;
+      if (
+        keyChanged ||
+        tokenChanged ||
+        previous?.apiKeyConfigured !== next.apiKeyConfigured ||
+        previous?.usageTokenConfigured !== next.usageTokenConfigured ||
+        previous?.usageCleanupUnconfirmed !== next.usageCleanupUnconfirmed
+      ) {
+        invalidateAccountFocus();
+      }
       const balanceReceived =
         receipt !== null && receipt !== observedBalance.current;
       observedCredentials.current = next;
@@ -469,7 +547,7 @@ function App() {
     const unsubscribe = subscribeCommittedConfig(synchronize);
     synchronize();
     return unsubscribe;
-  }, [applyChannel, loadBalance, loadUsage]);
+  }, [applyChannel, loadBalance, loadUsage, invalidateAccountFocus]);
 
   // Reads only feed the committed store. Scheduler and onboarding state have
   // one owner above; neither a stale GET nor its failure may reset them.
@@ -511,26 +589,38 @@ function App() {
   const [windowVisible, setWindowVisible] = React.useState(true);
   // 首帧后按实际窗口可见性校正，避免启动时若已在托盘仍多跑一轮刷新
   React.useEffect(() => {
+    const startedAt = windowVisibilityRevision.current;
     void invoke<boolean>("is_main_window_visible")
-      .then((visible) => setWindowVisible(visible))
+      .then((visible) => {
+        // 首次查询的迟到结果不能覆盖更新的显隐事件。
+        if (startedAt !== windowVisibilityRevision.current) return;
+        visibleForFocus.current = visible;
+        if (!visible) cancelViewFocus();
+        setWindowVisible(visible);
+      })
       .catch(() => undefined);
-  }, []);
+  }, [cancelViewFocus]);
 
   React.useEffect(() => {
     const shown = listen("main-window-shown", () => {
+      windowVisibilityRevision.current += 1;
+      visibleForFocus.current = true;
       setWindowVisible(true);
       // 面板被唤出即拉最新数据，避免托盘唤出后看到的是旧快照。
       // 走静默刷新：唤出瞬间面板上已有上一轮的数据，不该闪一下「查询中…」。
       refreshAll(true);
     });
     const hidden = listen("main-window-hidden", () => {
+      windowVisibilityRevision.current += 1;
+      visibleForFocus.current = false;
+      cancelViewFocus();
       setWindowVisible(false);
     });
     return () => {
       void shown.then((unlisten) => unlisten());
       void hidden.then((unlisten) => unlisten());
     };
-  }, [refreshAll]);
+  }, [refreshAll, cancelViewFocus]);
 
   // 两路各自独立调度（复评 R01）：每个通道有自己的 timer 与截止时间，
   // 一个通道完成不会推迟另一个通道的退避截止时间。
@@ -588,6 +678,8 @@ function App() {
   // 统一的导航出口：有未保存草稿时先拦下来，用户决定后再执行。
   const navigate = React.useCallback(
     (action: () => void) => {
+      // 即使新意图被草稿拦截，旧页面的待执行焦点也不再拥有导航。
+      cancelViewFocus();
       if (attemptLeave(leaveBlocker.current, action) === "blocked") {
         // 复评 Q04：新导航意图立即取得所有权 —— 作废在途旧决策，
         // 旧保存的迟到完成不得执行旧导航或清除这个新意图。
@@ -605,7 +697,7 @@ function App() {
       // 现在无论走哪条分支，都先作废旧决策并清掉提示，再执行新动作。
       leaveRunner.current?.cancel();
     },
-    [leaveBlocker],
+    [leaveBlocker, cancelViewFocus],
   );
 
   // 复评 F11：托盘「退出」不再直接结束进程 —— 它先唤出窗口并发出唯一
@@ -640,10 +732,11 @@ function App() {
   );
 
   const hideWindow = React.useCallback(() => {
+    cancelViewFocus();
     void invoke("hide_main_window").catch(() => {
       // Browser preview has no Tauri IPC. Keep it non-blocking for visual checks.
     });
-  }, []);
+  }, [cancelViewFocus]);
 
   // 记账日期驱动（评审 P1：跨月后不能把旧累计称为「本月」）。
   // 独立于刷新路径：即使自动刷新关闭、用户一直开着面板，跨过北京时间月界时
@@ -733,29 +826,121 @@ function App() {
     applyStoredGlass();
   }, []);
 
-  // 视图切换的焦点管理（评审 P2 无障碍）：
-  // 进入新视图时把焦点移到该视图的标题，返回时由各面板自己的返回按钮
-  // 触发 `restoreFocus`。这样纯键盘用户不会在切换后「丢失」当前位置。
-  const stageRef = React.useRef<HTMLDivElement>(null);
-  const previousView = React.useRef(view);
+  // 新交互或窗口失焦后，导航的异步焦点请求不再有权接管焦点。
+  // 不在重新显示窗口时补执行旧请求；新的显式导航会创建自己的请求。
   React.useEffect(() => {
-    if (previousView.current === view) return;
-    previousView.current = view;
-    // 复评 T18：**单一焦点所有者**。设置页有定向目标（`usageToken` 区块或
-    // 数据提示）时，焦点由 SettingsPanel 的定向 effect 负责 —— 这里的通用
-    // 「聚焦标题」必须跳过，否则后者的 RAF 会把焦点抢回顶部 h1，键盘/读屏
-    // 用户还得重新找 Token 区。普通入口（无定向目标）仍聚焦标题。
-    if (view === "settings" && settingsTarget) return;
-    // 让 React 先把新视图渲染出来，再找标题。
+    const onFocus = (event: FocusEvent) => {
+      // 卸载旧面板引起的 body 回退不算主动选择另一个控件。
+      if (
+        event.target !== document.body &&
+        event.target !== document.documentElement
+      ) {
+        cancelViewFocus();
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") cancelViewFocus();
+    };
+    document.addEventListener("focusin", onFocus, true);
+    document.addEventListener("keydown", cancelViewFocus, true);
+    document.addEventListener("pointerdown", cancelViewFocus, true);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", cancelViewFocus);
+    return () => {
+      cancelViewFocus();
+      document.removeEventListener("focusin", onFocus, true);
+      document.removeEventListener("keydown", cancelViewFocus, true);
+      document.removeEventListener("pointerdown", cancelViewFocus, true);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", cancelViewFocus);
+    };
+  }, [cancelViewFocus]);
+
+  // R28：仅详情的明确返回携带入口模型键，重挂载后重新查找原生按钮。
+  // 其他导航仍聚焦首标题；定向设置入口继续由 SettingsPanel 独占焦点。
+  // 每次提交都重新核对，后台数据更新不得留下读取旧 DOM/账户的 RAF。
+  React.useLayoutEffect(() => {
+    committedPage.current = page;
+    const request = focusRequest.current;
+    if (
+      !request ||
+      request.navigationId !== page.navigationId ||
+      request.view !== view
+    ) {
+      return;
+    }
+    if (view === "settings" && settingsTarget) {
+      cancelViewFocus();
+      return;
+    }
     const frame = window.requestAnimationFrame(() => {
-      const heading = stageRef.current?.querySelector<HTMLElement>(
+      if (focusFrame.current === frame) focusFrame.current = null;
+      if (
+        focusRequest.current !== request ||
+        navigationId.current !== request.navigationId ||
+        committedPage.current !== page
+      ) {
+        return;
+      }
+      // 凭据事件可能早于其 React 提交；等最新提交重新挂帧，不读旧账户 DOM。
+      if (accountFocusEpoch.current !== committedAccountFocusEpoch) return;
+      if (
+        !visibleForFocus.current ||
+        document.visibilityState !== "visible" ||
+        document.hasFocus?.() === false
+      ) {
+        cancelViewFocus();
+        return;
+      }
+      const active = document.activeElement;
+      if (
+        active !== request.activeElement &&
+        active !== document.body &&
+        active !== document.documentElement
+      ) {
+        cancelViewFocus();
+        return;
+      }
+      const stage = stageRef.current;
+      if (!stage || stage.isConnected === false) {
+        cancelViewFocus();
+        return;
+      }
+      const origin = request.origin;
+      const account = getCommittedConfig();
+      const button =
+        view === "dashboard" &&
+        origin?.accountEpoch === accountFocusEpoch.current &&
+        account &&
+        !account.configReadError
+          ? stage.querySelector<HTMLButtonElement>(
+              `.dashboard-panel button[data-usage-model="${origin.model}"]`,
+            )
+          : null;
+      // 先消费请求：下面的 focusin 属于本次导航，不生成第二次恢复。
+      focusRequest.current = null;
+      if (
+        button?.isConnected &&
+        !button.disabled &&
+        !button.closest("[inert], [hidden]") &&
+        button.getClientRects().length > 0
+      ) {
+        button.focus();
+        if (document.activeElement === button) return;
+      }
+      // “其他”行已消失、账户/凭据改变或按钮不可用时只回退当前页标题。
+      const heading = stage.querySelector<HTMLElement>(
         "h1, [role='heading'], .panel h2",
       );
       heading?.setAttribute("tabindex", "-1");
       heading?.focus();
     });
-    return () => window.cancelAnimationFrame(frame);
-  }, [view, settingsTarget]);
+    focusFrame.current = frame;
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (focusFrame.current === frame) focusFrame.current = null;
+    };
+  });
 
   // 复评 T05/T08：与局部出口共用同一提示组件 —— 对话框命名、初始焦点、
   // 焦点归还与提交中禁用都在组件内实现，两个出口行为一致。
@@ -840,9 +1025,25 @@ function App() {
               setSettingsTarget("dataNotices");
               setView("settings");
             }}
-            onDetail={(nextModel) => {
+            onDetail={(nextModel, trigger) => {
+              // 只记实际进入的原生入口，不记卸载后失效的 DOM 引用。
+              const fromDashboard =
+                committedPage.current.view === "dashboard" &&
+                committedPage.current.navigationId === navigationId.current &&
+                committedAccountFocusEpoch === accountFocusEpoch.current &&
+                trigger?.isConnected &&
+                trigger.tagName === "BUTTON" &&
+                trigger.dataset.usageModel === nextModel &&
+                stageRef.current?.contains(trigger);
               setModel(nextModel);
-              setView("detail");
+              const detailNavigationId = setView("detail");
+              if (fromDashboard) {
+                detailFocusOrigin.current = {
+                  model: nextModel,
+                  navigationId: detailNavigationId,
+                  accountEpoch: accountFocusEpoch.current,
+                };
+              }
             }}
           />
         </>
@@ -886,7 +1087,15 @@ function App() {
           usage={usage}
           usageState={usageState}
           usageError={usageError}
-          onBack={() => setView("dashboard")}
+          onBack={() => {
+            const origin = detailFocusOrigin.current;
+            const returningFromDetail =
+              committedPage.current.view === "detail" &&
+              committedPage.current.navigationId === navigationId.current &&
+              origin?.navigationId === page.navigationId &&
+              origin.model === model;
+            setView("dashboard", returningFromDetail ? origin : null);
+          }}
         />
       )}
       {view === "history" && (
