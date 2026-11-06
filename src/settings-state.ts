@@ -22,6 +22,7 @@ import { errorMessage } from "./error-state";
 import type { LeaveBlocker } from "./leave-guard";
 import { CredentialDraft } from "./credential-draft";
 import type { CredentialSnapshot } from "./credential-draft";
+import { ApiKeyFeedback } from "./api-key-feedback";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -119,8 +120,8 @@ export function useSettingsState(): SettingsState {
   const {
     draft: keyDraft,
     value: apiKey,
-    edit: setApiKey,
-    clear: discardApiKey,
+    edit: editApiKey,
+    clear: clearApiKeyDraft,
     commit: commitApiKey,
   } = useCredentialDraft(lifecycle);
   const {
@@ -152,10 +153,23 @@ export function useSettingsState(): SettingsState {
   const [config, setConfig] = React.useState<AppConfig | null>(
     getCommittedConfig,
   );
-  const [status, setStatus] = React.useState("正在读取本地配置");
-  // UI feedback has its own owner. A read must not begin/cancel a Key write,
-  // but its late result also must not replace a newer operation's feedback.
-  const keyStatusGeneration = React.useRef(0);
+  const keyFeedback = React.useRef(new ApiKeyFeedback(getCommittedConfig()));
+  const [status, setStatus] = React.useState(() => keyFeedback.current.status);
+  const setApiKey = React.useCallback(
+    (value: string) => {
+      if (!lifecycle.current.active) return;
+      editApiKey(value);
+      keyFeedback.current.edit();
+      setStatus(keyFeedback.current.status);
+    },
+    [editApiKey],
+  );
+  const discardApiKey = React.useCallback(() => {
+    if (!lifecycle.current.active) return;
+    clearApiKeyDraft();
+    keyFeedback.current.edit();
+    setStatus(keyFeedback.current.status);
+  }, [clearApiKeyDraft]);
   const [busy, setBusy] = React.useState(false);
   const preferenceBusy = React.useRef(false);
   const [settingErrors, setSettingErrors] = React.useState<
@@ -194,7 +208,7 @@ export function useSettingsState(): SettingsState {
     // 旧实现只 setConfig，自动刷新/间隔/自启这些局部 state 仍停留在旧值，
     // 于是后端已开启自动刷新、设置页开关却显示关闭（再点一次还会重复开启）。
     const current = capturePage();
-    const syncFromCommitted = (next: AppConfig, updateKeyStatus = true) => {
+    const syncFromCommitted = (next: AppConfig) => {
       if (!current()) return;
       setConfig(next);
       setRefresh(
@@ -202,15 +216,8 @@ export function useSettingsState(): SettingsState {
       );
       setAutoRefresh(next.configReadError ? null : next.autoRefreshEnabled);
       setAutostart(next.configReadError ? null : next.autostart);
-      if (next.configReadError || updateKeyStatus)
-        setStatus(
-          next.configReadError ??
-            (next.apiKeyConfigured
-              ? next.apiKeyPreview
-                ? `已配置 ${next.apiKeyPreview}`
-                : "API Key 已配置"
-              : "未配置 API Key"),
-        );
+      keyFeedback.current.observe(next);
+      setStatus(keyFeedback.current.status);
       if (
         !syncOwner.current.requestId ||
         syncOwner.current.ended ||
@@ -227,24 +234,26 @@ export function useSettingsState(): SettingsState {
       const committed = getCommittedConfig();
       if (committed) syncFromCommitted(committed);
     });
+    const cached = getCommittedConfig();
+    if (cached) syncFromCommitted(cached);
     // 复评 F08：挂载时的读取只是**读取**，不能无条件覆盖已提交配置。
     // 发起时捕获提交代际，返回时若已有新提交（保存/清除/事件）就丢弃，
     // 避免「旧 GET 最后到达」把已保存凭据回滚成未配置。
     const startedAt = getCommitRevision();
     const snapshotAtStart = getCommittedConfig();
-    const statusGenerationAtStart = keyStatusGeneration.current;
+    const statusOwner = keyFeedback.current.capture(keyDraft.current.revision);
     const readOwnsKeyStatus = () =>
-      keyStatusGeneration.current === statusGenerationAtStart;
+      keyFeedback.current.owns(statusOwner, keyDraft.current.revision);
     void invoke<AppConfig>("get_app_config")
       .then((nextConfig) => {
         if (!applyReadConfig(nextConfig, startedAt)) {
           // 已有更新的提交：用当前已提交配置收敛，不使用这份过期读取。
           const committed = getCommittedConfig();
-          if (committed) syncFromCommitted(committed, readOwnsKeyStatus());
+          if (committed) syncFromCommitted(committed);
           return;
         }
         const committed = getCommittedConfig();
-        if (committed) syncFromCommitted(committed, readOwnsKeyStatus());
+        if (committed) syncFromCommitted(committed);
       })
       .catch((error) => {
         if (!current()) return;
@@ -259,13 +268,23 @@ export function useSettingsState(): SettingsState {
         // 只有"根本没有 Tauri IPC"才是浏览器预览，属预期情况；真机上失败一律是真实错误，
         // 必须原样透出——否则配置文件损坏会被伪装成"浏览器预览模式"，用户完全无从定位。
         if (!isTauri()) {
-          setStatus("浏览器预览模式，未连接本地配置");
+          keyFeedback.current.readFailed(
+            statusOwner,
+            keyDraft.current.revision,
+            "浏览器预览模式，未连接本地配置",
+          );
+          setStatus(keyFeedback.current.status);
           return;
         }
-        setStatus(errorMessage(error));
+        keyFeedback.current.readFailed(
+          statusOwner,
+          keyDraft.current.revision,
+          errorMessage(error),
+        );
+        setStatus(keyFeedback.current.status);
       });
     return unsubscribe;
-  }, [capturePage]);
+  }, [capturePage, keyDraft]);
 
   React.useEffect(() => {
     const current = capturePage();
@@ -348,16 +367,31 @@ export function useSettingsState(): SettingsState {
   const pasteApiKey = React.useCallback(async () => {
     const current = capturePage();
     if (!current()) return;
-    keyStatusGeneration.current += 1;
+    const owner = keyFeedback.current.begin(
+      keyDraft.current.revision,
+      "正在读取剪贴板…",
+    );
+    setStatus(keyFeedback.current.status);
     try {
       const text = await navigator.clipboard.readText();
-      if (!current()) return;
-      setApiKey(text.trim());
-      setStatus("已从剪贴板读取");
+      if (
+        !current() ||
+        !keyFeedback.current.ownsIntent(owner, keyDraft.current.revision)
+      )
+        return;
+      editApiKey(text.trim());
+      keyFeedback.current.begin(keyDraft.current.revision, "已从剪贴板读取");
+      setStatus(keyFeedback.current.status);
     } catch {
-      if (current()) setStatus("剪贴板读取失败");
+      if (!current()) return;
+      keyFeedback.current.update(
+        owner,
+        keyDraft.current.revision,
+        "剪贴板读取失败",
+      );
+      setStatus(keyFeedback.current.status);
     }
-  }, [setApiKey, capturePage]);
+  }, [editApiKey, keyDraft, capturePage]);
 
   const keySaves = React.useRef(new Map<number, Promise<boolean>>());
   const saveKeySnapshot = React.useCallback(
@@ -366,7 +400,10 @@ export function useSettingsState(): SettingsState {
       if (pending) return pending;
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
-      keyStatusGeneration.current += 1;
+      const feedbackOwner =
+        submitted.revision === keyDraft.current.revision
+          ? keyFeedback.current.begin(submitted.revision, "正在验证 API Key…")
+          : keyFeedback.current.capture(submitted.revision);
       const generation = lifecycle.current.generation;
       const operation = beginApiKeyOperation();
       const requestId = newApiKeyRequest();
@@ -376,7 +413,7 @@ export function useSettingsState(): SettingsState {
         isCurrentApiKeyOperation(operation);
       const saving = (async () => {
         setBusy(true);
-        setStatus("正在验证 API Key…");
+        setStatus(keyFeedback.current.status);
         try {
           const { config: nextConfig, balance } = await apiKeyRequests.save(
             requestId,
@@ -390,15 +427,26 @@ export function useSettingsState(): SettingsState {
           setCommittedConfig(nextConfig, balance);
           if (!current() || !isCurrentCredential(nextConfig, "apiKey"))
             return false;
-          commitApiKey(submitted.revision);
           const symbol = currencySymbol(balance.currency);
           const tip = balance.isAvailable ? "" : "（余额不足）";
-          setStatus(
+          keyFeedback.current.update(
+            feedbackOwner,
+            keyDraft.current.revision,
             `验证通过，当前余额 ${symbol}${balance.totalBalance}${tip}`,
+            true,
           );
+          commitApiKey(submitted.revision);
+          setStatus(keyFeedback.current.status);
           return true;
         } catch (error) {
-          if (current()) setStatus(errorMessage(error));
+          if (current()) {
+            keyFeedback.current.update(
+              feedbackOwner,
+              keyDraft.current.revision,
+              errorMessage(error),
+            );
+            setStatus(keyFeedback.current.status);
+          }
           return false;
         } finally {
           if (current()) setBusy(false);
@@ -407,7 +455,7 @@ export function useSettingsState(): SettingsState {
       keySaves.current.set(submitted.revision, saving);
       return saving;
     },
-    [commitApiKey],
+    [commitApiKey, keyDraft],
   );
   const saveApiKey = React.useCallback(
     () => saveKeySnapshot(keyDraft.current.snapshot()),
@@ -416,15 +464,19 @@ export function useSettingsState(): SettingsState {
 
   const clearApiKey = React.useCallback(() => {
     if (!lifecycle.current.active) return;
-    keyStatusGeneration.current += 1;
     const operation = beginApiKeyOperation();
     const revision = keyDraft.current.revision;
+    const feedbackOwner = keyFeedback.current.begin(
+      revision,
+      "正在清除 API Key…",
+    );
     const generation = lifecycle.current.generation;
     const current = () =>
       lifecycle.current.active &&
       lifecycle.current.generation === generation &&
       isCurrentApiKeyOperation(operation);
     setBusy(true);
+    setStatus(keyFeedback.current.status);
     void apiKeyRequests
       .clear((cancelledRequestIds) =>
         invoke<AppConfig>("clear_api_key", { cancelledRequestIds }),
@@ -432,11 +484,24 @@ export function useSettingsState(): SettingsState {
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
         if (!current() || !isCurrentCredential(nextConfig, "apiKey")) return;
+        keyFeedback.current.update(
+          feedbackOwner,
+          keyDraft.current.revision,
+          "已清除 API Key",
+          true,
+        );
         commitApiKey(revision);
-        setStatus("已清除 API Key");
+        setStatus(keyFeedback.current.status);
       })
       .catch((error) => {
-        if (current()) setStatus(errorMessage(error));
+        if (current()) {
+          keyFeedback.current.update(
+            feedbackOwner,
+            keyDraft.current.revision,
+            errorMessage(error),
+          );
+          setStatus(keyFeedback.current.status);
+        }
       })
       .finally(() => {
         if (current()) setBusy(false);

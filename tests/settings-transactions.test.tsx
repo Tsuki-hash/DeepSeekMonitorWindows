@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { App } from "../src/App";
 import { useSettingsState } from "../src/settings-state";
 import {
+  applyReadConfig,
+  getCommitRevision,
   getCommittedConfig,
   getValidatedBalance,
   setCommittedConfig,
@@ -1772,5 +1774,288 @@ scenario(
     await startKeySave();
     assert.equal(backend.persisted, "SYNTHETIC_K3");
     assert.equal(getCommittedConfig().apiKeyConfigured, true);
+  },
+);
+
+// These cases enter actual store subscriber broadcasts, not just an equal-
+// revision idempotent read. Native hide/position persistence is still a Windows
+// acceptance check; the event below models its public, non-secret config reply.
+scenario(
+  "R16-01: first accepted snapshot repairs a mount read failure with no candidate owner",
+  async (concurrent) => {
+    handlers.get_app_config = () =>
+      Promise.reject(new Error("Synthetic initial read failure"));
+    await mount(<Probe />, concurrent);
+    assert.equal(state.status, "Synthetic initial read failure");
+    assert.equal(getCommittedConfig(), null);
+    await act(async () => applyReadConfig(config, getCommitRevision()));
+    assert.match(state.status, /已配置/);
+    assert.equal(state.config, config);
+  },
+);
+
+scenario(
+  "R16-01: bad configuration still permits clipboard draft preparation without hiding the root error",
+  async (concurrent) => {
+    config = { ...config, configReadError: "Synthetic root read error" };
+    const descriptor = Object.getOwnPropertyDescriptor(g, "navigator");
+    Object.defineProperty(g, "navigator", {
+      configurable: true,
+      value: { clipboard: { readText: async () => "SYNTHETIC_K1" } },
+    });
+    try {
+      await mount(<Probe />, concurrent);
+      await act(async () => state.pasteApiKey());
+      assert.equal(state.apiKey, "SYNTHETIC_K1");
+      assert.equal(state.status, "Synthetic root read error");
+      assert.equal(submitted("save_api_key").length, 0);
+    } finally {
+      if (descriptor) Object.defineProperty(g, "navigator", descriptor);
+      else delete g.navigator;
+    }
+  },
+);
+
+for (const failBeforeRead of [false, true]) {
+  scenario(
+    `R16-01: first store GET preserves ${failBeforeRead ? "failed" : "pending"} candidate feedback`,
+    async (concurrent) => {
+      const initial = deferred();
+      const saving = deferred();
+      handlers.get_app_config = () => initial.promise;
+      handlers.save_api_key = () => saving.promise;
+      await mount(<App />, concurrent);
+      await click(input("设置"));
+      assert.equal(getCommittedConfig(), null);
+      await change("API Key", "SYNTHETIC_K1");
+      await startKeySave();
+      const fail = async () => {
+        await act(async () =>
+          saving.reject(new Error("Synthetic K1 rejected")),
+        );
+        await flush();
+      };
+      if (failBeforeRead) await fail();
+      config = { ...config, refreshIntervalSeconds: 1800, autostart: true };
+      await finish(initial, config);
+      assert.equal(getCommittedConfig(), config);
+      assert.equal(input("API Key").props.value, "SYNTHETIC_K1");
+      assert.match(
+        textOf(renderer.toJSON()),
+        failBeforeRead ? /Synthetic K1 rejected/ : /正在验证 API Key…/,
+      );
+      if (!failBeforeRead) await fail();
+      assert.match(textOf(renderer.toJSON()), /Synthetic K1 rejected/);
+    },
+  );
+}
+
+scenario(
+  "R16-01: accepted higher reads and preference/Token broadcasts keep errors and synchronize controls",
+  async (concurrent) => {
+    handlers.save_api_key = () =>
+      Promise.reject(new Error("Synthetic K1 rejected"));
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setApiKey("SYNTHETIC_K1"));
+    await act(async () => state.saveApiKey());
+    const savedKeyRevision = state.config.apiKeyRevision;
+    for (const read of [true, false]) {
+      config = {
+        ...config,
+        configRevision: ++fixtureRevision,
+        usageTokenRevision: fixtureRevision,
+        usageTokenConfigured: false,
+        refreshIntervalSeconds: 1800,
+        autoRefreshEnabled: true,
+        autostart: true,
+      };
+      await act(async () => {
+        assert.equal(
+          read
+            ? applyReadConfig(config, getCommitRevision())
+            : setCommittedConfig(config),
+          true,
+        );
+      });
+      assert.equal(state.config, config);
+      assert.equal(state.config.apiKeyRevision, savedKeyRevision);
+      assert.equal(state.refresh, 1800);
+      assert.equal(state.autoRefresh, true);
+      assert.equal(state.autostart, true);
+      assert.equal(state.usageStatus, "未配置用量 Token");
+      assert.equal(state.apiKey, "SYNTHETIC_K1");
+      assert.equal(state.status, "Synthetic K1 rejected");
+    }
+  },
+);
+
+for (const readFails of [false, true]) {
+  scenario(
+    `R16-01: late mount ${readFails ? "failure" : "snapshot"} after an ordinary commit preserves a failed candidate until explicit retry`,
+    async (concurrent) => {
+      const stale = config;
+      setCommittedConfig(stale);
+      const read = deferred();
+      handlers.get_app_config = () => read.promise;
+      handlers.save_api_key = () =>
+        Promise.reject(new Error("Synthetic K1 rejected"));
+      await mount(<Probe />, concurrent);
+      await act(async () => state.setApiKey("SYNTHETIC_K1"));
+      await act(async () => state.saveApiKey());
+      config = {
+        ...config,
+        configRevision: ++fixtureRevision,
+        refreshIntervalSeconds: 1800,
+      };
+      await act(async () => setCommittedConfig(config));
+      await act(async () => {
+        if (readFails) read.reject(new Error("Synthetic obsolete GET failure"));
+        else read.resolve(stale);
+      });
+      await flush();
+      assert.equal(getCommittedConfig(), config);
+      assert.equal(state.refresh, 1800);
+      assert.equal(state.status, "Synthetic K1 rejected");
+      assert.equal(state.apiKey, "SYNTHETIC_K1");
+      const retry = deferred();
+      handlers.save_api_key = () => retry.promise;
+      let result;
+      await act(async () => {
+        result = state.saveApiKey();
+      });
+      assert.equal(state.status, "正在验证 API Key…");
+      config = nextCredentialConfig("apiKey", true);
+      await finish(retry, { config, balance });
+      assert.equal(await result, true);
+      assert.match(state.status, /验证通过/);
+      assert.equal(state.apiKey, "");
+      assert.equal(submitted("save_api_key").length, 2);
+    },
+  );
+}
+
+scenario(
+  "R16-01: hidden window position event and theme rerender keep candidate feedback",
+  async (concurrent) => {
+    handlers.save_api_key = () =>
+      Promise.reject(new Error("Synthetic K1 rejected"));
+    await openSettings(concurrent);
+    await change("API Key", "SYNTHETIC_K1");
+    await startKeySave();
+    const before = getCommittedConfig();
+    config = { ...before, configRevision: ++fixtureRevision };
+    await emit("credential-config-changed", config);
+    await emit("main-window-hidden");
+    assert.equal(getCommittedConfig(), config);
+    assert.equal(getCommittedConfig().apiKeyRevision, before.apiKeyRevision);
+    await emit("main-window-shown");
+    const theme = renderer.root
+      .findAllByType("label")
+      .find((node) => textOf(node).includes("浅色皮肤"));
+    await act(async () =>
+      theme.findByType("input").props.onChange({ target: { checked: false } }),
+    );
+    await flush();
+    assert.equal(panel("settings"), 1);
+    assert.equal(input("API Key").props.value, "SYNTHETIC_K1");
+    assert.match(textOf(renderer.toJSON()), /Synthetic K1 rejected/);
+    assert.equal(submitted("save_api_key").length, 1);
+  },
+);
+
+scenario(
+  "R16-01: success and clear receipts survive ordinary commits, while edit and real Key changes retire them",
+  async (concurrent) => {
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setApiKey("SYNTHETIC_K1"));
+    await act(async () => state.saveApiKey());
+    assert.match(state.status, /验证通过/);
+    config = { ...config, configRevision: ++fixtureRevision };
+    await act(async () => setCommittedConfig(config));
+    assert.match(state.status, /验证通过/);
+    await act(async () => state.setApiKey("SYNTHETIC_K2"));
+    assert.doesNotMatch(state.status, /验证通过/);
+    handlers.clear_api_key = () =>
+      (config = nextCredentialConfig("apiKey", false));
+    await act(async () => state.clearApiKey());
+    await flush();
+    assert.equal(state.status, "已清除 API Key");
+    assert.equal(state.apiKey, "");
+    config = { ...config, configRevision: ++fixtureRevision };
+    await act(async () => setCommittedConfig(config));
+    assert.equal(state.status, "已清除 API Key");
+    config = nextCredentialConfig("apiKey", true);
+    await act(async () => setCommittedConfig(config));
+    assert.match(state.status, /已配置/);
+    assert.doesNotMatch(state.status, /已清除/);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    handlers.get_app_config = () => new Promise(() => {});
+    await mount(<Probe />, concurrent);
+    assert.match(state.status, /已配置/);
+    assert.equal(state.apiKey, "");
+  },
+);
+
+scenario(
+  "R16-01: current save receipt survives its early commit event and a later Token snapshot",
+  async (concurrent) => {
+    const saving = deferred();
+    handlers.save_api_key = () => saving.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setApiKey("SYNTHETIC_K1"));
+    let result;
+    await act(async () => {
+      result = state.saveApiKey();
+    });
+    const receipt = nextCredentialConfig("apiKey", true);
+    await act(async () => setCommittedConfig(receipt));
+    config = {
+      ...receipt,
+      configRevision: ++fixtureRevision,
+      usageTokenRevision: fixtureRevision,
+    };
+    await act(async () => setCommittedConfig(config));
+    await finish(saving, { config: receipt, balance });
+    assert.equal(await result, true);
+    assert.equal(getCommittedConfig(), config);
+    assert.match(state.status, /验证通过/);
+    assert.equal(state.apiKey, "");
+  },
+);
+
+scenario(
+  "R16-01: real read error revokes account display and late candidate failure cannot hide it or revive on recovery",
+  async (concurrent) => {
+    const saving = deferred();
+    handlers.save_api_key = () => saving.promise;
+    await openSettings(concurrent);
+    await change("API Key", "SYNTHETIC_K1");
+    await startKeySave();
+    const trusted = config;
+    config = {
+      ...config,
+      configRevision: ++fixtureRevision,
+      configReadError: "Synthetic root read error",
+    };
+    await emit("credential-config-changed", config);
+    await act(async () =>
+      saving.reject(new Error("Synthetic late candidate failure")),
+    );
+    await flush();
+    assert.match(textOf(renderer.toJSON()), /Synthetic root read error/);
+    assert.doesNotMatch(
+      textOf(renderer.toJSON()),
+      /Synthetic late candidate failure/,
+    );
+    assert.equal(input("API Key").props.value, "SYNTHETIC_K1");
+    assert.equal(submitted("update_tray_balance").at(-1).args.total, null);
+    config = { ...trusted, configRevision: ++fixtureRevision };
+    await emit("credential-config-changed", config);
+    assert.doesNotMatch(
+      textOf(renderer.toJSON()),
+      /Synthetic root read error|Synthetic late candidate failure/,
+    );
+    assert.equal(input("API Key").props.value, "SYNTHETIC_K1");
   },
 );
