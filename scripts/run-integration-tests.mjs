@@ -138,6 +138,27 @@ function probeEngine(home) {
       },
     },
   );
+  const outcome = {
+    fullName: "probeEngine（fixture 探针）",
+    command: "tokscale",
+    args: [
+      "--json",
+      "--client",
+      "opencode,claude,zcode,hermes,openclaw,dsh",
+      "--group-by",
+      "client,workspace,session,model",
+      "--month",
+      "--no-spinner",
+      "--home",
+      home,
+    ],
+    cwd: root,
+    code: typeof result.status === "number" ? result.status : 1,
+    stdout: String(result.stdout ?? ""),
+    stderr: String(result.stderr ?? ""),
+  };
+  // 复评 Q10：探针失败也要留下完整命令与两个流，供发布记录定位。
+  recordLog(outcome);
   if (result.status !== 0) return null;
   try {
     const parsed = JSON.parse(String(result.stdout));
@@ -162,6 +183,24 @@ function listIgnoredTests() {
     ],
     { cwd: root, encoding: "utf8", shell: process.platform === "win32" },
   );
+  // 复评 Q10：枚举失败（编译错误等）同样留下底层诊断。
+  recordLog({
+    fullName: "listIgnoredTests（用例枚举）",
+    command: "cargo",
+    args: [
+      "test",
+      "--manifest-path",
+      "src-tauri/Cargo.toml",
+      "--lib",
+      "--",
+      "--ignored",
+      "--list",
+    ],
+    cwd: root,
+    code: typeof result.status === "number" ? result.status : 1,
+    stdout: String(result.stdout ?? ""),
+    stderr: String(result.stderr ?? ""),
+  });
   if (result.status !== 0) {
     return { error: `cargo --list 退出码 ${result.status}` };
   }
@@ -174,6 +213,32 @@ function listIgnoredTests() {
   return { names };
 }
 
+// 复评 Q10：诊断日志从脚本一开始就存在 —— 探针/枚举等前置失败也要留下
+// 完整命令、退出码与两个流，否则发布记录无法定位 fixture/编译错误。
+const logs = [];
+
+/** 记录一次底层调用（含两个流），供 --log-file 与发布记录使用。 */
+function recordLog(entry) {
+  logs.push(entry);
+}
+
+/** 把已记录的诊断写到 --log-file 指定的路径（若提供）。 */
+function flushLogs() {
+  if (!logFile) return;
+  try {
+    writeFileSync(
+      resolve(logFile),
+      JSON.stringify(
+        { generatedAt: new Date().toISOString(), results: logs },
+        null,
+        2,
+      ),
+    );
+  } catch (error) {
+    console.error(`诊断日志写入失败：${error.message}`);
+  }
+}
+
 const externalHome = process.env.DSM_TEST_LOCAL_USAGE_HOME;
 let fixture;
 let cleanup = null;
@@ -183,16 +248,19 @@ if (externalHome) {
   const second = process.env.DSM_TEST_LOCAL_USAGE_SECOND_HOME;
   if (!existsSync(externalHome)) {
     console.error("配置错误：DSM_TEST_LOCAL_USAGE_HOME 指向的目录不存在。");
+    flushLogs();
     process.exit(3);
   }
   if (!second || !existsSync(second)) {
     console.error(
       "配置错误：需要 DSM_TEST_LOCAL_USAGE_SECOND_HOME 指向另一个存在的目录。",
     );
+    flushLogs();
     process.exit(3);
   }
   if (resolve(externalHome) === resolve(second)) {
     console.error("配置错误：两个合成主目录相同，双主目录用例无法区分来源。");
+    flushLogs();
     process.exit(3);
   }
   fixture = { home: externalHome, second };
@@ -219,6 +287,7 @@ if (!existsSync(engine)) {
     "本次结论：INTEGRATION NOT RUN —— 不能把 ignored 项计入「通过」。",
   );
   if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+  flushLogs();
   process.exit(2);
 }
 
@@ -232,6 +301,7 @@ if (!existsSync(engine)) {
       "这不是产品回归，而是 fixture 与引擎格式不再匹配；请更新本脚本的格式。",
     );
     if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+    flushLogs();
     process.exit(3);
   }
   if (rows < VERIFIED_TOOLS.length) {
@@ -239,6 +309,7 @@ if (!existsSync(engine)) {
       `fixture 错误：引擎只解析出 ${rows} 条记录，至少应有 ${VERIFIED_TOOLS.length} 条。`,
     );
     if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+    flushLogs();
     process.exit(3);
   }
   console.log(`fixture 校验通过：单目录解析 ${rows} 条记录。`);
@@ -258,8 +329,6 @@ function parseResultLine(text) {
     ignored: Number(match[3]),
   };
 }
-
-const logs = [];
 
 /**
  * 运行单个用例并按证据分类。
@@ -357,6 +426,7 @@ for (const name of expectedNames) {
       `配置错误：用例「${name}」匹配到 ${matches.length} 个测试（期望 1）。请核对脚本中的用例名。`,
     );
     if (cleanup && !keep) rmSync(cleanup, { recursive: true, force: true });
+    flushLogs();
     process.exit(3);
   }
   resolved.push({ shortName: name, fullName: matches[0] });

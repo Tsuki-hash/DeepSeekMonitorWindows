@@ -104,7 +104,18 @@ const formatCounts = (counts) => {
   return `tests=${counts.tests} pass=${counts.passed} fail=${counts.failed} ignored=${counts.ignored}`;
 };
 
-const git = (...commandArgs) => run("git", commandArgs).stdout.trim();
+// 复评 Q08：git 读取失败不得被解读成「工作区干净」。
+// 返回 { value, ok, code, stderr }，调用方据此写 UNKNOWN 并阻断。
+const git = (...commandArgs) => {
+  const result = run("git", commandArgs);
+  return {
+    value: result.stdout.trim(),
+    ok: result.ok && result.stdout.trim().length > 0,
+    code: result.code,
+    stderr: result.stderr,
+    args: commandArgs,
+  };
+};
 
 const sha256 = (path) =>
   createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -125,6 +136,47 @@ const integrationLogFile = join(
  *
  * `releaseCritical: true` 表示发版必须真实执行并通过；`NOT RUN` 不放行。
  */
+/**
+ * 复评 Q09：从集成入口的结构化日志合计测试计数。
+ *
+ * 集成 stdout 含四条 `test result:` 行（每子用例一条），
+ * `testCounts` 的 exec 只取首个匹配会得到 tests=1、首过后败时 failed=0。
+ * 这里按子用例 verdict 分别累计：PASS 计 passed，FAIL 计 failed，
+ * NOT RUN / ERROR 不计入执行数（它们确实没跑或结论未知）。
+ */
+let integrationResults = [];
+/** 复评 Q09：从集成日志加载结构化子用例结果；失败返回 false 并保持空。 */
+function loadIntegrationResults() {
+  if (integrationResults.length) return true;
+  if (!existsSync(integrationLogFile)) return false;
+  try {
+    integrationResults =
+      JSON.parse(readFileSync(integrationLogFile, "utf8")).results ?? [];
+    return true;
+  } catch {
+    return false;
+  }
+}
+const integrationCounts = () => {
+  const totals = { passed: 0, failed: 0, ignored: 0, tests: 0 };
+  let known = false;
+  for (const item of integrationResults) {
+    if (item.verdict === "PASS" || item.verdict === "FAIL") {
+      known = true;
+      const counts = testCounts(`${item.stdout ?? ""}\n${item.stderr ?? ""}`);
+      totals.passed += counts.passed ?? 0;
+      totals.failed += counts.failed ?? 0;
+      totals.ignored += counts.ignored ?? 0;
+      totals.tests += counts.tests ?? counts.passed ?? 0;
+    }
+    // NOT RUN / ERROR：没有可合计的执行数，但整体仍标记为已知
+    // （覆盖不足是明确结论，不是解析失败）。
+    if (item.verdict === "NOT RUN") known = true;
+  }
+  if (!known) return { ...totals, parseable: false };
+  return { ...totals, parseable: true };
+};
+
 const checks = [
   ["版本一致性", "node", ["scripts/check-version.mjs"], true],
   ["前端测试", "npm", ["test"], true],
@@ -183,12 +235,40 @@ lines.push(`生成时间：${new Date().toISOString()}`);
 lines.push("");
 lines.push("## 提交与工作区");
 lines.push("");
-lines.push(`- 提交：\`${git("rev-parse", "HEAD")}\``);
-lines.push(`- 分支：\`${git("rev-parse", "--abbrev-ref", "HEAD")}\``);
-lines.push(`- 提交时间：${git("log", "-1", "--format=%cI")}`);
-lines.push(
-  `- 工作区是否干净：${git("status", "--porcelain") === "" ? "是" : "否（存在未提交改动）"}`,
-);
+const gitFailures = [];
+const gitField = (label, ...commandArgs) => {
+  const result = git(...commandArgs);
+  if (!result.ok) {
+    gitFailures.push(label);
+    lines.push(
+      `- ${label}：UNKNOWN（git ${commandArgs.join(" ")} 退出码 ${result.code}）`,
+    );
+    lines.push(`  - stderr：${result.stderr.trim() || "(空)"}`);
+    return null;
+  }
+  return result.value;
+};
+const headSha = gitField("提交", "rev-parse", "HEAD");
+gitField("分支", "rev-parse", "--abbrev-ref", "HEAD");
+gitField("提交时间", "log", "-1", "--format=%cI");
+// 复评 Q08：`status --porcelain` 成功时**空输出才代表干净**；
+// 命令失败（exit 128 等）输出也是空，必须区分，不能推导成干净。
+const status = git("status", "--porcelain");
+if (status.ok) {
+  lines.push(
+    `- 工作区是否干净：${status.value === "" ? "是" : "否（存在未提交改动）"}`,
+  );
+} else {
+  gitFailures.push("工作区状态");
+  lines.push("- 工作区是否干净：UNKNOWN（git status 执行失败）");
+  lines.push(`  - stderr：${status.stderr.trim() || "(空)"}`);
+}
+if (gitFailures.length) {
+  lines.push(
+    `- ⚠ Git 元数据存在 UNKNOWN 项：本记录不能作为「来自固定干净提交」的证据。`,
+  );
+}
+lines.push("");
 lines.push("");
 
 lines.push("## 工具链");
@@ -219,6 +299,8 @@ lines.push("");
 lines.push("> 与 `scripts/verify.ps1` 使用同一份清单；结果记录的是本次运行。");
 lines.push("");
 const failures = [];
+// 复评 Q08：Git 元数据 UNKNOWN 属于证据链失败，并入总失败清单阻断放行。
+failures.push(...gitFailures);
 const notRun = [];
 const checkResults = [];
 lines.push("| 门禁 | 结论 | 退出码 | 用时 | 测试计数 |");
@@ -229,7 +311,12 @@ for (const [label, command, commandArgs] of checks) {
   checkResults.push({ label, command, commandArgs, result, verdict });
   if (verdict === "FAIL") failures.push(label);
   if (verdict === "NOT RUN") notRun.push(label);
-  const counts = testCounts(`${result.stdout}\n${result.stderr}`);
+  // 复评 Q09：集成入口的 stdout 含四条 `test result:` 行（每子用例一条），
+  // exec 只取首个会得到 tests=1。集成项改用结构化子用例日志合计。
+  // 集成检查在本轮循环中刚跑完并写出日志，这里正是读取时机。
+  const counts = label.includes("集成")
+    ? loadIntegrationResults() && integrationCounts()
+    : testCounts(`${result.stdout}\n${result.stderr}`);
   lines.push(
     `| ${label} | ${verdict} | ${result.code} | ${result.seconds.toFixed(1)}s | ${formatCounts(counts)} |`,
   );
@@ -261,7 +348,8 @@ for (const { label, command, commandArgs, result, verdict } of checkResults) {
 // 复评 T09：把集成子用例日志嵌入发布记录 —— PASS/FAIL/NOT RUN 都可核验执行数。
 if (existsSync(integrationLogFile)) {
   try {
-    const integration = JSON.parse(readFileSync(integrationLogFile, "utf8"));
+    // 复评 Q09：结果已在门禁表格阶段加载，这里直接复用。
+    loadIntegrationResults();
     lines.push("## 引擎集成子用例日志");
     lines.push("");
     for (const item of integration.results ?? []) {
