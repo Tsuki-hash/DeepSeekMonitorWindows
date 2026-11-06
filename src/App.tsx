@@ -17,7 +17,15 @@ import { RequestGate } from "./request-gate";
 import { errorInfo } from "./error-state";
 import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
 import { msUntilNextAccountingDate } from "./accounting-clock";
-import { balancePublishable, channelDecision } from "./refresh-policy";
+import { balancePublishable } from "./refresh-policy";
+import {
+  initialChannelState,
+  onChannelFailure,
+  onChannelSuccess,
+  onCredentialChanged,
+  scheduledDelaySeconds,
+} from "./channel-state";
+import type { ChannelState } from "./channel-state";
 import { DashboardPanel } from "./components/DashboardPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelDetailPanel } from "./components/ModelDetailPanel";
@@ -29,12 +37,22 @@ import { onboardingTasks, shouldShowOnboarding } from "./onboarding";
 import { panelModeLabel, suggestedMode } from "./panel-mode";
 import type { PanelMode } from "./panel-mode";
 import { Maximize2, Minimize2 } from "lucide-react";
+import { attemptLeave, resolveLeave, useLeaveGuard } from "./leave-guard";
+import type { LeaveDecision } from "./leave-guard";
+import { draftGuardActions, draftGuardText } from "./draft-guard";
 
 // 刷新退避与托盘发布策略抽到 refresh-policy（纯函数，可单测）。
 
 function App() {
   const [showDataNotices, setShowDataNotices] = React.useState(false);
   const [view, setView] = React.useState<ViewName>("dashboard");
+  // 全局离开拦截（复评 F09）：任何导航出口都先问 blocker，草稿不再被静默丢弃。
+  const { blocker: leaveBlocker, register: registerLeaveBlocker } =
+    useLeaveGuard();
+  const [pendingLeave, setPendingLeave] = React.useState<{
+    action: () => void;
+    subject: string;
+  } | null>(null);
   const [model, setModel] = React.useState<ModelName>("flash");
 
   const [balance, setBalance] = React.useState<BalanceData | null>(null);
@@ -86,6 +104,8 @@ function App() {
     refreshIntervalRef.current = refreshIntervalSeconds;
   }, [refreshIntervalSeconds]);
   const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(false);
+  // 通道状态（暂停/退避）变化时递增，用于重建调度链。
+  const [scheduleRevision, setScheduleRevision] = React.useState(0);
 
   // silent=true 表示后台刷新：已有数据时保留旧值，不再把面板打回「查询中…」骨架，
   // 否则开启 1 分钟自动刷新后会周期性闪烁。若当前没有可用数据（首次或上次失败），
@@ -94,127 +114,154 @@ function App() {
   // 慢的旧响应（HTTP 超时上限 15s）不允许覆盖新响应，只接受各自最新一次的结果。
   const balanceRequestId = React.useRef(0);
   const availableSnapshot = React.useRef({ balance: false, usage: false });
-  const failures = React.useRef({ balance: 0, usage: 0 });
-  // 通道暂停状态：未配置或凭据失效时置 true，健康通道不受影响（评审 P2 独立退避）。
-  const paused = React.useRef({ balance: false, usage: false });
+  // 通道状态（复评 F01/F05）：暂停、失败数、下次延迟由同一状态机维护。
+  // 原先 paused/failures 分散在两个 ref，且调度重算时丢掉 code，退避从未生效。
+  const channels = React.useRef({
+    balance: initialChannelState(60),
+    usage: initialChannelState(60),
+  });
+  const applyChannel = React.useCallback(
+    (name: "balance" | "usage", next: ChannelState) => {
+      channels.current[name] = next;
+      // 通道状态变化后重启调度，让新的延迟立即生效。
+      setScheduleRevision((value) => value + 1);
+    },
+    [],
+  );
   const balanceGate = React.useRef(new RequestGate<BalanceData>());
-  const loadBalance = React.useCallback((silent = false) => {
-    const requestId = ++balanceRequestId.current;
-    if (silent) {
-      setBalanceState((prev) => (prev === "ok" ? prev : "loading"));
-    } else {
-      setBalanceState("loading");
-    }
-    return balanceGate.current
-      .run(() => invoke<BalanceData>("fetch_balance"))
-      .then((data) => {
-        if (requestId !== balanceRequestId.current) {
-          return;
-        }
-        availableSnapshot.current.balance = true;
-        paused.current.balance = false;
-        setBalance(data);
-        setBalanceUpdatedAt(Date.now());
-        setBalanceCredentialValid(true);
-        failures.current.balance = 0;
-        setBalanceState("ok");
-        setBalanceError("");
-      })
-      .catch((error) => {
-        if (requestId !== balanceRequestId.current) {
-          return;
-        }
-        const { message, code } = errorInfo(error);
-        setBalanceErrorCode(code);
-        // 只有可重试错误才累加退避次数；未配置/失效凭据走暂停通道。
-        const decision = channelDecision({
-          code,
-          failures: failures.current.balance,
-          baseSeconds: refreshIntervalRef.current,
-        });
-        paused.current.balance = decision.paused;
-        failures.current.balance = decision.failures;
-        // 凭据失效：撤销快照有效性，避免托盘把旧金额当成当前余额重新发布。
-        // 普通网络失败保留快照，但明确标旧。
-        if (decision.paused) {
-          availableSnapshot.current.balance = false;
-          setBalanceCredentialValid(false);
-          setBalance(null);
-          setBalanceUpdatedAt(null);
-        }
-        setBalanceError(message);
-        setBalanceState((prev) =>
-          nextLoadStateAfterError(
-            availableSnapshot.current.balance ? "ok" : prev,
-            availableSnapshot.current.balance,
-            message,
+  const loadBalance = React.useCallback(
+    (silent = false) => {
+      const requestId = ++balanceRequestId.current;
+      if (silent) {
+        setBalanceState((prev) => (prev === "ok" ? prev : "loading"));
+      } else {
+        setBalanceState("loading");
+      }
+      return balanceGate.current
+        .run(() => invoke<BalanceData>("fetch_balance"))
+        .then((data) => {
+          if (requestId !== balanceRequestId.current) {
+            return;
+          }
+          availableSnapshot.current.balance = true;
+          applyChannel(
+            "balance",
+            onChannelSuccess(
+              channels.current.balance,
+              refreshIntervalRef.current,
+            ),
+          );
+          setBalance(data);
+          setBalanceUpdatedAt(Date.now());
+          setBalanceCredentialValid(true);
+          setBalanceState("ok");
+          setBalanceError("");
+          setBalanceErrorCode(undefined);
+        })
+        .catch((error) => {
+          if (requestId !== balanceRequestId.current) {
+            return;
+          }
+          const { message, code } = errorInfo(error);
+          setBalanceErrorCode(code);
+          const next = onChannelFailure(
+            channels.current.balance,
             code,
-          ),
-        );
-      });
-  }, []);
+            refreshIntervalRef.current,
+          );
+          applyChannel("balance", next);
+          // 凭据失效：撤销快照有效性，避免托盘把旧金额当成当前余额重新发布。
+          // 普通网络失败保留快照，但明确标旧。
+          if (next.paused) {
+            availableSnapshot.current.balance = false;
+            setBalanceCredentialValid(false);
+            setBalance(null);
+            setBalanceUpdatedAt(null);
+          }
+          setBalanceError(message);
+          setBalanceState((prev) =>
+            nextLoadStateAfterError(
+              availableSnapshot.current.balance ? "ok" : prev,
+              availableSnapshot.current.balance,
+              message,
+              code,
+            ),
+          );
+        });
+    },
+    [applyChannel],
+  );
 
   const usageRequestId = React.useRef(0);
   const usageSnapshot = React.useRef<UsageResult | null>(null);
-  const loadUsage = React.useCallback((silent = false) => {
-    const requestId = ++usageRequestId.current;
-    const retained = currentUsageSnapshot(usageSnapshot.current, todayStr());
-    usageSnapshot.current = retained;
-    availableSnapshot.current.usage = retained !== null;
-    setUsage(retained);
-    if (!retained) setUsageUpdatedAt(null);
-    if (silent && retained) {
-      setUsageState((prev) => (prev === "ok" ? prev : "loading"));
-    } else {
-      setUsageState("loading");
-    }
-    return fetchCurrentUsage()
-      .then((data) => {
-        if (requestId !== usageRequestId.current) {
-          return;
-        }
-        const current = currentUsageSnapshot(data, todayStr());
-        if (!current) throw new Error("记账月份已变化，请重新刷新用量");
-        availableSnapshot.current.usage = true;
-        usageSnapshot.current = current;
-        setUsage(current);
-        setUsageUpdatedAt(Date.now());
-        failures.current.usage = 0;
-        setUsageState("ok");
-        setUsageError("");
-      })
-      .catch((error) => {
-        if (requestId !== usageRequestId.current) {
-          return;
-        }
-        const { message, code } = errorInfo(error);
-        setUsageErrorCode(code);
-        const decision = channelDecision({
-          code,
-          failures: failures.current.usage,
-          baseSeconds: refreshIntervalRef.current,
-        });
-        paused.current.usage = decision.paused;
-        failures.current.usage = decision.failures;
-        setUsageError(message);
-        const retained = decision.paused
-          ? null
-          : currentUsageSnapshot(usageSnapshot.current, todayStr());
-        usageSnapshot.current = retained;
-        availableSnapshot.current.usage = retained !== null;
-        setUsage(retained);
-        if (!retained) setUsageUpdatedAt(null);
-        // 同一凭据下刷新失败保留快照与时间；无凭据或失效凭据仍显示对应错误。
-        setUsageState((prev) =>
-          nextLoadStateAfterError(
-            availableSnapshot.current.usage ? "ok" : prev,
-            availableSnapshot.current.usage,
-            message,
+  const loadUsage = React.useCallback(
+    (silent = false) => {
+      const requestId = ++usageRequestId.current;
+      const retained = currentUsageSnapshot(usageSnapshot.current, todayStr());
+      usageSnapshot.current = retained;
+      availableSnapshot.current.usage = retained !== null;
+      setUsage(retained);
+      if (!retained) setUsageUpdatedAt(null);
+      if (silent && retained) {
+        setUsageState((prev) => (prev === "ok" ? prev : "loading"));
+      } else {
+        setUsageState("loading");
+      }
+      return fetchCurrentUsage()
+        .then((data) => {
+          if (requestId !== usageRequestId.current) {
+            return;
+          }
+          const current = currentUsageSnapshot(data, todayStr());
+          if (!current) throw new Error("记账月份已变化，请重新刷新用量");
+          availableSnapshot.current.usage = true;
+          usageSnapshot.current = current;
+          applyChannel(
+            "usage",
+            onChannelSuccess(
+              channels.current.usage,
+              refreshIntervalRef.current,
+            ),
+          );
+          setUsage(current);
+          setUsageUpdatedAt(Date.now());
+          setUsageState("ok");
+          setUsageError("");
+          setUsageErrorCode(undefined);
+        })
+        .catch((error) => {
+          if (requestId !== usageRequestId.current) {
+            return;
+          }
+          const { message, code } = errorInfo(error);
+          setUsageErrorCode(code);
+          const next = onChannelFailure(
+            channels.current.usage,
             code,
-          ),
-        );
-      });
-  }, []);
+            refreshIntervalRef.current,
+          );
+          applyChannel("usage", next);
+          setUsageError(message);
+          const retained = next.paused
+            ? null
+            : currentUsageSnapshot(usageSnapshot.current, todayStr());
+          usageSnapshot.current = retained;
+          availableSnapshot.current.usage = retained !== null;
+          setUsage(retained);
+          if (!retained) setUsageUpdatedAt(null);
+          // 同一凭据下刷新失败保留快照与时间；无凭据或失效凭据仍显示对应错误。
+          setUsageState((prev) =>
+            nextLoadStateAfterError(
+              availableSnapshot.current.usage ? "ok" : prev,
+              availableSnapshot.current.usage,
+              message,
+              code,
+            ),
+          );
+        });
+    },
+    [applyChannel],
+  );
 
   const refreshAll = React.useCallback(
     (silent = false) => {
@@ -234,8 +281,10 @@ function App() {
     usageTokenConfigured: boolean;
   } | null>(null);
 
-  React.useEffect(() => {
-    void invoke<AppConfig>("get_app_config")
+  // 配置状态必须能被重新读取：保存/清除凭据、开启本地统计后，
+  // 首次引导与历史页的恢复文案都依赖它（复评 F12）。
+  const reloadConfig = React.useCallback(() => {
+    return invoke<AppConfig>("get_app_config")
       .then((config) => {
         setRefreshIntervalSeconds(config.refreshIntervalSeconds || 60);
         setAutoRefreshEnabled(config.autoRefreshEnabled);
@@ -243,11 +292,24 @@ function App() {
           apiKeyConfigured: config.apiKeyConfigured,
           usageTokenConfigured: config.usageTokenConfigured,
         });
+        return config;
       })
       .catch(() => {
         setRefreshIntervalSeconds(60);
         setAutoRefreshEnabled(false);
+        return null;
       });
+  }, []);
+  React.useEffect(() => {
+    void reloadConfig();
+  }, [reloadConfig]);
+
+  // 本地统计是否开启：引导卡与历史页都要用真实状态，不能写死 false。
+  const [localEnabled, setLocalEnabled] = React.useState(false);
+  React.useEffect(() => {
+    void invoke<{ enabled: boolean }>("get_local_usage")
+      .then((status) => setLocalEnabled(status.enabled === true))
+      .catch(() => undefined);
   }, []);
 
   // 面板是否可见。窗口隐藏不会卸载 WebView，所以自动刷新定时器必须靠这个状态显式暂停，
@@ -293,26 +355,26 @@ function App() {
       run: (silent: boolean) => Promise<unknown>,
     ) => {
       if (cancelled) return;
-      const decision = channelDecision({
-        failures: failures.current[channel],
-        baseSeconds: refreshIntervalSeconds,
+      // 直接使用状态机已经算好的延迟（复评 F05）：失败后 120/240/…，暂停时探测间隔。
+      const state = channels.current[channel];
+      const delay = scheduledDelaySeconds({
+        ...state,
+        // 用户改过间隔后，未进入退避的通道跟随新间隔。
+        nextDelaySeconds:
+          state.failures === 0 && !state.paused
+            ? refreshIntervalSeconds
+            : state.nextDelaySeconds,
       });
-      const delay = decision.delaySeconds;
-      const timer = window.setTimeout(
-        () => {
-          timers.delete(timer);
-          if (cancelled) return;
-          // 暂停通道：不联网，但保留定时器以便凭据恢复后重新纳入调度。
-          if (paused.current[channel]) {
-            schedule(channel, run);
-            return;
-          }
-          void run(true).finally(() => schedule(channel, run));
-        },
-        paused.current[channel]
-          ? Math.min(300, refreshIntervalSeconds) * 1000
-          : delay * 1000,
-      );
+      const timer = window.setTimeout(() => {
+        timers.delete(timer);
+        if (cancelled) return;
+        // 暂停通道：不联网，但保留定时器以便凭据恢复后重新纳入调度。
+        if (channels.current[channel].paused) {
+          schedule(channel, run);
+          return;
+        }
+        void run(true).finally(() => schedule(channel, run));
+      }, delay * 1000);
       timers.add(timer);
     };
     schedule("balance", loadBalance);
@@ -327,6 +389,7 @@ function App() {
     loadBalance,
     loadUsage,
     refreshIntervalSeconds,
+    scheduleRevision,
     windowVisible,
   ]);
 
@@ -339,12 +402,46 @@ function App() {
     });
   }, [mode]);
 
-  const showOnboarding = shouldShowOnboarding({
-    apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
-    usageTokenConfigured: configSnapshot?.usageTokenConfigured ?? false,
-    localEnabled: false,
-    dismissed: onboardingDismissed,
-  });
+  // 配置尚未读取完成时不展示引导，避免把老用户当新手（复评 F12）。
+  const configLoaded = configSnapshot !== null;
+  const showOnboarding =
+    configLoaded &&
+    shouldShowOnboarding({
+      apiKeyConfigured: configSnapshot.apiKeyConfigured,
+      usageTokenConfigured: configSnapshot.usageTokenConfigured,
+      localEnabled,
+      dismissed: onboardingDismissed,
+    });
+
+  // 统一的导航出口：有未保存草稿时先拦下来，用户决定后再执行。
+  const navigate = React.useCallback(
+    (action: () => void) => {
+      if (attemptLeave(leaveBlocker.current, action) === "blocked") {
+        setPendingLeave({
+          action,
+          subject: leaveBlocker.current?.subject ?? "当前设置",
+        });
+      }
+    },
+    [leaveBlocker],
+  );
+
+  const decideLeave = React.useCallback(
+    (decision: LeaveDecision) => {
+      const pending = pendingLeave;
+      if (!pending) return;
+      if (decision === "cancel") {
+        setPendingLeave(null);
+        return;
+      }
+      void resolveLeave(leaveBlocker.current, decision, pending.action).then(
+        (left) => {
+          if (left) setPendingLeave(null);
+        },
+      );
+    },
+    [leaveBlocker, pendingLeave],
+  );
 
   const hideWindow = React.useCallback(() => {
     void invoke("hide_main_window").catch(() => {
@@ -398,19 +495,42 @@ function App() {
       invalidateUsageRequests();
       availableSnapshot.current.usage = false;
       usageSnapshot.current = null;
+      // 复评 F01：新 Token 已通过验证，必须先解除暂停，否则自动刷新会一直停在暂停态。
+      applyChannel(
+        "usage",
+        onCredentialChanged(
+          channels.current.usage,
+          true,
+          refreshIntervalRef.current,
+        ),
+      );
       setUsage(null);
       setUsageUpdatedAt(null);
+      setUsageState("loading");
+      setUsageError("");
+      setUsageErrorCode(undefined);
       void loadUsage();
+      void reloadConfig();
     });
     const cleared = listen("usage-token-cleared", () => {
       usageRequestId.current += 1;
       invalidateUsageRequests();
       availableSnapshot.current.usage = false;
       usageSnapshot.current = null;
+      applyChannel(
+        "usage",
+        onCredentialChanged(
+          channels.current.usage,
+          false,
+          refreshIntervalRef.current,
+        ),
+      );
       setUsage(null);
       setUsageUpdatedAt(null);
       setUsageState("nokey");
       setUsageError("未配置用量 Token");
+      setUsageErrorCode("not_configured");
+      void reloadConfig();
     });
     const browsingCleared = listen("browsing-data-cleared", () => {
       // 「退出并忘记账户」只应清除网页登录数据，外观偏好必须保留。
@@ -431,7 +551,7 @@ function App() {
         .then((unlisten) => unlisten())
         .catch(() => undefined);
     };
-  }, [loadUsage]);
+  }, [applyChannel, loadUsage, reloadConfig]);
 
   React.useEffect(() => {
     applyStoredGlass();
@@ -456,32 +576,52 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [view]);
 
+  const leavePrompt = pendingLeave ? (
+    <div className="leave-guard" role="alertdialog" aria-modal="false">
+      <p>{draftGuardText(pendingLeave.subject)}</p>
+      <div className="disclosure-actions">
+        <button className="primary" onClick={() => decideLeave("save")}>
+          {draftGuardActions.save}
+        </button>
+        <button className="secondary" onClick={() => decideLeave("discard")}>
+          {draftGuardActions.discard}
+        </button>
+        <button className="secondary" onClick={() => decideLeave("cancel")}>
+          {draftGuardActions.cancel}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div
       ref={stageRef}
-      className={`stage ${["dashboard", "local", "history"].includes(view) ? "with-navigation" : ""}`}
+      data-panel-mode={mode}
+      className={`stage mode-${mode} ${["dashboard", "local", "history"].includes(view) ? "with-navigation" : ""}`}
     >
       {view === "dashboard" && (
         <>
-          {showOnboarding && (
-            <OnboardingPanel
-              tasks={onboardingTasks({
-                apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
-                usageTokenConfigured:
-                  configSnapshot?.usageTokenConfigured ?? false,
-                localEnabled: false,
-                dismissed: onboardingDismissed,
-              })}
-              onChoose={(task) => {
-                setOnboardingDismissed(true);
-                setShowDataNotices(false);
-                // 平台用量与余额都在设置页配置；本地统计在 Agent 页开启。
-                setView(task === "local" ? "local" : "settings");
-              }}
-              onDismiss={() => setOnboardingDismissed(true)}
-            />
-          )}
           <DashboardPanel
+            onboarding={
+              showOnboarding ? (
+                <OnboardingPanel
+                  tasks={onboardingTasks({
+                    apiKeyConfigured: configSnapshot?.apiKeyConfigured ?? false,
+                    usageTokenConfigured:
+                      configSnapshot?.usageTokenConfigured ?? false,
+                    localEnabled,
+                    dismissed: onboardingDismissed,
+                  })}
+                  onChoose={(task) => {
+                    setOnboardingDismissed(true);
+                    setShowDataNotices(false);
+                    // 平台用量与余额都在设置页配置；本地统计在 Agent 页开启。
+                    setView(task === "local" ? "local" : "settings");
+                  }}
+                  onDismiss={() => setOnboardingDismissed(true)}
+                />
+              ) : null
+            }
             onHistory={() => setView("history")}
             balanceUpdatedAt={balanceUpdatedAt}
             usageUpdatedAt={usageUpdatedAt}
@@ -525,19 +665,46 @@ function App() {
             balanceRequestId.current += 1;
             balanceGate.current.invalidate();
             availableSnapshot.current.balance = true;
+            // 复评 F01：设置页验证成功等同一次成功请求，必须解除暂停并恢复托盘有效性。
+            applyChannel(
+              "balance",
+              onCredentialChanged(
+                channels.current.balance,
+                true,
+                refreshIntervalRef.current,
+              ),
+            );
+            channels.current.balance = onChannelSuccess(
+              channels.current.balance,
+              refreshIntervalRef.current,
+            );
             setBalance(nextBalance);
             setBalanceUpdatedAt(Date.now());
+            setBalanceCredentialValid(true);
             setBalanceState("ok");
             setBalanceError("");
+            setBalanceErrorCode(undefined);
+            void reloadConfig();
           }}
           onBalanceCleared={() => {
             balanceRequestId.current += 1;
             balanceGate.current.invalidate();
             availableSnapshot.current.balance = false;
+            applyChannel(
+              "balance",
+              onCredentialChanged(
+                channels.current.balance,
+                false,
+                refreshIntervalRef.current,
+              ),
+            );
             setBalance(null);
             setBalanceUpdatedAt(null);
+            setBalanceCredentialValid(false);
             setBalanceState("nokey");
             setBalanceError("");
+            setBalanceErrorCode(undefined);
+            void reloadConfig();
           }}
           onUsageLoaded={(nextUsage) => {
             const current = currentUsageSnapshot(nextUsage, todayStr());
@@ -550,20 +717,40 @@ function App() {
             usageRequestId.current += 1;
             availableSnapshot.current.usage = true;
             usageSnapshot.current = current;
+            // 复评 F01：用量成功路径原先不清 paused，凭据恢复后自动刷新永久暂停。
+            applyChannel(
+              "usage",
+              onChannelSuccess(
+                channels.current.usage,
+                refreshIntervalRef.current,
+              ),
+            );
             setUsage(current);
             setUsageUpdatedAt(Date.now());
             setUsageState("ok");
             setUsageError("");
+            setUsageErrorCode(undefined);
+            void reloadConfig();
           }}
           onUsageCleared={() => {
             usageRequestId.current += 1;
             invalidateUsageRequests();
             availableSnapshot.current.usage = false;
             usageSnapshot.current = null;
+            applyChannel(
+              "usage",
+              onCredentialChanged(
+                channels.current.usage,
+                false,
+                refreshIntervalRef.current,
+              ),
+            );
             setUsage(null);
             setUsageUpdatedAt(null);
             setUsageState("nokey");
             setUsageError("未配置用量 Token");
+            setUsageErrorCode("not_configured");
+            void reloadConfig();
           }}
           onRefreshIntervalChanged={setRefreshIntervalSeconds}
           onAutoRefreshChanged={setAutoRefreshEnabled}
@@ -589,11 +776,23 @@ function App() {
         />
       )}
       {view === "history" && (
-        <HistoryPanel onBack={() => setView("dashboard")} />
+        <HistoryPanel
+          onBack={() => navigate(() => setView("dashboard"))}
+          usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
+          onConfigureUsage={() => {
+            // 复评 F10：直接进入设置页并定位到用量 Token 区块。
+            setShowDataNotices(false);
+            setView("settings");
+          }}
+        />
       )}
       {view === "local" && (
-        <LocalUsagePanel onBack={() => setView("dashboard")} />
+        <LocalUsagePanel
+          onBack={() => navigate(() => setView("dashboard"))}
+          onRegisterLeaveBlocker={registerLeaveBlocker}
+        />
       )}
+      {leavePrompt}
       {["dashboard", "local", "history"].includes(view) && (
         <nav className="primary-navigation" aria-label="主导航">
           {(
@@ -606,7 +805,10 @@ function App() {
             <button
               key={target}
               aria-current={view === target ? "page" : undefined}
-              onClick={() => setView(target)}
+              onClick={() => {
+                if (view === target) return;
+                navigate(() => setView(target));
+              }}
             >
               {label}
             </button>
