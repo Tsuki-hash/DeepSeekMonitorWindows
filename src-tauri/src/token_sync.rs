@@ -145,22 +145,14 @@ const ORDER_BLOAT_SLACK: usize = 64;
 /// 记录「该路径本轮已处理过」。已有表项且内容指纹变化（刚被重读）视为一次
 /// LRU 触碰，换新代际号挪到队尾。
 pub(crate) fn mark_seen(scan: &mut CacheScanState, path: PathBuf, stamp: Stamp) {
-    match scan.seen.get_mut(&path) {
-        Some(entry) => {
-            if entry.0 != stamp {
-                scan.next_generation += 1;
-                let generation = scan.next_generation;
-                entry.1 = generation;
-                entry.0 = stamp;
-                scan.order.push_back((path, generation));
-            }
-        }
-        None => {
-            scan.next_generation += 1;
-            let generation = scan.next_generation;
-            scan.seen.insert(path.clone(), (stamp, generation));
-            scan.order.push_back((path, generation));
-        }
+    if !scan
+        .seen
+        .get(&path)
+        .is_some_and(|(seen_stamp, _)| *seen_stamp == stamp)
+    {
+        let generation = next_seen_generation(scan);
+        scan.seen.insert(path.clone(), (stamp, generation));
+        scan.order.push_back((path, generation));
     }
     let order_cap = scan.seen.len() * ORDER_BLOAT_FACTOR + ORDER_BLOAT_SLACK;
     if scan.order.len() > order_cap {
@@ -168,13 +160,33 @@ pub(crate) fn mark_seen(scan: &mut CacheScanState, path: PathBuf, stamp: Stamp) 
     }
 }
 
-/// 重建触碰队列：只保留每个路径当前代际的记录，过期排队记录全部丢弃。
+/// 只过滤过期记录，保持有效记录的先后顺序（即使不同路径代际相同也不重排）。
+/// 不能从 HashMap 重建：其随机迭代顺序会把刚触碰的热文件移到淘汰队首。
 fn compact_order(scan: &mut CacheScanState) {
-    scan.order = scan
-        .seen
-        .iter()
-        .map(|(path, (_, generation))| (path.clone(), *generation))
-        .collect();
+    let seen = &scan.seen;
+    scan.order.retain(|(path, generation)| {
+        seen.get(path)
+            .is_some_and(|(_, generation_now)| generation_now == generation)
+    });
+}
+
+/// 耗尽代际号前先移除旧记录，再按 LRU 顺序重新编号。不能 wrapping/saturating：
+/// 复用仍在队列里的旧代际会把过期记录误认成当前表项，提前淘汰热文件。
+fn next_seen_generation(scan: &mut CacheScanState) -> u64 {
+    if scan.next_generation == u64::MAX {
+        compact_order(scan);
+        scan.next_generation = 0;
+        // 有效队列每个 seen 路径仅一项；扫描上限与分批回写让其远小于 u64::MAX。
+        for (path, generation) in &mut scan.order {
+            scan.next_generation += 1;
+            *generation = scan.next_generation;
+            if let Some((_, generation_now)) = scan.seen.get_mut(path) {
+                *generation_now = *generation;
+            }
+        }
+    }
+    scan.next_generation += 1;
+    scan.next_generation
 }
 
 /// 把 `seen` 淘汰到 `keep` 项以内：从触碰历史最旧的一端出队，代际对不上的
@@ -643,6 +655,180 @@ mod tests {
             mark_seen(&mut scan, PathBuf::from(format!("f_{i:05}")), (i, None));
         }
         scan
+    }
+
+    fn assert_order(scan: &CacheScanState, paths: &[&str]) {
+        let actual: Vec<_> = scan.order.iter().map(|(path, _)| path.as_path()).collect();
+        let expected: Vec<_> = paths.iter().map(|path| Path::new(path)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn 压缩_只保留最新代际且保持触碰顺序() {
+        let mut scan = filled_state(5);
+        mark_seen(&mut scan, PathBuf::from("f_00001"), (101, None));
+        mark_seen(&mut scan, PathBuf::from("f_00003"), (103, None));
+        mark_seen(&mut scan, PathBuf::from("f_00001"), (201, None));
+        let next_generation = scan.next_generation;
+
+        compact_order(&mut scan);
+
+        assert_order(
+            &scan,
+            &["f_00000", "f_00002", "f_00004", "f_00003", "f_00001"],
+        );
+        assert_eq!(scan.order.len(), scan.seen.len());
+        assert_eq!(scan.next_generation, next_generation);
+        assert_eq!(scan.seen[&PathBuf::from("f_00001")].0, (201, None));
+        assert!(scan.order.iter().all(|(path, generation)| {
+            scan.seen.get(path).map(|(_, current)| current) == Some(generation)
+        }));
+        let once = scan.order.clone();
+        compact_order(&mut scan);
+        assert_eq!(scan.order, once, "连续压缩不应改变队列");
+    }
+
+    #[test]
+    fn 压缩_相同代际沿用队列顺序而非哈希顺序() {
+        let mut scan = filled_state(4);
+        // 人工构造不同路径的同代际，顺序必须由队列决定，不靠排序碰巧稳定。
+        for (_, generation) in scan.seen.values_mut() {
+            *generation = 7;
+        }
+        for (_, generation) in &mut scan.order {
+            *generation = 7;
+        }
+        scan.next_generation = 7;
+        compact_order(&mut scan);
+        assert_order(&scan, &["f_00000", "f_00001", "f_00002", "f_00003"]);
+
+        // 同一个 HashMap 不变、只反转队列；两次预期不同，旧实现不可能都满足。
+        scan.order.make_contiguous().reverse();
+        compact_order(&mut scan);
+        assert_order(&scan, &["f_00003", "f_00002", "f_00001", "f_00000"]);
+        evict_lru(&mut scan, 2);
+        assert_order(&scan, &["f_00001", "f_00000"]);
+        assert!(scan.seen.contains_key(&PathBuf::from("f_00000")));
+        assert!(scan.seen.contains_key(&PathBuf::from("f_00001")));
+    }
+
+    #[test]
+    fn 压缩后再次更新_旧代际不会淘汰新指纹() {
+        let mut scan = filled_state(4);
+        compact_order(&mut scan);
+        let path = PathBuf::from("f_00000");
+        let previous_generation = scan.seen[&path].1;
+        mark_seen(&mut scan, path.clone(), (100, None));
+        assert!(scan.seen[&path].1 > previous_generation);
+        assert_eq!(
+            scan.order.front(),
+            Some(&(path.clone(), previous_generation))
+        );
+
+        evict_lru(&mut scan, 3);
+
+        assert_eq!(scan.seen[&path].0, (100, None));
+        assert!(!scan.seen.contains_key(&PathBuf::from("f_00001")));
+        assert_order(&scan, &["f_00002", "f_00003", "f_00000"]);
+    }
+
+    #[test]
+    fn 连续更新_多次自动压缩始终有界且保留热文件() {
+        let mut scan = filled_state(4);
+        let cap = scan.seen.len() * ORDER_BLOAT_FACTOR + ORDER_BLOAT_SLACK;
+        let mut compactions = 0;
+        for version in 0..1024u64 {
+            for (name, stamp) in [
+                ("f_00000", 100 + version * 2),
+                ("f_00001", 101 + version * 2),
+            ] {
+                let previous_len = scan.order.len();
+                mark_seen(&mut scan, PathBuf::from(name), (stamp, None));
+                if scan.order.len() < previous_len {
+                    compactions += 1;
+                    if name == "f_00000" {
+                        assert_order(&scan, &["f_00002", "f_00003", "f_00001", "f_00000"]);
+                    } else {
+                        assert_order(&scan, &["f_00002", "f_00003", "f_00000", "f_00001"]);
+                    }
+                }
+                assert!(scan.order.len() <= cap);
+            }
+        }
+        assert!(compactions > 1, "回归必须实际跨过多次自动压缩阈值");
+        compact_order(&mut scan);
+        assert_order(&scan, &["f_00002", "f_00003", "f_00000", "f_00001"]);
+        evict_lru(&mut scan, 2);
+        assert_eq!(scan.seen[&PathBuf::from("f_00000")].0, (2146, None));
+        assert_eq!(scan.seen[&PathBuf::from("f_00001")].0, (2147, None));
+    }
+
+    #[test]
+    fn 超过上限_压缩后仍按最旧顺序淘汰到四分之三() {
+        let count = MAX_SEEN_ENTRIES + 1;
+        let keep = MAX_SEEN_ENTRIES * 3 / 4;
+        let mut scan = filled_state(count as u64);
+        // 最早插入的路径现在最新，不能因压缩而提前丢掉它的去重指纹。
+        mark_seen(&mut scan, PathBuf::from("f_00000"), (100_000, None));
+        compact_order(&mut scan);
+
+        evict_lru(&mut scan, keep);
+
+        assert_eq!(scan.seen.len(), keep);
+        assert_eq!(scan.order.len(), keep);
+        let removed = count - keep;
+        for i in 0..count {
+            assert_eq!(
+                scan.seen.contains_key(&PathBuf::from(format!("f_{i:05}"))),
+                i == 0 || i > removed,
+                "淘汰结果必须由触碰次序决定：f_{i:05}"
+            );
+        }
+        assert_eq!(scan.seen[&PathBuf::from("f_00000")].0, (100_000, None));
+    }
+
+    #[test]
+    fn 代际耗尽_先去旧记录再重编号且更新仍在队尾() {
+        let mut scan = filled_state(3);
+        mark_seen(&mut scan, PathBuf::from("f_00000"), (10, None));
+        scan.next_generation = u64::MAX - 1;
+        mark_seen(&mut scan, PathBuf::from("f_00001"), (11, None));
+        assert_eq!(scan.next_generation, u64::MAX);
+        let before = scan.order.clone();
+        mark_seen(&mut scan, PathBuf::from("f_00001"), (11, None));
+        assert_eq!(scan.next_generation, u64::MAX, "同一指纹不分配代际");
+        assert_eq!(scan.order, before);
+
+        mark_seen(&mut scan, PathBuf::from("f_00000"), (20, None));
+
+        assert_eq!(scan.next_generation, 4);
+        assert_order(&scan, &["f_00002", "f_00000", "f_00001", "f_00000"]);
+        assert_eq!(
+            scan.order
+                .iter()
+                .map(|(_, generation)| *generation)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        evict_lru(&mut scan, 1);
+        assert_eq!(scan.seen.len(), 1);
+        assert_eq!(scan.seen[&PathBuf::from("f_00000")], ((20, None), 4));
+        assert_order(&scan, &["f_00000"]);
+    }
+
+    #[test]
+    fn 代际耗尽_新增路径保持旧路径顺序() {
+        let mut scan = filled_state(2);
+        scan.next_generation = u64::MAX;
+
+        mark_seen(&mut scan, PathBuf::from("new"), (99, None));
+
+        assert_eq!(scan.next_generation, 3);
+        assert_order(&scan, &["f_00000", "f_00001", "new"]);
+        evict_lru(&mut scan, 2);
+        assert!(!scan.seen.contains_key(&PathBuf::from("f_00000")));
+        assert_eq!(scan.seen[&PathBuf::from("f_00001")].0, (1, None));
+        assert_eq!(scan.seen[&PathBuf::from("new")], ((99, None), 3));
     }
 
     #[test]

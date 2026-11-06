@@ -19,7 +19,8 @@ if ([string]::IsNullOrWhiteSpace($runtimeExecutable) -or -not [System.IO.Path]::
     throw '无法获取当前 PowerShell 可执行文件来源。'
 }
 Write-Host "PowerShell runtime: $runtimeVersion; source: PSVersionTable.PSVersion; executable: $runtimeExecutable (current process)"
-Set-Location (Join-Path $PSScriptRoot '..')
+# A known checkout path is literal, including brackets in directory names.
+Set-Location -LiteralPath (Join-Path $PSScriptRoot '..')
 
 # PowerShell 7 默认不把原生命令的非零退出码转为终止错误。
 function Invoke-Check {

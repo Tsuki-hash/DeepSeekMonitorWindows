@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +31,9 @@ const originalSpawn = cp.spawnSync;
 const originalWrite = fs.writeFileSync;
 const originalRead = fs.readFileSync;
 const originalAppend = fs.appendFileSync;
+const originalRename = fs.renameSync;
+const originalRemove = fs.rmSync;
+const originalLink = fs.linkSync;
 const scenario = process.env.DSM_GATE_TEST_SCENARIO;
 const reportScenario = process.env.DSM_GATE_TEST_REPORT_FAILURE || scenario;
 const required = ${JSON.stringify(REQUIRED_WINDOWS_TESTS)};
@@ -38,8 +42,10 @@ Object.defineProperty(process, "platform", { value: scenario.startsWith("non-win
 Object.defineProperty(process, "arch", { value: "x64" });
 fs.writeFileSync = (path, data, ...rest) => {
   const source = String(path).includes("dsm-rust-log-") ? "rust" : String(path).includes("dsm-version-log-") ? "version" : null;
+  // Exclusive, private reservation is not a child-produced gate log.
+  if (source && data === "" && rest[0]?.flag === "wx") return originalWrite(path, data, ...rest);
   if (String(path).includes("dsm-rust-log-")) {
-    if (scenario === "missing-log") return;
+    if (scenario === "missing-log") { originalRemove(path, { force: true }); return; }
     const log = JSON.parse(data);
     if (scenario === "tampered-counts") log.rust.counts.passed += 1;
     if (scenario === "tampered-coverage") log.rust.coverage.pop();
@@ -56,7 +62,7 @@ fs.writeFileSync = (path, data, ...rest) => {
     if (scenario === "empty-log") data = Buffer.alloc(0);
   }
   if (String(path).includes("dsm-version-log-")) {
-    if (scenario === "version-missing-log") return;
+    if (scenario === "version-missing-log") { originalRemove(path, { force: true }); return; }
     const log = JSON.parse(data);
     if (scenario === "version-tampered-counts") log.powershell.counts.passed += 1;
     if (scenario === "version-tampered-output") log.powershell.stdout = "";
@@ -77,6 +83,16 @@ fs.writeFileSync = (path, data, ...rest) => {
   }
   if (source) originalAppend(process.env.DSM_GATE_TEST_DIR + "/gate-sources.jsonl", JSON.stringify({ source, path: String(path), bytes: Buffer.from(data).toString("base64") }) + "\\n");
   if (String(path).endsWith("report.md")) {
+    if (reportScenario === "report-existing-output") {
+      originalWrite(path, "pre-existing report must remain unchanged", { flag: "wx", mode: 0o600 });
+    }
+    if (reportScenario === "report-source-alias") {
+      const sources = originalRead(process.env.DSM_GATE_TEST_DIR + "/gate-sources.jsonl", "utf8").trim().split("\\n").map(line => JSON.parse(line));
+      const original = sources.find(item => item.source === process.env.DSM_GATE_TEST_REPORT_ALIAS_SOURCE);
+      // Install a hardlink at the output path immediately before the real write.
+      // A truncating write would destroy the original despite having no rm call.
+      originalLink(original.path, path);
+    }
     if (reportScenario === "report-write-failure") throw new Error("synthetic report write failure");
     if (["report-partial-write", "report-truncated-write"].includes(reportScenario)) {
       originalWrite(path, String(data).slice(0, 80), ...rest);
@@ -91,13 +107,32 @@ fs.writeFileSync = (path, data, ...rest) => {
   return originalWrite(path, data, ...rest);
 };
 const changedSources = new Set();
+const replacementSnapshots = new Map();
 fs.readFileSync = (path, ...rest) => {
   if ((scenario === "unreadable-log" && String(path).includes("dsm-rust-log-")) ||
       (scenario === "version-unreadable-log" && String(path).includes("dsm-version-log-")) ||
       (reportScenario === "report-readback-failure" && String(path).endsWith("report.md"))) {
     const error = new Error("synthetic read failure"); error.code = "EACCES"; throw error;
   }
+  const source = String(path).includes("dsm-rust-log-") ? "rust" : String(path).includes("dsm-version-log-") ? "version" : null;
+  const replaceAfterRead = source && source === process.env.DSM_GATE_TEST_REPLACE_AFTER_READ;
+  // Model a competing writer around EVERY source read, including the former
+  // final comparison read immediately before rmSync. Restore A before a reread,
+  // then atomically replace the path with B after the actual read returns A.
+  // This deterministic A -> B -> A -> B schedule defeats repeated comparisons;
+  // the fixed entry reads once and retains B, while the old entry deletes B.
+  if (replaceAfterRead && replacementSnapshots.has(String(path))) {
+    originalWrite(path, replacementSnapshots.get(String(path)));
+  }
   const data = originalRead(path, ...rest);
+  if (replaceAfterRead) {
+    if (!replacementSnapshots.has(String(path))) replacementSnapshots.set(String(path), Buffer.from(data));
+    const replacement = Buffer.from("unarchived replacement B: " + source);
+    const staged = String(path) + ".replacement";
+    originalWrite(staged, replacement, { flag: "wx", mode: 0o600 });
+    originalRename(staged, path);
+    originalAppend(process.env.DSM_GATE_TEST_DIR + "/gate-read-replacements.jsonl", JSON.stringify({ path: String(path), readBytes: Buffer.from(data).toString("base64"), replacementBytes: replacement.toString("base64") }) + "\\n");
+  }
   if (scenario === "changed-log-after-snapshot" && String(path).includes("dsm-rust-log-") && !changedSources.has(String(path))) {
     changedSources.add(String(path));
     originalWrite(path, "changed after snapshot");
@@ -244,7 +279,12 @@ function fixture() {
 function execute(
   entry,
   scenario,
-  { stdoutOnly = false, reportFailure = "" } = {},
+  {
+    stdoutOnly = false,
+    reportFailure = "",
+    replaceAfterRead = "",
+    reportAliasSource = "",
+  } = {},
 ) {
   const { dir, preload } = fixture();
   try {
@@ -265,6 +305,8 @@ function execute(
           NODE_OPTIONS: `--import ${JSON.stringify(pathToFileURL(preload).href)}`,
           DSM_GATE_TEST_SCENARIO: scenario,
           DSM_GATE_TEST_REPORT_FAILURE: reportFailure,
+          DSM_GATE_TEST_REPLACE_AFTER_READ: replaceAfterRead,
+          DSM_GATE_TEST_REPORT_ALIAS_SOURCE: reportAliasSource,
           DSM_GATE_TEST_DIR: dir,
           TMPDIR: temp,
           TEMP: temp,
@@ -287,6 +329,10 @@ function execute(
               remainingBytes: existsSync(source.path)
                 ? readFileSync(source.path).toString("base64")
                 : null,
+              mode: existsSync(source.path)
+                ? statSync(source.path).mode & 0o777
+                : null,
+              directoryMode: statSync(dirname(source.path)).mode & 0o777,
             };
           })
       : [];
@@ -297,7 +343,14 @@ function execute(
         : existsSync(report)
           ? readFileSync(report, "utf8")
           : null,
+      reportMode: existsSync(report) ? statSync(report).mode & 0o777 : null,
       sources,
+      replacements: existsSync(join(dir, "gate-read-replacements.jsonl"))
+        ? readFileSync(join(dir, "gate-read-replacements.jsonl"), "utf8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line))
+        : [],
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -452,7 +505,10 @@ for (const [scenario, source] of [
       archived.sha256,
       createHash("sha256").update(bytes).digest("hex"),
     );
-    assert.equal(original.retained, false);
+    assert.equal(original.retained, true);
+    assert.equal(original.remainingBytes, original.bytes);
+    assert.ok(result.stderr.includes(original.path));
+    assert.match(result.stderr, /快照状态=rejected；报告已写入并核对/);
     assert.match(result.report, /不可信诊断数据/);
     assert.doesNotMatch(result.report, /INJECTED_UNTRUSTED_MARKDOWN/);
     assert.match(
@@ -519,16 +575,115 @@ for (const reportFailure of [
   }
 }
 
-test("stdout alone never authorizes deletion of source evidence", () => {
-  const result = execute("release-record.mjs", "pass", { stdoutOnly: true });
+for (const scenario of ["pass", "corrupt-log", "version-legacy-log"]) {
+  test(`stdout alone never authorizes deletion of source evidence: ${scenario}`, () => {
+    const result = execute("release-record.mjs", scenario, {
+      stdoutOnly: true,
+    });
+    assert.equal(result.status, scenario === "pass" ? 0 : 1);
+    assert.equal(archivedSnapshots(result.report).length, 2);
+    assert.equal(result.sources.length, 2);
+    for (const original of result.sources) {
+      assert.equal(original.retained, true);
+      assert.equal(original.remainingBytes, original.bytes);
+      assert.ok(result.stderr.includes(original.path));
+    }
+    assert.match(result.stderr, /仅 stdout 输出/);
+  });
+}
+
+for (const scenario of ["pass", "corrupt-log", "version-corrupt-log"]) {
+  test(`an existing report is never truncated: ${scenario}`, () => {
+    const result = execute("release-record.mjs", scenario, {
+      reportFailure: "report-existing-output",
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.report, "pre-existing report must remain unchanged");
+    assert.match(result.stderr, /EEXIST/);
+    assert.match(result.stderr, /--out 必须使用不存在的新路径/);
+    for (const original of result.sources) {
+      assert.equal(original.retained, true);
+      assert.equal(original.remainingBytes, original.bytes);
+    }
+  });
+  for (const source of ["rust", "version"]) {
+    test(`an output alias cannot truncate gate evidence: ${scenario}/${source}`, () => {
+      const result = execute("release-record.mjs", scenario, {
+        reportFailure: "report-source-alias",
+        reportAliasSource: source,
+      });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /EEXIST/);
+      assert.match(result.stderr, /报告未可靠保存/);
+      for (const original of result.sources) {
+        assert.equal(original.retained, true);
+        assert.equal(original.remainingBytes, original.bytes);
+      }
+      const original = result.sources.find((item) => item.source === source);
+      assert.equal(
+        result.report,
+        Buffer.from(original.bytes, "base64").toString("utf8"),
+      );
+    });
+  }
+}
+
+for (const [scenario, source, validation] of [
+  ["pass", "rust", "validated"],
+  ["pass", "version", "validated"],
+  ["corrupt-log", "rust", "rejected"],
+  ["version-corrupt-log", "version", "rejected"],
+]) {
+  test(`replacement B after the final source read is never deleted: ${scenario}/${source}`, () => {
+    const result = execute("release-record.mjs", scenario, {
+      replaceAfterRead: source,
+    });
+    assert.equal(result.status, validation === "validated" ? 0 : 1);
+    const original = result.sources.find((item) => item.source === source);
+    const archived = archivedSnapshots(result.report).find(
+      (item) => item.path === original.path,
+    );
+    assert.equal(archived.validation, validation);
+    assert.equal(archived.bytes, original.bytes);
+    assert.equal(result.replacements.length, 1);
+    const replacement = result.replacements[0];
+    assert.equal(replacement.path, original.path);
+    assert.equal(replacement.readBytes, original.bytes);
+    assert.notEqual(replacement.replacementBytes, archived.bytes);
+    assert.equal(original.retained, true);
+    assert.equal(original.remainingBytes, replacement.replacementBytes);
+    assert.ok(result.stderr.includes(original.path));
+    assert.match(result.stderr, /原始门禁日志不自动删除/);
+  });
+}
+
+test("release keeps private originals on success without deletion APIs", () => {
+  const result = execute("release-record.mjs", "pass");
   assert.equal(result.status, 0);
-  assert.equal(archivedSnapshots(result.report).length, 2);
-  assert.equal(result.sources.length, 2);
+  if (process.platform !== "win32") {
+    assert.notEqual(result.reportMode, null);
+    assert.equal(result.reportMode & 0o077, 0);
+  }
   for (const original of result.sources) {
     assert.equal(original.retained, true);
     assert.equal(original.remainingBytes, original.bytes);
-    assert.ok(result.stderr.includes(original.path));
+    assert.match(dirname(original.path), /dsm-release-evidence-[^/\\]+$/);
+    if (process.platform !== "win32") {
+      assert.equal(original.mode & 0o077, 0);
+      assert.equal(original.directoryMode & 0o077, 0);
+    }
   }
+  assert.match(result.stderr, /快照状态=validated；报告已写入并核对/);
+  assert.match(result.report, /原始证据保留政策/);
+  const source = readFileSync(
+    join(root, "scripts", "release-record.mjs"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    source,
+    /\b(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\b/,
+  );
+  assert.doesNotMatch(source, /readFileSync\(evidence\.path\)/);
 });
 
 test("validation uses the archived snapshot and never deletes a changed source", () => {
@@ -561,7 +716,7 @@ test("release: simulated complete Windows result records full coverage, not inst
   assert.match(result.report, /"version": "7\.4\.7"/);
   assert.match(result.report, /"source": "\$PSVersionTable\.PSVersion"/);
   assert.equal(result.sources.length, 2);
-  assert.ok(result.sources.every((source) => !source.retained));
+  assert.ok(result.sources.every((source) => source.retained));
   for (const name of REQUIRED_WINDOWS_TESTS)
     assert.ok(result.report.includes(name));
 });
@@ -732,6 +887,49 @@ test("verify uses the shared Windows gate and mandatory component/fault gates", 
     source.indexOf("$runtimeVersion.Major -lt 7") <
       source.indexOf("Invoke-Check '版本一致性'"),
   );
+});
+
+test("PowerShell known checkout and evidence paths use literal path binding", () => {
+  const verify = readFileSync(join(root, "scripts", "verify.ps1"), "utf8");
+  assert.match(
+    verify,
+    /^Set-Location -LiteralPath \(Join-Path \$PSScriptRoot '\.\.'\)/m,
+  );
+  const release = readFileSync(
+    join(root, "scripts", "verify-release.ps1"),
+    "utf8",
+  );
+  assert.match(release, /^Add-Type -LiteralPath @\(/m);
+  assert.match(
+    release,
+    /Get-Content -LiteralPath \(Join-Path \$PSScriptRoot '\.\.' 'package\.json'\)/,
+  );
+  for (const file of [
+    "verify-release-pe-bytes.static-tests.ps1",
+    "verify-release-snapshot.windows-tests.ps1",
+  ]) {
+    const source = readFileSync(join(root, "scripts", file), "utf8");
+    assert.match(source, /^Add-Type -LiteralPath \(Join-Path /m);
+    assert.doesNotMatch(source, /^Add-Type -Path\b/m);
+    // New-Item has no LiteralPath parameter. Its creation paths must not be
+    // mechanically changed with the read/navigation commands above.
+    assert.doesNotMatch(source, /New-Item[^\n]*-LiteralPath\b/);
+  }
+  const windows = readFileSync(
+    join(root, "scripts", "verify-release-snapshot.windows-tests.ps1"),
+    "utf8",
+  );
+  assert.match(windows, /'run \[ab\]'/);
+  assert.match(windows, /'run a'/);
+  assert.match(windows, /'no match \[xy\]'/);
+  assert.match(windows, /\$decoyPattern\.IsMatch\(\$decoyScriptsDirectory\)/);
+  assert.match(windows, /WILDCARD_DECOY_MUST_NOT_BE_COMPILED/);
+  assert.match(windows, /'parent with spaces \[ab\]'/);
+  assert.match(windows, /'parent with spaces a'/);
+  assert.match(windows, /\$locationCommands\[0\]\.Extent\.Text/);
+  assert.match(windows, /Invoke-LiteralPathProbe[^\n]+verify-release-pe-bytes/);
+  assert.match(windows, /源码声明版本：65535\.65535\.65535/);
+  assert.match(windows, /-ScriptDirectory \$unmatchedScriptsDirectory/);
 });
 
 test("pure version assertions preserve failure propagation and completion protocol", () => {

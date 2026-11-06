@@ -3,7 +3,7 @@
 # 用户运行：pwsh -NoProfile -File scripts/verify-release-pe-bytes.static-tests.ps1
 param([switch]$PassThru)
 $ErrorActionPreference = 'Stop'
-Add-Type -Path (Join-Path $PSScriptRoot 'release-pe-version.cs')
+Add-Type -LiteralPath (Join-Path $PSScriptRoot 'release-pe-version.cs')
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'verify-release.ps1'), [ref]$tokens, [ref]$parseErrors)

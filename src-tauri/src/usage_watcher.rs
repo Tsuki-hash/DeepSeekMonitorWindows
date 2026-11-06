@@ -309,27 +309,37 @@ fn verify_probe_months(now: SystemTime) -> Vec<(u32, u32)> {
 }
 
 /// 探针结果：通过 / 明确拒绝（401/403，与探针月份无关）/ 暂不可用（网络、
-/// 服务端或路由类失败，值得换探针月或稍后重试）。
+/// 服务端或路由类失败，值得换探针月或稍后重试）/ 会话已撤销。
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeOutcome {
     Passed,
     Rejected,
     Unavailable,
-}
-
-async fn probe_token(token: &str, probes: &[(u32, u32)]) -> ProbeOutcome {
-    probe_token_with(probes, |month, year| verify_usage_token(token, month, year)).await
+    Cancelled,
 }
 
 /// 手动保存、登录 IPC 和缓存候选共用同一个探针循环。
 /// 测试只替换单月请求，顺序、短路与错误优先级仍由生产循环决定。
-async fn probe_token_with<F, Fut>(probes: &[(u32, u32)], mut verify: F) -> ProbeOutcome
+/// 外层 while_current 负责主动丢弃挂起请求；这里必须逐月检查，防止同一次
+/// poll 内当前月刚返回 Transient，就越过尚未唤醒的取消计时器发出上月请求。
+async fn probe_token_with<F, Fut>(
+    probes: &[(u32, u32)],
+    is_current: impl Fn() -> bool,
+    mut verify: F,
+) -> ProbeOutcome
 where
     F: FnMut(u32, u32) -> Fut,
     Fut: std::future::Future<Output = Result<(), VerifyFailure>>,
 {
     for (month, year) in probes {
-        match verify(*month, *year).await {
+        if !is_current() {
+            return ProbeOutcome::Cancelled;
+        }
+        let result = verify(*month, *year).await;
+        if !is_current() {
+            return ProbeOutcome::Cancelled;
+        }
+        match result {
             Ok(()) => return ProbeOutcome::Passed,
             // 对凭据本身的拒绝与查询月份无关，无需再试其他探针月
             Err(VerifyFailure::Definitive) => return ProbeOutcome::Rejected,
@@ -435,7 +445,7 @@ where
                 tokio::select! {
                     biased;
                     _ = wait_until(deadline) => ProbeOutcome::Unavailable,
-                    result = probe_token_with(probes, |month, year| {
+                    result = probe_token_with(probes, &is_current, |month, year| {
                         attempted = true;
                         verify(token.clone(), month, year)
                     }) => result,
@@ -444,6 +454,10 @@ where
             &is_current,
         )
         .await?;
+        // 撤销不是网络失败：不推进候选游标/队龄，不计首遍或写 seen。
+        if outcome == ProbeOutcome::Cancelled {
+            return None;
+        }
         // precheck 与 select 之间也可能耗尽预算；未发出任何月请求就不能出队或计首遍。
         if !attempted {
             break;
@@ -464,7 +478,7 @@ where
             ProbeOutcome::Unavailable => {
                 unavailable += 1;
             }
-            ProbeOutcome::Passed => unreachable!(),
+            ProbeOutcome::Passed | ProbeOutcome::Cancelled => unreachable!(),
         }
         // 明确拒绝的候选跨轮跳过；未尝试/超时的位不置位，不能误计为全部拒绝。
         if progress.rejected_count == file.tokens.len() {
@@ -557,30 +571,44 @@ pub(crate) async fn prescan_cached_token(
     .await
 }
 
-/// IPC 捕获路径的统一校验：与预扫描/后台 watcher 一样走东八区探针月，
+/// 手动保存和 IPC 捕获路径的统一校验：与预扫描/后台 watcher 一样走东八区探针月，
 /// 不依赖登录窗口本地时区给出的月份（海外时区在月初边界会错拿月份，
-/// 可能把有效 Token 误判失效）。
-pub(crate) async fn verify_token_with_probes(token: &str) -> Result<(), String> {
+/// 可能把有效 Token 误判失效）。各路径只检查自己的 generation/lifetime，
+/// 手动保存不绑定被它替代的旧登录窗口。HTTP 请求仍保留原有超时。
+pub(crate) async fn verify_token_with_probes(
+    token: &str,
+    session: &SyncSession,
+    generation: u64,
+) -> Result<(), String> {
     let probes = verify_probe_months(SystemTime::now());
-    match probe_token(token, &probes).await {
+    verify_session_token_with(session, generation, &probes, |month, year| {
+        verify_usage_token(token, month, year)
+    })
+    .await
+}
+
+/// 两个命令共用的生产取消链；测试仅替换单月请求，不绕开真实多月循环。
+/// 最终落库仍由 commit 再检查代际，不能用 await 后的检查替代线性化守卫。
+async fn verify_session_token_with<F, Fut>(
+    session: &SyncSession,
+    generation: u64,
+    probes: &[(u32, u32)],
+    verify: F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), VerifyFailure>>,
+{
+    let is_current = || session.is_current(generation);
+    let outcome = while_current(probe_token_with(probes, &is_current, verify), &is_current)
+        .await
+        .unwrap_or(ProbeOutcome::Cancelled);
+    match outcome {
         ProbeOutcome::Passed => Ok(()),
         ProbeOutcome::Rejected => Err(VerifyFailure::Definitive.message()),
         ProbeOutcome::Unavailable => Err(VerifyFailure::Transient.message()),
+        ProbeOutcome::Cancelled => Err("同步已取消或已被新的操作替代".to_string()),
     }
-}
-
-/// 登录窗口的 IPC 校验也响应会话撤销；手动保存继续使用上面的独立探针。
-/// 最终落库仍由 commit 再检查代际，不能用 await 后的检查替代线性化守卫。
-pub(crate) async fn verify_login_token(
-    app: &tauri::AppHandle,
-    token: &str,
-    generation: u64,
-) -> Result<(), String> {
-    while_current(verify_token_with_probes(token), || {
-        app.state::<SyncSession>().is_current(generation)
-    })
-    .await
-    .ok_or_else(|| "同步已取消或已被新的操作替代".to_string())?
 }
 
 /// 同步会话的主动终止点：超时、建窗失败和 watcher 的窗口丢失兜底走这里。
@@ -729,6 +757,10 @@ mod login_close_tests;
 #[path = "cache_fairness_tests.rs"]
 mod cache_fairness_tests;
 
+#[cfg(test)]
+#[path = "probe_cancellation_tests.rs"]
+mod probe_cancellation_tests;
+
 /// 启动后台 watcher：周期扫缓存 + 目录事件即时唤醒，直到捕获成功、窗口关闭、
 /// 代际更替或轮次上限。每条退出路径都落日志（评审 F-23），内容不含任何凭据。
 pub(crate) fn spawn_title_watcher(app: tauri::AppHandle, generation: u64) {
@@ -840,15 +872,19 @@ mod tests {
         assert_eq!(probes, vec![(11, 2026), (10, 2026)]);
         let previous = previous.replace("2026-11-01", "2026-10-01");
         let mut visited = Vec::new();
-        let result = probe_token_with(&probes, |month, year| {
-            visited.push((month, year));
-            let body = if (month, year) == probes[0] {
-                current
-            } else {
-                previous.as_str()
-            };
-            std::future::ready(crate::deepseek_api::verify_usage_body(body))
-        })
+        let result = probe_token_with(
+            &probes,
+            || true,
+            |month, year| {
+                visited.push((month, year));
+                let body = if (month, year) == probes[0] {
+                    current
+                } else {
+                    previous.as_str()
+                };
+                std::future::ready(crate::deepseek_api::verify_usage_body(body))
+            },
+        )
         .await;
         (result, visited)
     }
@@ -918,11 +954,15 @@ mod tests {
             ),
         ] {
             let mut visited = Vec::new();
-            let result = probe_token_with(&probes, |month, year| {
-                let response = responses[visited.len()];
-                visited.push((month, year));
-                std::future::ready(response)
-            })
+            let result = probe_token_with(
+                &probes,
+                || true,
+                |month, year| {
+                    let response = responses[visited.len()];
+                    visited.push((month, year));
+                    std::future::ready(response)
+                },
+            )
             .await;
             assert_eq!(result, expected);
             assert_eq!(visited, probes[..count]);

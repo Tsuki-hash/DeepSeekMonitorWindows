@@ -2,6 +2,8 @@
 
 > 第 21 轮已进一步修复校验期间的并发替换：持有 Windows 本机 NTFS 拒写/拒删句柄，哈希、PE/仓库及 RT_VERSION 全部取同一字节快照；不再通过可能合并外部 MUI 的 FileVersionInfo 读取正式校验字段。新的限制、独立回归和未执行的 Windows 验收见 [同一文件快照回归说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md)。下面提及 FileVersionInfo 的历史实现和人工观察步骤，不代表当前主流程仍使用该 API。
 
+> 第 24 轮同步说明：第 18 轮“末行报告纯函数回归 PASS”是旧输出约定，不能作为当前门禁通过证据。当前必须有同一进程的 PowerShell 运行时行、四组非零逐断言（含 `pe-bytes`）、唯一完整汇总和真实成功退出码。旧三组日志或单独的 PASS 文案均不够；原始门禁日志现一律保留、不自动删除。详见 [当前发布门禁](RELEASE_GATES_1.3.1.md)。
+
 ## 修复范围与验收状态
 
 `scripts/verify-release.ps1` 原先使用无边界的文件名子串匹配，源码 `1.3.1` 会误认 `1.3.10`。文件名、哈希和明文仓库地址都符合时，即使输入不是 PE 或没有版本资源，也可能得到静态 PASS。
@@ -21,13 +23,13 @@
 
 ## 独立回归脚本文本
 
-已新增 `scripts/verify-release-version.static-tests.ps1`。它通过 PowerShell AST 只提取三个纯函数，对文件名边界、PE 结构内存 fixture、版本字段 fixture 进行断言，不执行发行校验主流程或任何安装包。用户可自行运行：
+第 18 轮新增 `scripts/verify-release-version.static-tests.ps1` 时，通过 PowerShell AST 提取三个纯函数验证文件名边界、PE 结构内存 fixture 和版本字段 fixture。当前入口还强制运行 `pe-bytes` 第四组，仍不执行发行校验主流程或任何安装包。用户可自行运行：
 
 ```powershell
 pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 ```
 
-预期：脚本无解析错误，末行报告纯函数回归 PASS。该结果也不能证明真实 NSIS 产物的字段格式正确，仍需下一节。
+当前预期：真实退出码为 0，有 `RELEASE_VERSION_RUNTIME`、四组非零 `RELEASE_VERSION_ASSERT` 及唯一完整的 `RELEASE_VERSION_SUMMARY`，计数和运行时来源一致。仅看到旧 PASS 字样或部分断言不能放行。即使这些要求满足，也不能证明真实 NSIS 产物的字段格式、Windows 文件锁或安装行为正确，仍需下一节及第 21 轮独立本机验收。
 
 ## Windows 本机发行验收
 

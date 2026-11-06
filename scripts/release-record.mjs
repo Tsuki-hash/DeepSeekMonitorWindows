@@ -18,7 +18,7 @@ import { spawnSync } from "node:child_process";
 import { hasNotRun, readRustGateLog } from "./run-rust-tests.mjs";
 import { readReleaseVersionGateLog } from "./run-release-version-tests.mjs";
 import { createHash } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -149,16 +149,26 @@ const version = JSON.parse(
   readFileSync(join(root, "package.json"), "utf8"),
 ).version;
 
+// Each run owns a newly created private directory (0700 on POSIX). Reserve
+// evidence files exclusively as 0600 before the child writers open them.
+// Windows access still follows the user's temporary directory ACL; mode bits
+// are not a substitute for an ACL. Never delete this directory or its files.
+const evidenceDirectory = mkdtempSync(join(tmpdir(), "dsm-release-evidence-"));
+console.error(`原始门禁证据目录（不自动删除）：${evidenceDirectory}`);
+
 // Rust 门禁保留完整结构化证据；缺失或不可解析的日志必须阻断发布。
 const rustLogFile = join(
-  tmpdir(),
+  evidenceDirectory,
   `dsm-rust-log-${process.pid}-${Date.now()}.json`,
 );
 
 const versionLogFile = join(
-  tmpdir(),
+  evidenceDirectory,
   `dsm-version-log-${process.pid}-${Date.now()}.json`,
 );
+for (const path of [rustLogFile, versionLogFile]) {
+  writeFileSync(path, "", { flag: "wx", mode: 0o600 });
+}
 
 // Read bytes independently of trust. Invalid UTF-8/JSON, stale schemas and
 // inconsistent fields must stay available for diagnosis without earning PASS.
@@ -559,6 +569,16 @@ lines.push(
 lines.push(
   "- 本次未做 CPU/内存/启动耗时采样，性能结论只基于代码结构，不含实测数值。",
 );
+lines.push("");
+lines.push("## 原始证据保留政策");
+lines.push("");
+lines.push(
+  "- 本入口不自动删除原始门禁日志及证据目录，无论日志通过或被拒绝、报告写入成功或失败、或仅输出到 stdout。报告只归档读取时的字节快照，不保证路径之后未被替换。",
+);
+lines.push(`- 原始证据目录：\`${evidenceDirectory}\`。`);
+lines.push(
+  "- 请保存报告、最终退出码与 stderr；确认需要的原件已另行安全归档后，由维护者自行决定是否清理。不要仅因报告中出现 PASS 就删除原件。",
+);
 
 lines.push("");
 lines.push("## 结论");
@@ -583,42 +603,41 @@ const text = lines.join("\n") + "\n";
 let reportPersisted = false;
 if (out) {
   try {
-    // Node's required minimum supports flush. Only a completed flush plus an
-    // exact read-back permits cleanup; partial/failed writes retain originals.
-    writeFileSync(resolve(out), text, { encoding: "utf8", flush: true });
+    // Exclusive creation rejects an existing report or link to any source
+    // evidence without a path-comparison race. Never truncate an existing file.
+    // Flush/read-back check persistence, never permission to delete evidence.
+    // New reports are private on POSIX. Node's minimum supports flush.
+    writeFileSync(resolve(out), text, {
+      encoding: "utf8",
+      flag: "wx",
+      flush: true,
+      mode: 0o600,
+    });
     if (!readFileSync(resolve(out)).equals(Buffer.from(text, "utf8")))
       throw new Error("发行记录落盘后逐字节核对不一致");
     reportPersisted = true;
     console.log(resolve(out));
   } catch (error) {
     failures.push("发行记录写入或核对失败");
-    console.error(`发行记录未可靠保存：${String(error)}`);
+    console.error(
+      `发行记录未可靠保存（--out 必须使用不存在的新路径）：${String(error)}`,
+    );
   }
 } else {
   // stdout may be piped, truncated or fail asynchronously. Its delivery is not
   // durable archival confirmation, so retain every temporary source file.
   console.log(text);
 }
-// Only this run's byte-for-byte archived snapshots may be removed. A rejected
-// log is eligible only because its exact untrusted bytes and hash were saved.
+// A path can be replaced after its final read, even if that read matched the
+// archived bytes. Node's path-based remove cannot bind deletion to those bytes
+// or the captured file identity. Keep all originals, validated or rejected,
+// on success, write failure and stdout-only output. Do not reread to authorize
+// deletion, and never remove a replacement file the report did not archive.
 for (const { evidence } of checkResults) {
-  if (!evidence || evidence.state === "missing") continue;
-  try {
-    if (
-      reportPersisted &&
-      evidence.bytes !== null &&
-      readFileSync(evidence.path).equals(evidence.bytes)
-    ) {
-      rmSync(evidence.path);
-    } else {
-      console.error(
-        `保留原始门禁日志（未确认完整归档或文件已变化）：${evidence.path}`,
-      );
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT")
-      console.error(`原始门禁日志未清理：${evidence.path}；${String(error)}`);
-  }
+  if (!evidence) continue;
+  console.error(
+    `原始门禁日志不自动删除（快照状态=${evidence.state}；${reportPersisted ? "报告已写入并核对" : out ? "报告未可靠保存" : "仅 stdout 输出"}）：${evidence.path}`,
+  );
 }
 
 // 失败必须传播到退出码；NOT RUN 在发版语境下同样不放行。

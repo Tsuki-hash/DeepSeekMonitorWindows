@@ -1,5 +1,5 @@
 #requires -Version 7.0
-# 第 21/22 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
+# 第 21/22/24 轮真实主流程回归文本；本次修改仅编写/静态审阅，未执行。
 # 用户在 Windows 本机 NTFS 上运行。只读用户提供的真实 PE，所有修改仅在新建
 # 隔离目录的测试副本中进行；绝不启动、安装或签名候选 PE，不构建项目。
 # 这不是既有的 release-version-pure-functions，也不算安装/升级验收。
@@ -15,17 +15,40 @@ $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-release.ps1'))
 $packagePath = Join-Path $PSScriptRoot '..' 'package.json'
 $version = (Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json).version
-$evidence = [IO.Path]::GetFullPath($EvidenceDirectory)
-if (Test-Path -LiteralPath $evidence) { throw '证据目录必须不存在，避免覆盖已有文件。' }
+$evidenceRoot = [IO.Path]::GetFullPath($EvidenceDirectory)
+if (Test-Path -LiteralPath $evidenceRoot) { throw '证据目录必须不存在，避免覆盖已有文件。' }
+$null = New-Item -ItemType Directory -Path $evidenceRoot
+# Every run exercises [] with a real wildcard-matching sibling. A lone []
+# path is insufficient: Add-Type -Path can fall back to a literal on no match.
+# Both directories are inside this new evidence root, never beside user files.
+$evidence = Join-Path $evidenceRoot 'run [ab]'
+$decoy = Join-Path $evidenceRoot 'run a'
 $null = New-Item -ItemType Directory -Path $evidence
 $scriptsDirectory = Join-Path $evidence 'scripts'
 $null = New-Item -ItemType Directory -Path $scriptsDirectory
+$decoyScriptsDirectory = Join-Path $decoy 'scripts'
+$null = New-Item -ItemType Directory -Path $decoyScriptsDirectory
+[IO.File]::WriteAllText((Join-Path $decoy 'package.json'), '{"version":"65535.65535.65535"}')
+foreach ($helper in @('release-file-snapshot.cs', 'release-pe-version.cs')) {
+    [IO.File]::WriteAllText((Join-Path $decoyScriptsDirectory $helper), '#error WILDCARD_DECOY_MUST_NOT_BE_COMPILED')
+}
 Copy-Item -LiteralPath $packagePath -Destination (Join-Path $evidence 'package.json')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-file-snapshot.cs') -Destination $scriptsDirectory
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release-pe-version.cs') -Destination $scriptsDirectory
-Add-Type -Path (Join-Path $scriptsDirectory 'release-pe-version.cs')
+foreach ($scriptFile in @('verify-release.ps1', 'verify-release-pe-bytes.static-tests.ps1', 'verify-release-version.static-tests.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptFile) -Destination $scriptsDirectory
+}
+$unmatched = Join-Path $evidenceRoot 'no match [xy]'
+$unmatchedScriptsDirectory = Join-Path $unmatched 'scripts'
+$null = New-Item -ItemType Directory -Path $unmatchedScriptsDirectory
+Copy-Item -LiteralPath $packagePath -Destination (Join-Path $unmatched 'package.json')
+foreach ($file in @('release-file-snapshot.cs', 'release-pe-version.cs', 'verify-release.ps1', 'verify-release-pe-bytes.static-tests.ps1', 'verify-release-version.static-tests.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $unmatchedScriptsDirectory
+}
+Add-Type -LiteralPath (Join-Path $scriptsDirectory 'release-pe-version.cs')
 $script:CaseNumber = 0
 $script:AssertionNumber = 0
+$script:PathProbeNumber = 0
 
 function Assert-Case([bool]$Condition, [string]$Label) {
     $script:AssertionNumber += 1
@@ -45,6 +68,85 @@ function Get-BytesHash([byte[]]$Bytes) {
     finally { $sha.Dispose() }
 }
 
+# Check the complete path pattern, not only the last component. An outer []
+# directory without its own matching sibling would mask the intended repro.
+$decoyPattern = [Management.Automation.WildcardPattern]::new($scriptsDirectory, [Management.Automation.WildcardOptions]::IgnoreCase)
+Assert-Case ($decoyPattern.IsMatch($decoyScriptsDirectory)) '完整路径确有旁路匹配；证据根及其祖先请使用不含通配元字符的普通路径'
+Assert-Case (-not (Test-Path -LiteralPath (Join-Path $evidenceRoot 'no match x')) -and
+    -not (Test-Path -LiteralPath (Join-Path $evidenceRoot 'no match y'))) '无匹配 [] 源码树没有旁路目录'
+
+function Invoke-LiteralPathProbe([string]$Label, [string]$ScriptPath) {
+    $script:PathProbeNumber += 1
+    $probeRoot = Join-Path $evidence ('path probe ' + $script:PathProbeNumber)
+    $null = New-Item -ItemType Directory -Path $probeRoot
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $pwsh
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @('-NoProfile', '-File', $ScriptPath)) { $start.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($start)
+    $outputTask = $process.StandardOutput.ReadToEndAsync()
+    $errorTask = $process.StandardError.ReadToEndAsync()
+    try {
+        if (-not $process.WaitForExit(60000)) { throw "路径回归未结束：$Label" }
+        $result = [pscustomobject]@{
+            label = $Label
+            scope = 'literal-path-only'
+            scriptPath = $ScriptPath
+            exitCode = $process.ExitCode
+            stdout = $outputTask.GetAwaiter().GetResult()
+            stderr = $errorTask.GetAwaiter().GetResult()
+        }
+        $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $probeRoot 'result.json') -Encoding utf8
+        Assert-Case ($result.exitCode -eq 0) "$Label：含 [] 的路径回归退出 0"
+        return $result
+    }
+    finally {
+        if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+        [IO.File]::WriteAllText((Join-Path $probeRoot 'stdout.txt'), $outputTask.GetAwaiter().GetResult())
+        [IO.File]::WriteAllText((Join-Path $probeRoot 'stderr.txt'), $errorTask.GetAwaiter().GetResult())
+        $process.Dispose()
+    }
+}
+
+# Only execute the actual Set-Location statement from verify.ps1. Do not run its
+# builds/tests here. ParseFile and -File accept literal paths; preserve the
+# statement exactly so changing production back to -Path makes this probe fail.
+$tokens = $null
+$parseErrors = $null
+$verifyAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'verify.ps1'), [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+$locationCommands = @($verifyAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Set-Location'
+}, $true))
+if ($locationCommands.Count -ne 1) { throw 'verify.ps1 必须恰有一个工作区定位命令。' }
+$locationSource = @'
+$ErrorActionPreference = 'Stop'
+'@ + "`n" + $locationCommands[0].Extent.Text + "`n" + @'
+$expected = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$actual = [IO.Path]::GetFullPath((Get-Location).ProviderPath)
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actual, $expected)) { throw 'Set-Location selected the wildcard decoy checkout' }
+Write-Host 'LITERAL_CHECKOUT_LOCATION_PASS'
+'@
+foreach ($checkout in @(
+    @{ Label = '有旁路匹配'; Scripts = $scriptsDirectory },
+    @{ Label = '无旁路匹配'; Scripts = $unmatchedScriptsDirectory }
+)) {
+    $locationProbe = Join-Path $checkout.Scripts 'literal checkout location.ps1'
+    [IO.File]::WriteAllText($locationProbe, $locationSource, [Text.UTF8Encoding]::new($false))
+    $locationResult = Invoke-LiteralPathProbe "$($checkout.Label)：verify 工作区定位" $locationProbe
+    Assert-Case ($locationResult.stdout.Contains('LITERAL_CHECKOUT_LOCATION_PASS')) "$($checkout.Label)：verify 精确进入含 [] 的源码树"
+    $byteResult = Invoke-LiteralPathProbe "$($checkout.Label)：纯字节脚本精确加载 C#" (Join-Path $checkout.Scripts 'verify-release-pe-bytes.static-tests.ps1')
+    $byteSummaryLines = @($byteResult.stdout -split '\r?\n' | Where-Object { $_.StartsWith('PE_BYTE_SUMMARY ') })
+    Assert-Case ($byteSummaryLines.Count -eq 1) "$($checkout.Label)：纯字节回归有唯一完成汇总"
+    $byteSummary = $byteSummaryLines[0].Substring('PE_BYTE_SUMMARY '.Length) | ConvertFrom-Json
+    Assert-Case ($byteSummary.completed -eq $true -and $byteSummary.assertions -gt 0 -and
+        $byteSummary.passed -eq $byteSummary.assertions -and $byteSummary.failed -eq 0) "$($checkout.Label)：纯字节回归完成且断言非零"
+}
+
 function Invoke-MainFlow {
     param(
         [string]$Label,
@@ -53,19 +155,25 @@ function Invoke-MainFlow {
         [ValidateSet('', 'AFTER_HASH', 'BEFORE_VERSION')][string]$Barrier = '',
         [scriptblock]$Mutation,
         [switch]$ExistingWriter,
-        [switch]$HardLink
+        [switch]$HardLink,
+        [string]$ScriptDirectory = $scriptsDirectory
     )
     $script:CaseNumber += 1
     $caseRoot = Join-Path $evidence ('case ' + $script:CaseNumber)
-    $parent = Join-Path $caseRoot 'parent with spaces'
+    $parent = Join-Path $caseRoot 'parent with spaces [ab]'
     $null = New-Item -ItemType Directory -Path $parent
+    # Mirror both bracket segments so a wildcard input path has an actual,
+    # different match, rather than merely failing because an ancestor is absent.
+    $decoyParent = Join-Path $decoy ('case ' + $script:CaseNumber) 'parent with spaces a'
+    $null = New-Item -ItemType Directory -Path $decoyParent
+    [IO.File]::WriteAllText((Join-Path $decoyParent "Monitor $version.exe"), 'WILDCARD_DECOY_NOT_A_PE')
     $target = Join-Path $parent "Monitor $version.exe"
     $replacement = Join-Path $caseRoot 'replacement.exe'
     $alias = Join-Path $caseRoot 'hard link.exe'
     [IO.File]::WriteAllBytes($target, $Bytes)
     [IO.File]::WriteAllBytes($replacement, $fixtureB)
     if ($HardLink) { $null = New-Item -ItemType HardLink -Path $alias -Target $target }
-    $caseScript = Join-Path $scriptsDirectory ('verify case ' + $script:CaseNumber + '.ps1')
+    $caseScript = Join-Path $ScriptDirectory ('verify case ' + $script:CaseNumber + '.ps1')
     $ready = $null
     $resume = $null
     $writer = $null
@@ -232,8 +340,13 @@ Assert-Case ($hashA -cne $hashB) 'A/B 是不同字节和哈希'
 
 # 首先执行未经屏障改写的完整主流程。B 不满足现有版本/仓库规则则直接失败，
 # 不把缺 fixture、版本不符、原件自带旧仓库、锁不支持记为测试通过。
-$stable = Invoke-MainFlow -Label '稳定文件与空格路径' -Bytes $fixtureB -ExpectedHash $hashB
+$stable = Invoke-MainFlow -Label '稳定文件、空格及 [] 路径与旁路目录' -Bytes $fixtureB -ExpectedHash $hashB
 Assert-Verdict $stable 0 'PASS'
+Assert-Case ($stable.stdout.Contains("源码声明版本：$version")) '读取含 [] 源码树的 package.json，不读旁路版本'
+Assert-Case (-not $stable.stdout.Contains('源码声明版本：65535.65535.65535')) '旁路 package.json 不能影响版本结论'
+$unmatchedStable = Invoke-MainFlow -Label '无旁路匹配的 [] 源码目录' -Bytes $fixtureB -ExpectedHash $hashB -ScriptDirectory $unmatchedScriptsDirectory
+Assert-Verdict $unmatchedStable 0 'PASS'
+Assert-Case ($unmatchedStable.stdout.Contains("源码声明版本：$version")) '无旁路匹配时仍读取正确源码版本'
 $differentVersion = Invoke-MainFlow -Label 'A 的真实固定版本不符' -Bytes $fixtureA -ExpectedHash $hashA
 Assert-Verdict $differentVersion 2 'INCONCLUSIVE'
 Assert-Case ($differentVersion.stdout.Contains('PE 固定 FileVersion 与源码版本不一致')) 'A 的实际 PE 版本资源确实被判定为不同版本'
@@ -306,7 +419,7 @@ foreach ($barrier in @('AFTER_HASH', 'BEFORE_VERSION')) {
 
 # 以下专门核对 helper 的同进程释放，不冒充上面的真实主流程用例。
 # 子进程退出会自动关闭句柄，因此仅“子进程退出后可写”不能证明 Dispose 正确。
-Add-Type -Path (Join-Path $scriptsDirectory 'release-file-snapshot.cs')
+Add-Type -LiteralPath (Join-Path $scriptsDirectory 'release-file-snapshot.cs')
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -373,6 +486,7 @@ $summary = [ordered]@{
     scope = 'release-snapshot-windows-main-flow'
     completed = $true
     cases = $script:CaseNumber
+    literalPathProbes = $script:PathProbeNumber
     assertions = $script:AssertionNumber
     powershell = $PSVersionTable.PSVersion.ToString()
     executable = $pwsh
@@ -382,6 +496,7 @@ $summary = [ordered]@{
     fixedFileInfoOffsets = $fixedOffsets
     resources = $resourceEvidence
     evidenceDirectory = $evidence
+    wildcardDecoyDirectory = $decoy
     installationAcceptance = 'NOT RUN'
 } | ConvertTo-Json -Depth 5
 $summary | Set-Content -LiteralPath (Join-Path $evidence 'summary.json') -Encoding utf8

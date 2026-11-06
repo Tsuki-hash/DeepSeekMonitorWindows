@@ -17,7 +17,7 @@ use crate::sync_session::{ApiKeySession, SyncSession};
 use crate::tray::hide_main_window_inner;
 use crate::usage_watcher::{
     capture_usage_token, open_login_window, prescan_cached_token, spawn_title_watcher,
-    verify_login_token, verify_token_with_probes,
+    verify_token_with_probes,
 };
 
 /// 敏感命令仅允许主面板窗口调用，防止远程登录页等非主窗口上下文滥用。
@@ -410,7 +410,9 @@ pub(crate) async fn save_usage_token(
     }
     let _ = app.emit("usage-sync-started", &status);
     let generation = status.generation;
-    if let Err(error) = verify_token_with_probes(&value).await {
+    if let Err(error) =
+        verify_token_with_probes(&value, &app.state::<SyncSession>(), generation).await
+    {
         crate::usage_watcher::end_sync_session(&app, generation);
         return Err(CommandError::new(
             format!("验证未通过，原 Token 未更改：{error}"),
@@ -637,7 +639,7 @@ pub(crate) async fn usage_token_captured(
     // 先验证再保存：拦截到的 token 可能是登录中途的临时 token。
     // 校验统一走东八区探针月（与预扫描/后台 watcher 一致），不再依赖
     // 登录窗口本地时区给出的月份
-    verify_login_token(&app, &value, generation).await?;
+    verify_token_with_probes(&value, &app.state::<SyncSession>(), generation).await?;
     capture_usage_token(&app, value, generation)
 }
 

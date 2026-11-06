@@ -103,7 +103,7 @@ try {
 if (-not $IsWindows) { throw '实际安装包校验要求 Windows 本机 NTFS；不能在未确认锁语义的平台上给出 PASS' }
 $installer = Get-Item -LiteralPath $InstallerPath
 if (-not $installer.Exists -or $installer.PSIsContainer) { throw "安装包不是可读文件：$InstallerPath" }
-Add-Type -Path @((Join-Path $PSScriptRoot 'release-file-snapshot.cs'), (Join-Path $PSScriptRoot 'release-pe-version.cs'))
+Add-Type -LiteralPath @((Join-Path $PSScriptRoot 'release-file-snapshot.cs'), (Join-Path $PSScriptRoot 'release-pe-version.cs'))
 $snapshot = [DeepSeekMonitor.ReleaseVerification.LockedFileSnapshot]::Open($installer.FullName)
 $bytes = $snapshot.Bytes
 $sha256 = [Security.Cryptography.SHA256]::Create()
@@ -167,7 +167,7 @@ else {
 }
 
 # 文件名仅为辅助证据；版本资源必须另外核对，不能靠改名得到静态 PASS。
-$packageVersion = (Get-Content (Join-Path $PSScriptRoot '..' 'package.json') -Raw | ConvertFrom-Json).version
+$packageVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..' 'package.json') -Raw | ConvertFrom-Json).version
 Write-Host "源码声明版本：$packageVersion"
 if (Test-ReleaseFileNameVersion -FileName $installer.Name -ExpectedVersion $packageVersion) {
     Write-Host "✅ 文件名包含完整版本 $packageVersion（辅助证据）" -ForegroundColor Green

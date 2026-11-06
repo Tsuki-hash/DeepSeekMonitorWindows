@@ -13,7 +13,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test": "npm run test:types && npm run test:unit",
     "test:types": "tsc --noEmit -p tsconfig.test.json",
-    "test:unit": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
+    "test:unit": "node --test --experimental-strip-types \"src/**/*.test.ts\" tests/sync-script.test.mjs",
     "lint": "eslint src",
     "format": "prettier --write .",
     "verify": "pwsh -NoProfile -File scripts/verify.ps1",

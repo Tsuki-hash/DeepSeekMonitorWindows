@@ -1,4 +1,4 @@
-//! R22/R23：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
+//! R22/R23/R24：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
 //! 只注入单月请求、合成时钟与 deadline 等待，不访问网络、不等待真实 15/30 秒。
 //! 本文件是待本机执行的测试源码，不是测试通过记录。
 
@@ -1117,5 +1117,90 @@ async fn r22_批校验挂起时窗口关闭或新代际_丢弃迟到成功且不
         assert!(session
             .commit::<()>(generation, || panic!("迟到候选不能落库"))
             .is_err());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r24_当前月Transient返回前撤销_不发上月或B且不推进队列seen提交() {
+    for mode in ["cancel", "close", "replace-web", "replace-manual"] {
+        let dir = TempConfigDir::new("r24-probe-cancel");
+        let path = dir.join("sessions");
+        write_cache(&path, &[A, B]);
+        let session = SyncSession::default();
+        let generation = session
+            .begin_usage("old".into(), &[], UsageSyncKind::Web, || ())
+            .unwrap()
+            .generation;
+        let lifetime = session.login_window_lifetime(generation).unwrap();
+        let mut scan = CacheScanState::default();
+        let mut state = CandidateVerificationState::default();
+        let candidates = state.collect_for_round(&mut scan, |scan| {
+            collect_cached_usage_tokens_in(scan, &dir, || true)
+        });
+        assert_eq!(candidates.len(), 2);
+        let clock = Clock::new();
+        let visited = RefCell::new(Vec::new());
+        let result = verify_candidates_with(
+            &mut scan,
+            &mut state,
+            candidates,
+            &MONTHS,
+            || session.is_current(generation),
+            || clock.now(),
+            |deadline| clock.wait_until(deadline),
+            |token, month, year| {
+                let session = &session;
+                let lifetime = &lifetime;
+                let visited = &visited;
+                async move {
+                    visited.borrow_mut().push((token.clone(), month, year));
+                    assert_eq!(token, A, "撤销后不能推进到候选B");
+                    assert_eq!((month, year), MONTHS[0], "撤销后不能启动上月请求");
+                    // 当前月请求就在返回 Transient 的这次 poll 内撤销，不让
+                    // 外层 while_current 的50毫秒唤醒掩盖共享多月循环缺口。
+                    match mode {
+                        "cancel" => {
+                            assert!(session
+                                .cancel_usage("old", Some(generation), || ())
+                                .is_some());
+                        }
+                        "close" => {
+                            assert!(lifetime.close());
+                        }
+                        "replace-web" | "replace-manual" => {
+                            let kind = if mode == "replace-web" {
+                                UsageSyncKind::Web
+                            } else {
+                                UsageSyncKind::Manual
+                            };
+                            session.begin_usage("new".into(), &[], kind, || ()).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    Err(VerifyFailure::Transient)
+                }
+            },
+        )
+        .await;
+        assert!(result.is_none());
+        assert_eq!(*visited.borrow(), vec![(A.to_string(), 11, 2026)]);
+        let progress = &state.files[&path];
+        assert_eq!(progress.next_candidate, 0);
+        assert_eq!(progress.untried, 2, "取消不能冒充已完成首遍");
+        assert_eq!(progress.last_attempt, 0, "取消不能把来源移到队尾");
+        assert_eq!(progress.rejected_count, 0);
+        assert!(progress.rejected.iter().all(|word| *word == 0));
+        assert!(state.pending.is_empty(), "取消不保留候选原文");
+        assert_eq!(
+            collect_cached_usage_tokens_in(&mut scan, &dir, || true).len(),
+            2,
+            "取消不能把来源写入seen"
+        );
+        assert!(session
+            .commit::<()>(generation, || panic!("取消的缓存候选不得提交"))
+            .is_err());
+        if mode.starts_with("replace") {
+            assert!(session.status().active, "旧批校验不能结束新所有者");
+        }
     }
 }
