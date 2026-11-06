@@ -9,7 +9,7 @@ import type { RawModelUsage, UsageResult } from "../src/types";
 // Synthetic component events and ref requests only. No browser is started:
 // .focus() mocks record requests, never pretend to deliver native focus events.
 // Real Tab/Enter/Space, activeElement, live announcements and Windows/WebView2
-// still require the R21/R22 viewport documents' manual acceptance.
+// still require the R21/R22/R23 viewport documents' manual acceptance.
 const g = globalThis as any;
 g.IS_REACT_ACT_ENVIRONMENT = true;
 const NativeDate = Date;
@@ -171,10 +171,14 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
   let width = initialWidth;
   let left = 0;
   let barWidth = 24;
-  const gap = 3;
+  let gap = 3;
   const visualWidths = new Map<string, number>();
   const nodes = new Map<string, any>();
   const writes: number[] = [];
+  // Native scroll has no historical position payload. Queue a notification on
+  // a changed setter, then explicitly deliver it to the live production handler.
+  // No automatic timers: each test controls scroll/observer ordering exactly.
+  const pendingScrollEvents: null[] = [];
   const focusRequests: string[] = [];
   const resizeListeners = new Set<() => void>();
   const ownerDocument: any = {
@@ -205,8 +209,10 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
       return left;
     },
     set scrollLeft(value: number) {
+      const previous = left;
       left = Math.max(0, Math.min(maximum(), value));
       writes.push(left);
+      if (left !== previous) pendingScrollEvents.push(null);
     },
     getBoundingClientRect: () => ({ left: 100, width }),
   };
@@ -216,6 +222,27 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
     focusRequests,
     resizeListeners,
     maximum,
+    get pendingScrolls() {
+      return pendingScrollEvents.length;
+    },
+    userScroll(value: number) {
+      const previous = left;
+      left = Math.max(0, Math.min(maximum(), value));
+      if (left !== previous) pendingScrollEvents.push(null);
+    },
+    dispatchScroll(view: any) {
+      assert.ok(
+        pendingScrollEvents.length > 0,
+        "a native scroll must be pending",
+      );
+      pendingScrollEvents.shift();
+      group(view).props.onScroll();
+    },
+    flushScrolls(view: any) {
+      // Writes made while delivering this batch remain pending for a later turn.
+      const count = pendingScrollEvents.length;
+      for (let index = 0; index < count; index++) this.dispatchScroll(view);
+    },
     node: (date: string) => nodes.get(date),
     setDays(next: Day[]) {
       days = next;
@@ -227,6 +254,9 @@ function monthlyViewport(initialDays: Day[], initialWidth = 81) {
     },
     setBarWidth(next: number) {
       barWidth = next;
+    },
+    setGap(next: number) {
+      gap = next;
     },
     setVisualWidth(date: string, next: number) {
       visualWidths.set(date, next);
@@ -323,6 +353,401 @@ test("R21 history: only active owns the selection inset; keyboard focus stays di
 
 for (const concurrent of [false, true]) {
   const mode = concurrent ? "concurrent" : "legacy";
+  for (const protection of protections) {
+    for (const order of ["scroll-first", "observer-first"] as const) {
+      test(`R23 monthly: ${protection}, delayed corrective scroll cannot consume the second narrowing (${order}, ${mode})`, async () => {
+        const viewport = monthlyViewport(months);
+        await render(
+          monthChart(),
+          concurrent,
+          async (view) => {
+            await act(async () => viewport.flushScrolls(view));
+            await act(async () => {
+              viewport.userScroll(81);
+              viewport.flushScrolls(view);
+            });
+            const date = months[5].date;
+            await protectMonth(view, viewport, date, protection);
+            const writes = viewport.writes.length;
+
+            viewport.setWidth(54);
+            await act(async () => viewport.resize());
+            assert.equal(viewport.container.scrollLeft, 105);
+            assert.equal(viewport.pendingScrolls, 1);
+            // The production scrollLeft setter queued an event. Change geometry
+            // again without dispatching it, then control which callback sees it.
+            viewport.setWidth(27);
+            await act(async () => {
+              if (order === "scroll-first") {
+                viewport.dispatchScroll(view);
+                assert.equal(viewport.container.scrollLeft, 132);
+                viewport.resize();
+              } else {
+                viewport.resize();
+                viewport.dispatchScroll(view);
+              }
+            });
+            assert.equal(viewport.container.scrollLeft, 132);
+            assert.equal(viewport.writes.length, writes + 2);
+            assert.equal(viewport.pendingScrolls, 1);
+            const rect = viewport.node(date).getBoundingClientRect();
+            assert.ok(rect.left >= 100 && rect.left + rect.width <= 127);
+            assertProtection(view, viewport, date, protection);
+
+            await act(async () => {
+              viewport.flushScrolls(view);
+              viewport.resize();
+            });
+            assert.equal(viewport.pendingScrolls, 0);
+            assert.equal(viewport.writes.length, writes + 2);
+            assert.equal(viewport.container.scrollLeft, 132);
+          },
+          viewport.createNodeMock,
+        );
+      });
+    }
+
+    for (const edge of ["left", "right"] as const) {
+      test(`R23 monthly: ${protection}, a live ${edge}-clipped user scroll beats the pending correction event and new narrowing (${mode})`, async () => {
+        const viewport = monthlyViewport(months);
+        await render(
+          monthChart(),
+          concurrent,
+          async (view) => {
+            await act(async () => viewport.flushScrolls(view));
+            await act(async () => {
+              viewport.userScroll(81);
+              viewport.flushScrolls(view);
+            });
+            const date = months[5].date;
+            await protectMonth(view, viewport, date, protection);
+            viewport.setWidth(54);
+            await act(async () => viewport.resize());
+            assert.equal(viewport.container.scrollLeft, 105);
+            assert.equal(viewport.pendingScrolls, 1);
+
+            viewport.setWidth(27);
+            const left = edge === "left" ? 158 : 109;
+            viewport.userScroll(left); // Deliberately leave 1px in the NEW width.
+            const pixel = viewport.node(date).getBoundingClientRect().left;
+            const writes = viewport.writes.length;
+            assert.equal(viewport.pendingScrolls, 2);
+            await act(async () => {
+              viewport.dispatchScroll(view); // The old correction notification.
+              viewport.resize();
+            });
+            assert.equal(viewport.container.scrollLeft, left);
+            assert.equal(viewport.writes.length, writes);
+            assert.equal(viewport.pendingScrolls, 1);
+
+            const appended = [...months, nextMonth];
+            viewport.setDays(appended);
+            await update(view, monthChart(appended));
+            assert.equal(viewport.container.scrollLeft, left);
+            const prepended = [previousMonth, ...appended];
+            viewport.setDays(prepended);
+            await update(view, monthChart(prepended));
+            assert.equal(viewport.container.scrollLeft, left + 27);
+            assert.equal(
+              viewport.node(date).getBoundingClientRect().left,
+              pixel,
+            );
+            await act(async () => viewport.flushScrolls(view));
+            assert.equal(viewport.pendingScrolls, 0);
+            assert.equal(viewport.writes.length, writes + 1);
+            assertProtection(view, viewport, date, protection);
+          },
+          viewport.createNodeMock,
+        );
+      });
+    }
+  }
+
+  test(`R23 monthly: repeated geometry, append/prepend and live user scrolling share one reconciled baseline (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await act(async () => viewport.flushScrolls(view));
+        await act(async () => {
+          viewport.userScroll(81);
+          viewport.flushScrolls(view);
+        });
+        const date = months[5].date;
+        await protectMonth(view, viewport, date, "escape-focus");
+        viewport.setWidth(54);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 105);
+        assert.equal(viewport.pendingScrolls, 1);
+
+        // A commit can reconcile the next narrowing before either scroll or RO.
+        viewport.setWidth(27);
+        let days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 132);
+        assert.equal(viewport.pendingScrolls, 2);
+        await act(async () => viewport.flushScrolls(view));
+        assert.equal(viewport.pendingScrolls, 0);
+        viewport.setWidth(81);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 132);
+
+        // A pending USER event deliberately leaves 1px of the focused bar.
+        // Pure append and then prepend must retain that clipping, not repair it.
+        viewport.userScroll(158);
+        const pixel = viewport.node(date).getBoundingClientRect().left;
+        const writes = viewport.writes.length;
+        days = [...days, { date: "2027-02-01", value: 14 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 158);
+        assert.equal(viewport.writes.length, writes);
+        await act(async () => viewport.flushScrolls(view));
+        days = [previousMonth, ...days];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 185);
+        assert.equal(viewport.node(date).getBoundingClientRect().left, pixel);
+        assert.equal(viewport.pendingScrolls, 1);
+        viewport.setWidth(54);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 185);
+        assert.equal(viewport.node(date).getBoundingClientRect().left, pixel);
+
+        // That prepend's event is still pending when the user scrolls away and
+        // geometry changes again. It must read 27 now, never replay 185 or swallow
+        // the real user event that follows it.
+        viewport.setWidth(27);
+        viewport.userScroll(27);
+        assert.equal(viewport.pendingScrolls, 2);
+        await act(async () => {
+          viewport.dispatchScroll(view);
+          viewport.resize();
+        });
+        assert.equal(viewport.container.scrollLeft, 27);
+        assert.equal(viewport.pendingScrolls, 1);
+        days = [...days, { date: "2027-03-01", value: 15 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        await act(async () => viewport.flushScrolls(view));
+        assert.equal(viewport.container.scrollLeft, 27);
+        assert.equal(viewport.pendingScrolls, 0);
+        assert.equal(viewport.writes.length, writes + 1);
+        assertProtection(view, viewport, date, "escape-focus");
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R23 monthly: actual focus still wins when a delayed scroll reconciles conflicting protection (${mode})`, async () => {
+    const viewport = monthlyViewport(months, 162);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await act(async () => viewport.flushScrolls(view));
+        await act(async () => {
+          viewport.userScroll(27);
+          viewport.flushScrolls(view);
+        });
+        const pinned = months[5].date;
+        const focused = months[2].date;
+        await protectMonth(view, viewport, pinned, "pin");
+        await protectMonth(view, viewport, focused, "actual-focus");
+        viewport.setWidth(108);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 51);
+        assert.equal(viewport.pendingScrolls, 1);
+        viewport.setWidth(54);
+        await act(async () => viewport.dispatchScroll(view));
+        assert.equal(viewport.container.scrollLeft, 54);
+        const writes = viewport.writes.length;
+        await act(async () => {
+          viewport.resize();
+          viewport.flushScrolls(view);
+        });
+        assert.equal(viewport.writes.length, writes);
+        assert.equal(viewport.node(focused).getBoundingClientRect().left, 100);
+        assertSelected(view, pinned, true);
+        assert.equal(
+          viewport.container.ownerDocument.activeElement,
+          viewport.node(focused),
+        );
+        assert.deepEqual(viewport.focusRequests, []);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R23 monthly: delayed scroll cannot replace a valid baseline with hidden geometry; daily mode disconnects (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await act(async () => viewport.flushScrolls(view));
+        await act(async () => {
+          viewport.userScroll(81);
+          viewport.flushScrolls(view);
+        });
+        await protectMonth(view, viewport, months[5].date, "actual-focus");
+        viewport.setWidth(54);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 105);
+        viewport.setWidth(0);
+        await act(async () => viewport.dispatchScroll(view));
+        assert.equal(viewport.container.scrollLeft, 105);
+        viewport.setWidth(27);
+        await act(async () => viewport.resize());
+        assert.equal(viewport.container.scrollLeft, 132);
+        assert.equal(viewport.pendingScrolls, 1);
+        const writes = viewport.writes.length;
+        await update(view, chart(months));
+        assert.equal(resizeCallbacks.size, 0);
+        await act(async () => viewport.dispatchScroll(view));
+        assert.equal(viewport.writes.length, writes);
+        assert.equal(viewport.container.scrollLeft, 132);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  test(`R23 monthly: a live user position equal to the OLD right edge is not a new tail-follow instruction (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await act(async () => viewport.flushScrolls(view));
+        const oldRightEdge = viewport.maximum();
+        await act(async () => {
+          viewport.userScroll(81);
+          viewport.flushScrolls(view);
+        });
+        viewport.setWidth(54);
+        viewport.userScroll(oldRightEdge);
+        const writes = viewport.writes.length;
+        await act(async () => viewport.dispatchScroll(view));
+        assert.equal(viewport.container.scrollLeft, 240);
+        assert.equal(viewport.maximum(), 267);
+        assert.equal(viewport.writes.length, writes);
+        await act(async () => viewport.resize());
+        let days = [...months, nextMonth];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 240);
+
+        // Unrecorded movement and a layout change do not reveal which came first.
+        // Keep the live reading position rather than infer old-tail intent.
+        viewport.userScroll(viewport.maximum());
+        days = [...days, { date: "2027-02-01", value: 14 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 294);
+        assert.equal(viewport.writes.length, writes);
+        await act(async () => viewport.flushScrolls(view));
+
+        // Once the user's tail position has actually been reconciled, normal
+        // append following resumes and its deferred notification is harmless.
+        await act(async () => {
+          viewport.userScroll(viewport.maximum());
+          viewport.flushScrolls(view);
+        });
+        days = [...days, { date: "2027-03-01", value: 15 }];
+        viewport.setDays(days);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, viewport.maximum());
+        assert.equal(viewport.writes.length, writes + 1);
+        await act(async () => viewport.flushScrolls(view));
+        assert.equal(viewport.writes.length, writes + 1);
+      },
+      viewport.createNodeMock,
+    );
+  });
+
+  for (const geometry of ["bar-width", "gap-only"] as const) {
+    test(`R23 monthly: live scrolling in a new ${geometry} layout does not reuse old bar coordinates (${mode})`, async () => {
+      const viewport = monthlyViewport(months);
+      await render(
+        monthChart(),
+        concurrent,
+        async (view) => {
+          await act(async () => viewport.flushScrolls(view));
+          await act(async () => {
+            viewport.userScroll(81);
+            viewport.flushScrolls(view);
+          });
+          await protectMonth(view, viewport, months[5].date, "actual-focus");
+          viewport.setWidth(54);
+          await act(async () => viewport.resize());
+          assert.equal(viewport.container.scrollLeft, 105);
+          assert.equal(viewport.pendingScrolls, 1);
+
+          if (geometry === "bar-width") viewport.setBarWidth(30);
+          else viewport.setGap(9);
+          viewport.userScroll(132); // The fifth date starts here in NEW geometry.
+          const writes = viewport.writes.length;
+          await act(async () => {
+            viewport.dispatchScroll(view);
+            viewport.resize();
+          });
+          assert.equal(viewport.container.scrollLeft, 132);
+          assert.equal(
+            viewport.node(months[4].date).getBoundingClientRect().left,
+            100,
+          );
+          assert.equal(viewport.writes.length, writes);
+
+          const appended = [...months, nextMonth];
+          viewport.setDays(appended);
+          await update(view, monthChart(appended));
+          assert.equal(viewport.container.scrollLeft, 132);
+          const prepended = [previousMonth, ...appended];
+          viewport.setDays(prepended);
+          await update(view, monthChart(prepended));
+          assert.equal(viewport.container.scrollLeft, 165);
+          assert.equal(
+            viewport.node(months[4].date).getBoundingClientRect().left,
+            100,
+          );
+          await act(async () => viewport.flushScrolls(view));
+          assert.equal(viewport.pendingScrolls, 0);
+          assert.equal(viewport.writes.length, writes + 1);
+          assertProtection(view, viewport, months[5].date, "actual-focus");
+        },
+        viewport.createNodeMock,
+      );
+    });
+  }
+
+  test(`R23 monthly: natural edge clamping is not mistaken for a new user scroll (${mode})`, async () => {
+    const viewport = monthlyViewport(months);
+    await render(
+      monthChart(),
+      concurrent,
+      async (view) => {
+        await act(async () => viewport.flushScrolls(view));
+        const date = months[9].date;
+        await protectMonth(view, viewport, date, "actual-focus");
+        const pixel = viewport.node(date).getBoundingClientRect().left;
+        const writes = viewport.writes.length;
+        // Removing a leading date changes both bar positions and the right edge.
+        // The mock's native clamp moves 240 -> 213 before the commit is handled.
+        const days = months.slice(1);
+        viewport.setDays(days);
+        assert.equal(viewport.container.scrollLeft, 213);
+        await update(view, monthChart(days));
+        assert.equal(viewport.container.scrollLeft, 213);
+        assert.equal(viewport.node(date).getBoundingClientRect().left, pixel);
+        assert.equal(viewport.writes.length, writes);
+        assertProtection(view, viewport, date, "actual-focus");
+      },
+      viewport.createNodeMock,
+    );
+  });
+
   test(`R21 monthly: first layout tails once, updates only follow a reader already at the end (${mode})`, async () => {
     const viewport = monthlyViewport(months);
     await render(
@@ -806,8 +1231,11 @@ for (const concurrent of [false, true]) {
     );
     // Existing ref-only renderer supplies no clientWidth, rects or ownerDocument.
     await render(monthChart(), concurrent, async (view) => {
+      await act(async () => group(view).props.onScroll());
       await update(view, monthChart([...months, nextMonth]));
+      await act(async () => group(view).props.onScroll());
       await update(view, monthChart([]));
+      await act(async () => group(view).props.onScroll());
       assertDismissed(view);
     });
   });

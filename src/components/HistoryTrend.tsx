@@ -76,29 +76,46 @@ function restoreViewport(
   );
   // 原生横滚／焦点滚动可先于 scroll 事件，也可紧挨着新快照提交。
   // 排除新布局自然夹紧旧位置的情况后，先尊重这个尚未记录的阅读位置。
+  const scrolledSinceSnapshot =
+    snapshot != null &&
+    Math.abs(current.left - Math.min(snapshot.left, rightEdge(current))) > 0.5;
   const previous =
-    snapshot &&
-    Math.abs(current.left - Math.min(snapshot.left, rightEdge(current))) > 0.5
+    snapshot && scrolledSinceSnapshot
       ? { ...snapshot, left: current.left }
       : snapshot;
   let left = previous?.left ?? rightEdge(current);
   if (previous) {
     if (
+      !scrolledSinceSnapshot &&
       Math.abs(rightEdge(previous) - previous.left) <= 1 &&
       protectedDates.length === 0
     ) {
+      // 只沿用已协调的贴尾状态，不能把新布局中的用户位置当成旧布局的尾部。
       left = rightEdge(current);
     } else {
       // 优先保留首个可见日期的像素位置，而非旧 scrollLeft；左侧补月不会换读到的内容。
-      const retained = previous.bars.filter((old) =>
-        current.bars.some((bar) => bar.date === old.date),
-      );
+      const retained = previous.bars.flatMap((old) => {
+        const bar = current.bars.find((item) => item.date === old.date);
+        return bar ? [{ old, bar }] : [];
+      });
       const anchor =
-        retained.find((bar) => isVisible(bar, previous)) ?? retained[0];
-      const moved = current.bars.find((bar) => bar.date === anchor?.date);
-      if (anchor && moved) left = previous.left + moved.left - anchor.left;
+        retained.find(({ old }) => isVisible(old, previous)) ?? retained[0];
+      if (anchor) {
+        const shift = anchor.bar.left - anchor.old.left;
+        const resized =
+          current.width !== previous.width ||
+          retained.some(
+            ({ old, bar }) =>
+              Math.abs(bar.width - old.width) > 0.5 ||
+              Math.abs(bar.left - old.left - shift) > 0.5,
+          );
+        // 新位置与尺寸／间距变化同时出现时，用户可能已按新布局横滚；
+        // 不再套旧坐标。纯 append/prepend 的统一日期平移仍恢复原锚点。
+        if (!scrolledSinceSnapshot || !resized) left = previous.left + shift;
+      }
       // 只修正缩窄／柱宽变化新增的遮挡；纯 append / prepend 不能把用户主动
-      // 留在边缘的部分可见柱拉回。两者放不下时真实焦点优先，不调用 focus。
+      // 留在边缘的部分可见柱拉回。若用户／浏览器刚按新布局滚动，保留它选择的
+      // 裁切，不再拿旧宽度修正新阅读位置。两者放不下时真实焦点优先，不调用 focus。
       let visibilityCorrected = false;
       for (const date of protectedDates) {
         const old = previous.bars.find((bar) => bar.date === date);
@@ -106,6 +123,7 @@ function restoreViewport(
         if (
           !old ||
           !bar ||
+          scrolledSinceSnapshot ||
           !isVisible(old, previous) ||
           (current.width >= previous.width &&
             Math.abs(bar.width - old.width) <= 0.5 &&
@@ -175,6 +193,7 @@ export function HistoryTrend({
   }, [days]);
   const chart = React.useRef<HTMLDivElement>(null);
   const buttons = React.useRef(new Map<string, HTMLButtonElement>());
+  // 这里只保存已协调的布局：scroll 不能直接用新几何覆盖尚未处理的尺寸变化。
   const viewport = React.useRef<MonthViewport | null>(null);
   const syncViewport = React.useRef<() => void>(() => {});
   useViewportLayoutEffect(() => {
@@ -263,10 +282,10 @@ export function HistoryTrend({
         role="group"
         aria-label={monthly ? "每月趋势数据" : "每日趋势数据"}
         onScroll={() => {
-          if (monthly && days.length && chart.current) {
-            const current = readViewport(chart.current, days, buttons.current);
-            if (current) viewport.current = current;
-          }
+          // scrollLeft 写入的原生 scroll 可晚于新布局、早于 observer。
+          // 先协调再记基线，不吞“自己的下一次事件”；到达时读取真实位置，
+          // 保留期间发生的用户横滚／浏览器焦点滚动。
+          syncViewport.current();
         }}
         onMouseLeave={() => setHoveredDate(null)}
       >

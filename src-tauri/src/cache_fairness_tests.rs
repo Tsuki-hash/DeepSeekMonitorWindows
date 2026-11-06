@@ -1,4 +1,4 @@
-//! R22：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
+//! R22/R23：实际缓存收集 → 生产批调度 → 生产多月探针 → 取消/seen 的回归。
 //! 只注入单月请求、合成时钟与 deadline 等待，不访问网络、不等待真实 15/30 秒。
 //! 本文件是待本机执行的测试源码，不是测试通过记录。
 
@@ -6,7 +6,7 @@ use super::*;
 use crate::{
     sync_session::{SyncSession, UsageSyncKind},
     test_support::TempConfigDir,
-    token_sync::collect_cached_usage_tokens_in,
+    token_sync::collect_cached_usage_tokens_in_with_clock,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -153,6 +153,16 @@ fn write_cache(path: &Path, tokens: &[&str]) {
     std::fs::write(path, text).unwrap();
 }
 
+fn collect_cached_usage_tokens_in(
+    scan: &mut CacheScanState,
+    dir: &Path,
+    keep_scanning: impl FnMut() -> bool,
+) -> Vec<CachedCandidate> {
+    // 真正读磁盘/解析/分页，只固定250ms扫描时钟，不依赖执行机的磁盘速度划批。
+    let now = Instant::now();
+    collect_cached_usage_tokens_in_with_clock(scan, dir, keep_scanning, || now)
+}
+
 async fn verify_collected(
     scan: &mut CacheScanState,
     state: &mut CandidateVerificationState,
@@ -182,6 +192,360 @@ async fn round(
         collect_cached_usage_tokens_in(scan, dir, || true)
     });
     verify_collected(scan, state, candidates, network).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_同批首文件11个慢候选_第二文件B在第二轮实际成功() {
+    let dir = TempConfigDir::new("r23-source-rotation");
+    let slow: Vec<_> = (1..=11)
+        .map(|i| format!("synthetic-r23-slow-token-A-{i:02}"))
+        .collect();
+    write_cache(
+        &dir.join("0-slow"),
+        &slow.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    write_cache(&dir.join("1-good"), &[B]);
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let network = Network::new();
+    for token in &slow {
+        network.slow(token);
+    }
+    network.add(B, 11, response(0, Ok(())));
+
+    for round_index in 0..2 {
+        let candidates = state.collect_for_round(&mut scan, |scan| {
+            let mut actual = collect_cached_usage_tokens_in(scan, &dir, || true);
+            assert_eq!(actual.len(), 12, "未全拒绝的两个真实文件都不能seen");
+            // read_dir不保证顺序；选择生产可能返回的F在G前排列，文件内次序不变。
+            actual.sort_by(|left, right| left.path.cmp(&right.path));
+            actual
+        });
+        let result = verify_collected(&mut scan, &mut state, candidates, &network).await;
+        if round_index == 0 {
+            assert!(result.is_none());
+            assert_eq!(network.clock.elapsed.get(), CANDIDATE_BATCH_BUDGET);
+            assert_eq!(state.pending.len(), 2);
+            let f = &state.files[&dir.join("0-slow")];
+            let g = &state.files[&dir.join("1-good")];
+            assert_eq!(f.untried, 10);
+            assert_eq!(f.next_candidate, 1);
+            assert_eq!(f.rejected_count, 0);
+            assert!(g.service_order() < f.service_order());
+            // 计入原有快轮询等待，不更改watcher的300秒入口窗口或30秒批预算。
+            network
+                .clock
+                .elapsed
+                .set(network.clock.elapsed.get() + Duration::from_millis(FAST_POLL_MS));
+        } else {
+            assert_eq!(result.as_deref(), Some(B));
+        }
+    }
+    assert_eq!(
+        *network.visited.borrow(),
+        vec![
+            (slow[0].clone(), 11, 2026),
+            (slow[0].clone(), 10, 2026),
+            (B.into(), 11, 2026),
+        ],
+        "必须实际调用B并当前月成功，不能只检查队列，也不能先消耗A2..A11"
+    );
+    assert_eq!(network.clock.elapsed.get(), Duration::from_millis(31_500));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_三个首遍来源跨轮轮转_序号压缩及重读不重置服务次序() {
+    let dir = TempConfigDir::new("r23-source-order-wrap");
+    let tokens: Vec<_> = (0..3)
+        .map(|i| format!("synthetic-r23-source-first-token-{i}"))
+        .collect();
+    for (i, token) in tokens.iter().enumerate() {
+        write_cache(&dir.join(format!("source-{i}")), &[token, B]);
+    }
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let network = Network::new();
+    for token in &tokens {
+        network.slow(token);
+    }
+    network.add(B, 11, response(0, Ok(())));
+    for expected in &tokens {
+        let candidates = state.collect_for_round(&mut scan, |scan| {
+            let mut actual = collect_cached_usage_tokens_in(scan, &dir, || true);
+            actual.sort_by(|left, right| left.path.cmp(&right.path));
+            actual
+        });
+        assert!(
+            verify_collected(&mut scan, &mut state, candidates, &network)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            network.visited.borrow().last(),
+            Some(&(expected.clone(), 10, 2026))
+        );
+        state.sequence = u64::MAX;
+    }
+    assert_eq!(
+        round(&mut scan, &mut state, &dir, &network)
+            .await
+            .as_deref(),
+        Some(B)
+    );
+    assert_eq!(network.clock.elapsed.get(), Duration::from_secs(90));
+    assert!(state.sequence < u64::MAX);
+    assert_eq!(network.visited.borrow().len(), 7);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_fresh身份改变_全体最老轮不能排除刚重读的驻留来源() {
+    let root = TempConfigDir::new("r23-fresh-identity");
+    let dir = root.join("cache");
+    let holding = root.join("holding");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir(&holding).unwrap();
+    let second_a = "synthetic-r23-second-slow-A";
+    let second_c = "synthetic-r23-second-slow-C";
+    let f = dir.join("first");
+    let g = dir.join("second");
+    write_cache(&f, &[A, second_a, B]);
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let network = Network::new();
+    for token in [A, second_a, C, second_c] {
+        network.slow(token);
+    }
+    network.add(B, 11, response(0, Ok(())));
+
+    assert!(round(&mut scan, &mut state, &dir, &network).await.is_none());
+    // 只改变真实目录可见来源，保持驻留快照。无需假定read_dir顺序或手工伪造候选。
+    std::fs::rename(&f, holding.join("first")).unwrap();
+    write_cache(&g, &[C, second_c]);
+    assert!(round(&mut scan, &mut state, &dir, &network).await.is_none());
+    assert!(!state.prefer_fresh);
+    assert_eq!(state.fresh_sources, HashSet::from([g.clone()]));
+    assert_eq!(
+        network.visited.borrow().last(),
+        Some(&(second_a.into(), 10, 2026))
+    );
+    assert!(round(&mut scan, &mut state, &dir, &network).await.is_none());
+    assert!(state.prefer_fresh);
+    assert_eq!(network.visited.borrow().last(), Some(&(C.into(), 10, 2026)));
+    assert!(state.files[&f].service_order() < state.files[&g].service_order());
+
+    std::fs::rename(holding.join("first"), &f).unwrap();
+    std::fs::rename(&g, holding.join("second")).unwrap();
+    assert_eq!(
+        round(&mut scan, &mut state, &dir, &network)
+            .await
+            .as_deref(),
+        Some(B),
+        "F刚重读变fresh，但全体轮必须按队龄给F席位，不能只优先非fresh的G"
+    );
+    assert!(!state.prefer_fresh);
+    assert_eq!(state.fresh_sources, HashSet::from([f]));
+    assert_eq!(network.visited.borrow().len(), 7);
+    assert_eq!(network.clock.elapsed.get(), Duration::from_secs(90));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_4099真实慢来源积压至pending准入上限_暂停扫描后排空并继续尾批() {
+    let dir = TempConfigDir::new("r23-real-pending-capacity");
+    let count = MAX_VERIFICATION_FILES + 3;
+    let mut network = Network::new();
+    for i in 0..count {
+        let a = format!("synthetic-r23-pending-{i:05}-A");
+        let b = format!("synthetic-r23-pending-{i:05}-B");
+        write_cache(&dir.join(format!("source-{i:05}")), &[&a, &b]);
+        network.slow(&a);
+        network.slow(&b);
+    }
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let collected_batches = Cell::new(0);
+    let batches_to_fill = MAX_VERIFICATION_FILES / crate::token_sync::MAX_SCAN_FILES;
+    for batch in 1..=batches_to_fill {
+        let candidates = state.collect_for_round(&mut scan, |scan| {
+            collected_batches.set(collected_batches.get() + 1);
+            collect_cached_usage_tokens_in(scan, &dir, || true)
+        });
+        assert!(
+            verify_collected(&mut scan, &mut state, candidates, &network)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            state.pending.len(),
+            batch * crate::token_sync::MAX_SCAN_FILES
+        );
+        assert_eq!(state.files.len(), state.pending.len());
+        assert!(state.pending.iter().all(|file| file.tokens.len() == 2));
+        assert!(state.files.len() <= MAX_VERIFICATION_FILES);
+    }
+    assert_eq!(state.pending.len(), 4000);
+    assert!(state.pending.len() > MAX_VERIFICATION_FILES - crate::token_sync::MAX_SCAN_FILES);
+    assert_eq!(collected_batches.get(), batches_to_fill);
+
+    // 容量测试刻意推进超过watcher窗口，验证资源契约，不声称4099慢来源5分钟可完成。
+    // 随后网络快速返回Transient，驻留候选实际完成首遍，不能凭空删除队列腾空间。
+    network.steps.borrow_mut().clear();
+    network.default_transient = true;
+    let retained = state.collect_for_round(&mut scan, |_| {
+        panic!("真实驻留来源已无下一整批空间，不能继续扫描或丢弃未试来源")
+    });
+    assert_eq!(retained.len(), 8000);
+    assert!(verify_collected(&mut scan, &mut state, retained, &network)
+        .await
+        .is_none());
+    assert!(state.pending.is_empty());
+    assert!(state.files.values().all(|progress| progress.untried == 0));
+
+    let tail = state.collect_for_round(&mut scan, |scan| {
+        collected_batches.set(collected_batches.get() + 1);
+        collect_cached_usage_tokens_in(scan, &dir, || true)
+    });
+    assert_eq!(
+        tail.len(),
+        (count - 4000) * 2,
+        "准入恢复后沿原目录游标读99个尾部来源"
+    );
+    assert!(verify_collected(&mut scan, &mut state, tail, &network)
+        .await
+        .is_none());
+    let observed: HashSet<_> = network
+        .visited
+        .borrow()
+        .iter()
+        .map(|(token, _, _)| token.clone())
+        .collect();
+    assert_eq!(
+        observed.len(),
+        count * 2,
+        "所有来源的两候选均真正调用过生产探针"
+    );
+    assert!(state.files.len() <= MAX_VERIFICATION_FILES);
+    assert!(state.pending.is_empty());
+    assert_eq!(collected_batches.get(), batches_to_fill + 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_首请求select前耗尽预算_不消耗来源席位或首遍游标() {
+    let dir = TempConfigDir::new("r23-deadline-before-request");
+    write_cache(&dir.join("sessions"), &[A, B]);
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let candidates = state.collect_for_round(&mut scan, |scan| {
+        collect_cached_usage_tokens_in(scan, &dir, || true)
+    });
+    let network = Network::new();
+    let requests = Cell::new(0);
+    assert!(verify_candidates_with(
+        &mut scan,
+        &mut state,
+        candidates,
+        &MONTHS,
+        || true,
+        || network.clock.now(),
+        |deadline| {
+            // precheck已经允许本轮，但biased select的deadline分支先返回。
+            network
+                .clock
+                .elapsed
+                .set(deadline.duration_since(network.clock.base));
+            std::future::ready(())
+        },
+        |_, _, _| {
+            requests.set(requests.get() + 1);
+            std::future::ready(Err(VerifyFailure::Definitive))
+        },
+    )
+    .await
+    .is_none());
+    assert_eq!(requests.get(), 0);
+    let progress = state.files.values().next().unwrap();
+    assert_eq!(progress.next_candidate, 0);
+    assert_eq!(progress.untried, 2);
+    assert_eq!(progress.last_attempt, 0);
+    assert_eq!(progress.rejected_count, 0);
+    assert_eq!(state.pending.len(), 1);
+    network.add(A, 11, response(0, Ok(())));
+    assert_eq!(
+        round(&mut scan, &mut state, &dir, &network)
+            .await
+            .as_deref(),
+        Some(A)
+    );
+    assert_eq!(*network.visited.borrow(), vec![(A.into(), 11, 2026)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r23_首遍已完成的单候选Transient来源轮转且每轮至多一次() {
+    let dir = TempConfigDir::new("r23-transient-source-rotation");
+    write_cache(&dir.join("0-first"), &[A]);
+    write_cache(&dir.join("1-second"), &[B]);
+    let mut scan = CacheScanState::default();
+    let mut state = CandidateVerificationState::default();
+    let mut network = Network::new();
+    network.default_transient = true;
+    let candidates = state.collect_for_round(&mut scan, |scan| {
+        let mut actual = collect_cached_usage_tokens_in(scan, &dir, || true);
+        actual.sort_by(|left, right| left.path.cmp(&right.path));
+        actual
+    });
+    assert!(
+        verify_collected(&mut scan, &mut state, candidates, &network)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        network.visited.borrow().len(),
+        4,
+        "两来源各探两月，不在同轮忙重试"
+    );
+    assert!(state.pending.is_empty());
+    assert!(state.files.values().all(|progress| progress.untried == 0));
+    network.slow(A);
+    network.add(B, 11, response(0, Ok(())));
+    assert!(round(&mut scan, &mut state, &dir, &network).await.is_none());
+    assert_eq!(
+        round(&mut scan, &mut state, &dir, &network)
+            .await
+            .as_deref(),
+        Some(B)
+    );
+    assert_eq!(network.visited.borrow().len(), 7);
+    assert_eq!(network.clock.elapsed.get(), Duration::from_secs(30));
+}
+
+#[test]
+fn r23_扫描250毫秒边界保留真实目录游标_固定时钟下一轮继续读取() {
+    let dir = TempConfigDir::new("r23-scan-clock");
+    write_cache(&dir.join("first"), &[A]);
+    write_cache(&dir.join("second"), &[B]);
+    let mut scan = CacheScanState::default();
+    let base = Instant::now();
+    let ticks = Cell::new(0);
+    let empty = collect_cached_usage_tokens_in_with_clock(
+        &mut scan,
+        &dir,
+        || true,
+        || {
+            let tick = ticks.replace(ticks.get() + 1);
+            base + if tick == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(250)
+            }
+        },
+    );
+    assert!(empty.is_empty());
+    let candidates = collect_cached_usage_tokens_in(&mut scan, &dir, || true);
+    assert_eq!(candidates.len(), 2);
+    let tokens: HashSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.token.as_str())
+        .collect();
+    assert_eq!(tokens, HashSet::from([A, B]));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -263,7 +627,8 @@ async fn r22_首批仍有未试候选时继续扫描后批_不堵住第251来源
     let initial = state.collect_for_round(&mut scan, |scan| {
         collect_cached_usage_tokens_in(scan, &dir, || true)
     });
-    assert!(initial.len() > 1 && initial.len() <= crate::token_sync::MAX_SCAN_FILES);
+    assert_eq!(initial.len(), crate::token_sync::MAX_SCAN_FILES);
+    assert!(state.prefer_fresh);
     let mut network = Network::new();
     network.default_transient = true;
     network.slow(&initial[0].token);
@@ -288,6 +653,7 @@ async fn r22_首批仍有未试候选时继续扫描后批_不堵住第251来源
         next_token.is_some(),
         "容量未满时不能被首批慢候选挡住目录游标"
     );
+    assert!(!state.prefer_fresh, "第二轮必须给全体最老待试来源公平席位");
     // 交替先给旧批第二个慢来源一次机会，随后新批的有效来源必须能完成。
     assert!(
         verify_collected(&mut scan, &mut state, candidates, &network)
@@ -298,6 +664,7 @@ async fn r22_首批仍有未试候选时继续扫描后批_不堵住第251来源
         round(&mut scan, &mut state, &dir, &network).await,
         next_token
     );
+    assert!(state.prefer_fresh, "第三轮恢复新批优先");
     assert_eq!(network.clock.elapsed.get(), Duration::from_secs(60));
 }
 

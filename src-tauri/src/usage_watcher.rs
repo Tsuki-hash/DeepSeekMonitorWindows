@@ -61,7 +61,7 @@ struct CandidateVerificationState {
     pending: Vec<CandidateFile>,
     fresh_sources: HashSet<PathBuf>,
     prefer_fresh: bool,
-    prefer_pending_next: bool,
+    prefer_oldest_next: bool,
 }
 
 struct FileVerificationProgress {
@@ -85,6 +85,12 @@ struct CandidateFile {
 }
 
 impl FileVerificationProgress {
+    // 新来源在当前序号入队；一次实际服务（包括耗满 deadline）后移到队尾。
+    // 不能用固定 first_observed 排首遍，也不能让新来源的 last_attempt=0 插队。
+    fn service_order(&self) -> u64 {
+        self.first_observed.max(self.last_attempt)
+    }
+
     fn is_rejected(&self, index: usize) -> bool {
         self.rejected[index / 64] & (1u64 << (index % 64)) != 0
     }
@@ -168,13 +174,14 @@ impl CandidateVerificationState {
                 stamp,
             })
         }));
-        // 新批与驻留批交替优先。若这轮目录刚结束，仍保留上个新批的优先身份，
-        // 不让首批慢文件挡住第 251 个文件，也不让不断新增文件压掉旧批的 B。
+        // 新批优先与全体最老来源优先交替。全体轮不能排除本轮被重新读到的来源，
+        // 否则 fresh 身份随目录分页变化时，老来源可能总在错误的半轮失去席位。
+        // 目录刚结束时保留上个新批身份，不让首批慢文件挡住第 251 个文件。
         if !fresh_sources.is_empty() {
             self.fresh_sources = fresh_sources;
         }
-        self.prefer_fresh = !self.prefer_pending_next;
-        self.prefer_pending_next = !self.prefer_pending_next;
+        self.prefer_fresh = !self.prefer_oldest_next;
+        self.prefer_oldest_next = !self.prefer_oldest_next;
         candidates
     }
 
@@ -349,7 +356,7 @@ async fn while_current<T>(
     }
 }
 
-/// 同一 watcher 的轮次共享验证进度：未尝试候选优先，暂不可用候选轮转到后面。
+/// 同一 watcher 的轮次共享来源队龄与候选游标：未尝试候选优先，服务后来源排队尾。
 /// 只有同一文件快照的全部候选明确拒绝，才回写 seen；通过与取消均短路。
 async fn verify_candidates(
     scan: &mut CacheScanState,
@@ -400,16 +407,11 @@ where
         let file = &files[*index];
         let progress = &verification.files[&file.path];
         let fresh = verification.fresh_sources.contains(&file.path);
-        let preferred = fresh == verification.prefer_fresh;
-        // 首遍按来源原始顺序续跑，不能每轮把同文件 B 放回所有文件的 A 后面。
-        // 首遍完成后的暂不可用重试才按最近尝试时间轮转。
+        // last_attempt 跨轮保存局部 push_back 的效果，不能在批 deadline 后丢失。
+        // 全体轮按队龄排序，重新扫描相同快照不能更新队龄；新批轮仅加一个优先组。
         (
-            !preferred,
-            if progress.untried > 0 {
-                progress.first_observed
-            } else {
-                progress.last_attempt
-            },
+            verification.prefer_fresh && !fresh,
+            progress.service_order(),
         )
     });
     let (mut untried, mut retry): (VecDeque<_>, VecDeque<_>) = order
@@ -427,12 +429,14 @@ where
         let file = &mut files[index];
         let cursor = verification.files[&file.path].next_candidate;
         let token = &file.tokens[cursor];
+        let mut attempted = false;
         let outcome = while_current(
             async {
                 tokio::select! {
                     biased;
                     _ = wait_until(deadline) => ProbeOutcome::Unavailable,
                     result = probe_token_with(probes, |month, year| {
+                        attempted = true;
                         verify(token.clone(), month, year)
                     }) => result,
                 }
@@ -440,6 +444,10 @@ where
             &is_current,
         )
         .await?;
+        // precheck 与 select 之间也可能耗尽预算；未发出任何月请求就不能出队或计首遍。
+        if !attempted {
+            break;
+        }
         if outcome == ProbeOutcome::Passed {
             return Some(token.clone());
         }

@@ -250,7 +250,18 @@ pub fn collect_webview_cached_usage_tokens_while(
 pub(crate) fn collect_cached_usage_tokens_in(
     scan: &mut CacheScanState,
     cache_dir: &Path,
+    keep_scanning: impl FnMut() -> bool,
+) -> Vec<CachedCandidate> {
+    collect_cached_usage_tokens_in_with_clock(scan, cache_dir, keep_scanning, Instant::now)
+}
+
+/// 与生产完全共用的读取/解析/分页路径；回归只固定扫描时钟，避免慢磁盘随机把
+/// 250 文件边界提前切成另一批。生产仍执行原来的 250ms 扫描预算。
+pub(crate) fn collect_cached_usage_tokens_in_with_clock(
+    scan: &mut CacheScanState,
+    cache_dir: &Path,
     mut keep_scanning: impl FnMut() -> bool,
+    now: impl Fn() -> Instant,
 ) -> Vec<CachedCandidate> {
     let mut candidates: Vec<CachedCandidate> = Vec::new();
     let mut entries = match scan.entries.take().or_else(|| fs::read_dir(cache_dir).ok()) {
@@ -260,12 +271,12 @@ pub(crate) fn collect_cached_usage_tokens_in(
     let mut read_files = 0usize;
     let mut read_bytes = 0u64;
     let mut visited_entries = 0usize;
-    let start = Instant::now();
+    let start = now();
     loop {
         if !keep_scanning()
             || read_files >= MAX_SCAN_FILES
             || visited_entries >= MAX_SCAN_ENTRIES
-            || start.elapsed() >= MAX_SCAN_DURATION
+            || now().saturating_duration_since(start) >= MAX_SCAN_DURATION
         {
             scan.entries = Some(entries);
             break;
