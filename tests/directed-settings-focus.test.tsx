@@ -13,7 +13,7 @@ import { invalidateUsageRequests } from "../src/usage-api";
 import { draftGuardActions } from "../src/draft-guard";
 import type { AppConfig, UsageResult } from "../src/types";
 
-// R29/R30: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
+// R29/R30/R31: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
 // records open/scrollIntoView/focus, including child refs if reintroduced.
 // It does not implement navigation or cancellation decisions for the component.
 // No DOM, native keyboard, WebView2, StrictEffects or screen reader is exercised.
@@ -35,6 +35,7 @@ let timer = 0;
 const frames = new Map<number, () => void>();
 const cancelledFrames = new Set<number>();
 const focusLog: string[] = [];
+const focusAttempts: FocusNode[] = [];
 const scrollLog: string[] = [];
 const openLog: string[] = [];
 const storage = new Map<string, string>();
@@ -62,6 +63,7 @@ class FocusNode {
   host: any;
   label: string;
   hidden = false;
+  disabledOverride = false;
   opened = false;
   attributes = new Map<string, string>();
   constructor(host: any) {
@@ -86,7 +88,11 @@ class FocusNode {
     return { usageModel: this.host.props["data-usage-model"] };
   }
   get disabled() {
-    return !this.isConnected || Boolean(this.host.props.disabled);
+    return (
+      !this.isConnected ||
+      this.disabledOverride ||
+      Boolean(this.host.props.disabled)
+    );
   }
   get open() {
     return this.isConnected && (this.opened || Boolean(this.host.props.open));
@@ -96,8 +102,10 @@ class FocusNode {
     this.opened = value;
     if (value) openLog.push(this.label);
   }
-  closest() {
-    return this.hidden ? this : null;
+  closest(selector = "") {
+    return this.hidden || (selector.includes(":disabled") && this.disabled)
+      ? this
+      : null;
   }
   getClientRects() {
     return this.isConnected && !this.hidden ? [{}] : [];
@@ -122,6 +130,9 @@ class FocusNode {
     return this.isConnected ? select(selector, this.host) : null;
   }
   focus() {
+    // Record rejected calls too: invalid-return tests must observe a bad
+    // production focus attempt, rather than relying on this mock to hide it.
+    focusAttempts.push(this);
     if (!this.isConnected || this.disabled || this.hidden) return;
     focusLog.push(this.label);
     g.document.activeElement = this;
@@ -153,8 +164,12 @@ function select(selector: string, root: any) {
               node.type === "button" &&
               node.props["data-usage-model"] === model[1],
           )
-        : selector === "button"
-          ? candidates.find((node: any) => node.type === "button")
+        : selector === "button" || selector === "button:not(:disabled)"
+          ? candidates.find(
+              (node: any) =>
+                node.type === "button" &&
+                (selector === "button" || !node.props.disabled),
+            )
           : candidates.find((node: any) => node.type === "h1");
   return host ? nodeFor(host) : null;
 }
@@ -327,6 +342,7 @@ async function emit(name: string, payload?: unknown) {
 }
 function clearLogs() {
   focusLog.length = 0;
+  focusAttempts.length = 0;
   scrollLog.length = 0;
   openLog.length = 0;
 }
@@ -893,5 +909,384 @@ scenario(
     assert.deepEqual(focusLog, ["row:flash"]);
     assert.deepEqual(scrollLog, []);
     assert.deepEqual(openLog, []);
+  },
+);
+
+// R31: exercise the real leave prompt through App, including the same native
+// gate as navigation. These synthetic checks do not establish native DOM focus
+// or Windows/WebView2 behavior, and are not claimed as executed this round.
+async function openLeavePrompt(target: Target) {
+  await enter(target);
+  await drainFrames();
+  await call(() =>
+    apiKeyInput().props.onChange({ target: { value: "SYNTHETIC_DRAFT" } }),
+  );
+  const origin = nodeFor(apiKeyInput());
+  origin.focus();
+  await call(() => renderer.root.findByType(SettingsPanel).props.onBack());
+  const dialog = renderer.root.findByProps({ role: "alertdialog" });
+  const buttons = dialog.findAllByType("button");
+  const first = nodeFor(buttons[0]);
+  const cancel = buttons.find(
+    (host: any) => text(host) === draftGuardActions.cancel,
+  );
+  const discard = buttons.find(
+    (host: any) => text(host) === draftGuardActions.discard,
+  );
+  assert.ok(cancel);
+  assert.ok(discard);
+  assert.equal(frames.size, 1, "Only the prompt owns the pending first focus");
+  clearLogs();
+  return { origin, first, cancel, discard, pending: [...frames] };
+}
+
+scenario(
+  "R31 prompt focuses once and Cancel safely restores its origin",
+  async (target) => {
+    const { origin, first, cancel } = await openLeavePrompt(target);
+    await drainFrames();
+    assert.equal(g.document.activeElement, first);
+    assert.deepEqual(focusLog, [first.label]);
+    const cancelNode = nodeFor(cancel);
+    dispatch(documentEvents, "keydown", { target: first, key: "Tab" });
+    dispatch(documentEvents, "pointerdown", { target: cancelNode });
+    cancelNode.focus();
+    clearLogs();
+    await call(() => cancel.props.onClick());
+    assert.equal(panelName(), "settings-panel");
+    assert.equal(g.document.activeElement, origin);
+    assert.deepEqual(focusLog, [origin.label]);
+    assert.equal(
+      renderer.root.findAllByProps({ role: "alertdialog" }).length,
+      0,
+    );
+    clearLogs();
+    await emit("main-window-shown");
+    await drainFrames();
+    assertUntouched();
+  },
+);
+
+for (const event of ["keydown", "pointerdown", "focusin"] as const) {
+  scenario(
+    `R31 prompt ${event} cancels before RAF and never replays`,
+    async (target) => {
+      const { origin, cancel, pending } = await openLeavePrompt(target);
+      if (event === "focusin") targetNode(target).focus();
+      else dispatch(documentEvents, event, { target: origin, key: "Tab" });
+      assert.equal(frames.size, 0, "New interaction revokes synchronously");
+      clearLogs();
+      await invokeStale(pending);
+      await emit("main-window-shown");
+      await drainFrames();
+      assertUntouched();
+      await call(() => cancel.props.onClick());
+      assertUntouched();
+      // A fresh explicit prompt still works; cancelled callbacks cannot own it.
+      await call(() => renderer.root.findByType(SettingsPanel).props.onBack());
+      const fresh = renderer.root.findByProps({ role: "alertdialog" });
+      await invokeStale(pending);
+      assertUntouched();
+      await drainFrames();
+      assert.equal(
+        g.document.activeElement,
+        nodeFor(fresh.findAllByType("button")[0]),
+      );
+    },
+  );
+}
+
+for (const event of ["pointerdown", "keydown", "focusin"] as const) {
+  scenario(
+    `R31 inside ${event} cancels first focus but allows safe Cancel`,
+    async (target) => {
+      const { origin, cancel, pending } = await openLeavePrompt(target);
+      const cancelNode = nodeFor(cancel);
+      if (event === "focusin") cancelNode.focus();
+      else {
+        dispatch(documentEvents, event, {
+          target: cancelNode,
+          key: "Tab",
+          shiftKey: true,
+        });
+      }
+      assert.equal(frames.size, 0, "Inside interaction cancels synchronously");
+      // In the key/pointer branches, deliver the old RAF before native focus
+      // would move. Cancellation must belong to that event, not later focusin.
+      clearLogs();
+      await invokeStale(pending);
+      assertUntouched();
+      cancelNode.focus();
+      clearLogs();
+      await call(() => cancel.props.onClick());
+      assert.equal(g.document.activeElement, origin);
+      assert.deepEqual(focusLog, [origin.label]);
+    },
+  );
+}
+
+for (const reason of ["native", "document", "blur"] as const) {
+  scenario(
+    `R31 prompt ${reason} revokes before a React commit and stays revoked`,
+    async (target) => {
+      const { first, cancel, pending } = await openLeavePrompt(target);
+      await call(() => {
+        if (reason === "native") {
+          for (const fn of g.__settingsListeners.get("main-window-hidden") ??
+            []) {
+            fn({});
+          }
+        } else if (reason === "document") {
+          g.document.visibilityState = "hidden";
+          dispatch(documentEvents, "visibilitychange");
+        } else {
+          documentFocused = false;
+          dispatch(windowEvents, "blur");
+        }
+        assert.equal(
+          frames.size,
+          0,
+          "Cancellation cannot wait for React commit",
+        );
+        for (const [id] of pending) assert.ok(cancelledFrames.has(id));
+        // Hide/show in one batch cannot revive the dialog's old ownership.
+        documentFocused = true;
+        g.document.visibilityState = "visible";
+        if (reason === "native") {
+          for (const fn of g.__settingsListeners.get("main-window-shown") ??
+            []) {
+            fn({});
+          }
+        }
+        for (const [, fn] of pending) fn();
+        assertUntouched();
+      });
+      await drainFrames();
+      assertUntouched();
+      // Even a later manual visit to the still-open dialog cannot resurrect
+      // return ownership lost to the window transition.
+      first.focus();
+      clearLogs();
+      await call(() => cancel.props.onClick());
+      assertUntouched();
+    },
+  );
+}
+
+for (const reason of ["document", "focus", "active-element"] as const) {
+  scenario(
+    `R31 first-focus callback rechecks ${reason} without an event`,
+    async (target) => {
+      const { cancel } = await openLeavePrompt(target);
+      if (reason === "document") g.document.visibilityState = "hidden";
+      else if (reason === "focus") documentFocused = false;
+      else g.document.activeElement = targetNode(target);
+      await drainFrames();
+      assertUntouched();
+      documentFocused = true;
+      g.document.visibilityState = "visible";
+      await emit("main-window-shown");
+      await drainFrames();
+      await call(() => cancel.props.onClick());
+      assertUntouched();
+    },
+  );
+}
+
+for (const reason of [
+  "native",
+  "document",
+  "blur",
+  "outside-focus",
+  "outside-click",
+  "hidden-origin",
+  "disabled-origin",
+  "silent-blur",
+  "silent-hidden",
+  "silent-outside-focus",
+] as const) {
+  scenario(
+    `R31 safe return rejects ${reason} after first focus`,
+    async (target) => {
+      const { origin, first, cancel } = await openLeavePrompt(target);
+      await drainFrames();
+      assert.equal(g.document.activeElement, first);
+      if (reason === "native") await emit("main-window-hidden");
+      else if (reason === "document") {
+        g.document.visibilityState = "hidden";
+        dispatch(documentEvents, "visibilitychange");
+      } else if (reason === "blur") {
+        documentFocused = false;
+        dispatch(windowEvents, "blur");
+      } else if (reason === "outside-focus") targetNode(target).focus();
+      else if (reason === "outside-click") {
+        dispatch(documentEvents, "pointerdown", { target: origin });
+      } else if (reason === "hidden-origin") origin.hidden = true;
+      else if (reason === "disabled-origin") origin.disabledOverride = true;
+      else if (reason === "silent-hidden") {
+        g.document.visibilityState = "hidden";
+      } else if (reason === "silent-outside-focus") {
+        g.document.activeElement = targetNode(target);
+      } else documentFocused = false;
+      clearLogs();
+      await call(() => cancel.props.onClick());
+      assertUntouched();
+      assert.deepEqual(
+        focusAttempts,
+        [],
+        "No invalid focus attempt is allowed",
+      );
+      documentFocused = true;
+      g.document.visibilityState = "visible";
+      await emit("main-window-shown");
+      await drainFrames();
+      assertUntouched();
+    },
+  );
+}
+
+scenario(
+  "R31 hidden creation has no pending focus and shown cannot start one",
+  async (target) => {
+    await enter(target);
+    await drainFrames();
+    await call(() =>
+      apiKeyInput().props.onChange({ target: { value: "SYNTHETIC_DRAFT" } }),
+    );
+    await emit("main-window-hidden");
+    await call(() => renderer.root.findByType(SettingsPanel).props.onBack());
+    assert.equal(
+      renderer.root.findAllByProps({ role: "alertdialog" }).length,
+      1,
+    );
+    assert.equal(frames.size, 0);
+    clearLogs();
+    await emit("main-window-shown");
+    await drainFrames();
+    assertUntouched();
+  },
+);
+
+scenario(
+  "R31 Discard leaves focus to the new page instead of restoring the old input",
+  async (target) => {
+    const { first, discard } = await openLeavePrompt(target);
+    await drainFrames();
+    assert.equal(g.document.activeElement, first);
+    clearLogs();
+    await call(() => discard.props.onClick());
+    assert.equal(panelName(), "dashboard-panel");
+    assert.deepEqual(focusLog, [], "Unmount must not steal navigation focus");
+    await drainFrames();
+    assert.deepEqual(focusLog, ["dashboard-panel:heading"]);
+  },
+);
+
+for (const outcome of ["saved", "failed", "cancelled"] as const) {
+  scenario(
+    `R31 Save ${outcome} keeps delayed focus and navigation ownership separate`,
+    async (target) => {
+      const originalIpc = g.__settingsIpc;
+      let resolveSave!: (value: unknown) => void;
+      let rejectSave!: (reason: Error) => void;
+      const saved = new Promise((resolve, reject) => {
+        resolveSave = resolve;
+        rejectSave = reject;
+      });
+      let saveCalls = 0;
+      let settled = false;
+      const finishSave = () => {
+        settled = true;
+        config = makeConfig();
+        resolveSave({
+          config: { ...config },
+          balance: {
+            isAvailable: true,
+            currency: "CNY",
+            totalBalance: "3",
+            grantedBalance: "0",
+            toppedUpBalance: "3",
+          },
+        });
+      };
+      g.__settingsIpc = (command: string, args: unknown) => {
+        if (command !== "save_api_key") return originalIpc(command, args);
+        saveCalls += 1;
+        return saved;
+      };
+      try {
+        const { origin, first, cancel, discard, pending } =
+          await openLeavePrompt(target);
+        // Direct activation also cancels, without depending on our synthetic
+        // pointer/keydown listeners. The pending IPC keeps the dialog mounted.
+        await call(() => first.host.props.onClick());
+        assert.equal(saveCalls, 1);
+        assert.equal(frames.size, 0);
+        assert.equal(first.host.props.disabled, true);
+        assert.equal(discard.props.disabled, true);
+        assert.equal(Boolean(cancel.props.disabled), false);
+        await invokeStale(pending);
+        assertUntouched();
+        nodeFor(cancel).focus();
+        clearLogs();
+
+        if (outcome === "cancelled") {
+          await call(() => cancel.props.onClick());
+          assert.equal(g.document.activeElement, origin);
+          assert.deepEqual(focusLog, [origin.label]);
+          clearLogs();
+        }
+        await call(() => {
+          if (outcome === "failed") {
+            settled = true;
+            rejectSave(new Error("Synthetic save failure"));
+          } else finishSave();
+        });
+        assertUntouched();
+        assert.deepEqual(
+          focusAttempts,
+          [],
+          "Save completion cannot return focus",
+        );
+        if (outcome === "saved") {
+          assert.equal(panelName(), "dashboard-panel");
+          await drainFrames();
+          assert.deepEqual(focusLog, ["dashboard-panel:heading"]);
+        } else {
+          assert.equal(panelName(), "settings-panel");
+          assert.equal(frames.size, 0);
+          if (outcome === "failed") {
+            assert.equal(first.host.props.disabled, false);
+            assert.equal(discard.props.disabled, false);
+            assert.equal(apiKeyInput().props.value, "SYNTHETIC_DRAFT");
+            assert.equal(g.document.activeElement, nodeFor(cancel));
+            await call(() => cancel.props.onClick());
+            assert.deepEqual(focusLog, [origin.label]);
+          }
+          assert.equal(
+            renderer.root.findAllByProps({ role: "alertdialog" }).length,
+            0,
+          );
+          clearLogs();
+          await emit("main-window-shown");
+          await drainFrames();
+          assertUntouched();
+        }
+      } finally {
+        if (!settled) await call(finishSave);
+        g.__settingsIpc = originalIpc;
+      }
+    },
+  );
+}
+
+scenario(
+  "R31 unmount revokes a captured prompt callback without restoring focus",
+  async (target) => {
+    const { pending } = await openLeavePrompt(target);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await invokeStale(pending);
+    assertUntouched();
   },
 );

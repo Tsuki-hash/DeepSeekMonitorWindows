@@ -1,43 +1,141 @@
 import React from "react";
 import { draftGuardActions, draftGuardText } from "../draft-guard";
 import type { LeaveDecision } from "../leave-guard";
+import type { WindowVisibilityGate } from "../window-visibility-gate";
 
 /**
  * 「有未保存修改」三选一提示。
  *
  * 凭据与提醒设置共用一个提示，保持对话框命名、焦点归还与提交中保护一致。
  *
- * 焦点策略：出现时把焦点移到第一个按钮，卸载时归还给触发控件。
+ * 焦点策略：出现时聚焦首个可用按钮；仅“留在此页”且仍拥有焦点时归还。
+ * 成功离开或被其它导航替代时，由 App 的新导航负责焦点，卸载不另行抢回。
  * 非模态提示不加焦点陷阱 —— 与「用户仍可看到页面」的交互一致。
  */
 export function LeavePromptDialog({
   subject,
   submitting,
   onDecide,
+  windowVisibilityGate,
 }: {
   /** 未保存内容的主体名，例如「提醒设置」。 */
   subject: string;
   /** 保存进行中：保存与放弃禁用，避免重复提交（复评 T05）。 */
   submitting: boolean;
   onDecide: (decision: LeaveDecision) => void;
+  /** 与 App 共用同步原生可见性，不等待 hidden 的 React 提交。 */
+  windowVisibilityGate: WindowVisibilityGate;
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
-  const returnFocus = React.useRef<HTMLElement | null>(null);
-  React.useEffect(() => {
-    // 记录触发控件：关闭（卸载）后把焦点还回去。
-    returnFocus.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    const frame = window.requestAnimationFrame(() => {
-      containerRef.current?.querySelector<HTMLElement>("button")?.focus();
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-      const node = returnFocus.current;
-      if (node?.isConnected) node.focus();
+  const cancelFirstFocus = React.useRef<() => void>(() => {});
+  const returnFocus = React.useRef<() => void>(() => {});
+  React.useLayoutEffect(() => {
+    const container = containerRef.current;
+    const origin = document.activeElement;
+    const epoch = windowVisibilityGate.epoch();
+    let live = true;
+    let owned =
+      windowVisibilityGate.isVisible() &&
+      document.visibilityState === "visible" &&
+      document.hasFocus?.() !== false;
+    let frame: number | null = null;
+    const cancelFirst = () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      frame = null;
     };
-  }, []);
+    const revoke = () => {
+      owned = false;
+      cancelFirst();
+    };
+    const available = () =>
+      live &&
+      owned &&
+      windowVisibilityGate.epoch() === epoch &&
+      windowVisibilityGate.isVisible() &&
+      document.visibilityState === "visible" &&
+      document.hasFocus?.() !== false;
+    const inside = (target: EventTarget | null) =>
+      target instanceof HTMLElement && container?.contains(target) === true;
+    const usable = (node: HTMLElement | null): node is HTMLElement =>
+      !!node?.isConnected &&
+      !node.closest("[inert], [hidden], :disabled") &&
+      node.getClientRects().length > 0;
+    const onInteraction = (event: Event) => {
+      // 对话框内的 Tab/点击也撤销尚未执行的首焦点；内部操作仍可正常取消。
+      cancelFirst();
+      if (!inside(event.target)) revoke();
+    };
+    const onFocus = (event: FocusEvent) => {
+      if (
+        event.target === document.body ||
+        event.target === document.documentElement
+      ) {
+        return;
+      }
+      onInteraction(event);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") revoke();
+    };
+    const unsubscribe = windowVisibilityGate.subscribeInvalidation(revoke);
+    document.addEventListener("focusin", onFocus, true);
+    document.addEventListener("keydown", onInteraction, true);
+    document.addEventListener("pointerdown", onInteraction, true);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", revoke);
+    cancelFirstFocus.current = cancelFirst;
+    returnFocus.current = () => {
+      // 在卸载前核对真实 activeElement。后台、外部新焦点、失效触发器均不归还。
+      if (
+        available() &&
+        inside(document.activeElement) &&
+        origin instanceof HTMLElement &&
+        usable(origin)
+      ) {
+        revoke();
+        origin.focus({ preventScroll: true });
+      }
+    };
+    if (owned) {
+      const scheduled = window.requestAnimationFrame(() => {
+        // 宿主即使交付已取消的 RAF，也不能恢复其所有权。
+        if (frame !== scheduled) return;
+        frame = null;
+        const active = document.activeElement;
+        if (
+          !available() ||
+          (active !== origin &&
+            active !== document.body &&
+            active !== document.documentElement)
+        ) {
+          revoke();
+          return;
+        }
+        const button =
+          container?.querySelector<HTMLElement>("button:not(:disabled)") ??
+          null;
+        if (usable(button)) button.focus({ preventScroll: true });
+      });
+      frame = scheduled;
+    }
+    return () => {
+      live = false;
+      revoke();
+      unsubscribe();
+      document.removeEventListener("focusin", onFocus, true);
+      document.removeEventListener("keydown", onInteraction, true);
+      document.removeEventListener("pointerdown", onInteraction, true);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", revoke);
+      cancelFirstFocus.current = () => {};
+      returnFocus.current = () => {};
+    };
+  }, [windowVisibilityGate]);
+  const decide = (decision: LeaveDecision) => {
+    cancelFirstFocus.current();
+    if (decision === "cancel") returnFocus.current();
+    onDecide(decision);
+  };
   return (
     <div
       ref={containerRef}
@@ -57,19 +155,19 @@ export function LeavePromptDialog({
         <button
           className="primary"
           disabled={submitting}
-          onClick={() => onDecide("save")}
+          onClick={() => decide("save")}
         >
           {submitting ? "保存中…" : draftGuardActions.save}
         </button>
         <button
           className="secondary"
           disabled={submitting}
-          onClick={() => onDecide("discard")}
+          onClick={() => decide("discard")}
         >
           {draftGuardActions.discard}
         </button>
         {/* 取消始终可用：它是用户收回导航请求的唯一出口（复评 T05）。 */}
-        <button className="secondary" onClick={() => onDecide("cancel")}>
+        <button className="secondary" onClick={() => decide("cancel")}>
           {draftGuardActions.cancel}
         </button>
       </div>

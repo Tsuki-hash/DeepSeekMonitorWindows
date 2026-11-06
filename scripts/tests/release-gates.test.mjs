@@ -1276,6 +1276,8 @@ test("component runner bundles every retained regression suite and executes all 
     "return-focus.test",
     "directed-settings-focus.test",
     "window-visibility.test",
+    "pricing-period-badge.test",
+    "quit-request-lifecycle.test",
   ]) {
     assert.ok(source.includes(`"${name}"`));
     assert.match(

@@ -22,6 +22,8 @@ try {
     "return-focus.test",
     "directed-settings-focus.test",
     "window-visibility.test",
+    "pricing-period-badge.test",
+    "quit-request-lifecycle.test",
   ];
   const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({

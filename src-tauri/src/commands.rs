@@ -533,6 +533,14 @@ pub(crate) async fn forget_usage_session(
 }
 
 // 通过 DeepSeek 平台内部接口拉取用量与费用（需网页登录 token，非官方 API Key）。
+fn read_usage_config() -> Result<crate::config::StoredConfig, CommandError> {
+    // Read failures preserve the file and belong to configuration recovery,
+    // regardless of words such as “无效” or “凭据” in the safe error message.
+    read_stored_config().map_err(|message| {
+        CommandError::kind(message, crate::error::ErrorKind::ConfigReadError, None)
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn fetch_usage(
     window: WebviewWindow,
@@ -544,7 +552,7 @@ pub(crate) async fn fetch_usage(
     if !(1..=12).contains(&month) || !(2020..=2100).contains(&year) {
         return Err("非法的月份或年份".into());
     }
-    let config = read_stored_config()?;
+    let config = read_usage_config()?;
     let token = config
         .usage_token
         .filter(|value| !value.is_empty())
@@ -645,6 +653,58 @@ pub(crate) async fn usage_token_captured(
     // 登录窗口本地时区给出的月份
     verify_token_with_probes(&value, &app.state::<SyncSession>(), generation).await?;
     capture_usage_token(&app, value, generation)
+}
+
+#[cfg(test)]
+mod usage_config_read_tests {
+    use super::*;
+    use crate::test_support::TempConfigDir;
+
+    #[test]
+    fn r31_unreadable_usage_config_has_explicit_code_and_preserves_original() {
+        for (tag, original) in [
+            ("json", b"{invalid JSON".as_slice()),
+            ("utf8", b"\xff\xfe".as_slice()),
+            (
+                "encrypted",
+                br#"{"usage_token":"DSM1:AAAAAAAAAAAAAAAAAAAAAA=="}"#.as_slice(),
+            ),
+        ] {
+            let dir = TempConfigDir::new(&format!("r31-usage-config-{tag}"));
+            let path = dir.join("config.json");
+            std::fs::write(&path, original).unwrap();
+            let error = read_usage_config()
+                .err()
+                .expect("must reject unreadable config");
+            assert_eq!(error.code, "config_read_error");
+            assert_eq!(error.credential, None);
+            assert!(!error.retryable);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn r31_usage_config_read_io_failure_is_not_missing_or_invalid_token() {
+        let dir = TempConfigDir::new("r31-usage-config-io");
+        // A directory deterministically makes fs::read fail on every platform,
+        // unlike permission bits when the test runner has elevated privileges.
+        let path = dir.join("config.json");
+        std::fs::create_dir(&path).unwrap();
+        let error = read_usage_config()
+            .err()
+            .expect("must reject unreadable config");
+        assert_eq!(error.code, "config_read_error");
+        assert_eq!(error.credential, None);
+        assert!(!error.retryable);
+        assert!(path.is_dir());
+        // Missing/empty readable configuration still reaches the normal
+        // not-configured path in fetch_usage, rather than becoming a read error.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(read_usage_config().unwrap().usage_token.is_none());
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(read_usage_config().unwrap().usage_token.is_none());
+    }
 }
 
 #[cfg(all(test, windows))]

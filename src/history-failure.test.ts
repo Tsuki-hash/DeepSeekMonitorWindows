@@ -8,6 +8,27 @@ import {
 
 const coded = (code: string, message = "失败") => ({ code, message });
 
+test("R31：配置读取失败优先于无效编码、Token 与凭据文案，恢复必须先重读配置", () => {
+  for (const message of [
+    "配置文件损坏或编码无效",
+    "用量 Token 凭据无法解密，请检查本机加密服务",
+    "无法读取配置文件，拒绝访问",
+  ]) {
+    for (const configured of [false, true]) {
+      const failure = classifyHistoryFailure(
+        coded("config_read_error", message),
+        "2026-10",
+      );
+      assert.equal(failure.kind, "config");
+      const outcome = historyFailureOutcome(failure, ["2026-10"], configured);
+      assert.equal(outcome.continue, false);
+      assert.equal(outcome.recovery, "config");
+      assert.ok(outcome.text.includes("重新读取配置"));
+      assert.equal(/重新同步|登录|尚未配置/.test(outcome.text), false);
+    }
+  }
+});
+
 test("凭据类错误必须终止_未配置与失效给出不同恢复入口", () => {
   const missing = classifyHistoryFailure(
     coded("not_configured", "未配置用量 Token"),

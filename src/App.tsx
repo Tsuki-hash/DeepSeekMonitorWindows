@@ -21,6 +21,8 @@ import { msUntilNextAccountingDate } from "./accounting-clock";
 import { balancePublishable } from "./refresh-policy";
 import { useChannelScheduler } from "./use-channel-scheduler";
 import { WindowVisibilityGate } from "./window-visibility-gate";
+import { useQuitRequest } from "./use-quit-request";
+import { QuitRecovery, quitRecoveryVisible } from "./components/QuitRecovery";
 import {
   initialChannelState,
   onChannelFailure,
@@ -778,19 +780,9 @@ function App() {
   // 复评 F11：托盘「退出」不再直接结束进程 —— 它先唤出窗口并发出唯一
   // quit intent，这里把它当作一次导航意图交给草稿会话：无草稿直接退出，
   // 有草稿则三选一，保存/放弃成功后才由 confirm_quit 真正退出。
-  React.useEffect(() => {
-    const confirmQuit = () => {
-      void invoke("confirm_quit").catch(() => {
-        // 浏览器预览没有 Tauri IPC。
-      });
-    };
-    const unlisten = listen("quit-requested", () =>
-      navigate(() => confirmQuit()),
-    );
-    return () => {
-      void unlisten.then((off) => off()).catch(() => undefined);
-    };
-  }, [navigate]);
+  const quitRequest = useQuitRequest(navigate);
+  const showRecovery =
+    visibilityError || quitRecoveryVisible(quitRequest.state);
 
   const decideLeave = React.useCallback(
     (decision: LeaveDecision) => {
@@ -1055,6 +1047,7 @@ function App() {
       subject={leaveBlocker.current?.subject || pendingLeave.subject}
       submitting={leaveSubmitting}
       onDecide={decideLeave}
+      windowVisibilityGate={windowVisibilityGate}
     />
   ) : null;
 
@@ -1062,23 +1055,32 @@ function App() {
     <div
       ref={stageRef}
       data-panel-mode={mode}
-      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${visibilityError ? "visibility-unavailable" : ""}`}
+      className={`stage mode-${mode} ${["dashboard", "history"].includes(view) ? "with-navigation" : ""} ${showRecovery ? "visibility-unavailable" : ""}`}
     >
-      {visibilityError && (
-        <section className="config-read-error visibility-error" role="alert">
-          <strong>无法确认窗口显隐状态</strong>
-          <p>
-            自动刷新、历史查询和导航自动聚焦已暂停。账户面板仍可手动刷新；
-            历史查询需先重试窗口状态。
-          </p>
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => retryVisibility()}
-          >
-            重试窗口状态
-          </button>
-        </section>
+      {showRecovery && (
+        <div className="visibility-error">
+          {visibilityError && (
+            <section className="config-read-error" role="alert">
+              <strong>无法确认窗口显隐状态</strong>
+              <p>
+                自动刷新、历史查询和导航自动聚焦已暂停。账户面板仍可手动刷新；
+                历史查询需先重试窗口状态。
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => retryVisibility()}
+              >
+                重试窗口状态
+              </button>
+            </section>
+          )}
+          <QuitRecovery
+            state={quitRequest.state}
+            onRetryListener={quitRequest.retryListener}
+            onQuit={quitRequest.requestQuit}
+          />
+        </div>
       )}
       {view === "dashboard" && (
         <>
@@ -1207,6 +1209,12 @@ function App() {
           visibilityError={visibilityError}
           onBack={() => navigate(() => setView("dashboard"))}
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
+          configReady={configSnapshot !== null}
+          configReadError={configSnapshot?.configReadError}
+          onReloadConfig={async () => {
+            const config = await reloadConfig();
+            return Boolean(config && !config.configReadError);
+          }}
           onConfigureUsage={() => {
             // 复评 F10/R16：直接进入设置页并滚动聚焦到用量 Token 区块。
             setView("settings", null, "usageToken");

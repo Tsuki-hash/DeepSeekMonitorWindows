@@ -32,6 +32,7 @@ import {
 } from "../history-failure";
 import type { HistoryRange, HistorySnapshot } from "../history";
 import type { WindowVisibilityGate } from "../window-visibility-gate";
+import { getCommittedConfig, subscribeCommittedConfig } from "../config-store";
 
 // 复评 R17：顶部/趋势合计改用共享的安全版本（Token 检查安全整数，
 // 金额只检查有限），不再用裸 reduce 产生不安全整数。
@@ -51,6 +52,9 @@ export function HistoryPanel({
   onBack,
   onConfigureUsage,
   usageTokenConfigured = true,
+  configReady = true,
+  configReadError = null,
+  onReloadConfig,
   windowVisible = true,
   windowVisibilityGate,
   visibilityError = false,
@@ -60,6 +64,10 @@ export function HistoryPanel({
   onConfigureUsage?: () => void;
   /** 真实配置状态：区分「首次配置」与「凭据失效」，不能默认当成失效。 */
   usageTokenConfigured?: boolean;
+  configReady?: boolean;
+  configReadError?: string | null;
+  /** Only a confirmed readable configuration may release the query block. */
+  onReloadConfig?: () => Promise<boolean>;
   /** Native tray visibility; a hidden WebView remains mounted. */
   windowVisible?: boolean;
   /** App-owned synchronous revocation, not a render-time visibility mirror. */
@@ -75,16 +83,52 @@ export function HistoryPanel({
     "totalTokens",
   );
   const [showUnused, setShowUnused] = React.useState(false);
-  const [selected, setSelected] = React.useState("");
+  const [storedSelected, setSelected] = React.useState("");
   const missingModelHintId = React.useId();
-  const [snapshot, setSnapshot] = React.useState<HistorySnapshot | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState("");
+  const [storedSnapshot, setSnapshot] = React.useState<HistorySnapshot | null>(
+    null,
+  );
+  const [storedBusy, setBusy] = React.useState(false);
+  const [storedError, setError] = React.useState("");
   const [recovery, setRecovery] = React.useState<
-    "configure" | "relogin" | "retry" | "partial" | "refresh" | null
+    "config" | "configure" | "relogin" | "retry" | "partial" | "refresh" | null
   >(null);
+  const [localConfigError, setLocalConfigError] = React.useState<string | null>(
+    null,
+  );
+  const localConfigErrorRef = React.useRef<string | null>(null);
+  const [readingConfig, setReadingConfig] = React.useState(false);
+  const [configRetryError, setConfigRetryError] = React.useState("");
+  const readingConfigRef = React.useRef(false);
+  const mounted = React.useRef(false);
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const committedConfig = React.useSyncExternalStore(
+    subscribeCommittedConfig,
+    getCommittedConfig,
+  );
+  const configStateRef = React.useRef({ configReady, configReadError });
+  configStateRef.current = { configReady, configReadError };
+  const configBlocked = React.useCallback(
+    () =>
+      !configStateRef.current.configReady ||
+      Boolean(
+        configStateRef.current.configReadError ||
+        localConfigErrorRef.current ||
+        getCommittedConfig()?.configReadError,
+      ),
+    [],
+  );
+  const publishedConfigError =
+    configReadError || committedConfig?.configReadError;
+  const configurationError = publishedConfigError || localConfigError;
+  const queriesBlocked = !configReady || Boolean(configurationError);
   const [failed, setFailed] = React.useState<string[]>([]);
-  const [exportStatus, setExportStatus] = React.useState("");
+  const [storedExportStatus, setExportStatus] = React.useState("");
   const snapshotEpoch = React.useRef(-1);
   const [clock, setClock] = React.useState(Date.now);
   const epoch = React.useSyncExternalStore(
@@ -100,6 +144,30 @@ export function HistoryPanel({
   const requestInProgress = React.useRef(false);
   const needsInitialQuery = React.useRef(true);
   const sequence = React.useRef({ value: 0 });
+  const configurationRevoked = React.useRef(false);
+  React.useEffect(() => {
+    const synchronize = () => {
+      const blocked =
+        !configStateRef.current.configReady ||
+        Boolean(
+          configStateRef.current.configReadError ||
+          getCommittedConfig()?.configReadError,
+        );
+      const wasBlocked = configurationRevoked.current;
+      configurationRevoked.current = blocked;
+      if (blocked && !wasBlocked) {
+        // Revoke before React renders. Even a fault followed by recovery in the
+        // same turn must prevent old loaders, continuations and exports winning.
+        sequence.current.value++;
+        requestInProgress.current = false;
+        historyCache.invalidate();
+        setBusy(false);
+      }
+    };
+    const unsubscribe = subscribeCommittedConfig(synchronize);
+    synchronize();
+    return unsubscribe;
+  }, [configReady, configReadError]);
   const stopForVisibility = React.useCallback(() => {
     sequence.current.value++;
     if (!requestInProgress.current) return;
@@ -131,6 +199,23 @@ export function HistoryPanel({
     // historyCache 的 epoch 在凭据变化时递增；镜像到本地代际用于作用域比较。
     scopeEpoch.current = epoch;
   }, [epoch]);
+  // Revocation and recovery may be batched into one render whose final config
+  // is already healthy. Never paint the previous epoch while waiting for the
+  // passive reset effect: this includes model names and feedback, not just data.
+  const ownsView =
+    !queriesBlocked &&
+    scopeEpoch.current === epoch &&
+    epoch === historyCache.epoch();
+  const snapshot =
+    ownsView &&
+    snapshotEpoch.current === epoch &&
+    storedSnapshot === snapshotRef.current
+      ? storedSnapshot
+      : null;
+  const selected = ownsView ? storedSelected : "";
+  const busy = ownsView && storedBusy;
+  const error = ownsView ? storedError : "";
+  const exportStatus = ownsView ? storedExportStatus : "";
   const request = React.useCallback(
     async (
       force = false,
@@ -141,6 +226,7 @@ export function HistoryPanel({
       // refresh/show reads the current date, rather than a captured render date.
       if (!visibleRef.current || windowVisibilityGate?.isVisible() === false)
         return;
+      if (configBlocked()) return;
       const visibilityEpoch = windowVisibilityGate?.epoch();
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
@@ -218,6 +304,7 @@ export function HistoryPanel({
       // 复评 R04：所有写状态的地方都必须先确认「这次请求仍然有效」。
       // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
       const stillOwner = () =>
+        !configBlocked() &&
         visibleRef.current &&
         windowVisibilityGate?.isVisible() !== false &&
         windowVisibilityGate?.epoch() === visibilityEpoch &&
@@ -293,7 +380,13 @@ export function HistoryPanel({
               // A registered cache request is already in flight and can be
               // shared by a new valid consumer (including effect replay).
               // Page ownership guards the loop/commit, not this shared loader.
-              () => fetchMonthUsage(number, year),
+              () => {
+                // Cache loaders start in a microtask. A configuration event can
+                // revoke trust after request() but before the actual IPC call.
+                if (configBlocked())
+                  throw new Error("配置状态已变化，请重新读取配置");
+                return fetchMonthUsage(number, year);
+              },
               force,
             ),
           );
@@ -329,6 +422,16 @@ export function HistoryPanel({
             [...failedMonths, month],
             configuredRef.current,
           );
+          if (classified.kind === "config") {
+            // A disk failure may arrive before App has reread its config.
+            // Latch it across range changes and invalidate old account data.
+            localConfigErrorRef.current = outcome.text;
+            setLocalConfigError(outcome.text);
+            historyCache.invalidate();
+            requestInProgress.current = false;
+            setBusy(false);
+            return;
+          }
           failedMonths.push(month);
           // 凭据/限流类失败立即停止：不让循环对每个月份重复无效请求。
           if (!outcome.continue) {
@@ -349,10 +452,44 @@ export function HistoryPanel({
       requestInProgress.current = false;
       setBusy(false);
     },
-    [range, selectedMonth, windowVisibilityGate],
+    [range, selectedMonth, windowVisibilityGate, configBlocked],
   );
+  const previousConfigError = React.useRef(publishedConfigError);
   React.useEffect(() => {
-    // Only an actual range/month selection or credential epoch clears data.
+    if (previousConfigError.current && !publishedConfigError && configReady) {
+      localConfigErrorRef.current = null;
+      setLocalConfigError(null);
+      setConfigRetryError("");
+    }
+    previousConfigError.current = publishedConfigError;
+  }, [configReady, publishedConfigError]);
+  const rereadConfig = async () => {
+    if (!onReloadConfig || readingConfigRef.current) return;
+    readingConfigRef.current = true;
+    setReadingConfig(true);
+    setConfigRetryError("");
+    try {
+      const readable = await onReloadConfig();
+      if (!mounted.current) return;
+      if (!readable || getCommittedConfig()?.configReadError) {
+        setConfigRetryError("配置仍无法读取，请修复后再试；历史查询保持暂停。");
+        return;
+      }
+      localConfigErrorRef.current = null;
+      setLocalConfigError(null);
+      // Entering the fault already revoked the cache. Clearing the latch (or
+      // the committed error) resumes the selected range in the reset effect;
+      // invalidating again here could cancel a recovery request just started.
+    } catch {
+      if (mounted.current)
+        setConfigRetryError("重新读取配置失败，请稍后再试；历史查询保持暂停。");
+    } finally {
+      readingConfigRef.current = false;
+      if (mounted.current) setReadingConfig(false);
+    }
+  };
+  React.useEffect(() => {
+    // Selection, credential epoch and configuration trust changes clear data.
     // A display clock tick must not discard loaded batches or model filters.
     sequence.current.value++;
     requestInProgress.current = false;
@@ -375,7 +512,7 @@ export function HistoryPanel({
     return () => {
       owner.value++;
     };
-  }, [request, epoch]);
+  }, [request, epoch, configReady, configurationError]);
   const previousVisible = React.useRef(windowVisible);
   React.useEffect(() => {
     const wasVisible = previousVisible.current;
@@ -431,6 +568,7 @@ export function HistoryPanel({
   // month/account's action. Keep old snapshots unchanged until a real commit.
   const committedScope = previousScopeRef.current;
   const ownsRecovery =
+    ownsView &&
     snapshotEpoch.current === historyCache.epoch() &&
     committedScope?.epoch === historyCache.epoch() &&
     committedScope.range === range &&
@@ -559,7 +697,16 @@ export function HistoryPanel({
     (month) => month.usage.schemaVersion !== 2,
   );
   const download = (format: "csv" | "json") => {
-    if (!snapshot || busy || snapshotEpoch.current !== historyCache.epoch())
+    if (
+      configBlocked() ||
+      !snapshot ||
+      busy ||
+      // Check this callback's immutable render epoch and snapshot identity.
+      // A newer commit must never make an old export closure valid again.
+      epoch !== historyCache.epoch() ||
+      snapshotEpoch.current !== epoch ||
+      snapshot !== snapshotRef.current
+    )
       return;
     const exported = historyExport(snapshot, Date.now(), stale);
     const blob = new Blob([exported[format]], {
@@ -596,12 +743,47 @@ export function HistoryPanel({
         <button
           className="history-icon-button"
           aria-label="重新查询历史"
-          disabled={busy || !windowVisible}
+          disabled={busy || !windowVisible || queriesBlocked}
           onClick={() => void request(true)}
         >
           <RefreshCw size={18} className={busy ? "refresh-spin" : undefined} />
         </button>
       </header>
+      {configurationError && (
+        <section className="history-message warning" role="alert">
+          <strong>配置读取失败</strong>
+          <p>{configurationError}</p>
+          <p>
+            历史查询已暂停，原文件未改动。请检查读取权限或本机加密服务；配置损坏时安全修复或移走
+            config.json，再重新读取配置。先恢复配置读取，再检查用量凭据。
+          </p>
+          {onReloadConfig && (
+            <button
+              className="secondary"
+              disabled={readingConfig}
+              onClick={() => void rereadConfig()}
+            >
+              {readingConfig ? "正在读取配置…" : "重新读取配置"}
+            </button>
+          )}
+          {configRetryError && <p role="status">{configRetryError}</p>}
+        </section>
+      )}
+      {!configReady && !configurationError && (
+        <section className="history-message warning" role="status">
+          <p>正在确认配置，历史查询已暂停。</p>
+          {onReloadConfig && (
+            <button
+              className="secondary"
+              disabled={readingConfig}
+              onClick={() => void rereadConfig()}
+            >
+              {readingConfig ? "正在读取配置…" : "重新读取配置"}
+            </button>
+          )}
+          {configRetryError && <p>{configRetryError}</p>}
+        </section>
+      )}
       {!windowVisible && (
         <p className="history-message warning" role="status">
           {visibilityError
@@ -621,7 +803,7 @@ export function HistoryPanel({
         ).map(([value, label]) => (
           <button
             key={value}
-            disabled={!windowVisible}
+            disabled={!windowVisible || queriesBlocked}
             aria-pressed={range === value}
             onClick={() => setRange(value)}
           >
@@ -634,7 +816,7 @@ export function HistoryPanel({
           月份
           <input
             type="month"
-            disabled={!windowVisible}
+            disabled={!windowVisible || queriesBlocked}
             aria-label="历史月份"
             min="2020-01"
             max={date.slice(0, 7)}
@@ -659,7 +841,7 @@ export function HistoryPanel({
           {earlierUnloaded.length > 0 ? (
             <button
               className="link-button"
-              disabled={busy || !windowVisible}
+              disabled={busy || !windowVisible || queriesBlocked}
               onClick={() => void request(false, null, true)}
             >
               继续加载更早月份 ›
@@ -668,7 +850,7 @@ export function HistoryPanel({
           {pendingLoadedMonths.length > 0 && (
             <button
               className="link-button"
-              disabled={busy || !windowVisible}
+              disabled={busy || !windowVisible || queriesBlocked}
               onClick={() => void request(true, pendingLoadedMonths)}
             >
               补查未加载月份（{pendingLoadedMonths.length}）
@@ -759,7 +941,7 @@ export function HistoryPanel({
               : ""}
           </p>
         )}
-        {recoveryAction && !busy && (
+        {recoveryAction && !busy && !queriesBlocked && (
           <div className="disclosure-actions history-recovery">
             {recoveryAction === "relogin" && (
               <button

@@ -5,8 +5,9 @@ import assert from "node:assert/strict";
 import { HistoryPanel } from "../src/components/HistoryPanel";
 import { HistoryTrend } from "../src/components/HistoryTrend";
 import { historyCache } from "../src/history-cache";
-import type { RawModelUsage, UsageResult } from "../src/types";
+import type { AppConfig, RawModelUsage, UsageResult } from "../src/types";
 import { historyWindow } from "../src/history";
+import { setCommittedConfig } from "../src/config-store";
 
 // Synthetic component fixtures only. These tests do not launch the application,
 // make platform requests or validate Windows tray/WebView delivery.
@@ -225,16 +226,29 @@ async function fixture(
   initialLoad: (month: string) => Promise<UsageResult> = async (month) =>
     usage(month),
   initialInstant = "2026-10-31T15:59:00Z",
+  initialProps: Partial<React.ComponentProps<typeof HistoryPanel>> = {},
+  onCommit?: () => void,
 ) {
   now = NativeDate.parse(initialInstant);
   calls = [];
   blobs.length = 0;
   load = initialLoad;
+  setCommittedConfig(null);
   historyCache.invalidate();
   await act(async () => {
-    view = Renderer.create(<HistoryPanel onBack={noop} windowVisible />, {
-      unstable_isConcurrent: concurrent,
-    } as any);
+    const panel = (
+      <HistoryPanel onBack={noop} windowVisible {...initialProps} />
+    );
+    view = Renderer.create(
+      onCommit ? (
+        <React.Profiler id="history-commits" onRender={onCommit}>
+          {panel}
+        </React.Profiler>
+      ) : (
+        panel
+      ),
+      { unstable_isConcurrent: concurrent } as any,
+    );
     await flush();
   });
   await act(flush);
@@ -247,6 +261,7 @@ async function fixture(
     });
     assert.equal(intervals.size, 0);
     assert.equal(events.get("visibilitychange")?.size ?? 0, 0);
+    setCommittedConfig(null);
   }
 }
 
@@ -303,6 +318,407 @@ const assertCsvStale = async (expected: boolean) => {
     rows.slice(1).every((record) => record[column] === String(expected)),
   );
 };
+
+let configVersion = 0;
+const readableConfig = (overrides: Partial<AppConfig> = {}): AppConfig => ({
+  configRevision: ++configVersion,
+  apiKeyRevision: 1,
+  usageTokenRevision: 1,
+  configReadError: null,
+  apiKeyConfigured: false,
+  apiKeyPreview: null,
+  usageTokenConfigured: true,
+  refreshIntervalSeconds: 60,
+  autoRefreshEnabled: false,
+  autostart: false,
+  configPath: "SYNTHETIC_ONLY",
+  ...overrides,
+});
+const assertConfigBlocked = () => {
+  assert.equal(button("重新查询历史").props.disabled, true);
+  assert.equal(button("全部").props.disabled, true);
+  assert.equal(button("JSON").props.disabled, true);
+  assert.equal(button("CSV").props.disabled, true);
+  assert.equal(button("去设置页重新同步 Token"), undefined);
+  assert.equal(button("去设置页配置用量 Token"), undefined);
+  assert.deepEqual(metrics(), ["—", "—"]);
+};
+
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+  for (const initialProps of [
+    { configReady: false },
+    {
+      configReadError: "SYNTHETIC unreadable config",
+      usageTokenConfigured: false,
+    },
+  ]) {
+    test(`R31 history (${mode}): ${JSON.stringify(initialProps)} blocks the initial query until trusted recovery`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          assert.equal(calls.length, 0);
+          assertConfigBlocked();
+          await click("重新查询历史");
+          await click("全部");
+          assert.equal(
+            calls.length,
+            0,
+            "stale/disabled handlers must not bypass the gate",
+          );
+          await act(async () => {
+            view.update(
+              <HistoryPanel onBack={noop} windowVisible configReady />,
+            );
+            await flush();
+          });
+          await act(flush);
+          assert.ok(calls.length > 0);
+          assert.equal(text(view.toJSON()).includes("配置读取失败"), false);
+          assert.equal(button("JSON").props.disabled, false);
+        },
+        async (month) => usage(month),
+        "2026-10-31T15:59:00Z",
+        initialProps,
+      );
+    });
+  }
+
+  test(`R31 history (${mode}): backend read failure stops the batch and only a confirmed reread resumes it`, async () => {
+    let reloads = 0;
+    let answer: "no" | "throw" | "yes" = "no";
+    const onReloadConfig = async () => {
+      reloads++;
+      if (answer === "throw") throw new Error("synthetic reread failure");
+      return answer === "yes";
+    };
+    await fixture(concurrent, async () => {
+      await act(async () => {
+        view.update(
+          <HistoryPanel onBack={noop} onReloadConfig={onReloadConfig} />,
+        );
+        await flush();
+      });
+      load = async () => {
+        throw { code: "config_read_error", message: "用量 Token 凭据编码无效" };
+      };
+      const before = calls.length;
+      await click("全部");
+      assert.equal(
+        calls.length,
+        before + 1,
+        "the first failing month stops the batch",
+      );
+      assert.ok(text(view.toJSON()).includes("配置读取失败"));
+      assert.equal(text(view.toJSON()).includes("Token 已失效"), false);
+      assert.equal(text(view.toJSON()).includes("A-one"), false);
+      assertConfigBlocked();
+      await click("重新查询历史");
+      await click("重新读取配置");
+      assert.ok(text(view.toJSON()).includes("配置仍无法读取"));
+      answer = "throw";
+      await click("重新读取配置");
+      assert.ok(text(view.toJSON()).includes("重新读取配置失败"));
+      assert.equal(calls.length, before + 1);
+      assertConfigBlocked();
+      answer = "yes";
+      load = async (month) => usage(month, "B");
+      await click("重新读取配置");
+      assert.equal(reloads, 3);
+      assert.equal(
+        calls.length,
+        before + 1 + 12,
+        "recovery fetches a fresh batch",
+      );
+      assert.equal(text(view.toJSON()).includes("配置读取失败"), false);
+      assert.ok(text(view.toJSON()).includes("B-one"));
+      assert.equal(button("JSON").props.disabled, false);
+    });
+  });
+
+  for (const late of ["success", "failure"] as const) {
+    test(`R31 history (${mode}): config event synchronously revokes requests, exports and late ${late}`, async () => {
+      await fixture(concurrent, async () => {
+        const oldExport = button("JSON").props.onClick;
+        const oldRefresh = button("重新查询历史").props.onClick;
+        const pending = deferredUsage();
+        load = () => pending.promise;
+        await click("重新查询历史");
+        const before = calls.length;
+        await act(async () => {
+          setCommittedConfig(
+            readableConfig({ configReadError: "SYNTHETIC config fault" }),
+          );
+          oldRefresh();
+          oldExport();
+          if (late === "success") pending.resolve(usage("2026-10", "OLD"));
+          else
+            pending.reject({
+              code: "credentials_invalid",
+              message: "old Token",
+            });
+          await flush();
+        });
+        await act(flush);
+        assert.equal(calls.length, before);
+        assert.equal(blobs.length, 0);
+        assertConfigBlocked();
+        assert.equal(text(view.toJSON()).includes("A-one"), false);
+        assert.equal(text(view.toJSON()).includes("OLD-one"), false);
+        assert.equal(text(view.toJSON()).includes("正在查询"), false);
+        load = async (month) => usage(month, "NEW");
+        await act(async () => {
+          setCommittedConfig(readableConfig());
+          await flush();
+        });
+        await act(flush);
+        assert.equal(calls.length, before + 1);
+        assert.ok(text(view.toJSON()).includes("NEW-one"));
+        assert.equal(text(view.toJSON()).includes("配置读取失败"), false);
+      });
+    });
+  }
+
+  test(`R31 history (${mode}): a config event before the cache loader microtask prevents IPC`, async () => {
+    await fixture(concurrent, async () => {
+      const before = calls.length;
+      const refresh = button("重新查询历史").props.onClick;
+      await act(async () => {
+        refresh();
+        setCommittedConfig(
+          readableConfig({ configReadError: "SYNTHETIC queued fault" }),
+        );
+        await flush();
+      });
+      await act(flush);
+      assert.equal(calls.length, before);
+      assertConfigBlocked();
+    });
+  });
+
+  test(`R31 history (${mode}): reread clicks coalesce and an obsolete success cannot release a newer fault`, async () => {
+    let finishRead!: (readable: boolean) => void;
+    let reloads = 0;
+    const result = new Promise<boolean>((resolve) => {
+      finishRead = resolve;
+    });
+    const onReloadConfig = () => {
+      reloads++;
+      return result;
+    };
+    await fixture(
+      concurrent,
+      async () => {
+        assertConfigBlocked();
+        const reread = button("重新读取配置").props.onClick;
+        await act(async () => {
+          reread();
+          reread();
+          await flush();
+        });
+        assert.equal(reloads, 1);
+        assert.equal(button("正在读取配置…").props.disabled, true);
+        const before = calls.length;
+        await act(async () => {
+          finishRead(true);
+          setCommittedConfig(
+            readableConfig({ configReadError: "SYNTHETIC newer fault" }),
+          );
+          await flush();
+        });
+        await act(flush);
+        assert.equal(calls.length, before);
+        assert.ok(text(view.toJSON()).includes("SYNTHETIC newer fault"));
+        assert.ok(text(view.toJSON()).includes("配置仍无法读取"));
+        assertConfigBlocked();
+      },
+      async () => {
+        throw {
+          code: "config_read_error",
+          message: "SYNTHETIC original fault",
+        };
+      },
+      "2026-10-31T15:59:00Z",
+      { onReloadConfig },
+    );
+  });
+
+  test(`R31 history (${mode}): same-turn fault and recovery cannot revive a previous request`, async () => {
+    await fixture(concurrent, async () => {
+      const pending = deferredUsage();
+      load = () => pending.promise;
+      await click("重新查询历史");
+      const before = calls.length;
+      load = async (month) => usage(month, "NEW");
+      await act(async () => {
+        setCommittedConfig(
+          readableConfig({ configReadError: "SYNTHETIC brief fault" }),
+        );
+        setCommittedConfig(readableConfig());
+        pending.resolve(usage("2026-10", "OLD"));
+        await flush();
+      });
+      await act(flush);
+      assert.equal(calls.length, before + 1);
+      assert.ok(text(view.toJSON()).includes("NEW-one"));
+      assert.equal(text(view.toJSON()).includes("OLD-one"), false);
+      assert.equal(text(view.toJSON()).includes("配置读取失败"), false);
+    });
+  });
+
+  test(`R31 history (${mode}): every recovery commit hides the old epoch before effects and old exports stay revoked`, async () => {
+    let recording = false;
+    const commits: {
+      content: string;
+      selected: string;
+      amounts: string[];
+      exportsDisabled: boolean;
+    }[] = [];
+    const nodes = (node: any): any[] =>
+      !node || typeof node === "string"
+        ? []
+        : Array.isArray(node)
+          ? node.flatMap(nodes)
+          : [node, ...(node.children ?? []).flatMap(nodes)];
+    const observeCommit = () => {
+      if (!recording) return;
+      // Profiler's commit callback runs before passive reset effects. Inspect
+      // committed host output, not only the final tree after act() flushes.
+      const tree = view.toJSON();
+      const committedNodes = nodes(tree);
+      const metricsNode = committedNodes.find(
+        (node) => node.props.className === "history-metrics",
+      );
+      const exports = committedNodes.filter(
+        (node) =>
+          node.type === "button" && ["CSV", "JSON"].includes(text(node)),
+      );
+      commits.push({
+        content: text(tree),
+        selected: committedNodes.find(
+          (node) => node.props["aria-label"] === "历史模型",
+        )?.props.value,
+        amounts: nodes(metricsNode)
+          .filter((node) => node.type === "strong")
+          .map(text),
+        exportsDisabled:
+          exports.length === 2 &&
+          exports.every((node) => node.props.disabled === true),
+      });
+    };
+    await fixture(
+      concurrent,
+      async () => {
+        await chooseModel("A-one");
+        load = async () => {
+          throw {
+            code: "invalid_data",
+            message: "SYNTHETIC old monthly failure",
+          };
+        };
+        await click("重新查询历史");
+        assert.ok(text(view.toJSON()).includes("1个月份未取得"));
+        await exportJson();
+        assert.ok(text(view.toJSON()).includes("已发起 JSON 下载"));
+        const oldExport = button("JSON").props.onClick;
+        const recovery = deferredUsage();
+        load = () => recovery.promise;
+        const before = calls.length;
+        recording = true;
+        await act(async () => {
+          setCommittedConfig(
+            readableConfig({ configReadError: "SYNTHETIC brief fault" }),
+          );
+          setCommittedConfig(readableConfig());
+          await flush();
+        });
+        await act(flush);
+        recording = false;
+        assert.equal(calls.length, before + 1);
+        assert.ok(
+          commits.length > 0,
+          "must inspect the intermediate recovery commits",
+        );
+        for (const commit of commits) {
+          assert.equal(commit.content.includes("A-"), false, commit.content);
+          assert.equal(
+            commit.content.includes("1个月份未取得"),
+            false,
+            commit.content,
+          );
+          assert.equal(
+            commit.content.includes("已发起 JSON 下载"),
+            false,
+            commit.content,
+          );
+          assert.equal(
+            commit.content.includes("当前记录："),
+            false,
+            commit.content,
+          );
+          assert.equal(commit.selected, "");
+          assert.deepEqual(commit.amounts, ["—", "—"]);
+          assert.equal(commit.exportsDisabled, true);
+        }
+        await act(async () => {
+          recovery.resolve(usage("2026-10", "NEW"));
+          await flush();
+        });
+        await act(flush);
+        assert.ok(text(view.toJSON()).includes("NEW-one"));
+        const exportCount = blobs.length;
+        await act(async () => {
+          oldExport();
+          await flush();
+        });
+        assert.equal(
+          blobs.length,
+          exportCount,
+          "a newer snapshot must not reauthorize an old closure",
+        );
+        const current = await exportJson();
+        assert.equal(
+          current.daily.length,
+          2,
+          "the recovered snapshot must export both returned models",
+        );
+        assert.ok(
+          current.daily.every((row: RawModelUsage) =>
+            row.model.startsWith("NEW-"),
+          ),
+        );
+      },
+      async (month) => usage(month),
+      "2026-10-31T15:59:00Z",
+      {},
+      observeCommit,
+    );
+  });
+
+  test(`R31 history (${mode}): a same-epoch refresh also revokes an older snapshot export closure`, async () => {
+    await fixture(concurrent, async () => {
+      const oldExport = button("JSON").props.onClick;
+      load = async (month) => usage(month, "NEW");
+      await click("重新查询历史");
+      await act(async () => {
+        oldExport();
+        await flush();
+      });
+      assert.equal(blobs.length, 0);
+      const current = await exportJson();
+      assert.equal(
+        current.daily.length,
+        2,
+        "the refreshed snapshot must export both returned models",
+      );
+      assert.ok(
+        current.daily.every((row: RawModelUsage) =>
+          row.model.startsWith("NEW-"),
+        ),
+      );
+    });
+  });
+}
 
 // Round 29: cache state is authoritative across selection resets/unmounts.
 for (const concurrent of [false, true]) {

@@ -42,6 +42,7 @@ type FailedMonth = {
 };
 
 const safeFailureMessages: Record<HistoryFailure["kind"], string> = {
+  config: "本地配置读取失败，原文件未改动，请修复后重新读取配置。",
   auth: "用量凭据需要配置或重新同步。",
   transient: "用量接口暂时不可用，请稍后重试。",
   month: "该月份用量查询失败，请重试。",

@@ -44,9 +44,18 @@ function PricingPeriodBadge() {
         setOpen(false);
     };
     const escape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // Other controls (for example a chart date) own their Escape handling.
+      // An unhandled outside Escape may close this explanation, but must not
+      // move keyboard focus back from the user's current control.
+      const container = root.current;
+      const ownsFocus =
+        container != null &&
+        event.target instanceof Node &&
+        container.contains(event.target) &&
+        container.contains(document.activeElement);
       setOpen(false);
-      button.current?.focus();
+      if (ownsFocus) button.current?.focus();
     };
     document.addEventListener("pointerdown", outside);
     document.addEventListener("keydown", escape);

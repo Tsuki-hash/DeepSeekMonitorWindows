@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
+    /// 本地配置无法读取；不能误判为平台凭据拒绝。
+    ConfigReadError,
     /// 尚未配置凭据。
     NotConfigured,
     /// 凭据被明确拒绝（401/403）。
@@ -31,6 +33,7 @@ pub enum ErrorKind {
 impl ErrorKind {
     pub fn code(self) -> &'static str {
         match self {
+            ErrorKind::ConfigReadError => "config_read_error",
             ErrorKind::NotConfigured => "not_configured",
             ErrorKind::CredentialsInvalid => "credentials_invalid",
             ErrorKind::Cancelled => "cancelled",
@@ -159,6 +162,7 @@ mod tests {
     #[test]
     fn 只有限流与暂不可用可重试() {
         for kind in [
+            ErrorKind::ConfigReadError,
             ErrorKind::NotConfigured,
             ErrorKind::CredentialsInvalid,
             ErrorKind::Cancelled,
@@ -175,6 +179,7 @@ mod tests {
     #[test]
     fn 每个种类都有稳定的序列化值() {
         for (kind, code) in [
+            (ErrorKind::ConfigReadError, "config_read_error"),
             (ErrorKind::NotConfigured, "not_configured"),
             (ErrorKind::CredentialsInvalid, "credentials_invalid"),
             (ErrorKind::Cancelled, "cancelled"),

@@ -26,7 +26,8 @@
 - [ ] 依赖审计结果被真实记录；网络错误或无法取得结果不是“无漏洞”。
 - [ ] 测试实际执行数大于零；没有把已移除的 Agent 测试、空集合或跳过计为通过。
 - [ ] 按 [发布门禁说明](RELEASE_GATES_1.3.1.md) 在 Windows 本机运行 Rust 门禁：11 项必需 Windows 测试全部真实完成，schema v3 的逐项覆盖、完成行和总数一致。非 Windows／中文跳过／缺必需项的注入均阻断放行。
-- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus、directed-settings-focus 与 window-visibility 十套回归；return-focus 使用合成节点/事件和可控 RAF，不是真实 DOM 或原生焦点测试。非零计数不替代 Windows 原生窗口、布局和通知验收。
+- [ ] 组件 runner 实际执行 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility、history-trend-interactions、month-accessibility、return-focus、directed-settings-focus、window-visibility、pricing-period-badge 与 quit-request-lifecycle 十二套回归；directed-settings-focus 包含 R31 LeavePromptDialog 回归。焦点套件使用合成节点/事件和可控 RAF，不是真实 DOM 或原生焦点测试。非零计数不替代 Windows 原生窗口、布局和通知验收。
+- [ ] 按[第 31 轮提示与峰谷说明回归](REVIEW31_PROMPT_BADGE_FOCUS_REGRESSIONS.md) 验收提示初始 RAF 的同步撤销、安全取消归还与保存/放弃导航；打开峰谷说明后 Tab 到图表日期再按 Escape，图表处理的事件不能关闭说明或把焦点拉回峰谷按钮。另测外部未处理 Escape 关闭说明但保持当前焦点。
 - [ ] 开发与打包不运行统计引擎准备，不下载或捆绑该引擎。
 - [ ] 执行 Windows NSIS 打包，并记录实际安装包哈希。构建成功仍不等于安装后可用。
 

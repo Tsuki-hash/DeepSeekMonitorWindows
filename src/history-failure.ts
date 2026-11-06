@@ -7,6 +7,8 @@
 // 这里把「该停止还是该继续」收敛成纯函数，组件只负责执行。
 
 export type HistoryFailureKind =
+  /** 本地配置不可信：先恢复读取，不能误导用户重新登录。 */
+  | "config"
   /** 未配置或凭据失效：后续月份一定也会失败，必须立即停止。 */
   | "auth"
   /** 限流/服务端暂时不可用：停止连打，等待用户重试。 */
@@ -36,18 +38,20 @@ export function classifyHistoryFailure(
         ? error
         : "";
   const kind: HistoryFailureKind =
-    code === "not_configured" || code === "credentials_invalid"
-      ? "auth"
-      : code === "rate_limited" || code === "unavailable"
-        ? "transient"
-        : code === "invalid_data"
-          ? // 已确认的数据错误不因提到 Token 统计或登录字段而变成鉴权失败。
-            "month"
-          : // unknown 是未分类，也可能来自旧鉴权错误；保留兼容文本兜底，
-            // 不能仅因为带有 code 字段就逐月重试可能已失效的凭据。
-            /未配置|Token|凭据|登录/.test(message)
-            ? "auth"
-            : "month";
+    code === "config_read_error"
+      ? "config"
+      : code === "not_configured" || code === "credentials_invalid"
+        ? "auth"
+        : code === "rate_limited" || code === "unavailable"
+          ? "transient"
+          : code === "invalid_data"
+            ? // 已确认的数据错误不因提到 Token 统计或登录字段而变成鉴权失败。
+              "month"
+            : // unknown 是未分类，也可能来自旧鉴权错误；保留兼容文本兜底，
+              // 不能仅因为带有 code 字段就逐月重试可能已失效的凭据。
+              /未配置|Token|凭据|登录/.test(message)
+              ? "auth"
+              : "month";
   return { kind, month, message };
 }
 
@@ -55,7 +59,7 @@ export type HistoryFailureOutcome = {
   /** 是否继续查询剩余月份。 */
   continue: boolean;
   /** 给用户的下一步动作。 */
-  recovery: "configure" | "relogin" | "retry" | "partial";
+  recovery: "config" | "configure" | "relogin" | "retry" | "partial";
   text: string;
 };
 
@@ -64,6 +68,13 @@ export function historyFailureOutcome(
   failedMonths: string[],
   credentialConfigured = true,
 ): HistoryFailureOutcome {
+  if (failure.kind === "config") {
+    return {
+      continue: false,
+      recovery: "config",
+      text: "本地配置读取失败，历史查询已暂停，原文件未改动。请检查文件读取权限或本机加密服务；配置损坏时安全修复或移走 config.json，再重新读取配置。",
+    };
+  }
   if (failure.kind === "auth") {
     return credentialConfigured
       ? {

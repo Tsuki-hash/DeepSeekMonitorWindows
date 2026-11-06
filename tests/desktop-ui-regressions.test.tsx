@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { App } from "../src/App";
 import { DashboardPanel } from "../src/components/DashboardPanel";
+import { HistoryPanel } from "../src/components/HistoryPanel";
 import { AlertSettings } from "../src/components/AlertSettings";
 import { SettingsPanel } from "../src/components/SettingsPanel";
 import { getCommittedConfig, setCommittedConfig } from "../src/config-store";
@@ -365,6 +366,57 @@ scenario(
     assert.equal(dashboard().usageState, "nokey");
     assert.equal(dashboard().balanceError, "");
     assert.equal(dashboard().usageError, "未配置用量 Token");
+  },
+);
+
+scenario(
+  "R31: App history waits for config and preserves read-error recovery instead of offering Token login",
+  async (concurrent) => {
+    const initialRead = deferred();
+    handlers.get_app_config = () => initialRead.promise;
+    await mount(<App />, concurrent);
+    const before = submitted("fetch_usage").length;
+    await click(button("历史"));
+    let history = renderer.root.findByType(HistoryPanel);
+    assert.equal(history.props.configReady, false);
+    assert.equal(submitted("fetch_usage").length, before);
+    assert.ok(text().includes("正在确认配置"));
+    config = baseConfig({
+      apiKeyConfigured: false,
+      usageTokenConfigured: false,
+      configReadError: "SYNTHETIC root config read error",
+    });
+    await act(async () => initialRead.resolve(config));
+    await flush();
+    history = renderer.root.findByType(HistoryPanel);
+    assert.equal(history.props.configReady, true);
+    assert.equal(history.props.configReadError, config.configReadError);
+    assert.ok(text().includes(config.configReadError));
+    assert.equal(button("去设置页配置用量 Token"), undefined);
+    assert.equal(button("去设置页重新同步 Token"), undefined);
+    assert.equal(submitted("fetch_usage").length, before);
+    handlers.get_app_config = async () => {
+      throw new Error("SYNTHETIC reread failed");
+    };
+    await click(button("重新读取配置"));
+    assert.ok(text().includes("配置仍无法读取"));
+    assert.equal(submitted("fetch_usage").length, before);
+    // Keep credential versions unchanged: trust recovery itself must restart
+    // the history query, rather than depending on a new Token revision.
+    config = {
+      ...config,
+      configRevision: ++revision,
+      configReadError: null,
+      usageTokenConfigured: true,
+    };
+    delete handlers.get_app_config;
+    await click(button("重新读取配置"));
+    assert.equal(text().includes("配置读取失败"), false);
+    assert.ok(submitted("fetch_usage").length > before);
+    assert.equal(
+      renderer.root.findByType(HistoryPanel).props.configReadError,
+      null,
+    );
   },
 );
 

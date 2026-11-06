@@ -126,6 +126,7 @@ const cachedFailure = async (task: Promise<unknown>) => {
 };
 
 for (const code of [
+  "config_read_error",
   "not_configured",
   "credentials_invalid",
   "rate_limited",
