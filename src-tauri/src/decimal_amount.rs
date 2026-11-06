@@ -232,8 +232,14 @@ mod tests {
         for zero in ["0", "-0", "+0.000", "0e10000", "0e-10000"] {
             assert_eq!(decimal(zero), DecimalAmount::zero(), "{zero}");
         }
-        for raw in [".8", "08.00", "+8e-1", " 0.800 ", "8000e-4"] {
+        for raw in [".8", "+8e-1", " 0.800 ", "8000e-4"] {
             assert_eq!(decimal(raw), decimal("0.8"), "{raw}");
+        }
+        // 前导零与小数末尾零都不改变数值：`08.00` 是 8，不是 0.8。
+        // 它曾与上面一组并列，断言 `== 0.8` 必然失败（用例数据错误，
+        // 不是解析错误）。
+        for raw in ["08.00", "8", "8.000", "08000e-3"] {
+            assert_eq!(decimal(raw), decimal("8"), "{raw}");
         }
         for raw in [
             "", ".", "NaN", "inf", "-1", "-1e-400", "1e40", "1e-4097", "1e--2", "1e2e3",
