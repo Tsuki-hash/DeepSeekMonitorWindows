@@ -44,7 +44,7 @@ export type MergeInput = {
   windowMonths: string[];
   /** 本次计划请求的月份。 */
   planned: string[];
-  /** 本次真正尝试过（含失败）的月份。 */
+  /** 本次已发起请求的月份；没有成功/失败结果的在途月份不推进边界。 */
   attempted: string[];
   /** 本次成功取得的月份。 */
   successful: HistoryMonth[];
@@ -61,7 +61,9 @@ export type MergeResult = {
   months: HistoryMonth[];
   /** 已覆盖到的最早月份；null 表示尚未覆盖任何月份。 */
   coveredFrom: string | null;
-  /** 窗口内尚未加载的月份：早于已覆盖范围、且从未尝试过的月份。 */
+  /** 已完成查询（成功或失败）的最早月份；与成功覆盖边界独立。 */
+  attemptedFrom: string | null;
+  /** 窗口内没有已提交结果的月份，包含更早月份和跨月产生的较新空洞。 */
   unloaded: string[];
   /** 累计失败月份（含前批次）：只有本次成功才从列表移除。 */
   failedMonths: string[];
@@ -80,8 +82,8 @@ export function mergeHistoryMonths(input: MergeInput): MergeResult {
   } = input;
 
   // 复评 R02：作用域不一致时**不继承**旧月份（切范围/换账户）。
-  const inheritable =
-    previousScope != null && sameScope(scope, previousScope) ? previous : [];
+  const canInherit = previousScope != null && sameScope(scope, previousScope);
+  const inheritable = canInherit ? previous : [];
 
   const windowSet = new Set(windowMonths);
   const byMonth = new Map<string, HistoryMonth>();
@@ -96,31 +98,34 @@ export function mergeHistoryMonths(input: MergeInput): MergeResult {
     a.month.localeCompare(b.month),
   );
 
-  const attemptedSet = new Set(attempted);
   // 复评 R05：失败状态跨批次累积，只有本次**成功**才清除对应月份。
   const succeededThisRun = new Set(successful.map((month) => month.month));
   const failedSet = new Set(
-    [...previousFailed, ...failed].filter(
+    [...(canInherit ? previousFailed : []), ...failed].filter(
       (month) => !succeededThisRun.has(month) && windowSet.has(month),
     ),
   );
 
-  const coveredFrom =
-    [
-      ...successful.map((month) => month.month),
-      ...months.map((month) => month.month),
-    ].sort()[0] ?? null;
+  const coveredFrom = months[0]?.month ?? null;
 
-  const unloaded = windowMonths.filter((month) => {
-    if (attemptedSet.has(month)) return false;
-    if (failedSet.has(month)) return false;
-    if (coveredFrom == null) return true;
-    return month < coveredFrom;
-  });
+  // Success coverage and pagination are different facts. Even a whole batch
+  // of month-level failures advances the cursor, but keeps every failed month
+  // retryable. Planned/in-flight months must not become covered or missing.
+  const completedAttempts = attempted.filter(
+    (month) => succeededThisRun.has(month) || failedSet.has(month),
+  );
+  const accounted = new Set([
+    ...months.map((month) => month.month),
+    ...failedSet,
+    ...completedAttempts.filter((month) => windowSet.has(month)),
+  ]);
+  const attemptedFrom = [...accounted].sort()[0] ?? null;
+  const unloaded = windowMonths.filter((month) => !accounted.has(month));
 
   return {
     months,
     coveredFrom,
+    attemptedFrom,
     unloaded,
     failedMonths: [...failedSet].sort(),
   };

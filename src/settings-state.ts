@@ -24,7 +24,10 @@ import { CredentialDraft } from "./credential-draft";
 import type { CredentialSnapshot } from "./credential-draft";
 import { ApiKeyFeedback } from "./api-key-feedback";
 import { UsageTokenFeedback } from "./usage-token-feedback";
-import type { UsageTokenFeedbackOwner } from "./usage-token-feedback";
+import type {
+  UsageSessionCleanupOwner,
+  UsageTokenFeedbackOwner,
+} from "./usage-token-feedback";
 import {
   beginApiKeyOperation,
   isCurrentApiKeyOperation,
@@ -150,6 +153,7 @@ export function useSettingsState(): SettingsState {
       key.clear();
       token.clear();
       feedback.edit();
+      feedback.invalidateCleanup();
     };
   }, [keyDraft, tokenDraft]);
   const capturePage = React.useCallback(() => {
@@ -598,6 +602,7 @@ export function useSettingsState(): SettingsState {
   const startUsageSync = React.useCallback(() => {
     const current = capturePage();
     if (!current()) return;
+    tokenFeedback.current.supersedeCleanup();
     const requestId = newUsageSyncRequest();
     syncOwner.current.begin(requestId);
     const feedback = tokenFeedback.current.begin(
@@ -784,6 +789,7 @@ export function useSettingsState(): SettingsState {
     (submitted: CredentialSnapshot): Promise<boolean> => {
       if (!lifecycle.current.active || !submitted.value.trim())
         return Promise.resolve(false);
+      tokenFeedback.current.supersedeCleanup();
       const feedback =
         submitted.revision === tokenDraft.current.revision
           ? tokenFeedback.current.begin(
@@ -928,6 +934,7 @@ export function useSettingsState(): SettingsState {
   const forgetOwner = React.useRef<{
     operation: number;
     consumed: boolean;
+    cleanup: UsageSessionCleanupOwner;
   } | null>(null);
   const forgetUsageSession = React.useCallback(() => {
     if (!lifecycle.current.active || forgetOwner.current) return;
@@ -936,18 +943,20 @@ export function useSettingsState(): SettingsState {
     syncFeedbackOwner.current = null;
     setUsageSyncing(false);
     const revision = tokenDraft.current.revision;
-    const feedback = tokenFeedback.current.begin(
-      revision,
-      "正在清除应用内的网页登录数据…",
-    );
+    const feedback = tokenFeedback.current.begin(revision, null);
     const generation = lifecycle.current.generation;
-    const owner = { operation: beginUsageTokenOperation(), consumed: false };
+    const owner = {
+      operation: beginUsageTokenOperation(),
+      consumed: false,
+      cleanup: tokenFeedback.current.beginCleanup(),
+    };
     forgetOwner.current = owner;
-    const current = () =>
+    const currentPage = () =>
       lifecycle.current.active &&
       lifecycle.current.generation === generation &&
-      forgetOwner.current === owner &&
-      isCurrentUsageTokenOperation(owner.operation);
+      forgetOwner.current === owner;
+    const current = () =>
+      currentPage() && isCurrentUsageTokenOperation(owner.operation);
     setBusy(true);
     setUsageStatus(tokenFeedback.current.status);
     void usageSyncRequests
@@ -956,33 +965,29 @@ export function useSettingsState(): SettingsState {
       )
       .then((nextConfig) => {
         setCommittedConfig(nextConfig);
-        if (
-          !current() ||
-          owner.consumed ||
-          !isCurrentCredential(nextConfig, "usageToken")
-        )
-          return;
+        if (!currentPage() || owner.consumed) return;
         owner.consumed = true;
+        tokenFeedback.current.finishCleanup(owner.cleanup, null);
         const ownsReceipt =
+          current() &&
+          isCurrentCredential(nextConfig, "usageToken") &&
           syncOwner.current.requestId === null &&
           tokenFeedback.current.update(
             feedback,
             tokenDraft.current.revision,
-            "已清除监控 Token 和应用内网页登录数据，下次同步需要重新登录",
+            null,
             true,
           );
         if (ownsReceipt) commitUsageToken(revision);
         setUsageStatus(tokenFeedback.current.status);
       })
       .catch((error) => {
-        if (current()) {
-          tokenFeedback.current.update(
-            feedback,
-            tokenDraft.current.revision,
+        if (currentPage()) {
+          // Privacy failure belongs to the cleanup operation, not to the draft.
+          // New login/save labels it as a previous cleanup; editing B/ABA does not.
+          tokenFeedback.current.finishCleanup(
+            owner.cleanup,
             errorMessage(error),
-            // Forget may clear the Token before browser-data deletion fails.
-            // Report that current operation failure across its partial commit.
-            true,
           );
           setUsageStatus(tokenFeedback.current.status);
         }

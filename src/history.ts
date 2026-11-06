@@ -18,13 +18,15 @@ export type HistoryMonth = {
   usage: UsageResult;
 };
 export type HistoryRecord = { date: string; model: RawModelUsage };
+/** Coverage exists even when every attempted month failed and no data returned. */
 export type HistorySnapshot = {
   window: HistoryWindow;
   months: HistoryMonth[];
   rows: HistoryRecord[];
   missingDates: string[];
+  /** 已查询但失败的月份，可与保留的旧成功快照重叠，不能视作恢复。 */
   failedMonths: string[];
-  /** 尚未加载的月份（全部历史分批加载）：这些月份不能算作「未返回」。 */
+  /** 尚无已提交查询结果的月份：包括更早批次、在途和跨月空洞，不算「未返回」。 */
   unloadedMonths: string[];
 };
 

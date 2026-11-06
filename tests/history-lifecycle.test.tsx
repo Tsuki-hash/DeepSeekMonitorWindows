@@ -6,6 +6,7 @@ import { HistoryPanel } from "../src/components/HistoryPanel";
 import { HistoryTrend } from "../src/components/HistoryTrend";
 import { historyCache } from "../src/history-cache";
 import type { RawModelUsage, UsageResult } from "../src/types";
+import { historyWindow } from "../src/history";
 
 // Synthetic component fixtures only. These tests do not launch the application,
 // make platform requests or validate Windows tray/WebView delivery.
@@ -118,7 +119,8 @@ const metrics = () =>
     .map(text);
 const flush = async () => {
   // Finite local promise chains for sequential synthetic month responses.
-  for (let i = 0; i < 240; i++) await Promise.resolve();
+  // Also cover an explicit retry of every failed month since 2020.
+  for (let i = 0; i < 1200; i++) await Promise.resolve();
 };
 const click = async (label: string) => {
   const target = button(label);
@@ -147,11 +149,16 @@ const exportJson = async () => {
   await click("JSON");
   return JSON.parse(await blobs[blobs.length - 1].text());
 };
-async function fixture(concurrent: boolean, inspect: () => Promise<void>) {
+async function fixture(
+  concurrent: boolean,
+  inspect: () => Promise<void>,
+  initialLoad: (month: string) => Promise<UsageResult> = async (month) =>
+    usage(month),
+) {
   now = NativeDate.parse("2026-10-31T15:59:00Z");
   calls = [];
   blobs.length = 0;
-  load = async (month) => usage(month);
+  load = initialLoad;
   historyCache.invalidate();
   await act(async () => {
     view = Renderer.create(<HistoryPanel onBack={noop} windowVisible />, {
@@ -460,5 +467,340 @@ for (const concurrent of [false, true]) {
       assert.equal(text(view.toJSON()).includes("A-one"), false);
       assert.equal(select().props.value, "");
     });
+  });
+}
+
+// Round 18: explicit recovery for expired retries, and independent attempt cursors.
+for (const concurrent of [false, true]) {
+  const mode = concurrent ? "concurrent" : "legacy";
+  for (const scenario of [
+    { label: "本月", at: "2026-10-31T16:01:00Z", expected: ["2026-11"] },
+    { label: "上月", at: "2026-10-31T16:01:00Z", expected: ["2026-10"] },
+    {
+      label: "近30天",
+      at: "2026-11-30T16:01:00Z",
+      expected: ["2026-12", "2026-11"],
+    },
+  ]) {
+    test(`R18 history (${mode}): expired failed-only ${scenario.label} retry offers a real current-window query`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          await click(scenario.label);
+          const before = calls.length;
+          const original = await exportJson();
+          assert.deepEqual(original.daily, []);
+          assert.equal(original.failedMonths.length, 1);
+          await tick(scenario.at);
+          await click("只重试失败月份（1）");
+          assert.equal(
+            calls.length,
+            before,
+            "an empty retry does not query outside the selected window",
+          );
+          assert.ok(text(view.toJSON()).includes("重试范围已过期"));
+          assert.ok(text(view.toJSON()).includes("本次未发起查询"));
+          assert.ok(button("重新查询当前区间"));
+          assert.equal(button("只重试失败月份（1）"), undefined);
+          const unchanged = await exportJson();
+          assert.equal(unchanged.from, original.from);
+          assert.equal(unchanged.to, original.to);
+          assert.deepEqual(unchanged.failedMonths, original.failedMonths);
+          assert.equal(
+            unchanged.stale,
+            true,
+            "zero targets must not clear the error or imply recovery",
+          );
+          load = async (month) => usage(month);
+          await click("重新查询当前区间");
+          assert.deepEqual(calls.slice(before), scenario.expected);
+          const recovered = await exportJson();
+          assert.deepEqual(recovered.failedMonths, []);
+          assert.deepEqual(recovered.unloadedMonths, []);
+          assert.equal(recovered.stale, false);
+          assert.equal(view.root.findAllByProps({ role: "alert" }).length, 0);
+        },
+        async () => {
+          throw { code: "invalid_data", message: "synthetic month failure" };
+        },
+      );
+    });
+  }
+
+  test(`R18 history (${mode}): an expired retry preserves previous successful data until recovery`, async () => {
+    await fixture(concurrent, async () => {
+      load = async () => {
+        throw { code: "unknown", message: "synthetic month failure" };
+      };
+      await click("重新查询历史");
+      const original = await exportJson();
+      const before = calls.length;
+      await tick("2026-10-31T16:01:00Z");
+      await click("只重试失败月份（1）");
+      assert.equal(calls.length, before);
+      assert.deepEqual((await exportJson()).daily, original.daily);
+      assert.deepEqual(metrics(), ["30", "¥3.00"]);
+      assert.ok(button("重新查询当前区间"));
+      load = async (month) => usage(month);
+      await click("重新查询历史");
+      assert.deepEqual(calls.slice(before), ["2026-11"]);
+      assert.equal((await exportJson()).from, "2026-11-01");
+    });
+  });
+
+  test(`R18 history (${mode}): a fixed failed historical month remains retryable after rollover`, async () => {
+    await fixture(concurrent, async () => {
+      load = async () => {
+        throw { code: "invalid_data", message: "synthetic month failure" };
+      };
+      await click("历史月份");
+      await click("重新查询历史");
+      await tick("2026-10-31T16:01:00Z");
+      const before = calls.length;
+      load = async (month) => usage(month);
+      await click("只重试失败月份（1）");
+      assert.deepEqual(calls.slice(before), ["2026-10"]);
+      assert.equal((await exportJson()).from, "2026-10-01");
+      assert.equal(view.root.findAllByProps({ role: "alert" }).length, 0);
+    });
+  });
+
+  for (const code of ["invalid_data", "unknown"]) {
+    test(`R18 history (${mode}): all-${code} batches reach 2020 without repeating or inventing successful months`, async () => {
+      await fixture(
+        concurrent,
+        async () => {
+          const before = calls.length;
+          const all = historyWindow("all", "2026-10-31").months;
+          await click("全部");
+          assert.deepEqual(calls.slice(before), all.slice(-12).reverse());
+          let exported = await exportJson();
+          assert.deepEqual(exported.failedMonths, all.slice(-12));
+          assert.deepEqual(exported.unloadedMonths, all.slice(0, -12));
+          assert.deepEqual(metrics(), ["—", "—"]);
+          assert.ok(trend().every((item) => item.value === null));
+          // Traverse the finite 2020..current range. Every batch must move older,
+          // including when there has never been a single successful response.
+          for (
+            let remaining = all.length - 12;
+            remaining > 0;
+            remaining -= 12
+          ) {
+            const batchStart = calls.length;
+            await click("继续加载更早月份 ›");
+            assert.deepEqual(
+              calls.slice(batchStart),
+              all.slice(Math.max(0, remaining - 12), remaining).reverse(),
+            );
+            exported = await exportJson();
+            assert.deepEqual(exported.daily, []);
+            assert.deepEqual(exported.monthly, []);
+            assert.ok(
+              exported.missingDates.every((date: string) =>
+                exported.failedMonths.includes(date.slice(0, 7)),
+              ),
+            );
+          }
+          assert.deepEqual(calls.slice(before), [...all].reverse());
+          assert.deepEqual(exported.failedMonths, all);
+          assert.deepEqual(exported.unloadedMonths, []);
+          assert.equal(button("继续加载更早月份 ›"), undefined);
+          assert.ok(button(`只重试失败月份（${all.length}）`));
+          const retryStart = calls.length;
+          load = async (month) => usage(month);
+          await click(`只重试失败月份（${all.length}）`);
+          assert.deepEqual(calls.slice(retryStart), [...all].reverse());
+          const recovered = await exportJson();
+          assert.deepEqual(recovered.failedMonths, []);
+          assert.deepEqual(recovered.unloadedMonths, []);
+          assert.equal(recovered.monthly.length, all.length);
+          assert.equal(recovered.stale, false);
+        },
+        async () => {
+          throw {
+            code,
+            message:
+              code === "invalid_data"
+                ? "平台 Token 数据解析失败"
+                : "月份样本异常",
+          };
+        },
+      );
+    });
+  }
+
+  test(`R18 history (${mode}): successful, failed and older successful batches remain independently retryable`, async () => {
+    await fixture(concurrent, async () => {
+      await click("全部");
+      await act(async () =>
+        select().props.onChange({ target: { value: "A-one" } }),
+      );
+      const all = historyWindow("all", "2026-10-31").months;
+      const failedBatch = all.slice(-24, -12);
+      load = async () => {
+        throw { code: "invalid_data", message: "synthetic month failure" };
+      };
+      await click("继续加载更早月份 ›");
+      assert.deepEqual((await exportJson()).failedMonths, failedBatch);
+      const before = calls.length;
+      load = async (month) => usage(month);
+      await click("继续加载更早月份 ›");
+      assert.deepEqual(calls.slice(before), all.slice(-36, -24).reverse());
+      const expanded = await exportJson();
+      assert.deepEqual(expanded.failedMonths, failedBatch);
+      assert.equal(expanded.monthly.length, 24);
+      assert.deepEqual(expanded.unloadedMonths, all.slice(0, -36));
+      assert.equal(select().props.value, "A-one");
+      assert.equal(trend().filter((item) => item.value !== null).length, 24);
+      const retryStart = calls.length;
+      await click("只重试失败月份（12）");
+      assert.deepEqual(calls.slice(retryStart), [...failedBatch].reverse());
+      const recovered = await exportJson();
+      assert.equal(recovered.monthly.length, 36);
+      assert.deepEqual(recovered.failedMonths, []);
+      assert.deepEqual(recovered.unloadedMonths, all.slice(0, -36));
+      assert.equal(recovered.stale, false);
+      assert.equal(select().props.value, "A-one");
+    });
+  });
+
+  for (const [status, code] of [
+    [401, "credentials_invalid"],
+    [403, "credentials_invalid"],
+    [404, "unavailable"],
+    [429, "rate_limited"],
+    [503, "unavailable"],
+  ] as const) {
+    test(`R18 history (${mode}): backend HTTP ${status} classification still stops after one month`, async () => {
+      // The native API maps these statuses to stable codes; this fixture tests
+      // the component's code boundary, not the real HTTP/native mapping.
+      await fixture(
+        concurrent,
+        async () => {
+          const before = calls.length;
+          await click("全部");
+          assert.deepEqual(calls.slice(before), ["2026-10"]);
+          const json = await exportJson();
+          const all = historyWindow("all", "2026-10-31").months;
+          assert.deepEqual(json.failedMonths, ["2026-10"]);
+          assert.deepEqual(json.unloadedMonths, all.slice(0, -1));
+          assert.ok(
+            json.missingDates.every((date: string) =>
+              date.startsWith("2026-10"),
+            ),
+          );
+          const retryStart = calls.length;
+          await click("只重试失败月份（1）");
+          assert.deepEqual(calls.slice(retryStart), ["2026-10"]);
+          assert.deepEqual(
+            (await exportJson()).unloadedMonths,
+            all.slice(0, -1),
+          );
+        },
+        async () => {
+          throw { code, message: `synthetic HTTP ${status}` };
+        },
+      );
+    });
+  }
+
+  test(`R18 history (${mode}): unknown legacy authentication text still stops the batch`, async () => {
+    await fixture(
+      concurrent,
+      async () => {
+        const before = calls.length;
+        await click("全部");
+        assert.deepEqual(calls.slice(before), ["2026-10"]);
+        assert.ok(button("去设置页重新同步 Token"));
+        assert.deepEqual((await exportJson()).failedMonths, ["2026-10"]);
+      },
+      async () => {
+        throw { code: "unknown", message: "请重新登录，用量 Token 已失效" };
+      },
+    );
+  });
+
+  test(`R18 history (${mode}): cancel after a failed month does not advance over a late in-flight failure`, async () => {
+    await fixture(
+      concurrent,
+      async () => {
+        let rejectPending!: (reason: unknown) => void;
+        load = async (month) => {
+          if (month === "2026-10") throw { code: "invalid_data" };
+          return new Promise<UsageResult>((_, reject) => {
+            rejectPending = reject;
+          });
+        };
+        await click("全部");
+        assert.ok(rejectPending);
+        await click("停止查询");
+        const stopped = await exportJson();
+        assert.deepEqual(stopped.failedMonths, ["2026-10"]);
+        assert.ok(stopped.unloadedMonths.includes("2026-09"));
+        assert.equal(stopped.missingDates.includes("2026-09-01"), false);
+        const before = calls.length;
+        await act(async () => {
+          rejectPending({ code: "unknown", message: "late failure" });
+          await flush();
+        });
+        assert.equal(calls.length, before);
+        assert.deepEqual(
+          (await exportJson()).failedMonths,
+          stopped.failedMonths,
+        );
+        load = async (month) => usage(month);
+        await click("继续加载更早月份 ›");
+        assert.equal(calls[before], "2026-09");
+        assert.equal(calls.slice(before).length, 12);
+        assert.deepEqual((await exportJson()).failedMonths, ["2026-10"]);
+      },
+      async () => {
+        throw { code: "invalid_data" };
+      },
+    );
+  });
+
+  test(`R18 history (${mode}): hidden account changes reset a failed-only cursor and discard late errors`, async () => {
+    await fixture(
+      concurrent,
+      async () => {
+        let rejectPending!: (reason: unknown) => void;
+        load = async (month) => {
+          if (month === "2026-10") throw { code: "invalid_data" };
+          return new Promise<UsageResult>((_, reject) => {
+            rejectPending = reject;
+          });
+        };
+        await click("全部");
+        assert.ok(rejectPending);
+        const before = calls.length;
+        await visibility(false);
+        await act(async () => {
+          historyCache.invalidate();
+          rejectPending({
+            code: "unknown",
+            message: "old account late failure",
+          });
+          await flush();
+        });
+        assert.equal(calls.length, before);
+        assert.equal(button("继续加载更早月份 ›"), undefined);
+        assert.equal(button("只重试失败月份（1）"), undefined);
+        assert.equal(button("JSON").props.disabled, true);
+        load = async (month) => usage(month, "B");
+        await visibility(true);
+        const all = historyWindow("all", "2026-10-31").months;
+        assert.deepEqual(calls.slice(before), all.slice(-12).reverse());
+        const json = await exportJson();
+        assert.deepEqual(json.failedMonths, []);
+        assert.deepEqual(json.unloadedMonths, all.slice(0, -12));
+        assert.ok(
+          json.daily.every((row: RawModelUsage) => row.model.startsWith("B-")),
+        );
+      },
+      async () => {
+        throw { code: "invalid_data" };
+      },
+    );
   });
 }

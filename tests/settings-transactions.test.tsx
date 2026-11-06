@@ -2194,7 +2194,13 @@ for (const [command, action] of [
           await finish(clearing, nextCredentialConfig("usageToken", false));
           await finish(clipboard, "SYNTHETIC_EXPLICIT_NEW_TOKEN");
           assert.equal(state.usageToken, "SYNTHETIC_EXPLICIT_NEW_TOKEN");
-          assert.equal(state.usageStatus, "已从剪贴板读取");
+          if (command === "forget_usage_session") {
+            assert.match(state.usageStatus, /^已从剪贴板读取。/);
+            assert.match(
+              state.usageStatus,
+              /已清除监控 Token 和应用内网页登录数据/,
+            );
+          } else assert.equal(state.usageStatus, "已从剪贴板读取");
           assert.equal(getCommittedConfig().usageTokenConfigured, false);
           assert.equal(submitted("save_usage_token").length, 0);
         },
@@ -2526,39 +2532,266 @@ for (const [command, action] of [
   );
 }
 
-for (const editAfterClear of [false, true]) {
+for (const edits of ["none", "B", "ABA"]) {
+  for (const succeeds of [false, true]) {
+    scenario(
+      `R18: forget cleanup ${succeeds ? "success" : "failure"} is independent of ${edits} draft edits`,
+      async (concurrent) => {
+        const forgetting = deferred();
+        handlers.forget_usage_session = () => forgetting.promise;
+        await mount(<Probe />, concurrent);
+        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        await act(async () => state.forgetUsageSession());
+        const cleared = nextCredentialConfig("usageToken", false);
+        await emit("usage-token-cleared", cleared);
+        if (edits !== "none")
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+        if (edits === "ABA")
+          await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+        assert.match(state.usageStatus, /监控 Token 已清除/);
+        assert.match(state.usageStatus, /正在清理网页登录数据/);
+        if (succeeds) await finish(forgetting, cleared);
+        else
+          await act(async () =>
+            forgetting.reject(
+              new Error("Synthetic browser-data deletion failure"),
+            ),
+          );
+        await flush();
+        assert.equal(getCommittedConfig().usageTokenConfigured, false);
+        const expectedDraft =
+          succeeds && edits === "none"
+            ? ""
+            : edits === "B"
+              ? "SYNTHETIC_TOKEN_B"
+              : "SYNTHETIC_TOKEN_A";
+        assert.equal(state.usageToken, expectedDraft);
+        assert.match(
+          state.usageStatus,
+          succeeds
+            ? /已清除监控 Token 和应用内网页登录数据/
+            : /监控 Token 已清除；网页登录数据清理尚未确认完成/,
+        );
+        if (!succeeds) {
+          assert.match(
+            state.usageStatus,
+            /Synthetic browser-data deletion failure/,
+          );
+          assert.match(state.usageStatus, /重试/);
+          const failure = state.usageStatus;
+          await act(async () => state.setUsageToken("SYNTHETIC_LATER_TOKEN"));
+          await act(async () =>
+            setCommittedConfig({
+              ...cleared,
+              configRevision: ++fixtureRevision,
+              refreshIntervalSeconds: 300,
+            }),
+          );
+          assert.equal(state.usageStatus, failure);
+        }
+        let blocker;
+        state.registerCredentialBlocker((value) => {
+          blocker = value;
+        });
+        assert.equal(blocker.dirty, !succeeds || edits !== "none");
+        assert.equal(state.busy, false);
+        assert.equal(submitted("save_usage_token").length, 0);
+        assert.equal(submitted("forget_usage_session").length, 1);
+      },
+    );
+  }
+}
+
+scenario(
+  "R18: forget failure before Token commit does not claim Token or browser data was removed",
+  async (concurrent) => {
+    handlers.forget_usage_session = () =>
+      Promise.reject(new Error("Synthetic Token disk failure"));
+    await mount(<Probe />, concurrent);
+    const previous = getCommittedConfig();
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
+    await act(async () => state.forgetUsageSession());
+    await flush();
+    assert.equal(getCommittedConfig(), previous);
+    assert.equal(state.usageToken, "SYNTHETIC_TOKEN_A");
+    assert.match(state.usageStatus, /^尚未确认监控 Token 已清除/);
+    assert.match(state.usageStatus, /Synthetic Token disk failure/);
+    assert.equal(state.busy, false);
+  },
+);
+
+scenario(
+  "R18: cleanup timeout stays unconfirmed until an explicit retry and ignores unowned completion events",
+  async (concurrent) => {
+    const forgetting = deferred();
+    handlers.forget_usage_session = () => forgetting.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.forgetUsageSession());
+    const cleared = nextCredentialConfig("usageToken", false);
+    await emit("usage-token-cleared", cleared);
+    await act(async () => state.setUsageToken("SYNTHETIC_NEW_TOKEN"));
+    await act(async () =>
+      forgetting.reject(
+        new Error(
+          "监控 Token 已清除，网页登录数据仍在清理；完成前无法重新同步",
+        ),
+      ),
+    );
+    await flush();
+    const failed = state.usageStatus;
+    await emit("browsing-data-cleared", null);
+    await emit("usage-token-cleared", cleared);
+    assert.equal(state.usageStatus, failed);
+    assert.match(failed, /尚未确认完成/);
+    assert.equal(submitted("forget_usage_session").length, 1);
+    const retry = deferred();
+    handlers.forget_usage_session = () => retry.promise;
+    await act(async () => state.forgetUsageSession());
+    assert.equal(submitted("forget_usage_session").length, 2);
+    assert.match(state.usageStatus, /正在清理网页登录数据/);
+    await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
+    await act(async () => state.setUsageToken("SYNTHETIC_NEW_TOKEN"));
+    await emit("browsing-data-cleared", null);
+    await emit("usage-token-cleared", cleared);
+    assert.match(state.usageStatus, /正在清理网页登录数据/);
+    await finish(retry, nextCredentialConfig("usageToken", false));
+    const completed = state.usageStatus;
+    await emit("browsing-data-cleared", null);
+    await emit("usage-token-cleared", cleared);
+    assert.equal(state.usageStatus, completed);
+    assert.match(completed, /已清除监控 Token 和应用内网页登录数据/);
+    assert.equal(state.usageToken, "SYNTHETIC_NEW_TOKEN");
+    let blocker;
+    state.registerCredentialBlocker((value) => {
+      blocker = value;
+    });
+    assert.equal(blocker.dirty, true);
+    assert.equal(state.busy, false);
+    assert.equal(submitted("save_usage_token").length, 0);
+  },
+);
+
+for (const newer of ["save", "login"]) {
+  for (const oldFails of [false, true]) {
+    scenario(
+      `R18: old forget ${oldFails ? "failure" : "success"} keeps its attribution after newer ${newer}`,
+      async (concurrent) => {
+        const forgetting = deferred();
+        const replacement = deferred();
+        handlers.forget_usage_session = () => forgetting.promise;
+        handlers.save_usage_token = () => replacement.promise;
+        handlers.start_usage_sync = () => replacement.promise;
+        await mount(<Probe />, concurrent);
+        await act(async () => state.forgetUsageSession());
+        const cleared = nextCredentialConfig("usageToken", false);
+        await emit("usage-token-cleared", cleared);
+        await act(async () => state.setUsageToken("SYNTHETIC_NEW_TOKEN"));
+        let result;
+        await act(async () => {
+          if (newer === "save") result = state.saveUsageToken();
+          else state.startUsageSync();
+        });
+        if (oldFails)
+          await act(async () =>
+            forgetting.reject(new Error("Synthetic previous cleanup failure")),
+          );
+        else await finish(forgetting, cleared);
+        await flush();
+        assert.match(
+          state.usageStatus,
+          newer === "save" ? /^正在验证候选 Token/ : /^正在打开登录窗口/,
+        );
+        assert.match(state.usageStatus, /此前的“退出并忘记账户”/);
+        assert.equal(state.usageToken, "SYNTHETIC_NEW_TOKEN");
+        if (oldFails)
+          assert.match(state.usageStatus, /Synthetic previous cleanup failure/);
+        const current = nextCredentialConfig("usageToken", true);
+        if (newer === "save") {
+          await finish(replacement, current);
+          assert.equal(await result, true);
+          assert.equal(state.usageToken, "");
+          assert.match(state.usageStatus, /^验证通过并已保存。/);
+        } else {
+          const requestId = submitted("start_usage_sync").at(-1).args.requestId;
+          const active = syncStatus(requestId, true);
+          await finish(replacement, { ...active, synced: false });
+          assert.equal(state.usageSyncing, true);
+          assert.match(state.usageStatus, /^等待网页登录/);
+          await emit("usage-token-captured", capturedPayload(current, active));
+          assert.equal(state.usageSyncing, false);
+          assert.equal(state.usageToken, "SYNTHETIC_NEW_TOKEN");
+          assert.match(state.usageStatus, /^用量 Token 已配置。/);
+        }
+        const displayed = state.usageStatus;
+        await emit("usage-token-cleared", cleared);
+        await emit("browsing-data-cleared", null);
+        assert.equal(getCommittedConfig(), current);
+        assert.equal(state.usageStatus, displayed);
+        assert.equal(submitted("forget_usage_session").length, 1);
+      },
+    );
+  }
+}
+
+for (const oldFails of [false, true]) {
   scenario(
-    `R17: forget reports partial browser-data failure only for its current intent (${editAfterClear})`,
+    `R18: forget ${oldFails ? "failure" : "receipt"} arriving after a newer committed account is historical only`,
     async (concurrent) => {
       const forgetting = deferred();
       handlers.forget_usage_session = () => forgetting.promise;
       await mount(<Probe />, concurrent);
-      await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_A"));
       await act(async () => state.forgetUsageSession());
       const cleared = nextCredentialConfig("usageToken", false);
       await emit("usage-token-cleared", cleared);
-      if (editAfterClear)
-        await act(async () => state.setUsageToken("SYNTHETIC_TOKEN_B"));
-      await act(async () =>
-        forgetting.reject(new Error("Synthetic browser-data deletion failure")),
-      );
+      await act(async () => state.setUsageToken("SYNTHETIC_NEW_ACCOUNT_DRAFT"));
+      const current = nextCredentialConfig("usageToken", true);
+      await emit("usage-token-captured", capturedPayload(current));
+      if (oldFails)
+        await act(async () =>
+          forgetting.reject(
+            new Error("Synthetic older account cleanup failure"),
+          ),
+        );
+      else await finish(forgetting, cleared);
       await flush();
-      assert.equal(getCommittedConfig().usageTokenConfigured, false);
-      assert.equal(
-        state.usageToken,
-        editAfterClear ? "SYNTHETIC_TOKEN_B" : "SYNTHETIC_TOKEN_A",
-      );
-      assert.equal(
+      assert.equal(getCommittedConfig(), current);
+      assert.equal(state.usageToken, "SYNTHETIC_NEW_ACCOUNT_DRAFT");
+      assert.match(state.usageStatus, /^用量 Token 已配置。此前的/);
+      assert.match(
         state.usageStatus,
-        editAfterClear
-          ? "未配置用量 Token"
-          : "Synthetic browser-data deletion failure",
+        oldFails
+          ? /Synthetic older account cleanup failure/
+          : /后续新登录或保存的账户不在该次清理范围内/,
       );
-      assert.equal(state.busy, false);
       assert.equal(submitted("save_usage_token").length, 0);
+      assert.equal(submitted("forget_usage_session").length, 1);
     },
   );
 }
+
+scenario(
+  "R18: old forget failure after remount cannot attach to the new page draft",
+  async (concurrent) => {
+    const forgetting = deferred();
+    handlers.forget_usage_session = () => forgetting.promise;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.forgetUsageSession());
+    config = nextCredentialConfig("usageToken", false);
+    await emit("usage-token-cleared", config);
+    await act(async () => renderer.unmount());
+    renderer = null;
+    await mount(<Probe />, concurrent);
+    await act(async () => state.setUsageToken("SYNTHETIC_NEW_PAGE_TOKEN"));
+    const displayed = state.usageStatus;
+    await act(async () =>
+      forgetting.reject(new Error("Synthetic unmounted cleanup failure")),
+    );
+    await flush();
+    assert.equal(state.usageStatus, displayed);
+    assert.equal(state.usageToken, "SYNTHETIC_NEW_PAGE_TOKEN");
+    assert.equal(state.busy, false);
+  },
+);
 
 for (const eventFirst of [false, true]) {
   scenario(

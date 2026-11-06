@@ -650,6 +650,144 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r18_完整日记录与有效月费不能放行月数量空桶或仅REQUEST() {
+        use deepseek_api::regression_samples::{
+            checked_result, complete_month, missing_month_token_rows, period,
+        };
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for rows in missing_month_token_rows() {
+            let (mut amount, cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total = rows;
+            for threshold in [100.0, 120.0, 121.0] {
+                let data = checked_result(&amount, &cost, scope);
+                assert_eq!(data.month_cost, Some(120.0));
+                assert_eq!(data.days[9].total_tokens, Some(35));
+                assert_eq!(data.days[9].total_cost, Some(120.0));
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    outcome(Some(Ok(data)), |data| budget_sample(data, &options)),
+                    Some(("invalid_data".into(), false)),
+                    "不论是否达线都应待核对，不能进入通知触发分支"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r18_有效月总量恢复后预算阈值含等号_缺子字段与同名空片段不误阻() {
+        use deepseek_api::regression_samples::{checked_result, complete_month, period, row};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for rows in [
+            vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "35")])],
+            vec![row("deepseek-flash", &[("PROMPT_TOKEN", "35")])],
+            vec![row(
+                "deepseek-flash",
+                &[("PROMPT_CACHE_HIT_TOKEN", "30"), ("RESPONSE_TOKEN", "5")],
+            )],
+            vec![
+                row("deepseek-flash", &[]),
+                row("deepseek-flash", &[("REQUEST", "1")]),
+                row("deepseek-flash", &[("RESPONSE_TOKEN", "35")]),
+            ],
+        ] {
+            let (mut amount, cost) = complete_month(2026, 11, 10);
+            let mut rows = rows;
+            for _ in 0..2 {
+                amount.data.biz_data.total = rows.clone();
+                for (threshold, trigger) in [(100.0, true), (120.0, true), (121.0, false)] {
+                    let data = checked_result(&amount, &cost, scope);
+                    assert_eq!(data.models[0].total_tokens, Some(35));
+                    assert_eq!(data.month_cost, Some(120.0));
+                    assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+                    let options = AlertOptions {
+                        monthly_budget_cny: threshold,
+                        ..Default::default()
+                    };
+                    assert_eq!(budget_sample(data, &options), ("ok".into(), trigger));
+                }
+                rows.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn r18_月Token与费用显式零正常未达线_空片段不改变真零() {
+        use deepseek_api::regression_samples::{checked_result, complete_month, period, row};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for split in [false, true] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total = vec![row("deepseek-flash", &[("RESPONSE_TOKEN", "0")])];
+            amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+            cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+            cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+            if split {
+                amount.data.biz_data.total.extend([
+                    row("deepseek-flash", &[]),
+                    row("deepseek-flash", &[("REQUEST", "0")]),
+                ]);
+            }
+            for threshold in [100.0, 120.0, 121.0] {
+                let data = checked_result(&amount, &cost, scope);
+                assert_eq!(data.models[0].total_tokens, Some(0));
+                assert_eq!(data.month_cost, Some(0.0));
+                assert!(data.warnings.is_empty());
+                let options = AlertOptions {
+                    monthly_budget_cny: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(budget_sample(data, &options), ("ok".into(), false));
+            }
+        }
+    }
+
+    #[test]
+    fn r18_有效月模型不能替缺数量别名或其他模型放行预算() {
+        use deepseek_api::regression_samples::{checked_result, complete_month, period, row};
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for missing_model in ["deepseek-v4-flash", "deepseek-v4-pro", "future-model"] {
+            for entries in [vec![], vec![("REQUEST", "1")]] {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                amount
+                    .data
+                    .biz_data
+                    .total
+                    .push(row(missing_model, &entries));
+                cost.data.biz_data[0]
+                    .total
+                    .push(row(missing_model, &[("RESPONSE_TOKEN", "0")]));
+                for index in 0..10 {
+                    amount.data.biz_data.days[index]
+                        .data
+                        .push(row(missing_model, &[("RESPONSE_TOKEN", "0")]));
+                    cost.data.biz_data[0].days[index]
+                        .data
+                        .push(row(missing_model, &[("RESPONSE_TOKEN", "0")]));
+                }
+                for threshold in [100.0, 120.0, 121.0] {
+                    let data = checked_result(&amount, &cost, scope);
+                    assert_eq!(data.month_cost, Some(120.0));
+                    assert!(data
+                        .days
+                        .iter()
+                        .all(|day| day.total_tokens.is_some() && day.total_cost.is_some()));
+                    let options = AlertOptions {
+                        monthly_budget_cny: threshold,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        budget_sample(data, &options),
+                        ("invalid_data".into(), false)
+                    );
+                }
+            }
+        }
+    }
+
     // R15 数据回归：同一合成响应经过生产日期范围与聚合后进入预算判定。
     // 不改变 budget_sample 的失败关闭语义。
     #[test]

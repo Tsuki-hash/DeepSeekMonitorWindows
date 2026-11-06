@@ -78,3 +78,35 @@ test("只重试失败月份_保持原有顺序且不重复", () => {
   assert.deepEqual(failedMonthsOnly([], all), []);
   assert.deepEqual(failedMonthsOnly(["2025-01"], all), []);
 });
+
+test("R18：明确数据错误不因 Token 或登录字段文案而变成鉴权失败", () => {
+  for (const message of ["平台 Token 数据解析失败", "登录字段统计口径异常"]) {
+    const failure = classifyHistoryFailure(
+      coded("invalid_data", message),
+      "2024-05",
+    );
+    assert.equal(failure.kind, "month");
+    assert.equal(historyFailureOutcome(failure, ["2024-05"]).continue, true);
+  }
+});
+
+test("R18：未分类 unknown 保留旧鉴权兜底，普通未知月错误仍可继续", () => {
+  for (const message of [
+    "用量 Token 已失效",
+    "请重新登录",
+    "尚未配置用量凭据",
+  ]) {
+    const failure = classifyHistoryFailure(
+      coded("unknown", message),
+      "2024-05",
+    );
+    assert.equal(failure.kind, "auth");
+    assert.equal(historyFailureOutcome(failure, ["2024-05"]).continue, false);
+  }
+  const monthly = classifyHistoryFailure(
+    coded("unknown", "月份样本异常"),
+    "2024-05",
+  );
+  assert.equal(monthly.kind, "month");
+  assert.equal(historyFailureOutcome(monthly, ["2024-05"]).continue, true);
+});

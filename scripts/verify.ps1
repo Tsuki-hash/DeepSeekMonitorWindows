@@ -1,7 +1,7 @@
 # 本地一键验证（替代已取消的 GitHub CI）。
 # 用法：pwsh -File scripts/verify.ps1
 # 这是 Windows 发布源码门禁；非 Windows 可运行开发检查，但最终必须 NOT RUN。
-# 需要：PowerShell 7+（pwsh）、Node 22.6+、Rust 1.88+ MSVC 工具链。
+# 需要：PowerShell 7+（pwsh）、Node 22.13+（仅22.x）或 Node 24+、Rust 1.88+ MSVC 工具链。
 # Windows PowerShell 5.1 不支持本脚本的调用方式，请安装 PowerShell 7。
 
 # 统一输出编码，避免中文在非 UTF-8 控制台里乱码

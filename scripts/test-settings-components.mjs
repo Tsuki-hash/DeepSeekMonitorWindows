@@ -16,6 +16,7 @@ try {
     "desktop-ui-regressions.test",
     "usage-fidelity.test",
     "history-lifecycle.test",
+    "chart-accessibility.test",
   ];
   const outfiles = entries.map((name) => join(directory, `${name}.mjs`));
   await build({

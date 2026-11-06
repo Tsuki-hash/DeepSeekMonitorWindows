@@ -77,7 +77,8 @@ test("提前停止时未尝试月份必须算未加载_不能当成平台未返�
     previous: [],
     failed: ["2026-03"],
   });
-  assert.deepEqual(result.unloaded, ["2026-01", "2026-02"]);
+  assert.deepEqual(result.unloaded, ["2026-01", "2026-02", "2026-05"]);
+  assert.equal(result.attemptedFrom, "2026-03");
   // 失败月份本身既不是未加载，也不是「未返回」的已覆盖范围。
   assert.equal(result.unloaded.includes("2026-03"), false);
   assert.equal(result.coveredFrom, "2026-04");
@@ -101,7 +102,7 @@ test("首次批次半途停止后_继续加载能发出更早月份请求", () =
   assert.ok(first.unloaded.length > 0);
 });
 
-test("没有任何成功数据时_整个窗口都算未加载", () => {
+test("没有任何成功数据时_已失败月份与未加载月份分开", () => {
   const result = mergeHistoryMonths({
     scope: scope(),
     previousScope: null,
@@ -252,3 +253,97 @@ test("窗口外的旧失败记录被清理", () => {
   });
   assert.deepEqual(result.failedMonths, []);
 });
+
+// ---------- Round 18: completed attempts are not successful coverage ----------
+
+test("R18：连续整批失败仍推进边界且保留失败集合", () => {
+  const first = mergeHistoryMonths({
+    scope: scope(),
+    previousScope: null,
+    previousFailed: [],
+    windowMonths,
+    planned: ["2026-04", "2026-05"],
+    attempted: ["2026-05", "2026-04"],
+    successful: [],
+    previous: [],
+    failed: ["2026-05", "2026-04"],
+  });
+  assert.equal(first.coveredFrom, null);
+  assert.equal(first.attemptedFrom, "2026-04");
+  assert.deepEqual(first.unloaded, ["2026-01", "2026-02", "2026-03"]);
+  const nextTargets = windowMonths.filter(
+    (value) => first.attemptedFrom != null && value < first.attemptedFrom,
+  );
+  const second = mergeHistoryMonths({
+    scope: scope(),
+    previousScope: scope(),
+    previousFailed: first.failedMonths,
+    windowMonths,
+    planned: nextTargets,
+    attempted: nextTargets,
+    successful: [],
+    previous: first.months,
+    failed: nextTargets,
+  });
+  assert.equal(second.coveredFrom, null);
+  assert.equal(second.attemptedFrom, "2026-01");
+  assert.deepEqual(second.failedMonths, windowMonths);
+  assert.deepEqual(second.unloaded, []);
+  const recovered = mergeHistoryMonths({
+    scope: scope(),
+    previousScope: scope(),
+    previousFailed: second.failedMonths,
+    windowMonths,
+    planned: ["2026-01", "2026-05"],
+    attempted: ["2026-05", "2026-01"],
+    successful: [month("2026-01", 1), month("2026-05", 5)],
+    previous: [],
+    failed: [],
+  });
+  assert.equal(recovered.attemptedFrom, "2026-01");
+  assert.equal(recovered.coveredFrom, "2026-01");
+  assert.deepEqual(recovered.failedMonths, ["2026-02", "2026-03", "2026-04"]);
+  assert.deepEqual(recovered.unloaded, []);
+});
+
+test("R18：在途、计划和较新空洞不能被游标误当已查询", () => {
+  const result = mergeHistoryMonths({
+    scope: scope(),
+    previousScope: scope(),
+    previousFailed: ["2026-04"],
+    windowMonths,
+    planned: ["2026-01", "2026-02", "2026-03"],
+    attempted: ["2026-03", "2026-02"],
+    successful: [month("2026-03", 3)],
+    previous: [],
+    failed: [],
+  });
+  assert.equal(result.attemptedFrom, "2026-03");
+  assert.equal(result.coveredFrom, "2026-03");
+  assert.deepEqual(result.unloaded, ["2026-01", "2026-02", "2026-05"]);
+  assert.deepEqual(result.failedMonths, ["2026-04"]);
+});
+
+for (const previousScope of [
+  null,
+  scope({ epoch: 0 }),
+  scope({ range: "month" }),
+]) {
+  test(`R18：旧作用域失败不能推进新作用域边界 ${JSON.stringify(previousScope)}`, () => {
+    const result = mergeHistoryMonths({
+      scope: scope(),
+      previousScope,
+      previousFailed: ["2026-01", "2026-04"],
+      windowMonths,
+      planned: ["2026-05"],
+      attempted: ["2026-05"],
+      successful: [],
+      previous: [month("2026-02", 2)],
+      failed: ["2026-05"],
+    });
+    assert.equal(result.attemptedFrom, "2026-05");
+    assert.equal(result.coveredFrom, null);
+    assert.deepEqual(result.failedMonths, ["2026-05"]);
+    assert.deepEqual(result.unloaded, windowMonths.slice(0, -1));
+  });
+}

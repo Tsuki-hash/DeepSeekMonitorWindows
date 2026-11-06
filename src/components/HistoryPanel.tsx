@@ -67,7 +67,7 @@ export function HistoryPanel({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [recovery, setRecovery] = React.useState<
-    "configure" | "relogin" | "retry" | "partial" | null
+    "configure" | "relogin" | "retry" | "partial" | "refresh" | null
   >(null);
   const [failed, setFailed] = React.useState<string[]>([]);
   const [exportStatus, setExportStatus] = React.useState("");
@@ -87,11 +87,12 @@ export function HistoryPanel({
   const needsInitialQuery = React.useRef(true);
   const sequence = React.useRef({ value: 0 });
   // 全部历史分批加载（评审 P2）：先查最近一批，明确「还有更早月份未加载」，
-  // 不把未加载误当成「平台没有记录」。`loadedFrom` 记录已请求到的最早月份。
+  // 不把未加载误当成「平台没有记录」。分页边界独立于成功数据：已完成的
+  // 月级失败也推进 attemptedFrom，失败状态另存并保留单独重试入口。
   const BATCH_MONTHS = 12;
   // 用 ref 而非 state：它只影响「继续加载」的目标范围，不需要触发重渲染，
   // 也避免把它放进 request 依赖后与重置 effect 形成循环。
-  const loadedFrom = React.useRef<string | null>(null);
+  const attemptedFrom = React.useRef<string | null>(null);
   // 快照也走 ref：继续加载时需要读上一批结果，但不应让 request 依赖它而重置列表。
   const snapshotRef = React.useRef<HistorySnapshot | null>(null);
   // 复评 R02/R05：上一批的作用域身份与累计失败月份，供合并器判断能否继承。
@@ -144,16 +145,32 @@ export function HistoryPanel({
       if (monthsOnly) {
         targets = failedMonthsOnly(monthsOnly, window.months);
       } else if (range === "all") {
-        const alreadyLoaded = loadedFrom.current;
+        const alreadyAttempted = sameSelection ? attemptedFrom.current : null;
         targets = older
           ? window.months
-              .filter((month) => alreadyLoaded != null && month < alreadyLoaded)
+              .filter(
+                (month) => alreadyAttempted != null && month < alreadyAttempted,
+              )
               .slice(-BATCH_MONTHS)
-          : alreadyLoaded == null
+          : alreadyAttempted == null
             ? window.months.slice(-BATCH_MONTHS)
-            : window.months.filter((month) => month >= alreadyLoaded);
+            : window.months.filter((month) => month >= alreadyAttempted);
       } else {
         targets = window.months;
+      }
+      // A rolling window can exclude every failed month. A zero-request retry
+      // is not recovery: retain the old snapshot/failures and offer an explicit
+      // current-window query instead of running the success commit below.
+      if (!targets.length) {
+        requestInProgress.current = false;
+        setBusy(false);
+        setRecovery("refresh");
+        setError(
+          monthsOnly
+            ? `重试范围已过期：原目标月份已不在当前统计区间（${window.from} 至 ${window.to}）。本次未发起查询，请重新查询当前区间。`
+            : "当前区间没有可继续加载的更早月份；本次未发起查询，可重新查询当前区间。",
+        );
+        return;
       }
       // 本次请求之前已成功取得的月份：重试与继续加载都要保留它们。
       const previousMonths = retained?.months ?? [];
@@ -185,36 +202,22 @@ export function HistoryPanel({
           failed: failedMonths,
           previousFailed,
         });
-        if (merged.coveredFrom && range === "all") {
-          const previousFrom = loadedFrom.current;
-          loadedFrom.current =
-            previousFrom != null && previousFrom < merged.coveredFrom
-              ? previousFrom
-              : merged.coveredFrom;
-        }
-        if (successful.length || previousMonths.length) {
-          snapshotEpoch.current = requestedEpoch;
-          // A rolling window can have unqueried months above the old loaded
-          // range (e.g. "load older" after a month boundary). Do not rely on
-          // the merge helper's older-only, contiguous-range approximation.
-          const accounted = new Set([
-            ...merged.months.map((month) => month.month),
-            ...merged.failedMonths,
-          ]);
-          const next = buildHistory(
-            window,
-            merged.months,
-            merged.failedMonths,
-            window.months.filter((month) => !accounted.has(month)),
-          );
-          snapshotRef.current = next;
-          setSnapshot(next);
-          // 复评 T03：快照、作用域身份与失败集合必须**同一次提交**。
-          // 原实现只在整批结束或分类错误终止时记录 scope，首次批次中途停止
-          // （停止查询/新请求使 sequence 失效）后 scope 仍为 null，
-          // 继续加载时同身份月份被合并器的防线拒绝继承，用户已看到的月份静默消失。
-        }
-        // Failed-only batches also own a scope, even without a usable snapshot.
+        if (range === "all") attemptedFrom.current = merged.attemptedFrom;
+        // Failed-only batches still need a snapshot of coverage, so the user
+        // can load older months and export explicit failed/unloaded states.
+        // A pending or cancelled month has no committed outcome and stays
+        // unloaded; never infer coverage from the planned contiguous range.
+        snapshotEpoch.current = requestedEpoch;
+        const next = buildHistory(
+          window,
+          merged.months,
+          merged.failedMonths,
+          merged.unloaded,
+        );
+        snapshotRef.current = next;
+        setSnapshot(next);
+        // Snapshot, scope, failure set and cursor are one owned commit. A late
+        // response after cancel/hide/account changes cannot update any of them.
         previousScopeRef.current = requestedScope;
         setFailed(merged.failedMonths);
         failedRef.current = merged.failedMonths;
@@ -299,7 +302,7 @@ export function HistoryPanel({
     setRecovery(null);
     setFailed([]);
     setExportStatus("");
-    loadedFrom.current = null;
+    attemptedFrom.current = null;
     // 复评 R02：切范围时必须同步清空快照与继承来源，否则 request 会读到旧月份。
     snapshotRef.current = null;
     previousScopeRef.current = null;
@@ -331,7 +334,7 @@ export function HistoryPanel({
     const nextWindow = historyWindow(range, todayStr(), selectedMonth);
     // Showing the native window is an explicit refresh opportunity, matching
     // App's tray contract. A fixed historical month has no new date window.
-    if (needsInitialQuery.current || !retained) {
+    if (needsInitialQuery.current || !retained?.months.length) {
       void request();
     } else if (
       retained.window.from !== nextWindow.from ||
@@ -371,11 +374,12 @@ export function HistoryPanel({
   );
   const earlierUnloaded =
     snapshot?.unloadedMonths.filter(
-      (month) => loadedFrom.current != null && month < loadedFrom.current,
+      (month) => attemptedFrom.current != null && month < attemptedFrom.current,
     ) ?? [];
   const pendingLoadedMonths =
     snapshot?.unloadedMonths.filter(
-      (month) => loadedFrom.current != null && month >= loadedFrom.current,
+      (month) =>
+        attemptedFrom.current != null && month >= attemptedFrom.current,
     ) ?? [];
   const summaryModels = snapshot ? returnedHistoryModels(snapshot) : [];
   const knownNames = new Set(summaryModels.map((model) => model.model));
@@ -646,7 +650,12 @@ export function HistoryPanel({
                 去设置页配置用量 Token
               </button>
             )}
-            {failed.length > 0 && (
+            {recovery === "refresh" && (
+              <button className="secondary" onClick={() => void request(true)}>
+                重新查询当前区间
+              </button>
+            )}
+            {failed.length > 0 && recovery !== "refresh" && (
               <button
                 className="secondary"
                 disabled={busy}

@@ -281,6 +281,8 @@ test("component runner bundles every retained regression suite and executes all 
     "settings-transactions.test",
     "desktop-ui-regressions.test",
     "usage-fidelity.test",
+    "history-lifecycle.test",
+    "chart-accessibility.test",
   ]) {
     assert.ok(source.includes(`"${name}"`));
     assert.match(

@@ -17,7 +17,7 @@ use crate::sync_session::{ApiKeySession, SyncSession};
 use crate::tray::hide_main_window_inner;
 use crate::usage_watcher::{
     capture_usage_token, open_login_window, prescan_cached_token, spawn_title_watcher,
-    verify_token_with_probes,
+    verify_login_token, verify_token_with_probes,
 };
 
 /// 敏感命令仅允许主面板窗口调用，防止远程登录页等非主窗口上下文滥用。
@@ -398,16 +398,16 @@ pub(crate) async fn save_usage_token(
     if value.is_empty() {
         return Err("用量 Token 不能为空".into());
     }
+    let mut previous_login = None;
     let status = app.state::<SyncSession>().begin_usage(
         request_id,
         &superseded_request_ids,
         crate::sync_session::UsageSyncKind::Manual,
-        || {
-            if let Some(login) = app.get_webview_window("login-sync") {
-                let _ = login.close();
-            }
-        },
+        || previous_login = app.get_webview_window("login-sync"),
     )?;
+    if let Some(login) = previous_login {
+        let _ = login.close();
+    }
     let _ = app.emit("usage-sync-started", &status);
     let generation = status.generation;
     if let Err(error) = verify_token_with_probes(&value).await {
@@ -424,43 +424,51 @@ pub(crate) async fn save_usage_token(
     result
 }
 
+// 获取 SyncSession 的命令均异步派发，避免 UI IPC 回调因会话锁被阻塞，
+// 不依赖原生建窗的派发细节。invoke 的返回数据保持不变。
 #[tauri::command]
-pub(crate) fn clear_usage_token(
+pub(crate) async fn clear_usage_token(
     window: WebviewWindow,
     app: tauri::AppHandle,
     cancelled_request_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
     require_main(&window)?;
-    let config = app
+    let mut previous_login = None;
+    let result = app
         .state::<SyncSession>()
         .clear_usage(&cancelled_request_ids, || {
-            if let Some(login) = app.get_webview_window("login-sync") {
-                let _ = login.close();
-            }
+            previous_login = app.get_webview_window("login-sync");
             to_app_config(edit_config(|config| {
                 config.usage_token = None;
                 Ok(())
             })?)
-        })?;
+        });
+    // 即使配置写入失败，会话撤销仍已生效；关闭之前捕获的窗口，不重查标签。
+    if let Some(login) = previous_login {
+        let _ = login.close();
+    }
+    let config = result?;
     let _ = app.emit("credential-config-changed", &config);
     Ok(config)
 }
 
 #[tauri::command]
-pub(crate) fn cancel_usage_sync(
+pub(crate) async fn cancel_usage_sync(
     window: WebviewWindow,
     app: tauri::AppHandle,
     request_id: String,
     generation: Option<u64>,
 ) -> Result<Option<crate::sync_session::UsageSyncStatus>, String> {
     require_main(&window)?;
+    let mut login_to_close = None;
     let ended = app
         .state::<SyncSession>()
         .cancel_usage(&request_id, generation, || {
-            if let Some(login) = app.get_webview_window("login-sync") {
-                let _ = login.close();
-            }
+            login_to_close = app.get_webview_window("login-sync");
         });
+    if let Some(login) = login_to_close {
+        let _ = login.close();
+    }
     if let Some(ended) = &ended {
         let _ = app.emit("usage-sync-ended", ended);
     }
@@ -468,7 +476,7 @@ pub(crate) fn cancel_usage_sync(
 }
 
 #[tauri::command]
-pub(crate) fn get_usage_sync_status(
+pub(crate) async fn get_usage_sync_status(
     window: WebviewWindow,
     app: tauri::AppHandle,
 ) -> Result<crate::sync_session::UsageSyncStatus, String> {
@@ -483,17 +491,28 @@ pub(crate) async fn forget_usage_session(
     cancelled_request_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
     require_main(&window)?;
-    let config = app
-        .state::<SyncSession>()
-        .start_clear(&cancelled_request_ids, || {
-            if let Some(login) = app.get_webview_window("login-sync") {
-                login.close().map_err(|e| e.to_string())?;
-            }
-            to_app_config(edit_config(|stored| {
-                stored.usage_token = None;
-                Ok(())
-            })?)
-        })?;
+    let session = app.state::<SyncSession>();
+    let previous_login = session.start_clear(&cancelled_request_ids, || {
+        Ok(app.get_webview_window("login-sync"))
+    })?;
+    // clearing 屏障已生效，释放会话锁后关窗，避免原生回调重入；在这段同步
+    // 准备完成前不会 await，失败时仍保留撤销，但必须释放清理屏障。
+    let prepared = (|| {
+        if let Some(login) = previous_login {
+            login.close().map_err(|e| e.to_string())?;
+        }
+        to_app_config(edit_config(|stored| {
+            stored.usage_token = None;
+            Ok(())
+        })?)
+    })();
+    let config = match prepared {
+        Ok(config) => config,
+        Err(error) => {
+            session.finish_clear();
+            return Err(error);
+        }
+    };
     let _ = app.emit("usage-token-cleared", &config);
     crate::browsing_data::clear(&window).await?;
     Ok(config)
@@ -532,16 +551,16 @@ pub(crate) async fn start_usage_sync(
         return Err("非法调用方".to_string());
     }
     let session = app.state::<SyncSession>();
+    let mut previous_login = None;
     let mut status = session.begin_usage(
         request_id,
         &superseded_request_ids,
         crate::sync_session::UsageSyncKind::Web,
-        || {
-            if let Some(stale) = app.get_webview_window("login-sync") {
-                let _ = stale.close();
-            }
-        },
+        || previous_login = app.get_webview_window("login-sync"),
     )?;
+    if let Some(login) = previous_login {
+        let _ = login.close();
+    }
     let generation = status.generation;
     let _ = app.emit("usage-sync-started", &status);
 
@@ -562,7 +581,12 @@ pub(crate) async fn start_usage_sync(
 
     // 建窗和取消也共用会话锁，防止慢预扫描在取消后重新弹窗。
     // 建窗失败同样要释放会话，否则前端会一直停在「等待网页登录」。
-    if let Err(error) = session.with_current(generation, || open_login_window(&app, generation)) {
+    let opened = session
+        .login_window_lifetime(generation)
+        .and_then(|lifetime| {
+            session.with_current(generation, || open_login_window(&app, generation, lifetime))
+        });
+    if let Err(error) = opened {
         crate::usage_watcher::end_sync_session(&app, generation);
         return Err(error);
     }
@@ -605,7 +629,7 @@ pub(crate) async fn usage_token_captured(
     // 先验证再保存：拦截到的 token 可能是登录中途的临时 token。
     // 校验统一走东八区探针月（与预扫描/后台 watcher 一致），不再依赖
     // 登录窗口本地时区给出的月份
-    verify_token_with_probes(&value).await?;
+    verify_login_token(&app, &value, generation).await?;
     capture_usage_token(&app, value, generation)
 }
 

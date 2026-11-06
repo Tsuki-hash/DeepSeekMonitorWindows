@@ -1,5 +1,24 @@
 //! 同步会话的线性化点：取消与凭据提交共用一把锁。
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+
+/// One native window's revocation signal. Its callback must never wait for the
+/// session mutex or depend on lock/dispatch ordering during window creation.
+/// The signal is checked inside commit's guarded admission instead.
+#[derive(Clone, Default)]
+pub struct LoginWindowLifetime(Arc<AtomicBool>);
+
+impl LoginWindowLifetime {
+    pub fn close(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,6 +87,7 @@ struct SessionState {
     clearing: bool,
     request_id: Option<String>,
     kind: UsageSyncKind,
+    window_lifetime: LoginWindowLifetime,
     cancelled_requests: std::collections::HashSet<String>,
 }
 
@@ -87,21 +107,23 @@ impl SessionState {
         UsageSyncStatus {
             generation: self.generation,
             request_id: self.request_id.clone(),
-            active: self.active,
+            active: self.active && !self.window_lifetime.is_closed(),
             kind: self.kind,
         }
     }
 }
 
 impl SyncSession {
-    /// Replace the old login and close its window under the same lock. A slow
-    /// caller cannot close a newer generation's window after begin returns.
+    /// Replace the old login and capture its window under the same lock. Native
+    /// close operations happen after this method returns; retain the specific
+    /// old handle, never look up the shared window label again after releasing
+    /// the lock. Native callbacks publish their lifetime signal without it.
     pub fn begin_usage(
         &self,
         request_id: String,
         superseded_request_ids: &[String],
         kind: UsageSyncKind,
-        close_previous: impl FnOnce(),
+        capture_previous: impl FnOnce(),
     ) -> Result<UsageSyncStatus, String> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.clearing {
@@ -123,9 +145,10 @@ impl SyncSession {
         state.cancel_queued_usage(superseded_request_ids)?;
         state.generation += 1;
         state.active = true;
+        state.window_lifetime = LoginWindowLifetime::default();
         state.request_id = Some(request_id);
         state.kind = kind;
-        close_previous();
+        capture_previous();
         Ok(state.status())
     }
 
@@ -139,7 +162,7 @@ impl SyncSession {
         &self,
         request_id: &str,
         generation: Option<u64>,
-        close_current: impl FnOnce(),
+        capture_current: impl FnOnce(),
     ) -> Option<UsageSyncStatus> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !request_id.is_empty() && request_id.len() <= 128 {
@@ -153,7 +176,38 @@ impl SyncSession {
             return None;
         }
         state.active = false;
-        close_current();
+        capture_current();
+        Some(state.status())
+    }
+
+    /// Capture ownership before building the native window, without re-entering
+    /// the lock from with_current's builder callback.
+    pub fn login_window_lifetime(&self, generation: u64) -> Result<LoginWindowLifetime, String> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.active
+            || state.generation != generation
+            || state.window_lifetime.is_closed()
+            || !matches!(state.kind, UsageSyncKind::Web)
+        {
+            return Err("同步已取消或已被新的操作替代".into());
+        }
+        Ok(state.window_lifetime.clone())
+    }
+
+    /// Finish the generation whose native callback has already revoked its
+    /// lifetime. Run off the UI thread so native dispatch never waits for
+    /// ongoing session work, including window creation. CloseRequested + Destroyed,
+    /// old-window events and successful programmatic closes are idempotent.
+    pub fn close_web_window(&self, generation: u64) -> Option<UsageSyncStatus> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.active
+            || state.generation != generation
+            || !matches!(state.kind, UsageSyncKind::Web)
+        {
+            return None;
+        }
+        state.window_lifetime.close();
+        state.active = false;
         Some(state.status())
     }
 
@@ -164,17 +218,18 @@ impl SyncSession {
         }
         state.generation += 1;
         state.active = true;
+        state.window_lifetime = LoginWindowLifetime::default();
         Ok(state.generation)
     }
 
     pub fn is_current(&self, generation: u64) -> bool {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.active && state.generation == generation
+        state.active && state.generation == generation && !state.window_lifetime.is_closed()
     }
 
     pub fn active_generation(&self) -> Option<u64> {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.active.then_some(state.generation)
+        (state.active && !state.window_lifetime.is_closed()).then_some(state.generation)
     }
 
     pub fn commit<T>(
@@ -200,7 +255,11 @@ impl SyncSession {
         action: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.active || state.generation != generation {
+        // Admission is the linearization point. A native close that publishes
+        // first rejects this action, even before its notification task obtains
+        // the mutex. Once admission wins, persistence owns the lock through its
+        // result; a later close cannot turn a successful commit into cancellation.
+        if !state.active || state.generation != generation || state.window_lifetime.is_closed() {
             return Err("同步已取消或已被新的操作替代".to_string());
         }
         let value = action()?;

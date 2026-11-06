@@ -826,6 +826,13 @@ fn build_usage_result_inner(
     };
 
     let mut warnings = usage_alignment_warnings(amount, cost, &days, period);
+    // R18：模型名对齐不等于月数量完整。先按原始模型收齐全部片段，再检查
+    // 关键总 Tokens；空桶/REQUEST-only 不得靠完整日记录绕过预算质量门禁。
+    // 缺 REQUEST 或某个可容许的 Token 子字段不影响已有总量，也不是坏值。
+    // 只追加质量警告，不清空可靠月费用、日记录或其他模型的有效数量。
+    if raw_models.is_empty() || raw_models.iter().any(|model| model.total_tokens.is_none()) {
+        warnings.push("本月 Token 总量不完整或不可用，相关数量按未知显示".into());
+    }
     if raw_models
         .iter()
         .chain(
@@ -1051,6 +1058,26 @@ fn validate_usage_entries(amount: &AmountResp, cost: &CostResp) -> Result<(), St
 pub(crate) mod regression_samples {
     use super::*;
 
+    /// 与生产请求相同的数值验证 → 日期范围聚合链路，不发网络请求。
+    pub(crate) fn checked_result(
+        amount: &AmountResp,
+        cost: &CostResp,
+        period: UsagePeriod,
+    ) -> UsageResult {
+        validate_usage_entries(amount, cost).expect("合成响应应通过生产数值入口");
+        build_usage_result_for_period(amount, cost, period)
+    }
+
+    pub(crate) fn missing_month_token_rows() -> Vec<Vec<ModelUsage>> {
+        vec![
+            vec![],
+            vec![row("deepseek-flash", &[])],
+            vec![row("deepseek-flash", &[]), row("deepseek-flash", &[])],
+            vec![row("deepseek-flash", &[("REQUEST", "0")])],
+            vec![row("deepseek-flash", &[("REQUEST", "1")])],
+        ]
+    }
+
     pub(crate) fn row(model: &str, entries: &[(&str, &str)]) -> ModelUsage {
         ModelUsage {
             model: model.into(),
@@ -1138,8 +1165,169 @@ pub(crate) mod regression_samples {
 
 #[cfg(test)]
 mod tests {
-    use super::regression_samples::{complete_month, period, row};
+    use super::regression_samples::{
+        checked_result, complete_month, missing_month_token_rows, period, row,
+    };
     use super::*;
+
+    #[test]
+    fn r18_月数量空桶与仅REQUEST产生完整性警告_保留月费与完整日数据() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for rows in missing_month_token_rows() {
+            let (mut amount, cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total = rows;
+            let result = checked_result(&amount, &cost, scope);
+            assert_eq!(result.month_cost, Some(120.0));
+            assert_eq!(result.models[0].total_tokens, None);
+            assert_eq!(result.models[0].cost, Some(120.0));
+            assert_eq!(result.raw_models[0].total_tokens, None);
+            assert_eq!(result.raw_models[0].cost, Some(120.0));
+            assert!(
+                result.raw_models[0].data_warning.is_none(),
+                "缺失不伪装坏值"
+            );
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("本月 Token 总量")));
+            assert!(!result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("计数异常")));
+            assert_eq!(result.days.len(), 10);
+            assert!(result
+                .days
+                .iter()
+                .all(|day| day.total_tokens.is_some() && day.total_cost.is_some()));
+            assert_eq!(result.days[9].total_tokens, Some(35));
+            assert_eq!(result.days[9].total_cost, Some(120.0));
+            assert_eq!(result.days[9].raw_models[0].total_tokens, Some(35));
+        }
+    }
+
+    #[test]
+    fn r18_月数量真零与合法稀疏明细不被泛化为缺失() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for (entries, total) in [
+            (vec![("RESPONSE_TOKEN", "0")], 0),
+            (vec![("RESPONSE_TOKEN", "35")], 35),
+            (vec![("PROMPT_TOKEN", "35")], 35),
+            (vec![("PROMPT_TOKEN", "30"), ("RESPONSE_TOKEN", "5")], 35),
+            (
+                vec![("PROMPT_CACHE_HIT_TOKEN", "10"), ("RESPONSE_TOKEN", "5")],
+                15,
+            ),
+            (
+                vec![("PROMPT_CACHE_MISS_TOKEN", "20"), ("RESPONSE_TOKEN", "5")],
+                25,
+            ),
+        ] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total = vec![row("deepseek-flash", &entries)];
+            amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+            if total == 0 {
+                cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+                cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+            }
+            let result = checked_result(&amount, &cost, scope);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert_eq!(
+                result.month_cost,
+                Some(if total == 0 { 0.0 } else { 120.0 })
+            );
+            assert_eq!(result.models[0].total_tokens, Some(total));
+            assert_eq!(result.models[0].request_count, None);
+            assert_eq!(result.raw_models[0].total_tokens, Some(total));
+            assert!(result.raw_models[0].data_warning.is_none());
+            assert_eq!(result.days[9].total_tokens, Some(total));
+        }
+    }
+
+    #[test]
+    fn r18_同原始模型空片段与REQUEST片段不掩盖有效月总量() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for tokens in ["35", "0"] {
+            let (mut amount, mut cost) = complete_month(2026, 11, 10);
+            amount.data.biz_data.total = vec![row(
+                "deepseek-flash",
+                &[("REQUEST", "1"), ("RESPONSE_TOKEN", tokens)],
+            )];
+            amount.data.biz_data.days[9].data = amount.data.biz_data.total.clone();
+            if tokens == "0" {
+                cost.data.biz_data[0].total = cost.data.biz_data[0].days[0].data.clone();
+                cost.data.biz_data[0].days[9].data = cost.data.biz_data[0].total.clone();
+            }
+            let single = checked_result(&amount, &cost, scope);
+            assert!(single.warnings.is_empty());
+            let expected = serde_json::to_value(single).unwrap();
+            let mut rows = vec![
+                row("deepseek-flash", &[]),
+                row("deepseek-flash", &[("REQUEST", "1")]),
+                row("deepseek-flash", &[("RESPONSE_TOKEN", tokens)]),
+            ];
+            for _ in 0..2 {
+                amount.data.biz_data.total = rows.clone();
+                let split = checked_result(&amount, &cost, scope);
+                assert_eq!(serde_json::to_value(split).unwrap(), expected);
+                rows.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn r18_有效月模型不能掩盖别名或其他模型的总量缺失() {
+        let scope = period(2026, 11, "2026-11-10T04:00:00Z");
+        for missing_model in ["deepseek-v4-flash", "deepseek-v4-pro", "future-model"] {
+            for entries in [vec![], vec![("REQUEST", "1")]] {
+                let (mut amount, mut cost) = complete_month(2026, 11, 10);
+                amount
+                    .data
+                    .biz_data
+                    .total
+                    .push(row(missing_model, &entries));
+                cost.data.biz_data[0]
+                    .total
+                    .push(row(missing_model, &[("RESPONSE_TOKEN", "7")]));
+                for index in 0..10 {
+                    amount.data.biz_data.days[index].data.push(row(
+                        missing_model,
+                        &[("RESPONSE_TOKEN", if index == 9 { "1" } else { "0" })],
+                    ));
+                    cost.data.biz_data[0].days[index].data.push(row(
+                        missing_model,
+                        &[("RESPONSE_TOKEN", if index == 9 { "7" } else { "0" })],
+                    ));
+                }
+                let result = checked_result(&amount, &cost, scope);
+                assert_eq!(result.month_cost, Some(127.0));
+                assert!(result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("本月 Token 总量")));
+                let valid = result
+                    .raw_models
+                    .iter()
+                    .find(|model| model.model == "deepseek-flash")
+                    .unwrap();
+                let missing = result
+                    .raw_models
+                    .iter()
+                    .find(|model| model.model == missing_model)
+                    .unwrap();
+                assert_eq!(valid.total_tokens, Some(35));
+                assert_eq!(valid.cost, Some(120.0));
+                assert_eq!(missing.total_tokens, None);
+                assert_eq!(missing.cost, Some(7.0));
+                assert!(missing.data_warning.is_none());
+                assert_eq!(
+                    result.models[0].total_tokens,
+                    (missing_model != "deepseek-v4-flash").then_some(35)
+                );
+                assert_eq!(result.days[9].total_tokens, Some(36));
+                assert_eq!(result.days[9].total_cost, Some(127.0));
+            }
+        }
+    }
 
     #[test]
     fn r15_01_未来空日不改变当前质量且不伪装零() {

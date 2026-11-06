@@ -21,25 +21,36 @@ function StackedBarChart({
   variant: "summary" | "detail";
   hasOther: boolean;
 }) {
-  const [hoveredIdx, setHoveredIdx] = React.useState<number | null>(null);
-  const [focusedIdx, setFocusedIdx] = React.useState<number | null>(null);
+  const [hoveredDate, setHoveredDate] = React.useState<string | null>(null);
+  const [focusedDate, setFocusedDate] = React.useState<string | null>(null);
   const [pinnedDate, setPinnedDate] = React.useState<string | null>(null);
-  const matchingIndex = points.findIndex((point) => point.date === pinnedDate);
-  const pinnedIdx = matchingIndex >= 0 ? matchingIndex : null;
-  const activeIdx = pinnedIdx ?? focusedIdx ?? hoveredIdx;
-  const active = activeIdx == null ? null : points[activeIdx];
+  // React 按日期复用按钮；跨日窗口位移时，交互身份也必须跟随同一日期。
+  // 当前渲染先过滤移出的日期，不能等 effect 后才避免播报另一根柱子的值。
+  const pinned = points.find((point) => point.date === pinnedDate);
+  const focused = points.find((point) => point.date === focusedDate);
+  const hovered = points.find((point) => point.date === hoveredDate);
+  const active = pinned ?? focused ?? hovered;
+  React.useEffect(() => {
+    const dates = new Set(points.map((point) => point.date));
+    const retainVisible = (date: string | null) =>
+      date != null && dates.has(date) ? date : null;
+    // 清掉失效身份，之后同一日期重新进入窗口时不能自行恢复旧预览／固定态。
+    setHoveredDate(retainVisible);
+    setFocusedDate(retainVisible);
+    setPinnedDate(retainVisible);
+  }, [points]);
   const dismiss = () => {
     setPinnedDate(null);
-    setFocusedIdx(null);
-    setHoveredIdx(null);
+    setFocusedDate(null);
+    setHoveredDate(null);
   };
   React.useEffect(() => {
     if (pinnedDate == null) return;
     const onEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setPinnedDate(null);
-        setFocusedIdx(null);
-        setHoveredIdx(null);
+        setFocusedDate(null);
+        setHoveredDate(null);
       }
     };
     document.addEventListener("keydown", onEscape);
@@ -53,7 +64,7 @@ function StackedBarChart({
     <>
       <div
         className={isSummary ? "bars" : "detail-bars"}
-        onMouseLeave={() => setHoveredIdx(null)}
+        onMouseLeave={() => setHoveredDate(null)}
       >
         {points.map((point, idx) => {
           // 键盘用户与读屏用户拿到的是同一条信息：日期、合计与各分段明细
@@ -69,7 +80,7 @@ function StackedBarChart({
           return (
             <div
               className={`${isSummary ? "bar-column" : "detail-bar-column"}${
-                activeIdx === idx ? " hovered" : ""
+                active?.date === point.date ? " hovered" : ""
               }`}
               key={point.date}
             >
@@ -94,11 +105,15 @@ function StackedBarChart({
                 className={isSummary ? "bar-slot" : "detail-bar-slot"}
                 type="button"
                 aria-label={`${label}。点击或按 Enter 固定明细，Escape 收起`}
-                aria-pressed={pinnedIdx === idx}
-                onMouseEnter={() => setHoveredIdx(idx)}
-                onMouseLeave={() => setHoveredIdx(null)}
-                onFocus={() => setFocusedIdx(idx)}
-                onBlur={() => setFocusedIdx(null)}
+                aria-pressed={pinned?.date === point.date}
+                onMouseEnter={() => setHoveredDate(point.date)}
+                onMouseLeave={() =>
+                  setHoveredDate((prev) => (prev === point.date ? null : prev))
+                }
+                onFocus={() => setFocusedDate(point.date)}
+                onBlur={() =>
+                  setFocusedDate((prev) => (prev === point.date ? null : prev))
+                }
                 onClick={() =>
                   setPinnedDate((prev) =>
                     prev === point.date ? null : point.date,
@@ -164,7 +179,7 @@ function StackedBarChart({
             <div className="chart-inspector-head">
               <span>
                 {mmdd(active.date)}
-                {pinnedIdx != null ? " · 已固定" : ""}
+                {pinned != null ? " · 已固定" : ""}
               </span>
               <strong>
                 {active.unavailable

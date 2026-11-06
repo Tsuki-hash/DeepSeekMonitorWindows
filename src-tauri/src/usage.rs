@@ -552,6 +552,22 @@ mod tests {
     }
 
     #[test]
+    fn r18_REQUEST零与非零都不能证明Token总量_缺失仍不是坏值() {
+        for (request, expected) in [("0", 0), ("1", 1)] {
+            let mut entries = vec![entry("REQUEST", request)];
+            let missing = token_breakdown(&entries);
+            assert_eq!(missing.request, Some(expected));
+            assert_eq!(missing.total, None);
+            assert!(!invalid_token_counts(&entries, &missing));
+            entries.push(entry("RESPONSE_TOKEN", "0"));
+            let zero = token_breakdown(&entries);
+            assert_eq!(zero.total, Some(0));
+            assert_eq!(zero.request, Some(expected));
+            assert!(!invalid_token_counts(&entries, &zero));
+        }
+    }
+
+    #[test]
     fn r14_08_字段缺失与显式零分开_有效兄弟保留() {
         for (request, expected) in [(None, None), (Some("0"), Some(0)), (Some("2"), Some(2))] {
             let mut entries = vec![entry("RESPONSE_TOKEN", "100")];

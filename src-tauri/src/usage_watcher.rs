@@ -231,7 +231,22 @@ pub(crate) async fn verify_token_with_probes(token: &str) -> Result<(), String> 
     Err(VerifyFailure::Transient.message())
 }
 
-/// 同步会话的统一终止点：超时、窗口关闭、建窗失败都走这里。
+/// 登录窗口的 IPC 校验也响应会话撤销；手动保存继续使用上面的独立探针。
+/// 最终落库仍由 commit 再检查代际，不能用 await 后的检查替代线性化守卫。
+pub(crate) async fn verify_login_token(
+    app: &tauri::AppHandle,
+    token: &str,
+    generation: u64,
+) -> Result<(), String> {
+    while_current(verify_token_with_probes(token), || {
+        app.state::<SyncSession>().is_current(generation)
+    })
+    .await
+    .ok_or_else(|| "同步已取消或已被新的操作替代".to_string())?
+}
+
+/// 同步会话的主动终止点：超时、建窗失败和 watcher 的窗口丢失兜底走这里。
+/// 原生关闭事件先撤销窗口自己的 lifetime，再异步收尾，不递归调用 close。
 ///
 /// 评审 P2：原实现里超时路径只结束会话、发事件，却没有关闭 `login-sync` 窗口。
 /// 下一次同步若仍找不到有效缓存 Token 会创建同名窗口，旧窗口还带着旧代际留在屏幕上，
@@ -245,13 +260,16 @@ pub(crate) fn end_sync_session(app: &tauri::AppHandle, generation: u64) {
         return;
     }
     status.active = false;
-    let _ = app.state::<SyncSession>().commit(generation, || {
-        if let Some(login) = app.get_webview_window("login-sync") {
+    let ended = app.state::<SyncSession>().commit(generation, || {
+        // 只捕获本次会话的窗口句柄，释放会话锁后再触发原生事件。
+        Ok(app.get_webview_window("login-sync"))
+    });
+    if let Ok(login) = ended {
+        if let Some(login) = login {
             let _ = login.close();
         }
         let _ = app.emit("usage-sync-ended", &status);
-        Ok(())
-    });
+    }
 }
 
 /// 三条捕获路径共用的落库动作：写配置、置成功标志、关登录窗、广播事件。
@@ -269,42 +287,52 @@ pub(crate) fn capture_usage_token(
         return Err("同步已取消或已被新的操作替代".into());
     }
     status.active = false;
-    app.state::<SyncSession>().commit(generation, || {
+    let (app_config, login) = app.state::<SyncSession>().commit(generation, || {
         let app_config = to_app_config(crate::config::edit_validated_credential(
             crate::config::ValidatedCredential::UsageToken,
             value,
         )?)?;
+        Ok((app_config, app.get_webview_window("login-sync")))
+    })?;
 
-        if let Some(window) = app.get_webview_window("login-sync") {
-            // 防御：确保标题不含历史 title 通道残留后再关窗
-            let _ = window.eval("try { document.title = 'DeepSeek 账号登录'; } catch (e) {}");
-            let _ = window.close();
-        }
+    // commit 已经标记成功并释放锁。原生关闭回调此时只会看到已结束的旧代际，
+    // 既不会锁重入，也不会把成功改成取消或关闭随后创建的新窗口。
+    if let Some(window) = login {
+        let _ = window.eval("try { document.title = 'DeepSeek 账号登录'; } catch (e) {}");
+        let _ = window.close();
+    }
 
-        #[derive(Clone, serde::Serialize)]
-        struct Captured<'a> {
-            #[serde(flatten)]
-            status: &'a crate::sync_session::UsageSyncStatus,
-            config: &'a AppConfig,
-        }
-        let _ = app.emit("usage-token-captured", Captured {
+    #[derive(Clone, serde::Serialize)]
+    struct Captured<'a> {
+        #[serde(flatten)]
+        status: &'a crate::sync_session::UsageSyncStatus,
+        config: &'a AppConfig,
+    }
+    let _ = app.emit(
+        "usage-token-captured",
+        Captured {
             status: &status,
             config: &app_config,
-        });
-        Ok(app_config)
-    })
+        },
+    );
+    Ok(app_config)
 }
 
 /// 打开登录窗口（只允许 DeepSeek 站内导航，降低钓鱼/任意站点套壳风险）。
-pub(crate) fn open_login_window(app: &tauri::AppHandle, generation: u64) -> Result<(), String> {
+pub(crate) fn open_login_window(
+    app: &tauri::AppHandle,
+    generation: u64,
+    lifetime: crate::sync_session::LoginWindowLifetime,
+) -> Result<(), String> {
     let url = WebviewUrl::External("https://platform.deepseek.com".parse().unwrap());
-    WebviewWindowBuilder::new(app, "login-sync", url)
+    let login = WebviewWindowBuilder::new(app, "login-sync", url)
         .title("DeepSeek 账号登录")
         .inner_size(480.0, 720.0)
         .min_inner_size(360.0, 480.0)
         .resizable(true)
         .center()
-        .visible(true)
+        // 先注册绑定本窗口代际的原生回调，再显示可交互的窗口。
+        .visible(false)
         .initialization_script(USAGE_SYNC_POLL_JS.replace(
             "token: token",
             &format!("token: token, generation: {generation}"),
@@ -331,9 +359,33 @@ pub(crate) fn open_login_window(app: &tauri::AppHandle, generation: u64) -> Resu
             }
         })
         .build()
-        .map(|_| ())
-        .map_err(|error| format!("打开登录窗口失败：{error}"))
+        .map_err(|error| format!("打开登录窗口失败：{error}"))?;
+    let event_app = app.clone();
+    login.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) && lifetime.close()
+        {
+            // 原生事件立即撤销这个窗口自己的提交资格；不读同名新窗口或最新会话。
+            // UI 回调不等会话锁，避免阻塞原生事件派发或依赖建窗的调度细节。
+            // commit 在锁内检查 lifetime；后续异步工作仅收尾状态和发事件。
+            let app = event_app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(status) = app.state::<SyncSession>().close_web_window(generation) {
+                    let _ = app.emit("usage-sync-ended", &status);
+                }
+            });
+        }
+    });
+    login
+        .show()
+        .map_err(|error| format!("显示登录窗口失败：{error}"))
 }
+
+#[cfg(test)]
+#[path = "login_close_tests.rs"]
+mod login_close_tests;
 
 /// 启动后台 watcher：周期扫缓存 + 目录事件即时唤醒，直到捕获成功、窗口关闭、
 /// 代际更替或轮次上限。每条退出路径都落日志（评审 F-23），内容不含任何凭据。

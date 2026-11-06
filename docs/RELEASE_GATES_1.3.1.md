@@ -39,7 +39,7 @@
 # 只验证门禁的拒绝行为，使用合成进程输出，不证明 DPAPI/Win32 已运行。
 node --test scripts/tests/release-gates.test.mjs
 
-# 包含 settings-transactions、desktop-ui-regressions、usage-fidelity。
+# 包含 settings-transactions、desktop-ui-regressions、usage-fidelity、history-lifecycle、chart-accessibility。
 # 每个 .tsx 输出为独立 .mjs，再由 node --test 的文件级进程隔离执行。
 npm run test:components
 

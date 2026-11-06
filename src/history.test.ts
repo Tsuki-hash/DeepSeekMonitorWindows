@@ -778,3 +778,36 @@ test("R17: rolling-window retention clips days and does not promote future place
   });
   assert.equal(safeKnownSum(returnedHistoryModels(clipped), "totalTokens"), 20);
 });
+
+test("R18: failed-only snapshots export failures without inventing data or unqueried missing dates", () => {
+  const window = historyWindow("all", "2026-10-31");
+  const failed = window.months.slice(-12);
+  const unloaded = window.months.slice(0, -12);
+  const snapshot = buildHistory(window, [], failed, unloaded);
+  assert.deepEqual(snapshot.months, []);
+  assert.deepEqual(snapshot.rows, []);
+  assert.equal(
+    safeKnownSum(returnedHistoryModels(snapshot), "totalTokens"),
+    null,
+  );
+  assert.deepEqual(snapshot.failedMonths, failed);
+  assert.deepEqual(snapshot.unloadedMonths, unloaded);
+  assert.ok(
+    snapshot.missingDates.every((date) => failed.includes(date.slice(0, 7))),
+  );
+  const exported = historyExport(snapshot, 0, true);
+  const json = JSON.parse(exported.json);
+  assert.deepEqual(json.daily, []);
+  assert.deepEqual(json.monthly, []);
+  assert.deepEqual(json.sourceMonthlySnapshots, []);
+  assert.deepEqual(json.failedMonths, failed);
+  assert.deepEqual(json.unloadedMonths, unloaded);
+  assert.equal(exported.csv.includes('"2020-01-01"'), false);
+  const advanced = retainHistoryWindow(
+    snapshot,
+    historyWindow("all", "2026-11-01"),
+  );
+  assert.deepEqual(advanced.failedMonths, failed);
+  assert.ok(advanced.unloadedMonths.includes("2026-11"));
+  assert.equal(advanced.missingDates.includes("2026-11-01"), false);
+});

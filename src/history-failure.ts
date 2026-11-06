@@ -20,7 +20,7 @@ export type HistoryFailure = {
   message: string;
 };
 
-/** 从 IPC 错误的稳定 code 判定类别；文案不参与判定。 */
+/** 已知 IPC code 优先判定；未分类及旧错误仍保留鉴权文案兼容兜底。 */
 export function classifyHistoryFailure(
   error: unknown,
   month: string,
@@ -40,10 +40,14 @@ export function classifyHistoryFailure(
       ? "auth"
       : code === "rate_limited" || code === "unavailable"
         ? "transient"
-        : // 没有 code 的老式错误按文案兜底，但只用于决定「是否继续」。
-          /未配置|Token|凭据|登录/.test(message)
-          ? "auth"
-          : "month";
+        : code === "invalid_data"
+          ? // 已确认的数据错误不因提到 Token 统计或登录字段而变成鉴权失败。
+            "month"
+          : // unknown 是未分类，也可能来自旧鉴权错误；保留兼容文本兜底，
+            // 不能仅因为带有 code 字段就逐月重试可能已失效的凭据。
+            /未配置|Token|凭据|登录/.test(message)
+            ? "auth"
+            : "month";
   return { kind, month, message };
 }
 

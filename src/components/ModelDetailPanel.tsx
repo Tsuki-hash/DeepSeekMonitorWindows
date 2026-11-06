@@ -74,79 +74,86 @@ function ModelDetailPanel({
       >
         <X size={20} />
       </button>
-      <article className="card detail-hero" data-tauri-drag-region>
-        <div className={`model-badge large ${tintClass}`}>
-          {isFlash ? (
-            <Zap size={34} fill="currentColor" />
-          ) : isOther ? (
-            <Shapes size={31} />
-          ) : (
-            <Brain size={33} />
-          )}
-        </div>
-        <div>
-          <h1 title={title}>{title}</h1>
-          <p title={data?.cost != null ? fmtMoney(data.cost) : undefined}>
-            本月 · {cost}
-          </p>
-        </div>
-      </article>
-
-      <div className="detail-metrics">
-        <article className="card metric-card">
-          <span>本月请求次数</span>
-          <strong className={tintClass}>
-            {data?.requestCount != null ? fmtInt(data.requestCount) : "—"}
-          </strong>
+      <div
+        className="detail-scroll"
+        role="region"
+        aria-label={`${title} 用量详情`}
+        tabIndex={0}
+      >
+        <article className="card detail-hero" data-tauri-drag-region>
+          <div className={`model-badge large ${tintClass}`}>
+            {isFlash ? (
+              <Zap size={34} fill="currentColor" />
+            ) : isOther ? (
+              <Shapes size={31} />
+            ) : (
+              <Brain size={33} />
+            )}
+          </div>
+          <div>
+            <h1 title={title}>{title}</h1>
+            <p title={data?.cost != null ? fmtMoney(data.cost) : undefined}>
+              本月 · {cost}
+            </p>
+          </div>
         </article>
-        <article className="card metric-card">
-          <span>本月 Tokens</span>
-          <strong className={tintClass}>{totalText}</strong>
+
+        <div className="detail-metrics">
+          <article className="card metric-card">
+            <span>本月请求次数</span>
+            <strong className={tintClass}>
+              {data?.requestCount != null ? fmtInt(data.requestCount) : "—"}
+            </strong>
+          </article>
+          <article className="card metric-card">
+            <span>本月 Tokens</span>
+            <strong className={tintClass}>{totalText}</strong>
+          </article>
+        </div>
+
+        <article className="card detail-chart">
+          <div className="detail-chart-head">
+            <div>
+              <h2>按日 Token 消耗</h2>
+              <span>{rangeText}</span>
+              {(notices.length > 0 ||
+                hasUnknown ||
+                (usageError && usageState !== "nokey") ||
+                updatedAt) && (
+                <button className="data-status-link" onClick={onDataStatus}>
+                  {usageError
+                    ? "更新失败 ›"
+                    : notices.length || hasUnknown
+                      ? "数据待核对 ›"
+                      : `${updateTime(updatedAt)} 更新 ›`}
+                </button>
+              )}
+            </div>
+          </div>
+          {usageState === "ok" && points.length > 0 ? (
+            <StackedBarChart
+              points={points}
+              variant="detail"
+              hasOther={hasOther}
+            />
+          ) : (
+            <div className="chart-placeholder">
+              {usageState === "nokey" && (
+                <button className="empty-settings" onClick={onSettings}>
+                  同步用量 Token ›
+                </button>
+              )}
+              {usageState === "nokey"
+                ? ""
+                : usageState === "loading"
+                  ? "查询中…"
+                  : usageState === "error"
+                    ? usageError || "用量不可用"
+                    : "暂无数据"}
+            </div>
+          )}
         </article>
       </div>
-
-      <article className="card detail-chart">
-        <div className="detail-chart-head">
-          <div>
-            <h2>按日 Token 消耗</h2>
-            <span>{rangeText}</span>
-            {(notices.length > 0 ||
-              hasUnknown ||
-              (usageError && usageState !== "nokey") ||
-              updatedAt) && (
-              <button className="data-status-link" onClick={onDataStatus}>
-                {usageError
-                  ? "更新失败 ›"
-                  : notices.length || hasUnknown
-                    ? "数据待核对 ›"
-                    : `${updateTime(updatedAt)} 更新 ›`}
-              </button>
-            )}
-          </div>
-        </div>
-        {usageState === "ok" && points.length > 0 ? (
-          <StackedBarChart
-            points={points}
-            variant="detail"
-            hasOther={hasOther}
-          />
-        ) : (
-          <div className="chart-placeholder">
-            {usageState === "nokey" && (
-              <button className="empty-settings" onClick={onSettings}>
-                同步用量 Token ›
-              </button>
-            )}
-            {usageState === "nokey"
-              ? ""
-              : usageState === "loading"
-                ? "查询中…"
-                : usageState === "error"
-                  ? usageError || "用量不可用"
-                  : "暂无数据"}
-          </div>
-        )}
-      </article>
     </section>
   );
 }
