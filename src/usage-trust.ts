@@ -72,7 +72,6 @@ export type UsageTrust = {
   period: string;
   lastSuccess: string | null;
   completeness: Completeness;
-  accountVerified: boolean;
   stale: boolean;
   /** 给用户的补充说明：为什么不是完整。 */
   reason: string | null;
@@ -164,8 +163,6 @@ export function usageTrust(input: {
     period: `${snapshotMonth ?? currentMonth} · 北京时间`,
     lastSuccess: lastSuccessText,
     completeness,
-    // 余额 Key 与用量 Token 未做账户匹配，始终如实标「未核对」。
-    accountVerified: false,
     stale,
     reason,
   };

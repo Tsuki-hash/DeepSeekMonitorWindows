@@ -129,21 +129,6 @@ test("跨月快照期间标注为快照所属月", () => {
   assert.ok(trust.period.startsWith("2026-10"), trust.period);
 });
 
-test("账户匹配始终标未核对_不伪造自动核对", () => {
-  assert.equal(
-    usageTrust({
-      usage: usage(),
-      state: "ok",
-      error: "",
-      updatedAt: 1,
-      snapshotMonth: "2026-11",
-      currentMonth: "2026-11",
-      lastSuccessText: null,
-    }).accountVerified,
-    false,
-  );
-});
-
 test("R14-06：同一源覆盖驱动图表、完整性、历史和 CSV", () => {
   const data = usage({ days: [returnedZero("2026-11-09")] });
   const days = recentUsageDays(data.days, 7, [], NOW);

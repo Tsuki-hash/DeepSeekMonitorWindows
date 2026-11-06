@@ -15,8 +15,6 @@ export type SourceTrust = {
   lastSuccess: string | null;
   /** 完整性：完整 / 部分 / 未知。 */
   completeness: "complete" | "partial" | "unknown";
-  /** 可选：账户是否已核对。 */
-  accountVerified?: boolean;
   /** 可选：数据是否已失效（跨月、凭据撤销等）。 */
   stale?: boolean;
 };
@@ -30,7 +28,6 @@ export function SourceTrustLine({ trust }: { trust: SourceTrust }) {
     trust.period,
     `最后成功 ${trust.lastSuccess ?? "尚未取得"}`,
     completenessText(trust.completeness),
-    ...(trust.accountVerified === false ? ["账户未核对"] : []),
     ...(trust.stale ? ["已失效，需刷新"] : []),
   ];
   return (
@@ -40,9 +37,7 @@ export function SourceTrustLine({ trust }: { trust: SourceTrust }) {
           {index > 0 && <span aria-hidden="true"> · </span>}
           <span
             className={
-              part === "账户未核对" || part === "已失效，需刷新"
-                ? "source-trust-warn"
-                : undefined
+              part === "已失效，需刷新" ? "source-trust-warn" : undefined
             }
           >
             {part}
