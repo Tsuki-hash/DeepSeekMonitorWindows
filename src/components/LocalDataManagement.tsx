@@ -36,13 +36,15 @@ export function LocalDataManagement({
   onClearRetention,
   /** 采集状态或快照变化时变化的信号：驱动 overview 重新读取（复评 T06）。 */
   refreshSignal,
-  /** 打开归档/留存管理页（复评 T07：读取错误的恢复指引必须可达）。 */
+  /** 复评 Q03：按错误类型打开对应管理页，而不是固定导向手动归档。 */
   onOpenArchiveManager,
+  onOpenRetentionManager,
 }: {
   onClearArchives?: () => void;
   onClearRetention?: () => void;
   refreshSignal?: string;
   onOpenArchiveManager?: () => void;
+  onOpenRetentionManager?: () => void;
 }) {
   const [overview, setOverview] = React.useState<LocalDataOverview | null>(
     null,
@@ -197,11 +199,18 @@ export function LocalDataManagement({
           {overview.archiveError && overview.retentionError ? "；" : ""}
           {overview.retentionError && `自动留存：${overview.retentionError}`}
           。数据可能仍在磁盘上。
-          {onOpenArchiveManager ? (
+          {/* 复评 Q03：恢复入口按错误类型分开，留存错误直接到留存列表。 */}
+          {onOpenArchiveManager && overview?.archiveError && (
             <button className="link-button" onClick={onOpenArchiveManager}>
-              打开归档与留存管理 ›
+              打开手动快照管理 ›
             </button>
-          ) : (
+          )}
+          {onOpenRetentionManager && overview?.retentionError && (
+            <button className="link-button" onClick={onOpenRetentionManager}>
+              打开自动留存管理 ›
+            </button>
+          )}
+          {!onOpenArchiveManager && !onOpenRetentionManager && (
             <span>可在「数据」页的归档/留存列表删除或清空（有二次确认）。</span>
           )}
         </p>

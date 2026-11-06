@@ -255,18 +255,35 @@ export function LocalUsagePanel({
     else action();
   };
   // 与 App 的 decideLeave 同构：保存/放弃/取消都经过代际令牌校验。
+  // 复评 Q04：决策所有权收敛在 `activeDecision` 一个 ref 里 ——
+  // 令牌、提交状态与导航意图同属一次决策；旧决策的迟到完成不允许
+  // 解除新决策的 submitting，新的导航意图也会先作废旧令牌。
+  const activeDecision = React.useRef<{
+    ticket: ReturnType<LeaveDecisions["begin"]>;
+    action: () => void;
+  } | null>(null);
+  const saveInFlight = React.useRef(false);
   const decideLeave = (decision: LeaveDecision) => {
-    const pending = pendingLeave;
-    if (!pending) return;
     if (decision === "cancel") {
       // 取消使当前令牌失效：只撤销导航，不声称能撤回已提交的保存。
-      leaveDecisions.current.cancel(leaveDecisions.current.begin());
+      if (activeDecision.current) {
+        leaveDecisions.current.cancel(activeDecision.current.ticket);
+        activeDecision.current = null;
+      }
       setPendingLeave(null);
       setLeaveSubmitting(false);
       return;
     }
-    if (leaveSubmitting) return; // 连点只认第一次
+    if (saveInFlight.current) return; // 连点/并发只认第一次
+    const pending = pendingLeave;
+    if (!pending) return;
+    // 新导航意图明确取代旧决策：作废旧令牌，旧保存的迟到完成不再生效。
+    if (activeDecision.current) {
+      leaveDecisions.current.cancel(activeDecision.current.ticket);
+    }
     const ticket = leaveDecisions.current.begin();
+    activeDecision.current = { ticket, action: pending };
+    saveInFlight.current = true;
     setLeaveSubmitting(true);
     void resolveLeave(
       {
@@ -282,7 +299,14 @@ export function LocalUsagePanel({
       pending,
       () => leaveDecisions.current.isCurrent(ticket),
     ).then((left) => {
+      saveInFlight.current = false;
+      // 复评 Q04：只有**当前**决策的完成可以更新 submitting 与导航。
+      const isCurrent =
+        activeDecision.current?.ticket === ticket &&
+        leaveDecisions.current.isCurrent(ticket);
+      if (!isCurrent) return;
       leaveDecisions.current.finish(ticket);
+      activeDecision.current = null;
       setLeaveSubmitting(false);
       if (left) {
         setSourceDirty(false);
@@ -749,11 +773,22 @@ export function LocalUsagePanel({
           <LocalDataManagement
             refreshSignal={`${busy}-${snapshot?.collectedAt ?? 0}-${enabled}`}
             onOpenArchiveManager={() => {
-              // 复评 T07：读取错误的恢复入口必须真实可达，且停止后续轮询。
-              control.current.sequence++;
-              tracker.current.reset();
-              setBusy(false);
-              setArchiveView("manual");
+              // 复评 Q02：与正常归档入口一样走守卫，不能丢未保存的目录草稿。
+              guarded(() => {
+                control.current.sequence++;
+                tracker.current.reset();
+                setBusy(false);
+                setArchiveView("manual");
+              });
+            }}
+            onOpenRetentionManager={() => {
+              // 复评 Q02/Q03：留存错误直达留存列表，同样经守卫。
+              guarded(() => {
+                control.current.sequence++;
+                tracker.current.reset();
+                setBusy(false);
+                setArchiveView("retention");
+              });
             }}
           />
           <details className="history-details local-explanation">
