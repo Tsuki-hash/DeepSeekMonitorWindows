@@ -681,6 +681,276 @@ test("R26: 已返回未知模型坏总量在首页保留其他—与合法兄弟
   }
 });
 
+const otherScopeFixture = (
+  sibling: RawModelUsage,
+  others: RawModelUsage[],
+  otherTotal: number | null,
+): UsageResult => {
+  const affected = sibling.groupKey as "flash" | "pro";
+  const rawModels = [sibling, ...others];
+  const data = usage({
+    schemaVersion: 2,
+    rawModels,
+    monthCost: 0.15,
+    models: [
+      model({
+        key: affected,
+        totalTokens: sibling.totalTokens,
+        cacheHitTokens: sibling.cacheHitTokens,
+        cacheMissTokens: sibling.cacheMissTokens,
+        responseTokens: sibling.responseTokens,
+        otherTokens: sibling.otherTokens,
+        cost: 0.1,
+      }),
+      model({
+        key: "other",
+        name: "其他",
+        totalTokens: otherTotal,
+        cost: 0.05,
+      }),
+    ],
+  });
+  data.days[9] = day("2026-11-10", {
+    rawModels,
+    [`${affected}Tokens`]: sibling.totalTokens,
+    [`${affected}CacheHit`]: sibling.cacheHitTokens,
+    [`${affected}CacheMiss`]: sibling.cacheMissTokens,
+    [`${affected}Response`]: sibling.responseTokens,
+    [`${affected}OtherTokens`]: sibling.otherTokens,
+    totalTokens: null,
+    totalCost: 0.15,
+  });
+  return data;
+};
+const futureRaw = (
+  totalTokens: number | null,
+  modelName = "future-model",
+): RawModelUsage =>
+  raw({
+    model: modelName,
+    groupKey: null,
+    totalTokens,
+    cacheHitTokens: null,
+    cacheMissTokens: null,
+    responseTokens: totalTokens,
+    cost: 0.05,
+  });
+const costOnlyRaw = (groupKey: "flash" | "pro"): RawModelUsage =>
+  raw({
+    model: groupKey === "flash" ? "deepseek-flash" : "deepseek-v4-pro",
+    groupKey,
+    totalTokens: null,
+    requestCount: null,
+    cacheHitTokens: null,
+    cacheMissTokens: null,
+    responseTokens: null,
+    otherTokens: null,
+    cost: 0.1,
+  });
+
+test("R27: 费用侧Flash/Pro或Flash超界不污染other详情50/真实0，首页总量仍未知且JSON保真", async () => {
+  const siblings = [
+    costOnlyRaw("flash"),
+    costOnlyRaw("pro"),
+    raw({
+      totalTokens: Number.MAX_SAFE_INTEGER,
+      cacheHitTokens: Number.MAX_SAFE_INTEGER,
+      cost: 0.1,
+    }),
+    raw({
+      totalTokens: null,
+      cacheHitTokens: Number.MAX_SAFE_INTEGER,
+      responseTokens: 1,
+      cost: 0.1,
+    }),
+  ];
+  for (const sibling of siblings) {
+    // MAX+50 导致全日超界；只有费用侧缺计数与槽位自身超界也覆盖future=0。
+    const values = sibling.totalTokens == null ? [50, 0] : [50];
+    for (const futureTotal of values) {
+      const data = otherScopeFixture(
+        sibling,
+        [futureRaw(futureTotal)],
+        futureTotal,
+      );
+      const before = JSON.stringify(data);
+      const exportJson = () =>
+        historyExport(
+          buildHistory(
+            { from: "2026-11-10", to: "2026-11-10", months: ["2026-11"] },
+            [{ month: "2026-11", fetchedAt: NOW, usage: data }],
+            [],
+          ),
+          NOW,
+        ).json;
+      const jsonBefore = exportJson();
+      await render(dashboard(data), (view) => {
+        const label = chartBar(view, "2026-11-10").props["aria-label"];
+        assert.match(label, /合计未知/);
+        assert.doesNotMatch(label, /数据暂未取得|合计 0 tokens/);
+        assert.equal(
+          text(view.root.findByProps({ className: "chart-total" })),
+          "数据待核对 ›",
+        );
+        assert.equal(view.root.findByType(BalanceCard).props.todayCost, 0.15);
+        assert.equal(view.root.findByType(BalanceCard).props.monthCost, 0.15);
+      });
+      await render(detail(data, "other"), async (view) => {
+        const bar = chartBar(view, "2026-11-10");
+        assert.match(
+          bar.props["aria-label"],
+          new RegExp(`合计 ${futureTotal} tokens`),
+        );
+        assert.doesNotMatch(
+          bar.props["aria-label"],
+          /未知|未取得|超出安全整数/,
+        );
+        assert.match(
+          chartBar(view, "2026-11-09").props["aria-label"],
+          /合计 0 tokens/,
+        );
+        await act(async () => bar.props.onClick());
+        assert.equal(
+          text(
+            view.root
+              .findByProps({ className: "chart-inspector-head" })
+              .findByType("strong"),
+          ),
+          `${futureTotal} Tokens`,
+        );
+        if (futureTotal > 0) {
+          assert.match(bar.props["aria-label"], /其他 50/);
+          assert.equal(
+            text(view.root.findByProps({ title: "其他：50 Tokens" })),
+            "其他 50",
+          );
+        }
+      });
+      const exported = JSON.parse(exportJson());
+      assert.deepEqual(exported.missingDates, []);
+      assert.equal(exported.daily.length, 2);
+      const exportedFuture = exported.daily.find(
+        (row: any) => row.model === "future-model",
+      );
+      assert.equal(exportedFuture.totalTokens, futureTotal);
+      assert.equal(exportedFuture.cost, 0.05);
+      assert.equal(data.days[9].totalTokens, null);
+      assert.equal(exportJson(), jsonBefore);
+      assert.equal(JSON.stringify(data), before);
+    }
+  }
+});
+
+test("R27: other多个模型合计57只计一次，自身null与多模型超界在文字和aria均未知", async () => {
+  for (const [totals, expected, unsafe] of [
+    [[50, 7], 57, false],
+    [[50, null], null, false],
+    [[2 ** 52, 2 ** 52 - 1], Number.MAX_SAFE_INTEGER, false],
+    [[2 ** 52, 2 ** 52], null, true],
+  ] as const) {
+    const data = otherScopeFixture(
+      costOnlyRaw("pro"),
+      totals.map((total, index) => futureRaw(total, `future-model-${index}`)),
+      expected,
+    );
+    const before = JSON.stringify(data);
+    await render(detail(data, "other"), async (view) => {
+      const bar = chartBar(view, "2026-11-10");
+      if (expected == null) {
+        assert.match(bar.props["aria-label"], /合计未知/);
+        assert.match(bar.props["aria-label"], /其他 未知/);
+        assert.doesNotMatch(
+          bar.props["aria-label"],
+          /合计 0 tokens|数据暂未取得/,
+        );
+        if (unsafe) assert.match(bar.props["aria-label"], /超出安全整数范围/);
+        else assert.doesNotMatch(bar.props["aria-label"], /超出安全整数范围/);
+        await act(async () => bar.props.onClick());
+        assert.equal(
+          text(view.root.findByProps({ title: "其他：未知" })),
+          "其他 —",
+        );
+        assert.equal(
+          text(
+            view.root
+              .findByProps({ className: "chart-inspector-head" })
+              .findByType("strong"),
+          ),
+          "合计未知",
+        );
+      } else {
+        const precise = expected.toLocaleString("en-US");
+        assert.ok(bar.props["aria-label"].includes(`合计 ${precise} tokens`));
+        assert.ok(bar.props["aria-label"].includes(`其他 ${precise}`));
+        await act(async () => bar.props.onClick());
+        assert.ok(view.root.findByProps({ title: `其他：${precise} Tokens` }));
+      }
+    });
+    assert.equal(JSON.stringify(data), before);
+  }
+});
+
+test("R27: 旧差额保留50和真实0，矛盾/缺归属/缺源不能变成other实测0", async () => {
+  for (const totalTokens of [150, 100, 50]) {
+    const legacy = usage();
+    legacy.days[9] = day("2026-11-10", {
+      rawModels: [raw({ totalTokens: 100, cacheHitTokens: 100 })],
+      flashTokens: 100,
+      flashCacheHit: 100,
+      totalTokens,
+    });
+    await render(detail(legacy, "other"), async (view) => {
+      const bar = chartBar(view, "2026-11-10");
+      if (totalTokens >= 100) {
+        assert.match(
+          bar.props["aria-label"],
+          new RegExp(`合计 ${totalTokens - 100} tokens`),
+        );
+      } else {
+        assert.match(bar.props["aria-label"], /合计未知/);
+        assert.match(bar.props["aria-label"], /其他 未知/);
+        assert.doesNotMatch(bar.props["aria-label"], /合计 0 tokens/);
+      }
+      await act(async () => bar.props.onClick());
+      if (totalTokens === 150)
+        assert.equal(
+          text(view.root.findByProps({ title: "其他：50 Tokens" })),
+          "其他 50",
+        );
+      else if (totalTokens === 50)
+        assert.equal(
+          text(view.root.findByProps({ title: "其他：未知" })),
+          "其他 —",
+        );
+    });
+  }
+  for (const shape of ["missing-group", "empty", "missing"] as const) {
+    const data = otherScopeFixture(costOnlyRaw("flash"), [futureRaw(50)], 50);
+    if (shape === "missing-group") {
+      delete (data.days[9].rawModels![0] as { groupKey?: string | null })
+        .groupKey;
+    } else {
+      data.days[9].rawModels = shape === "empty" ? [] : undefined;
+    }
+    await render(detail(data, "other"), async (view) => {
+      const bar = chartBar(view, "2026-11-10");
+      assert.doesNotMatch(bar.props["aria-label"], /合计 (0|50) tokens/);
+      assert.match(
+        bar.props["aria-label"],
+        shape === "missing-group" ? /合计未知/ : /数据暂未取得/,
+      );
+      await act(async () => bar.props.onClick());
+      if (shape === "missing-group")
+        assert.equal(
+          text(view.root.findByProps({ title: "其他：未知" })),
+          "其他 —",
+        );
+      else
+        assert.ok(text(view.toJSON()).includes("尚未取得数据，不代表用量为零"));
+    });
+  }
+});
+
 test("R26: 后端缺计数的other=null保留—，纯总量溢出的other=7保留7，兄弟不受影响", async () => {
   for (const affected of ["flash", "pro"] as const) {
     const sibling = affected === "flash" ? "pro" : "flash";

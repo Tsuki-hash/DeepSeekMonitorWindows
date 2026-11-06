@@ -386,7 +386,7 @@ test("chartPointFromDay：单模型不含未识别模型差额", () => {
   assert.equal(pro.total, 999);
 });
 
-test("chartPointFromDay：other 档只含未接入模型量（合计 − flash − pro）", () => {
+test("chartPointFromDay：无目标raw的旧schema按安全差额取得other", () => {
   const sample: UsageDay = {
     ...returnedDay("2026-09-11"),
     flashTokens: 100,
@@ -394,7 +394,8 @@ test("chartPointFromDay：other 档只含未接入模型量（合计 − flash �
     flashCacheMiss: 40,
     proTokens: 20,
     proResponse: 20,
-    // 合计 150：flash 100 + pro 20 → 未接入模型 30，无分段明细
+    // 旧形状没有未接入模型 raw：150 − flash 100 − pro 20 = 30。
+    // 这是安全旧差额的兼容用例，不代表完整现代 raw 必须依赖全日总量。
     totalTokens: 150,
   };
   const point = chartPointFromDay(sample, "other");
@@ -405,16 +406,18 @@ test("chartPointFromDay：other 档只含未接入模型量（合计 − flash �
   assert.equal(point.total, 30);
 });
 
-test("chartPointFromDay：other 档在合计小于已知模型时夹到 0", () => {
-  // 防御：接口口径异常时不应出现负数柱高
+test("chartPointFromDay：旧schema合计小于已知模型时未知，不再夹成伪零", () => {
+  // R27 修复旧断言所接受的不可信行为：负差额证明来源矛盾，不能夹成真实0。
   const sample: UsageDay = {
     ...returnedDay("2026-09-11"),
     flashTokens: 100,
     totalTokens: 50,
   };
   const point = chartPointFromDay(sample, "other");
-  assert.equal(point.other, 0);
-  assert.equal(point.total, 0);
+  assert.equal(point.other, null);
+  assert.equal(point.total, null);
+  assert.equal(point.unavailable, true);
+  assert.equal(point.countIssue, "unknown");
 });
 
 test("大额货币展示保持紧凑，普通金额保留分位与币种", () => {
@@ -499,6 +502,7 @@ test("R14-08：HIT存在但MISS缺失时柱和近7日合计保持未知", () => 
 });
 
 test("R14-08：Pro未知不能污染完整Flash，all与差额other仍未知", () => {
+  // 没有明确的 other raw 行，只能依赖旧差额；Pro=null 时不能从空筛选造0。
   const completeFlash = returnedDay("2026-11-10", 100);
   completeFlash.flashCacheHit = 100;
   const partial: UsageDay = {
@@ -755,6 +759,10 @@ test("R26：未知模型缺值、坏值与超界为未知，安全兄弟分段�
     assert.equal(point.response, 0);
     assert.equal(chartPointFromDay(sample, "flash").total, 100);
     assert.equal(chartPointFromDay(sample, "pro").total, 0);
+    const other = chartPointFromDay(sample, "other");
+    assert.equal(other.other, null);
+    assert.equal(other.total, null);
+    assert.equal(other.countIssue, invalid == null ? "unknown" : "unsafe");
   }
 });
 
@@ -785,6 +793,10 @@ test("R26：多个未知组及已知other分别安全累加，MAX与超界1不�
       );
       if (!safe) assert.equal(point.countIssue, "unsafe");
       assert.equal(chartPointFromDay(sample, "pro").total, 0);
+      const other = chartPointFromDay(sample, "other");
+      assert.equal(other.total, safe ? Number.MAX_SAFE_INTEGER : null);
+      assert.equal(other.other, other.total);
+      if (!safe) assert.equal(other.countIssue, "unsafe");
     }
   }
   const combined = futureModelDay(Number.MAX_SAFE_INTEGER, 0);
@@ -798,6 +810,10 @@ test("R26：多个未知组及已知other分别安全累加，MAX与超界1不�
   assert.equal(chartPointFromDay(combined).other, null);
   assert.equal(chartPointFromDay(combined).countIssue, "unsafe");
   assert.equal(chartPointFromDay(combined, "flash").total, 1);
+  assert.equal(
+    chartPointFromDay(combined, "other").total,
+    Number.MAX_SAFE_INTEGER,
+  );
 });
 
 test("R26：空raw、旧group形状与不可归属差额不能创造other零", () => {
@@ -810,10 +826,12 @@ test("R26：空raw、旧group形状与不可归属差额不能创造other零", (
   delete (legacy.rawModels![1] as { groupKey?: string | null }).groupKey;
   assert.equal(chartPointFromDay(legacy).other, null);
   assert.equal(chartPointFromDay(legacy).total, null);
+  assert.equal(chartPointFromDay(legacy, "other").total, null);
   const unassigned = futureModelDay();
   unassigned.rawModels = [unassigned.rawModels![0]];
   assert.equal(chartPointFromDay(unassigned).other, null);
   assert.equal(chartPointFromDay(unassigned).total, null);
+  assert.equal(chartPointFromDay(unassigned, "other").total, 50);
   unassigned.flashCacheMiss = 0;
   assert.equal(chartPointFromDay(unassigned).other, 50);
   assert.equal(chartPointFromDay(unassigned).total, 150);
@@ -848,5 +866,180 @@ test("R26：缺MISS且总量仅因溢出未知时，已证明安全的other=7或
     assert.equal(point.total, null);
     assert.equal(point.countIssue, "unsafe");
     assert.equal(chartPointFromDay(sample, "pro").total, 0);
+  }
+});
+
+test("R27：费用侧Flash/Pro缺计数不污染明确future的50与真实0，自身null仍未知", () => {
+  for (const affected of ["flash", "pro"] as const) {
+    for (const futureTotal of [50, 0, null]) {
+      const future = futureModelDay(futureTotal).rawModels![1];
+      const costOnly = {
+        ...returnedDay("2026-11-10").rawModels![0],
+        model: affected === "flash" ? "deepseek-flash" : "deepseek-v4-pro",
+        groupKey: affected,
+        totalTokens: null,
+        requestCount: null,
+        cacheHitTokens: null,
+        cacheMissTokens: null,
+        responseTokens: null,
+        otherTokens: null,
+        cost: 0.1,
+      };
+      const sample: UsageDay = {
+        ...returnedDay("2026-11-10", 0, 0.15),
+        rawModels: [costOnly, future],
+        [`${affected}Tokens`]: null,
+        [`${affected}CacheHit`]: null,
+        [`${affected}CacheMiss`]: null,
+        [`${affected}Response`]: null,
+        [`${affected}OtherTokens`]: null,
+        totalTokens: null,
+      };
+      const before = JSON.stringify(sample);
+      const point = chartPointFromDay(sample, "other");
+      assert.equal(point.total, futureTotal);
+      assert.equal(point.other, futureTotal);
+      assert.equal(point.unavailable, futureTotal == null);
+      assert.equal(
+        point.countIssue,
+        futureTotal == null ? "unknown" : undefined,
+      );
+      assert.equal(point.hit, 0);
+      assert.equal(point.miss, 0);
+      assert.equal(point.response, 0);
+      assert.equal(chartTotal([point]), futureTotal);
+      assert.equal(chartPointFromDay(sample).total, null, "全日仍未知");
+      assert.equal(chartPointFromDay(sample, affected).total, null);
+      assert.equal(
+        chartPointFromDay(sample, affected === "flash" ? "pro" : "flash").total,
+        0,
+      );
+      assert.equal(hasReturnedUsageDay(sample), true);
+      assert.equal(sample.totalCost, 0.15);
+      assert.equal(JSON.stringify(sample), before);
+    }
+  }
+});
+
+test("R27：Flash MAX加future50导致全日超界，或Flash自身溢出，other仍为50", () => {
+  for (const flashOverflow of [false, true]) {
+    const sample = futureModelDay(50, 0);
+    sample.flashCacheHit = Number.MAX_SAFE_INTEGER;
+    sample.flashResponse = flashOverflow ? 1 : 0;
+    sample.flashTokens = flashOverflow ? null : Number.MAX_SAFE_INTEGER;
+    sample.totalTokens = null;
+    sample.rawModels![0] = {
+      ...sample.rawModels![0],
+      cacheHitTokens: sample.flashCacheHit,
+      responseTokens: sample.flashResponse,
+      totalTokens: sample.flashTokens,
+    };
+    const before = JSON.stringify(sample);
+    assert.equal(chartPointFromDay(sample).total, null);
+    assert.equal(chartPointFromDay(sample).countIssue, "unsafe");
+    assert.equal(chartPointFromDay(sample).other, 50);
+    assert.equal(chartPointFromDay(sample, "flash").total, sample.flashTokens);
+    const other = chartPointFromDay(sample, "other");
+    assert.equal(other.total, 50);
+    assert.equal(other.other, 50);
+    assert.equal(other.unavailable, false);
+    assert.equal(other.countIssue, undefined);
+    assert.equal(JSON.stringify(sample), before);
+  }
+});
+
+test("R27：多个other原始模型只各计一次，自身缺值/超界不被安全兄弟或旧差额掩盖", () => {
+  for (const second of [0, 7, null, Number.MAX_SAFE_INTEGER]) {
+    const sample = futureModelDay(50, 0);
+    sample.rawModels!.push({
+      ...sample.rawModels![1],
+      model: "another-future-model",
+      groupKey: "future-group",
+      totalTokens: second,
+      responseTokens: second,
+    });
+    sample.totalTokens = second == null || second > 7 ? null : 150 + second;
+    const point = chartPointFromDay(sample, "other");
+    const expected = second == null || second > 7 ? null : 50 + second;
+    assert.equal(point.total, expected);
+    assert.equal(point.other, expected);
+    assert.equal(point.unavailable, expected == null);
+    assert.equal(
+      point.countIssue,
+      second == null ? "unknown" : second > 7 ? "unsafe" : undefined,
+    );
+    assert.equal(chartPointFromDay(sample, "flash").total, 100);
+  }
+});
+
+test("R27：来源/归属不可证明完整时other保持未知，不能空筛选造0或重复计数", () => {
+  for (const rawModels of [undefined, []]) {
+    const point = chartPointFromDay(
+      { ...futureModelDay(), rawModels },
+      "other",
+    );
+    assert.equal(point.total, null);
+    assert.equal(point.other, null);
+    assert.equal(point.unavailable, true);
+  }
+  const unassigned = futureModelDay(50, 0);
+  delete (unassigned.rawModels![0] as { groupKey?: string | null }).groupKey;
+  const missingGroup = futureModelDay(50, 0);
+  delete (missingGroup.rawModels![1] as { groupKey?: string | null }).groupKey;
+  const duplicate = futureModelDay(50, 0);
+  duplicate.rawModels!.push({ ...duplicate.rawModels![1] });
+  const conflictingGroup = futureModelDay(50, 0);
+  conflictingGroup.rawModels!.push({
+    ...conflictingGroup.rawModels![1],
+    groupKey: "flash",
+  });
+  const incomplete = futureModelDay(50, 0);
+  incomplete.totalTokens = 175; // raw只解释150；不能把50当作完整other。
+  const noOther = futureModelDay(50, 0);
+  noOther.rawModels = [noOther.rawModels![0]];
+  noOther.totalTokens = null;
+  for (const sample of [
+    unassigned,
+    missingGroup,
+    duplicate,
+    conflictingGroup,
+    incomplete,
+    noOther,
+  ]) {
+    const before = JSON.stringify(sample);
+    const point = chartPointFromDay(sample, "other");
+    assert.equal(point.total, null);
+    assert.equal(point.other, null);
+    assert.equal(point.unavailable, true);
+    assert.equal(point.countIssue, "unknown");
+    assert.equal(hasReturnedUsageDay(sample), true);
+    assert.equal(JSON.stringify(sample), before);
+  }
+});
+
+test("R27：旧差额路径保留真实0与50，但任一参与总量未知或超界不能造已知other", () => {
+  for (const total of [50, 100, 150, null, 2 ** 53]) {
+    const sample = countedDay("2026-11-10", 100);
+    sample.totalTokens = total;
+    const point = chartPointFromDay(sample, "other");
+    assert.equal(
+      point.total,
+      total == null || total < 100 || total > 150 ? null : total - 100,
+    );
+    assert.equal(point.other, point.total);
+  }
+  const unsafeRaw = countedDay("2026-11-10", 100);
+  unsafeRaw.rawModels![0].totalTokens = 2 ** 53;
+  assert.equal(chartPointFromDay(unsafeRaw, "other").countIssue, "unsafe");
+  const conflictingRaw = countedDay("2026-11-10", 10);
+  conflictingRaw.flashTokens = 0;
+  conflictingRaw.proTokens = 10;
+  assert.equal(chartPointFromDay(conflictingRaw, "other").total, null);
+  for (const groupKey of ["flash", "pro"]) {
+    const repeated = countedDay("2026-11-10", 100);
+    repeated.rawModels!.push({ ...repeated.rawModels![0], groupKey });
+    const point = chartPointFromDay(repeated, "other");
+    assert.equal(point.total, null, "旧差额不能掩盖重复身份或跨组同名冲突");
+    assert.equal(point.countIssue, "unknown");
   }
 });

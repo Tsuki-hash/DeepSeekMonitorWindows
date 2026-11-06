@@ -779,6 +779,17 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 月来源表保留每位数字；窄窗/放大时换行，不以省略号或 K/M 替代精确值。 */
+.history-source-months caption {
+  text-align: left;
+  margin-top: 8px;
+  color: var(--text-strong);
+}
+.history-source-months .month-token-exact {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
 .history-export {
   display: flex;
   align-items: center;
@@ -2311,6 +2322,22 @@ button:disabled:hover {
 .detail-scroll .metric-card strong {
   overflow: visible;
   white-space: normal;
+  overflow-wrap: anywhere;
+}
+.detail-scroll .metric-card .month-token-exact {
+  font-size: 20px;
+  line-height: 1.35;
+}
+.detail-metrics [role="group"]:focus-visible {
+  /* 焦点环留在卡片内，避免被 detail-scroll 的滚动边界裁切。 */
+  outline-offset: -2px;
+}
+.month-source-note {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 @media (max-width: 340px) {

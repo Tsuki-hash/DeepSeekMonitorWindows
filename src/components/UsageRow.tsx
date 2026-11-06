@@ -23,10 +23,12 @@ function UsageRow({
   // 显示名优先取后端 model_slot 的 name，避免前后端双源漂移
   const name =
     data?.name ?? (isFlash ? "V4.1 Flash" : isOther ? "其他" : "V4 Pro");
+  const monthDescriptionId = React.useId();
   // 这一行只有约 115px 给 token 数，千万级以上再写精确千分位会溢出成省略号，
-  // 因此大数用紧凑写法，精确值仍可通过图表按钮的无障碍标签与明细标题查看。
-  // totalTokens 为 null 表示平台没给或无法解析 —— 不能写成 0 Tokens。
-  const totalTokens = data?.totalTokens ?? null;
+  // 因此大数用紧凑写法。整行原生按钮可用 Enter/Space 打开常显完整月值的详情；
+  // 同源月值也作为按钮描述提供给读屏，不借用近 7 日图表的合计。
+  // 缺项或不安全计数都是未知，不能把溢出/小数格式化成貌似精确的整数。
+  const totalTokens = sumUsageCounts([data?.totalTokens]).total;
   const tokensText =
     totalTokens == null
       ? data
@@ -59,7 +61,15 @@ function UsageRow({
   const hitRate = cacheInput != null && cacheInput > 0 ? cacheInput : null;
 
   return (
-    <button className="card usage-row" onClick={onClick}>
+    <button
+      type="button"
+      className="card usage-row"
+      onClick={onClick}
+      aria-describedby={monthDescriptionId}
+    >
+      <span id={monthDescriptionId} hidden>
+        {`${name}，平台本月 Tokens：${totalTokens == null ? "未知" : fmtInt(totalTokens)}。打开详情查看完整月值；此数值不是近 7 日合计。`}
+      </span>
       <div className={`model-badge ${tint}`}>
         {isFlash ? (
           <Zap size={27} fill="currentColor" />
@@ -74,7 +84,7 @@ function UsageRow({
           <span className="model-name" title={name}>
             {name}
           </span>
-          <small className="model-period">本月</small>
+          <small className="model-period">本月 ›</small>
         </h2>
         <div className="token-line">
           <span

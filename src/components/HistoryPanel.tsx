@@ -1,7 +1,14 @@
 import React from "react";
 import { HistoryTrend } from "./HistoryTrend";
 import { ArrowLeft, Download, RefreshCw } from "lucide-react";
-import { todayStr, fmtTokensShort, fmtMoneyDisplay, mmdd } from "../format";
+import {
+  todayStr,
+  fmtInt,
+  fmtTokensShort,
+  fmtMoneyDisplay,
+  mmdd,
+} from "../format";
+import { sumUsageCounts } from "../usage-counts";
 import { historyDateLabel } from "../history-date-label";
 import { mergeHistoryMonths } from "../history-merge";
 import type { HistoryScope } from "../history-merge";
@@ -840,7 +847,7 @@ export function HistoryPanel({
                 </tbody>
               </table>
             </details>
-            <details className="history-details">
+            <details className="history-details history-source-months">
               <summary>平台原始月汇总 · 独立来源口径</summary>
               <p>
                 以下保留平台月接口原值，可能包含未返回每日明细的用量，不能当作上方已返回日合计。
@@ -848,27 +855,37 @@ export function HistoryPanel({
                 sourceMonthlySnapshots。
               </p>
               <table>
+                <caption>平台原始月汇总 · Tokens 为完整数值</caption>
                 <thead>
                   <tr>
-                    <th>来源月份 / 模型</th>
-                    <th>原始月 Tokens</th>
-                    <th>原始月费用</th>
+                    <th scope="col">来源月份 / 模型</th>
+                    <th scope="col">原始月 Tokens</th>
+                    <th scope="col">原始月费用</th>
                   </tr>
                 </thead>
                 <tbody>
                   {snapshot.months.flatMap((month) =>
                     (month.usage.rawModels ?? [])
                       .filter((model) => !selected || model.model === selected)
-                      .map((model) => (
-                        <tr key={`${month.month}-${model.model}`}>
-                          <td>
-                            {month.month}
-                            <span title={model.model}>{model.model}</span>
-                          </td>
-                          <td>{valueText(model.totalTokens, "totalTokens")}</td>
-                          <td>{valueText(model.cost, "cost")}</td>
-                        </tr>
-                      )),
+                      .map((model) => {
+                        const total = sumUsageCounts([model.totalTokens]).total;
+                        const exact = total == null ? "未知" : fmtInt(total);
+                        return (
+                          <tr key={`${month.month}-${model.model}`}>
+                            <td>
+                              {month.month}
+                              <span title={model.model}>{model.model}</span>
+                            </td>
+                            <td
+                              className="month-token-exact"
+                              aria-label={`${month.month}，${model.model}，平台原始月 Tokens：${exact}`}
+                            >
+                              {exact}
+                            </td>
+                            <td>{valueText(model.cost, "cost")}</td>
+                          </tr>
+                        );
+                      }),
                   )}
                 </tbody>
               </table>

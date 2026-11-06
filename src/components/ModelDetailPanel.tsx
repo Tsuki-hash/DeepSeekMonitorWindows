@@ -5,13 +5,13 @@ import {
   fmtInt,
   fmtMoney,
   fmtMoneyDisplay,
-  fmtTokensShort,
   mmdd,
   recentUsageDays,
 } from "../format";
 import type { LoadState, ModelName, UsageResult } from "../types";
 import { updateTime } from "../data-display";
 import { usageNotices } from "../usage-notices";
+import { sumUsageCounts } from "../usage-counts";
 import { StackedBarChart } from "./StackedBarChart";
 
 function ModelDetailPanel({
@@ -40,10 +40,13 @@ function ModelDetailPanel({
   const title =
     data?.name ?? (isFlash ? "V4.1 Flash" : isOther ? "其他" : "V4 Pro");
   const tintClass = isFlash ? "flash" : isOther ? "other" : "pro";
-  // 费用/计数为 null 表示未取得：显示「—」，不能显示成 ¥0.00 / 0 Tokens。
+  // 费用/请求数为 null 表示未取得：显示「—」，不能显示成 ¥0.00 / 0。
   const cost = data?.cost != null ? fmtMoneyDisplay(data.cost) : "—";
-  const totalText =
-    data?.totalTokens != null ? fmtTokensShort(data.totalTokens) : "—";
+  // 月数值只读月槽位；下方日图表即使完整，也不能代替平台月汇总。
+  const totalTokens = sumUsageCounts([data?.totalTokens]).total;
+  const totalText = totalTokens == null ? "未知" : fmtInt(totalTokens);
+  const monthValueId = React.useId();
+  const monthSourceId = React.useId();
 
   const now = new Date();
   const days = recentUsageDays(
@@ -109,9 +112,24 @@ function ModelDetailPanel({
               {data?.requestCount != null ? fmtInt(data.requestCount) : "—"}
             </strong>
           </article>
-          <article className="card metric-card">
+          <article
+            className="card metric-card"
+            data-testid="month-token-metric"
+            role="group"
+            tabIndex={0}
+            aria-label={`${title}，平台本月 Tokens 完整数值`}
+            aria-describedby={`${monthValueId} ${monthSourceId}`}
+          >
             <span>本月 Tokens</span>
-            <strong className={tintClass}>{totalText}</strong>
+            <strong
+              id={monthValueId}
+              className={`${tintClass} month-token-exact`}
+            >
+              {totalText}
+            </strong>
+            <small id={monthSourceId} className="month-source-note">
+              完整数值 · 平台月汇总，非近 7 日合计
+            </small>
           </article>
         </div>
 

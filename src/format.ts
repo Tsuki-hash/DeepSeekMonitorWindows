@@ -194,6 +194,82 @@ export type ChartPoint = {
 export const CHART_TOTAL_UNSAFE_REASON =
   "近7日 Token 计数或合计超出安全整数范围，合计未知；已知日期与分段保留";
 
+/** 未接入模型独立计数；全日/兄弟槽位的未知不代表本组未知。 */
+function otherUsageCount(day: UsageDay): UsageCountSum {
+  const models = day.rawModels!;
+  // 现代 raw 是数量/费用两侧模型的并集，groupKey=null 明确表示未接入。
+  // 缺失归属的旧行也可能属于 other，不能筛掉后把部分和当作完整值。
+  if (
+    models.some(
+      (model) =>
+        model.groupKey !== null &&
+        (typeof model.groupKey !== "string" || !model.groupKey.trim()),
+    )
+  )
+    return { total: null, issue: "unknown" };
+  const otherModels = models.filter(
+    (model) => model.groupKey !== "flash" && model.groupKey !== "pro",
+  );
+  if (otherModels.length > 0) {
+    // 后端按原始模型身份合并。重复或跨组同名的行不能重复计数，也不能
+    // 擅自取其中一条；此时无法证明 other 的归属与来源完整。
+    if (
+      otherModels.some(
+        (model) =>
+          typeof model.model !== "string" ||
+          !model.model.trim() ||
+          models.filter((row) => row.model === model.model).length !== 1,
+      )
+    )
+      return { total: null, issue: "unknown" };
+    const other = sumUsageCounts(otherModels.map((model) => model.totalTokens));
+    if (other.total == null) return other;
+    // 若旧/不完整快照的安全聚合明确与 raw 不符，不把 raw 部分和升格。
+    // 只在两侧都可比较时检查；兄弟缺计数或全日超界不否定本组安全值。
+    const total = sumUsageCounts([day.totalTokens]);
+    const known = sumUsageCounts([day.flashTokens, day.proTokens]);
+    if (
+      total.total != null &&
+      known.total != null &&
+      total.total - known.total !== other.total
+    )
+      return { total: null, issue: "unknown" };
+    return other;
+  }
+  // 没有目标 raw 行不能靠空数组求和创造 0。保留旧 schema 的差额路径，
+  // 但只有全部原始计数、全日与两个槽位都安全已知时才能使用（含真实0）。
+  if (
+    models.some(
+      (model) => typeof model.model !== "string" || !model.model.trim(),
+    ) ||
+    new Set(models.map((model) => model.model)).size !== models.length
+  )
+    return { total: null, issue: "unknown" };
+  const checks = [
+    sumUsageCounts(models.map((model) => model.totalTokens)),
+    sumUsageCounts([day.totalTokens]),
+    sumUsageCounts([day.flashTokens, day.proTokens]),
+  ];
+  if (checks.some((check) => check.issue === "unsafe"))
+    return { total: null, issue: "unsafe" };
+  if (checks.some((check) => check.total == null))
+    return { total: null, issue: "unknown" };
+  // 旧 raw 可以缺少行，但不能反过来超过其已知槽位；负差额也不是实测0。
+  if (
+    checks[1].total! < checks[2].total! ||
+    (["flash", "pro"] as const).some(
+      (scope) =>
+        sumUsageCounts(
+          models
+            .filter((model) => model.groupKey === scope)
+            .map((model) => model.totalTokens),
+        ).total! > (scope === "flash" ? day.flashTokens! : day.proTokens!),
+    )
+  )
+    return { total: null, issue: "unknown" };
+  return sumUsageCounts([checks[1].total! - checks[2].total!]);
+}
+
 /**
  * 把单日用量映射成柱状图数据点。
  *
@@ -201,8 +277,8 @@ export const CHART_TOTAL_UNSAFE_REASON =
  * 未识别 rawModels 的安全总量先独立并入 other，保留缺段时已知的新模型用量；
  * 仅完整安全分段才能把总量的剩余差额并入 other，且不能重复累加 rawModels。
  * 单模型（flash/pro）按分段求和，但不能绕过后端槽位总量的未知状态。
- * `scope === "other"` 是未接入模型的兜底档：平台不给分段明细，
- * 按日量 = 当日合计 − flash − pro，柱子只有一段。
+ * `scope === "other"` 按明确的非 Flash/Pro 原始模型独立安全累加，
+ * 柱子只有一段；没有目标 raw 行时才尝试完整安全的旧聚合差额。
  *
  * 任一参与计算的字段为 `null` 时返回 `unavailable: true`：接口缺项与真实零用量
  * 在图上必须是两种不同的显示。
@@ -221,14 +297,30 @@ export const chartPointFromDay = (
     total: null,
   };
   if (!hasReturnedUsageDay(day)) return unknown;
+  if (scope === "other") {
+    const other = otherUsageCount(day);
+    return {
+      ...unknown,
+      hit: 0,
+      miss: 0,
+      response: 0,
+      other: other.total,
+      total: other.total,
+      unavailable: other.total == null,
+      ...(other.issue && {
+        countIssue: other.issue,
+        unavailableReason:
+          other.issue === "unsafe"
+            ? "Token 计数或合计超出安全整数范围，合计未知；已知分段保留"
+            : "部分 Token 计数未取得或无法汇总，合计未知；已知分段保留",
+      }),
+    };
+  }
   // 非空原始行及后端槽位的未知/超界不能被分段和或旧版聚合零掩盖。
   // 单槽位仅检查所属模型，不能让异常 Flash 污染合法 Pro（反之亦然）。
   const rawTotal = sumUsageCounts(
     day
-      .rawModels!.filter(
-        (model) =>
-          scope === "all" || scope === "other" || model.groupKey === scope,
-      )
+      .rawModels!.filter((model) => scope === "all" || model.groupKey === scope)
       .map((model) => model.totalTokens),
   );
   const slotTotals = (
@@ -281,17 +373,11 @@ export const chartPointFromDay = (
       ? sumUsageCounts([day.flashOtherTokens])
       : scope === "pro"
         ? sumUsageCounts([day.proOtherTokens])
-        : scope === "all"
-          ? sumUsageCounts([
-              day.flashOtherTokens,
-              day.proOtherTokens,
-              rawOther.total,
-            ])
-          : knownSlots.total == null || slotTotals[0].total == null
-            ? { total: null, issue: knownSlots.issue ?? slotTotals[0].issue }
-            : sumUsageCounts([
-                Math.max(0, slotTotals[0].total - knownSlots.total),
-              ]);
+        : sumUsageCounts([
+            day.flashOtherTokens,
+            day.proOtherTokens,
+            rawOther.total,
+          ]);
   // 旧聚合可能有未归属差额，却没有对应的 raw 模型行。缺段时无法使用
   // 「日总量 − 全部分段」辨认来源，不得把空 raw 筛选误当成确定的 other=0。
   // 只有安全日总量明确多出一部分才算差额证据，total=null 不能清掉已知 other。
@@ -316,7 +402,7 @@ export const chartPointFromDay = (
   const checks = [
     rawTotal,
     ...slotTotals,
-    ...(scope === "all" || scope === "other" ? [knownSlots] : []),
+    ...(scope === "all" ? [knownSlots] : []),
     ...(scope === "all" ? [rawOther] : []),
     hit,
     miss,
