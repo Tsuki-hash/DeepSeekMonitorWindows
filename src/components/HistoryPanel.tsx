@@ -31,6 +31,7 @@ import {
   failedMonthsOnly,
 } from "../history-failure";
 import type { HistoryRange, HistorySnapshot } from "../history";
+import type { WindowVisibilityGate } from "../window-visibility-gate";
 
 // 复评 R17：顶部/趋势合计改用共享的安全版本（Token 检查安全整数，
 // 金额只检查有限），不再用裸 reduce 产生不安全整数。
@@ -51,6 +52,8 @@ export function HistoryPanel({
   onConfigureUsage,
   usageTokenConfigured = true,
   windowVisible = true,
+  windowVisibilityGate,
+  visibilityError = false,
 }: {
   onBack: () => void;
   /** 直接打开并定位到用量 Token 设置（复评 F10：不能只回首页）。 */
@@ -59,6 +62,9 @@ export function HistoryPanel({
   usageTokenConfigured?: boolean;
   /** Native tray visibility; a hidden WebView remains mounted. */
   windowVisible?: boolean;
+  /** App-owned synchronous revocation, not a render-time visibility mirror. */
+  windowVisibilityGate?: WindowVisibilityGate;
+  visibilityError?: boolean;
 }) {
   const [range, setRange] = React.useState<HistoryRange>("month");
   const [selectedMonth, setSelectedMonth] = React.useState(
@@ -94,6 +100,19 @@ export function HistoryPanel({
   const requestInProgress = React.useRef(false);
   const needsInitialQuery = React.useRef(true);
   const sequence = React.useRef({ value: 0 });
+  const stopForVisibility = React.useCallback(() => {
+    sequence.current.value++;
+    if (!requestInProgress.current) return;
+    requestInProgress.current = false;
+    setBusy(false);
+    setError(
+      "窗口已隐藏或状态未确认，后续月份查询已停止；已取得记录保留，恢复后可重新查询或继续加载。",
+    );
+  }, []);
+  React.useEffect(
+    () => windowVisibilityGate?.subscribeInvalidation(stopForVisibility),
+    [windowVisibilityGate, stopForVisibility],
+  );
   // 全部历史分批加载（评审 P2）：先查最近一批，明确「还有更早月份未加载」，
   // 不把未加载误当成「平台没有记录」。分页边界独立于成功数据：已完成的
   // 月级失败也推进 attemptedFrom，失败状态另存并保留单独重试入口。
@@ -120,7 +139,9 @@ export function HistoryPanel({
     ) => {
       // Date ticks and hidden windows cannot initiate a query. An explicit
       // refresh/show reads the current date, rather than a captured render date.
-      if (!visibleRef.current) return;
+      if (!visibleRef.current || windowVisibilityGate?.isVisible() === false)
+        return;
+      const visibilityEpoch = windowVisibilityGate?.epoch();
       const id = ++sequence.current.value;
       const requestedEpoch = historyCache.epoch();
       const window = historyWindow(range, todayStr(), selectedMonth);
@@ -198,6 +219,8 @@ export function HistoryPanel({
       // 旧请求在切换范围/取消/换凭据后返回，只能丢弃，不得覆盖新状态。
       const stillOwner = () =>
         visibleRef.current &&
+        windowVisibilityGate?.isVisible() !== false &&
+        windowVisibilityGate?.epoch() === visibilityEpoch &&
         id === sequence.current.value &&
         requestedEpoch === historyCache.epoch() &&
         scopeEpoch.current === requestedScope.epoch;
@@ -326,7 +349,7 @@ export function HistoryPanel({
       requestInProgress.current = false;
       setBusy(false);
     },
-    [range, selectedMonth],
+    [range, selectedMonth, windowVisibilityGate],
   );
   React.useEffect(() => {
     // Only an actual range/month selection or credential epoch clears data.
@@ -358,14 +381,7 @@ export function HistoryPanel({
     const wasVisible = previousVisible.current;
     previousVisible.current = windowVisible;
     if (!windowVisible) {
-      sequence.current.value++;
-      if (requestInProgress.current) {
-        requestInProgress.current = false;
-        setBusy(false);
-        setError(
-          "窗口已隐藏，后续月份查询已停止；已取得记录保留，可重新查询或继续加载。",
-        );
-      }
+      stopForVisibility();
       return;
     }
     if (wasVisible) return;
@@ -393,7 +409,7 @@ export function HistoryPanel({
         changedMonths.length ? changedMonths : nextWindow.months.slice(-1),
       );
     }
-  }, [windowVisible, range, selectedMonth, request]);
+  }, [windowVisible, range, selectedMonth, request, stopForVisibility]);
   React.useEffect(() => {
     const tick = () => setClock(Date.now());
     const timer = window.setInterval(tick, 60000);
@@ -580,12 +596,19 @@ export function HistoryPanel({
         <button
           className="history-icon-button"
           aria-label="重新查询历史"
-          disabled={busy}
+          disabled={busy || !windowVisible}
           onClick={() => void request(true)}
         >
           <RefreshCw size={18} className={busy ? "refresh-spin" : undefined} />
         </button>
       </header>
+      {!windowVisible && (
+        <p className="history-message warning" role="status">
+          {visibilityError
+            ? "无法确认窗口状态，历史查询已暂停。请先点击上方“重试窗口状态”；已取得记录保留。"
+            : "窗口不可见或状态尚未确认，历史查询已暂停。确认窗口可见后可重新查询；已取得记录保留。"}
+        </p>
+      )}
       <div className="history-range" role="group" aria-label="历史统计区间">
         {(
           [
@@ -598,6 +621,7 @@ export function HistoryPanel({
         ).map(([value, label]) => (
           <button
             key={value}
+            disabled={!windowVisible}
             aria-pressed={range === value}
             onClick={() => setRange(value)}
           >
@@ -610,6 +634,7 @@ export function HistoryPanel({
           月份
           <input
             type="month"
+            disabled={!windowVisible}
             aria-label="历史月份"
             min="2020-01"
             max={date.slice(0, 7)}
@@ -634,7 +659,7 @@ export function HistoryPanel({
           {earlierUnloaded.length > 0 ? (
             <button
               className="link-button"
-              disabled={busy}
+              disabled={busy || !windowVisible}
               onClick={() => void request(false, null, true)}
             >
               继续加载更早月份 ›
@@ -643,7 +668,7 @@ export function HistoryPanel({
           {pendingLoadedMonths.length > 0 && (
             <button
               className="link-button"
-              disabled={busy}
+              disabled={busy || !windowVisible}
               onClick={() => void request(true, pendingLoadedMonths)}
             >
               补查未加载月份（{pendingLoadedMonths.length}）
@@ -753,14 +778,18 @@ export function HistoryPanel({
               </button>
             )}
             {recoveryAction === "refresh" && (
-              <button className="secondary" onClick={() => void request(true)}>
+              <button
+                className="secondary"
+                disabled={!windowVisible}
+                onClick={() => void request(true)}
+              >
                 重新查询当前区间
               </button>
             )}
             {retryableFailed.length > 0 && recoveryAction !== "refresh" && (
               <button
                 className="secondary"
-                disabled={busy}
+                disabled={busy || !windowVisible}
                 // 第五轮复评 N01：失败月份重试必须 force —— 否则 5 分钟 TTL 内
                 // 会直接命中旧成功缓存，不发出请求却把旧值当本次成功，
                 // 清掉 failed/error 表现成「已恢复」。

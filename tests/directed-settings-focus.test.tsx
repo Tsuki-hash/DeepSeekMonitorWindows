@@ -13,8 +13,8 @@ import { invalidateUsageRequests } from "../src/usage-api";
 import { draftGuardActions } from "../src/draft-guard";
 import type { AppConfig, UsageResult } from "../src/types";
 
-// R29: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
-// observes every open/scroll/focus, including child refs if they are reintroduced.
+// R29/R30: real App + SettingsPanel, synthetic refs/events/RAF/IPC only. The mock
+// records open/scrollIntoView/focus, including child refs if reintroduced.
 // It does not implement navigation or cancellation decisions for the component.
 // No DOM, native keyboard, WebView2, StrictEffects or screen reader is exercised.
 const g = globalThis as any;
@@ -86,12 +86,13 @@ class FocusNode {
     return { usageModel: this.host.props["data-usage-model"] };
   }
   get disabled() {
-    return Boolean(this.host.props.disabled);
+    return !this.isConnected || Boolean(this.host.props.disabled);
   }
   get open() {
-    return this.opened || Boolean(this.host.props.open);
+    return this.isConnected && (this.opened || Boolean(this.host.props.open));
   }
   set open(value: boolean) {
+    if (!this.isConnected) return;
     this.opened = value;
     if (value) openLog.push(this.label);
   }
@@ -102,10 +103,23 @@ class FocusNode {
     return this.isConnected && !this.hidden ? [{}] : [];
   }
   setAttribute(name: string, value: string) {
+    if (!this.isConnected) return;
     this.attributes.set(name, value);
   }
+  scrollTo() {}
   scrollIntoView() {
+    if (!this.isConnected) return;
     scrollLog.push(this.label);
+  }
+  contains(node: FocusNode) {
+    return (
+      this.isConnected &&
+      node.isConnected &&
+      this.host.findAll((host: any) => host === node.host).length > 0
+    );
+  }
+  querySelector(selector: string) {
+    return this.isConnected ? select(selector, this.host) : null;
   }
   focus() {
     if (!this.isConnected || this.disabled || this.hidden) return;
@@ -119,63 +133,45 @@ function nodeFor(host: any): FocusNode {
   if (!nodes.has(host)) nodes.set(host, new FocusNode(host));
   return nodes.get(host)!;
 }
-function select(selector: string) {
+function select(selector: string, root: any) {
+  const candidates = root.findAll((node: any) => typeof node.type === "string");
   const directed = selector.match(/data-settings-focus=["'](\w+)["']/);
   const disclosure = selector.match(/data-settings-disclosure=["'](\w+)["']/);
   const model = selector.match(/data-usage-model=["'](\w+)["']/);
   const host = directed
-    ? hosts().find((node) => node.props["data-settings-focus"] === directed[1])
+    ? candidates.find(
+        (node: any) => node.props["data-settings-focus"] === directed[1],
+      )
     : disclosure
-      ? hosts().find(
-          (node) => node.props["data-settings-disclosure"] === disclosure[1],
+      ? candidates.find(
+          (node: any) =>
+            node.props["data-settings-disclosure"] === disclosure[1],
         )
       : model
-        ? hosts().find(
-            (node) =>
+        ? candidates.find(
+            (node: any) =>
               node.type === "button" &&
               node.props["data-usage-model"] === model[1],
           )
-        : hosts().find((node) => node.type === "h1");
+        : selector === "button"
+          ? candidates.find((node: any) => node.type === "button")
+          : candidates.find((node: any) => node.type === "h1");
   return host ? nodeFor(host) : null;
 }
-const stage = {
-  get isConnected() {
-    return renderer !== null;
-  },
-  contains: (node: FocusNode) => node.isConnected,
-  querySelector: select,
-};
-// Resolve real ref hosts lazily after commit. This also observes an accidental
-// reintroduction of SettingsPanel's independent RAF instead of hiding it behind
-// no-op child refs. LeavePromptDialog's own focus remains observable separately.
+// R30: bind once at ref attachment, while the committed host still has these
+// props. ReactTestInstance identity survives updates; props object identity does
+// not. Never re-resolve an old ref by selector: an identical replacement belongs
+// to a different mount. This observes synthetic operations, not native DOM.
 function refMock(element: any) {
-  if (element.props.className?.startsWith("stage ")) return stage;
-  const host = () =>
-    hosts().find(
-      (node) => node.type === element.type && node.props === element.props,
-    );
-  return {
-    get isConnected() {
-      return Boolean(host());
-    },
-    get open() {
-      return host() ? nodeFor(host()).open : false;
-    },
-    set open(value: boolean) {
-      if (host()) nodeFor(host()).open = value;
-    },
-    scrollTo: noop,
-    scrollIntoView: () => host() && nodeFor(host()).scrollIntoView(),
-    setAttribute: (name: string, value: string) =>
-      host() && nodeFor(host()).setAttribute(name, value),
-    focus: () => host() && nodeFor(host()).focus(),
-    querySelector: (selector: string) => {
-      const selected = host()?.findAll(
-        (node: any) => node.type === selector,
-      )[0];
-      return selected ? nodeFor(selected) : null;
-    },
-  };
+  const matches = hosts().filter(
+    (node) => node.type === element.type && node.props === element.props,
+  );
+  assert.equal(
+    matches.length,
+    1,
+    "A ref must bind to one committed host, never a silent no-op or alias",
+  );
+  return nodeFor(matches[0]);
 }
 g.HTMLElement = FocusNode;
 g.window = {
@@ -305,16 +301,20 @@ async function flush() {
     g.document.activeElement = body;
   }
 }
-async function mount(concurrent: boolean) {
+async function mountTree(element: React.ReactElement, concurrent: boolean) {
   await act(async () => {
-    renderer = Renderer.create(
-      <React.StrictMode>
-        <App />
-      </React.StrictMode>,
-      { unstable_isConcurrent: concurrent, createNodeMock: refMock } as any,
-    );
+    // Publish the renderer before any host ref attaches, including legacy mode.
+    // Ref attachment occurs after the renderer has committed the current tree.
+    renderer = Renderer.create(null, {
+      unstable_isConcurrent: concurrent,
+      createNodeMock: refMock,
+    } as any);
+    renderer.update(<React.StrictMode>{element}</React.StrictMode>);
   });
   await flush();
+}
+async function mount(concurrent: boolean) {
+  await mountTree(<App />, concurrent);
 }
 async function call(callback: () => void) {
   await act(async () => callback());
@@ -449,6 +449,177 @@ function scenario(
       });
     }
   }
+}
+
+type RefSnapshot = {
+  revision: number;
+  root: FocusNode;
+  disclosure: FocusNode;
+  target: FocusNode;
+  usage: FocusNode;
+  props: unknown[];
+};
+const refKeys = ["root", "disclosure", "target", "usage"] as const;
+function RefLifetimeProbe({
+  record,
+}: {
+  record: (value: RefSnapshot) => void;
+}) {
+  const root = React.useRef<HTMLDivElement>(null);
+  const disclosure = React.useRef<HTMLDetailsElement>(null);
+  const target = React.useRef<HTMLElement>(null);
+  const usage = React.useRef<HTMLDivElement>(null);
+  const [revision, setRevision] = React.useState(0);
+  React.useEffect(() => {
+    let mounted = true;
+    void Promise.resolve().then(() => {
+      if (mounted) setRevision(1);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+  React.useLayoutEffect(() => {
+    const refs = {
+      root: root.current as unknown as FocusNode,
+      disclosure: disclosure.current as unknown as FocusNode,
+      target: target.current as unknown as FocusNode,
+      usage: usage.current as unknown as FocusNode,
+    };
+    record({
+      revision,
+      ...refs,
+      props: refKeys.map((key) => refs[key].host.props),
+    });
+  }, [record, revision]);
+  return (
+    <div
+      ref={root}
+      className="stage mode-settings"
+      data-fixture-revision={revision}
+    >
+      <details
+        ref={disclosure}
+        data-settings-disclosure="dataNotices"
+        data-fixture-revision={revision}
+      >
+        <summary
+          ref={target}
+          data-settings-focus="dataNotices"
+          data-fixture-revision={revision}
+        >
+          Synthetic disclosure
+        </summary>
+        <button type="button">Synthetic action</button>
+      </details>
+      <div
+        ref={usage}
+        data-settings-focus="usageToken"
+        data-fixture-revision={revision}
+        tabIndex={-1}
+      />
+    </div>
+  );
+}
+function assertRefUpdate(snapshots: RefSnapshot[]) {
+  const first = snapshots.find((snapshot) => snapshot.revision === 0);
+  const updated = snapshots.find((snapshot) => snapshot.revision === 1);
+  assert.ok(first, "The probe must capture its first committed refs");
+  assert.ok(updated, "The probe must commit its asynchronous state update");
+  for (const [index, key] of refKeys.entries()) {
+    assert.equal(
+      first[key],
+      updated[key],
+      "A retained host keeps its ref node",
+    );
+    assert.notEqual(first.props[index], updated.props[index]);
+    assert.equal(first[key].isConnected, true);
+    assert.equal(first[key].host.props["data-fixture-revision"], 1);
+  }
+  assert.equal(
+    first.root.querySelector('[data-settings-focus="dataNotices"]'),
+    first.target,
+  );
+  assert.equal(first.root.contains(first.target), true);
+  return first;
+}
+function exerciseRefs(snapshot: RefSnapshot) {
+  snapshot.disclosure.open = true;
+  snapshot.target.scrollIntoView();
+  snapshot.target.focus();
+  snapshot.usage.scrollIntoView();
+  snapshot.usage.focus();
+}
+for (const concurrent of [false, true]) {
+  test(`R30 ref fixture (${concurrent ? "concurrent" : "legacy"}): updates stay observable and remounts stay isolated`, async () => {
+    frames.clear();
+    cancelledFrames.clear();
+    clearLogs();
+    nodes = new Map();
+    g.document.activeElement = body;
+    const snapshots: RefSnapshot[] = [];
+    const record = (snapshot: RefSnapshot) => snapshots.push(snapshot);
+    try {
+      await mountTree(<RefLifetimeProbe record={record} />, concurrent);
+      const original = assertRefUpdate(snapshots);
+      clearLogs();
+      // Deliberately duplicate the same late child operation. A broken mock
+      // would silently erase both calls after the asynchronous props change.
+      for (let i = 0; i < 2; i++) {
+        g.window.requestAnimationFrame(() => exerciseRefs(original));
+      }
+      await drainFrames();
+      const actions = ["settings:dataNotices", "settings:usageToken"];
+      assert.deepEqual(focusLog, [...actions, ...actions]);
+      assert.deepEqual(scrollLog, [...actions, ...actions]);
+      assert.deepEqual(openLog, [
+        "disclosure:dataNotices",
+        "disclosure:dataNotices",
+      ]);
+      assert.equal(g.document.activeElement, original.usage);
+      assert.equal(original.disclosure.open, true);
+
+      await call(() => renderer.update(null));
+      for (const key of refKeys) assert.equal(original[key].isConnected, false);
+      clearLogs();
+      exerciseRefs(original);
+      assertUntouched();
+      assert.equal(original.root.querySelector("button"), null);
+
+      const nextStart = snapshots.length;
+      await call(() =>
+        renderer.update(
+          <React.StrictMode>
+            <RefLifetimeProbe record={record} />
+          </React.StrictMode>,
+        ),
+      );
+      const replacement = assertRefUpdate(snapshots.slice(nextStart));
+      for (const key of refKeys) {
+        assert.notEqual(original[key], replacement[key]);
+        assert.equal(original[key].isConnected, false);
+      }
+      clearLogs();
+      exerciseRefs(original);
+      assertUntouched();
+      assert.equal(original.root.querySelector("button"), null);
+      assert.equal(original.root.contains(replacement.target), false);
+      assert.equal(replacement.root.contains(original.target), false);
+      assert.equal(replacement.disclosure.open, false);
+      assert.equal(g.document.activeElement, body);
+      exerciseRefs(replacement);
+      assert.deepEqual(focusLog, actions);
+      assert.deepEqual(scrollLog, actions);
+      assert.deepEqual(openLog, ["disclosure:dataNotices"]);
+      assert.equal(g.document.activeElement, replacement.usage);
+    } finally {
+      if (renderer) await act(async () => renderer.unmount());
+      renderer = null;
+      await flush();
+      frames.clear();
+      clearLogs();
+    }
+  });
 }
 
 scenario(

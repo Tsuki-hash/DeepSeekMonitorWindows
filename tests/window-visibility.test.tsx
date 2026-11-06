@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 import { App } from "../src/App";
 import { DashboardPanel } from "../src/components/DashboardPanel";
 import { ModelDetailPanel } from "../src/components/ModelDetailPanel";
+import { HistoryPanel } from "../src/components/HistoryPanel";
+import { HistoryTrend } from "../src/components/HistoryTrend";
 import { setCommittedConfig } from "../src/config-store";
 import { invalidateUsageRequests } from "../src/usage-api";
 import { todayStr } from "../src/format";
@@ -174,6 +176,8 @@ let nativeVisible = true;
 let queryCalls = 0;
 let fetchCalls = 0;
 let query: () => Promise<boolean>;
+const usageCalls: string[] = [];
+let usageRead: (month: string) => Promise<UsageResult>;
 const sampleUsage = (): UsageResult => ({
   models: [
     {
@@ -191,7 +195,10 @@ const sampleUsage = (): UsageResult => ({
   days: [],
   monthCost: 1,
 });
-g.__settingsIpc = async (command: string) => {
+g.__settingsIpc = async (
+  command: string,
+  args?: { year: number; month: number },
+) => {
   switch (command) {
     case "get_app_config":
       return { ...config };
@@ -204,9 +211,12 @@ g.__settingsIpc = async (command: string) => {
         grantedBalance: "0",
         toppedUpBalance: "3",
       };
-    case "fetch_usage":
+    case "fetch_usage": {
       fetchCalls += 1;
-      return sampleUsage();
+      const month = `${args!.year}-${String(args!.month).padStart(2, "0")}`;
+      usageCalls.push(month);
+      return usageRead(month);
+    }
     case "is_main_window_visible":
       queryCalls += 1;
       return query();
@@ -341,6 +351,8 @@ function scenario(
       registrations.length = 0;
       queryCalls = 0;
       fetchCalls = 0;
+      usageCalls.length = 0;
+      usageRead = async () => sampleUsage();
       nativeVisible = true;
       query = async () => nativeVisible;
       focusLog.length = 0;
@@ -647,6 +659,287 @@ scenario("late rejection and repeated remounts", async (concurrent) => {
   }
   assert.equal(queryCalls, 3);
 });
+
+const historyButton = (label: string) => {
+  const node = hosts().find(
+    (item) =>
+      item.type === "button" &&
+      (nodeText(item) === label || item.props["aria-label"] === label),
+  );
+  assert.ok(node, `Missing history action: ${label}`);
+  return node;
+};
+const clickHistoryAction = async (label: string) => {
+  const node = historyButton(label);
+  assert.notEqual(node.props.disabled, true, `${label} must be available`);
+  await change(() => node.props.onClick());
+};
+const previousMonth = (month: string) => {
+  const date = new Date(`${month}-01T00:00:00Z`);
+  date.setUTCMonth(date.getUTCMonth() - 1);
+  return date.toISOString().slice(0, 7);
+};
+const historyUsage = (month: string): UsageResult => {
+  const raw = {
+    model: "SYNTHETIC_HISTORY_ONLY",
+    groupKey: null,
+    totalTokens: 123,
+    requestCount: 1,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    responseTokens: 123,
+    otherTokens: 0,
+    cost: 1,
+  };
+  return {
+    schemaVersion: 2,
+    models: [],
+    rawModels: [raw],
+    days: [{ date: `${month}-01`, rawModels: [raw] }] as UsageResult["days"],
+    monthCost: 1,
+  };
+};
+const historyDays = () =>
+  structuredClone(renderer.root.findByType(HistoryTrend).props.days);
+
+// R30: exercise production App -> HistoryPanel ownership, not a directly
+// updated windowVisible prop. Concurrent act holds the React commit while the
+// native callback and the IPC promise continuation run in the same turn.
+for (const outcome of ["success", "failure"] as const) {
+  for (const showAgain of [false, true]) {
+    scenario(
+      `R30 history hidden before commit: ${outcome}, shown=${showAgain}`,
+      async (concurrent) => {
+        await mount(concurrent);
+        await acceptBoth();
+        await clickHistoryAction("历史");
+        const pending = deferred<UsageResult>();
+        const blockedMonth = previousMonth(todayStr().slice(0, 7));
+        const nextMonth = previousMonth(blockedMonth);
+        let blockedLoads = 0;
+        usageRead = async (month) => {
+          if (month !== blockedMonth) return historyUsage(month);
+          blockedLoads += 1;
+          return pending.promise;
+        };
+        await clickHistoryAction("全部");
+        assert.equal(
+          blockedLoads,
+          1,
+          "The history deferred loader has started",
+        );
+        assert.equal(usageCalls.includes(nextMonth), false);
+        const before = historyDays();
+        await act(async () => {
+          nativeChange(false);
+          if (concurrent) {
+            assert.equal(
+              renderer.root.findByType(HistoryPanel).props.windowVisible,
+              true,
+              "The native hidden event precedes the React prop commit",
+            );
+          }
+          if (showAgain) nativeChange(true);
+          if (outcome === "success")
+            pending.resolve(historyUsage(blockedMonth));
+          else pending.reject({ code: "invalid_data" });
+          for (let turn = 0; turn < 80; turn++) await Promise.resolve();
+          assert.equal(
+            usageCalls.includes(nextMonth),
+            false,
+            "Revoked history must not fetch its next month before commit",
+          );
+        });
+        await flush();
+        assert.equal(usageCalls.includes(nextMonth), false);
+        assert.deepEqual(historyDays(), before, "Late history cannot commit");
+        assert.match(
+          nodeText(renderer.root.findByType(HistoryPanel)),
+          /后续月份查询已停止/,
+        );
+        assert.equal(
+          historyButton("重新查询历史").props.disabled,
+          !showAgain,
+          "A revoked batch releases busy even if hidden/shown are batched",
+        );
+        if (!showAgain) {
+          assert.equal(
+            historyButton("继续加载更早月份 ›").props.disabled,
+            true,
+          );
+          await change(() => nativeChange(true));
+          assert.deepEqual(historyDays(), before);
+        }
+        usageRead = async (month) => historyUsage(month);
+        await clickHistoryAction("继续加载更早月份 ›");
+        // Twelve serial monthly requests require more microtasks than the
+        // ordinary visibility fixture. This does not advance native timers.
+        await act(async () => {
+          for (let turn = 0; turn < 400; turn++) await Promise.resolve();
+        });
+        assert.ok(
+          usageCalls.includes(nextMonth),
+          "A new explicit query can run",
+        );
+        assert.doesNotMatch(
+          nodeText(renderer.root.findByType(HistoryPanel)),
+          /后续月份查询已停止/,
+        );
+      },
+    );
+  }
+}
+
+scenario(
+  "R30 retained history actions and custom month survive hidden",
+  async (concurrent) => {
+    await mount(concurrent);
+    await acceptBoth();
+    await clickHistoryAction("历史");
+    const failedMonth = previousMonth(todayStr().slice(0, 7));
+    usageRead = async (month) => {
+      if (month === failedMonth) throw { code: "invalid_data" };
+      return historyUsage(month);
+    };
+    await clickHistoryAction("全部");
+    await act(async () => {
+      for (let turn = 0; turn < 400; turn++) await Promise.resolve();
+    });
+    assert.equal(historyButton("只重试失败月份（1）").props.disabled, false);
+    assert.equal(historyButton("继续加载更早月份 ›").props.disabled, false);
+    const before = historyDays();
+    await change(() => nativeChange(false));
+    assert.equal(historyButton("只重试失败月份（1）").props.disabled, true);
+    assert.equal(historyButton("继续加载更早月份 ›").props.disabled, true);
+    assert.equal(historyButton("全部").props["aria-pressed"], true);
+    assert.deepEqual(historyDays(), before);
+    await change(() => nativeChange(true));
+    assert.equal(historyButton("只重试失败月份（1）").props.disabled, false);
+    assert.deepEqual(historyDays(), before);
+    usageRead = async (month) => historyUsage(month);
+    await clickHistoryAction("历史月份");
+    const monthInput = () => renderer.root.findByProps({ type: "month" });
+    await change(() =>
+      monthInput().props.onChange({ target: { value: "2024-02" } }),
+    );
+    await change(() => nativeChange(false));
+    assert.equal(monthInput().props.disabled, true);
+    assert.equal(monthInput().props.value, "2024-02");
+    const fixedCount = usageCalls.filter((month) => month === "2024-02").length;
+    await change(() => nativeChange(true));
+    assert.equal(monthInput().props.disabled, false);
+    assert.equal(monthInput().props.value, "2024-02");
+    assert.equal(
+      usageCalls.filter((month) => month === "2024-02").length,
+      fixedCount,
+      "Showing a fixed historical month preserves its selection and cache",
+    );
+  },
+);
+
+scenario(
+  "R30 retained manual history action cannot start before hidden commit",
+  async (concurrent) => {
+    await mount(concurrent);
+    await acceptBoth();
+    await clickHistoryAction("历史");
+    const action = historyButton("重新查询历史");
+    assert.equal(action.props.disabled, false);
+    const before = usageCalls.length;
+    await act(async () => {
+      nativeChange(false);
+      if (concurrent) {
+        assert.equal(
+          renderer.root.findByType(HistoryPanel).props.windowVisible,
+          true,
+        );
+      }
+      action.props.onClick();
+      for (let turn = 0; turn < 80; turn++) await Promise.resolve();
+      assert.equal(usageCalls.length, before);
+    });
+    await flush();
+    assert.equal(usageCalls.length, before);
+    assert.equal(historyButton("重新查询历史").props.disabled, true);
+  },
+);
+
+scenario(
+  "R30 initial unknown history is explained until ready",
+  async (concurrent) => {
+    await mount(concurrent);
+    const before = usageCalls.length;
+    await clickHistoryAction("历史");
+    assert.equal(usageCalls.length, before);
+    assert.equal(historyButton("重新查询历史").props.disabled, true);
+    assert.equal(historyButton("全部").props.disabled, true);
+    assert.match(
+      nodeText(renderer.root.findByType(HistoryPanel)),
+      /状态尚未确认/,
+    );
+    await acceptBoth();
+    assert.equal(
+      usageCalls.length,
+      before + 1,
+      "Readiness starts one history query",
+    );
+    assert.equal(historyButton("重新查询历史").props.disabled, false);
+    assert.doesNotMatch(
+      nodeText(renderer.root.findByType(HistoryPanel)),
+      /状态尚未确认/,
+    );
+  },
+);
+
+for (const failure of ["shown", "hidden", "query"] as const) {
+  scenario(
+    `R30 history recovery after ${failure} failure`,
+    async (concurrent) => {
+      if (failure === "query") {
+        query = async () => {
+          throw new Error("Synthetic query failure");
+        };
+      }
+      await mount(concurrent);
+      if (failure === "query") await acceptBoth();
+      else {
+        await change(() => {
+          registrations[failure === "shown" ? 0 : 1].reject();
+          registrations[failure === "shown" ? 1 : 0].accept();
+        });
+      }
+      assert.equal(errorShown(), true);
+      const before = usageCalls.length;
+      await clickHistoryAction("历史");
+      assert.equal(usageCalls.length, before);
+      assert.equal(historyButton("重新查询历史").props.disabled, true);
+      assert.equal(historyButton("全部").props.disabled, true);
+      assert.match(
+        nodeText(renderer.root.findByType(HistoryPanel)),
+        /请先点击上方“重试窗口状态”/,
+      );
+      const old = registrations.slice();
+      query = async () => true;
+      await retry();
+      assert.equal(historyButton("重新查询历史").props.disabled, true);
+      await change(() => old.forEach((entry) => entry.callback({})));
+      assert.equal(
+        usageCalls.length,
+        before,
+        "Old callbacks cannot release history",
+      );
+      await acceptBoth();
+      assert.equal(usageCalls.length, before + 1);
+      assert.equal(historyButton("重新查询历史").props.disabled, false);
+      await clickHistoryAction("重新查询历史");
+      assert.equal(
+        usageCalls.length,
+        before + 2,
+        "Manual refresh works after recovery",
+      );
+    },
+  );
+}
 
 // Source contracts complement the synthetic IPC rejection scenarios above.
 // They do not execute Rust, create a native window or validate browser layout.

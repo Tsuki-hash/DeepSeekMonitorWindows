@@ -20,6 +20,7 @@ import { THEME_STORAGE_KEY, THEME_MIGRATION_KEY, THEME_ATTR } from "./theme";
 import { msUntilNextAccountingDate } from "./accounting-clock";
 import { balancePublishable } from "./refresh-policy";
 import { useChannelScheduler } from "./use-channel-scheduler";
+import { WindowVisibilityGate } from "./window-visibility-gate";
 import {
   initialChannelState,
   onChannelFailure,
@@ -87,6 +88,9 @@ function App() {
   const [committedAccountFocusEpoch, setAccountFocusEpoch] = React.useState(0);
   // 原生订阅和首次快照均未就绪时不能猜测窗口可见。
   const visibleForFocus = React.useRef(false);
+  const [windowVisibilityGate] = React.useState(
+    () => new WindowVisibilityGate(),
+  );
   const cancelFocusFrame = React.useCallback(() => {
     if (focusFrame.current !== null) {
       window.cancelAnimationFrame(focusFrame.current);
@@ -634,6 +638,7 @@ function App() {
     };
     const applyVisibility = (visible: boolean) => {
       visibleForFocus.current = visible;
+      windowVisibilityGate.setVisible(visible);
       if (!visible) cancelViewFocus();
       setWindowVisible(visible);
     };
@@ -685,9 +690,10 @@ function App() {
       disposed = true;
       releaseAll();
       visibleForFocus.current = false;
+      windowVisibilityGate.setVisible(false);
       cancelViewFocus();
     };
-  }, [refreshAll, cancelViewFocus, visibilityAttempt]);
+  }, [refreshAll, cancelViewFocus, visibilityAttempt, windowVisibilityGate]);
 
   // 两路各自独立调度（复评 R01）：每个通道有自己的 timer 与截止时间，
   // 一个通道完成不会推迟另一个通道的退避截止时间。
@@ -1061,7 +1067,10 @@ function App() {
       {visibilityError && (
         <section className="config-read-error visibility-error" role="alert">
           <strong>无法确认窗口显隐状态</strong>
-          <p>自动刷新和导航自动聚焦已暂停，仍可手动刷新。</p>
+          <p>
+            自动刷新、历史查询和导航自动聚焦已暂停。账户面板仍可手动刷新；
+            历史查询需先重试窗口状态。
+          </p>
           <button
             type="button"
             className="secondary"
@@ -1194,6 +1203,8 @@ function App() {
       {view === "history" && (
         <HistoryPanel
           windowVisible={windowVisible}
+          windowVisibilityGate={windowVisibilityGate}
+          visibilityError={visibilityError}
           onBack={() => navigate(() => setView("dashboard"))}
           usageTokenConfigured={configSnapshot?.usageTokenConfigured ?? false}
           onConfigureUsage={() => {
