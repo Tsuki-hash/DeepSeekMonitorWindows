@@ -58,7 +58,11 @@ fn atomic(path: PathBuf, data: &[u8]) -> Result<(), String> {
     fs::create_dir_all(path.parent().ok_or("留存目录不可用")?).map_err(|_| "留存目录不可用")?;
     let temp = path.with_extension("tmp");
     fs::write(&temp, data).map_err(|_| "留存无法保存，原记录保留")?;
-    fs::rename(temp, path).map_err(|_| "留存无法提交，原记录保留".into())
+    fs::rename(&temp, path).map_err(|error| {
+        // 复评 T12：提交失败时尽力删除临时副本，避免留下可读的元数据文件。
+        let _ = fs::remove_file(&temp);
+        format!("留存无法提交，原记录保留（{error}）")
+    })
 }
 pub fn enabled() -> Result<bool, String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
@@ -295,10 +299,30 @@ fn validate_id(id: &str) -> Result<(), String> {
 }
 pub fn clear() -> Result<(), String> {
     let _guard = lock().lock().map_err(|_| "留存状态不可用")?;
-    match fs::remove_file(store_path()?) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("会话留存无法清空，原记录保留".into()),
+    // 复评 T12：写后 rename 失败或进程中断会留下 `.tmp` 临时副本，
+    // 内容与正式文件相同（会话 ID、项目名等）。清空必须连同删除；
+    // 任一失败都如实报告，不宣称「已全部清空」。只删本应用固定名称的文件。
+    let mut failed = Vec::new();
+    for target in [store_path()?, store_path()?.with_extension("tmp")] {
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed.push(
+                target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "会话留存无法完全清空（{} 保留）；请检查文件权限后重试",
+            failed.join("、")
+        ))
     }
 }
 
@@ -308,6 +332,20 @@ mod tests {
     use crate::test_support::TempConfigDir;
     fn snapshot(at: u64) -> LocalSnapshot {
         crate::local_usage::normalize_report(&serde_json::json!({"entries":[{"client":"opencode","sessionId":"s1","workspaceKey":"w1","model":"deepseek","input":100,"output":20,"reasoning":0,"cacheRead":10,"cacheWrite":0},{"client":"hermes","sessionId":"s2","model":"deepseek","input":null,"output":20}],"workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}],"sessions":[]}),at).unwrap()
+    }
+    #[test]
+    fn clear_removes_leftover_tmp_copy() {
+        // 复评 T12：写后 rename 失败/中断留下的 `.tmp` 副本必须随清空一并删除，
+        // 否则清空返回成功、总览却仍有可读的会话元数据文件。
+        let _dir = TempConfigDir::new("retention-tmp");
+        let stale = store_path().unwrap().with_extension("tmp");
+        std::fs::write(&stale, b"stale-copy").unwrap();
+        std::fs::write(store_path().unwrap(), b"stale-store").unwrap();
+        clear().unwrap();
+        assert!(!store_path().unwrap().exists());
+        assert!(!stale.exists(), "临时副本必须一并删除");
+        // 再次清空（两个文件都不存在）也应成功。
+        clear().unwrap();
     }
     #[test]
     fn opt_in_private_session_summary_roundtrip_and_unknown() {

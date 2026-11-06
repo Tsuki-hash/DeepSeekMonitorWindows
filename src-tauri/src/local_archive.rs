@@ -13,6 +13,10 @@ const MAX_ENTRIES: usize = 12;
 fn path() -> Result<PathBuf, String> {
     Ok(crate::config::config_path()?.with_file_name("local-usage-archive.json"))
 }
+/// 原子写入的临时副本路径（复评 T12：清空时必须连同删除）。
+fn tmp_path() -> Result<PathBuf, String> {
+    Ok(path()?.with_extension("tmp"))
+}
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -256,7 +260,11 @@ fn write(store: &Store) -> Result<(), String> {
     fs::create_dir_all(path.parent().ok_or("归档目录不可用")?).map_err(|_| "归档目录不可用")?;
     let temp = path.with_extension("tmp");
     fs::write(&temp, data).map_err(|_| "归档无法保存，原记录保留")?;
-    fs::rename(temp, path).map_err(|_| "归档无法提交，原记录保留".into())
+    fs::rename(&temp, path).map_err(|_| {
+        // 复评 T12：提交失败时尽力删除临时副本，避免留下可读的元数据文件。
+        let _ = fs::remove_file(&temp);
+        "归档无法提交，原记录保留".to_string()
+    })
 }
 pub(crate) fn sanitized_rows(
     rows: Vec<&crate::local_usage::LocalRow>,
@@ -407,10 +415,30 @@ pub fn delete(id: &str) -> Result<(), String> {
 }
 pub fn clear() -> Result<(), String> {
     let _guard = lock().lock().map_err(|_| "归档状态不可用")?;
-    match fs::remove_file(path()?) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("归档无法清空，原记录保留".into()),
+    // 复评 T12：写入与提交之间中断会留下 `.tmp` 临时副本（内容与正式文件相同，
+    // 含会话 ID、项目名等元数据）。清空必须连同删除；任一失败都如实报告，
+    // 不宣称「已全部清空」。只删本应用固定名称的文件，不扩大到同目录其他文件。
+    let mut failed = Vec::new();
+    for target in [path()?, tmp_path()?] {
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed.push(
+                target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "归档无法完全清空（{} 保留）；请检查文件权限后重试",
+            failed.join("、")
+        ))
     }
 }
 
@@ -425,6 +453,18 @@ mod tests {
             {"client":"hermes","sessionId":"s3","model":"deepseek","input":50,"output":60}
         ], "workspaces":[{"workspaceKey":"w1","path":"D:\\Private\\Repo"}], "sessions":[]});
         normalize_report(&value, at).unwrap()
+    }
+    #[test]
+    fn clear_removes_leftover_tmp_copy_and_reports_permission_failure() {
+        // 复评 T12：写后 rename 失败/中断会留下 `.tmp` 临时副本，
+        // 清空必须连同删除，不能返回成功却留下可读的元数据文件。
+        let _dir = crate::test_support::TempConfigDir::new("archive-tmp");
+        std::fs::write(tmp_path().unwrap(), b"stale-copy").unwrap();
+        clear().unwrap();
+        assert!(!path().unwrap().exists());
+        assert!(!tmp_path().unwrap().exists(), "临时副本必须一并删除");
+        // 正常成功路径本来就不该残留 tmp；再次清空（无文件）也应成功。
+        clear().unwrap();
     }
     #[test]
     fn session_in_project_is_intersection_and_all_session_retains_all_projects() {
