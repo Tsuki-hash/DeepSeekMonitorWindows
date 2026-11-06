@@ -772,8 +772,10 @@ fn build_usage_result_inner(
             pro_cache_hit: if pro_known { pro_hit } else { None },
             pro_cache_miss: if pro_known { pro_miss } else { None },
             pro_response: if pro_known { pro_resp } else { None },
-            flash_other_tokens: flash_other,
-            pro_other_tokens: pro_other,
+            // R26：缺失别名同样使 other 不完整，不能展示已知别名的部分和。
+            // 只按来源缺项传播；槽位总量单独溢出时，合法 other 仍须保留。
+            flash_other_tokens: if flash_known { flash_other } else { None },
+            pro_other_tokens: if pro_known { pro_other } else { None },
             // 缺数量的模型让当日 Token 合计未知；缺费用不污染有效 Tokens。
             total_tokens: if count_side_incomplete { None } else { total },
             // 缺费用的模型让当日费用合计未知，而不是把已知部分表现成完整值。
@@ -2825,6 +2827,278 @@ mod tests {
             .unwrap();
         assert_eq!(day.flash_tokens, None, "Flash 槽位缺别名数量的分段必须未知");
         assert_eq!(day.total_tokens, None);
+    }
+
+    // ---------- R26：日级 other 与同槽位缺项使用同一来源证据 ----------
+
+    fn r26_token_row(model: &str, other: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "usage": [
+                { "type": "PROMPT_CACHE_HIT_TOKEN", "amount": "0" },
+                { "type": "PROMPT_CACHE_MISS_TOKEN", "amount": "0" },
+                { "type": "RESPONSE_TOKEN", "amount": "0" },
+                { "type": "MULTIMODAL_IMAGE_TOKEN", "amount": other },
+                { "type": "REQUEST", "amount": "0" }
+            ]
+        })
+    }
+
+    fn r26_cost_row(model: &str, amount: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "usage": [{ "type": "RESPONSE_TOKEN", "amount": amount }]
+        })
+    }
+
+    /// 使用真实响应结构、日期和费用入口的合成样本，不手工伪造 UsageDaySummary。
+    fn r26_daily_result(
+        amount_rows: Vec<serde_json::Value>,
+        cost_rows: Vec<serde_json::Value>,
+    ) -> UsageResult {
+        let amount_body = serde_json::json!({ "data": { "biz_data": {
+            "total": amount_rows.clone(),
+            "days": [{ "date": "2026-11-01", "data": amount_rows }]
+        } } })
+        .to_string();
+        let cost_body = serde_json::json!({ "data": { "biz_data": [{
+            "total": cost_rows.clone(),
+            "days": [{ "date": "2026-11-01", "data": cost_rows }]
+        }] } })
+        .to_string();
+        let amount: AmountResp = serde_json::from_str(&amount_body).unwrap();
+        let cost: CostResp = serde_json::from_str(&cost_body).unwrap();
+        checked_result(&amount, &cost, period(2026, 11, "2026-11-01T04:00:00Z"))
+    }
+
+    #[test]
+    fn r26_同槽别名只有费用_other未知且保留原始模型兄弟槽与费用() {
+        let aliases = [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ];
+        for known in aliases {
+            for missing in aliases.into_iter().filter(|alias| *alias != known) {
+                for known_other in ["7", "0"] {
+                    // 费用零也只证明费用存在，不能证明该别名的数量为零。
+                    for missing_cost in ["2", "0"] {
+                        let result = r26_daily_result(
+                            vec![
+                                r26_token_row(known, known_other),
+                                r26_token_row("deepseek-v4-pro", "11"),
+                            ],
+                            vec![
+                                r26_cost_row(known, "1"),
+                                r26_cost_row(missing, missing_cost),
+                                r26_cost_row("deepseek-v4-pro", "3"),
+                            ],
+                        );
+                        let day = &result.days[0];
+                        assert_eq!(day.date, "2026-11-01");
+                        assert_eq!(
+                            (
+                                day.flash_tokens,
+                                day.flash_cache_hit,
+                                day.flash_cache_miss,
+                                day.flash_response,
+                                day.flash_other_tokens,
+                            ),
+                            (None, None, None, None, None)
+                        );
+                        assert_eq!(
+                            (
+                                day.pro_tokens,
+                                day.pro_cache_hit,
+                                day.pro_cache_miss,
+                                day.pro_response,
+                                day.pro_other_tokens,
+                            ),
+                            (Some(11), Some(0), Some(0), Some(0), Some(11))
+                        );
+                        assert_eq!(day.total_tokens, None);
+                        let expected_cost = 4.0 + missing_cost.parse::<f64>().unwrap();
+                        assert_eq!(day.total_cost, Some(expected_cost));
+                        assert_eq!(result.month_cost, Some(expected_cost));
+
+                        assert_eq!(day.raw_models.len(), 3);
+                        let raw_known = day
+                            .raw_models
+                            .iter()
+                            .find(|row| row.model == known)
+                            .unwrap();
+                        assert_eq!(
+                            raw_known.other_tokens,
+                            Some(known_other.parse::<u64>().unwrap())
+                        );
+                        assert_eq!(raw_known.total_tokens, raw_known.other_tokens);
+                        assert_eq!(raw_known.cost, Some(1.0));
+                        let raw_missing = day
+                            .raw_models
+                            .iter()
+                            .find(|row| row.model == missing)
+                            .unwrap();
+                        assert_eq!(raw_missing.other_tokens, None);
+                        assert_eq!(raw_missing.total_tokens, None);
+                        assert_eq!(raw_missing.cost, Some(missing_cost.parse::<f64>().unwrap()));
+                        assert!(result
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.contains("部分日期缺少费用或数量")));
+
+                        let wire = serde_json::to_value(&result).unwrap();
+                        assert!(wire["days"][0]["flashOtherTokens"].is_null());
+                        assert_eq!(wire["days"][0]["proOtherTokens"], serde_json::json!(11));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r26_别名明确数量零_other保留七或真实零() {
+        for known_other in ["7", "0"] {
+            let result = r26_daily_result(
+                vec![
+                    r26_token_row("deepseek-flash", known_other),
+                    r26_token_row("deepseek-v4-flash", "0"),
+                    r26_token_row("deepseek-v4-pro", "11"),
+                ],
+                vec![
+                    r26_cost_row("deepseek-flash", "1"),
+                    r26_cost_row("deepseek-v4-flash", "0"),
+                    r26_cost_row("deepseek-v4-pro", "3"),
+                ],
+            );
+            let day = &result.days[0];
+            let expected_other = known_other.parse::<u64>().unwrap();
+            assert_eq!(day.flash_other_tokens, Some(expected_other));
+            assert_eq!(day.flash_tokens, Some(expected_other));
+            assert_eq!(day.pro_other_tokens, Some(11));
+            assert_eq!(day.total_tokens, Some(expected_other + 11));
+            assert_eq!(day.total_cost, Some(4.0));
+            assert_eq!(result.month_cost, Some(4.0));
+            assert!(result.warnings.is_empty(), "明确零且两侧完整不能虚构缺项");
+            let raw_zero = day
+                .raw_models
+                .iter()
+                .find(|row| row.model == "deepseek-v4-flash")
+                .unwrap();
+            assert_eq!(
+                (raw_zero.total_tokens, raw_zero.other_tokens, raw_zero.cost),
+                (Some(0), Some(0), Some(0.0))
+            );
+            let wire = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                wire["days"][0]["flashOtherTokens"],
+                serde_json::json!(expected_other)
+            );
+        }
+    }
+
+    #[test]
+    fn r26_flash与pro缺数量互换_other只污染缺项槽位() {
+        for (known, missing) in [
+            ("deepseek-flash", "deepseek-v4-pro"),
+            ("deepseek-v4-pro", "deepseek-flash"),
+        ] {
+            for known_other in ["7", "0"] {
+                let result = r26_daily_result(
+                    vec![r26_token_row(known, known_other)],
+                    vec![r26_cost_row(known, "1"), r26_cost_row(missing, "2")],
+                );
+                let day = &result.days[0];
+                let (known_total, known_other_count, missing_total, missing_other) =
+                    if known == "deepseek-flash" {
+                        (
+                            day.flash_tokens,
+                            day.flash_other_tokens,
+                            day.pro_tokens,
+                            day.pro_other_tokens,
+                        )
+                    } else {
+                        (
+                            day.pro_tokens,
+                            day.pro_other_tokens,
+                            day.flash_tokens,
+                            day.flash_other_tokens,
+                        )
+                    };
+                assert_eq!(known_total, Some(known_other.parse::<u64>().unwrap()));
+                assert_eq!(known_other_count, known_total);
+                assert_eq!(
+                    (missing_total, missing_other, day.total_tokens),
+                    (None, None, None)
+                );
+                assert_eq!(day.total_cost, Some(3.0));
+                assert_eq!(result.month_cost, Some(3.0));
+                let raw_known = day
+                    .raw_models
+                    .iter()
+                    .find(|row| row.model == known)
+                    .unwrap();
+                assert_eq!(raw_known.other_tokens, known_other_count);
+                let raw_missing = day
+                    .raw_models
+                    .iter()
+                    .find(|row| row.model == missing)
+                    .unwrap();
+                assert_eq!(raw_missing.other_tokens, None);
+                assert_eq!(raw_missing.cost, Some(2.0));
+                let wire = serde_json::to_value(&result).unwrap();
+                let missing_key = if missing == "deepseek-flash" {
+                    "flashOtherTokens"
+                } else {
+                    "proOtherTokens"
+                };
+                assert!(wire["days"][0][missing_key].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn r26_槽位总量溢出但来源齐全_保留安全other与费用() {
+        for model in ["deepseek-flash", "deepseek-v4-pro"] {
+            for other in ["7", "0"] {
+                let mut counts = r26_token_row(model, other);
+                counts["usage"][0]["amount"] = serde_json::json!("1");
+                counts["usage"][2]["amount"] =
+                    serde_json::json!(crate::usage::MAX_SAFE_COUNT.to_string());
+                let result = r26_daily_result(vec![counts], vec![r26_cost_row(model, "2")]);
+                let day = &result.days[0];
+                let (total, other_count) = if model == "deepseek-flash" {
+                    (day.flash_tokens, day.flash_other_tokens)
+                } else {
+                    (day.pro_tokens, day.pro_other_tokens)
+                };
+                assert_eq!(total, None, "仅分段加总超出安全整数，不是模型缺项");
+                assert_eq!(day.total_tokens, None);
+                assert_eq!(other_count, Some(other.parse::<u64>().unwrap()));
+                assert_eq!(day.raw_models[0].other_tokens, other_count);
+                assert_eq!(day.total_cost, Some(2.0));
+                assert_eq!(result.month_cost, Some(2.0));
+            }
+        }
+
+        // 两个原始 Flash 别名各自合法，只在槽位求和时溢出也不能抹掉 other。
+        let mut first = r26_token_row("deepseek-flash", "0");
+        first["usage"][2]["amount"] = serde_json::json!(crate::usage::MAX_SAFE_COUNT.to_string());
+        let result = r26_daily_result(
+            vec![first, r26_token_row("deepseek-v4-flash", "7")],
+            vec![
+                r26_cost_row("deepseek-flash", "1"),
+                r26_cost_row("deepseek-v4-flash", "2"),
+            ],
+        );
+        let day = &result.days[0];
+        assert_eq!(day.flash_tokens, None);
+        assert_eq!(day.flash_other_tokens, Some(7));
+        assert_eq!(day.total_tokens, None);
+        assert!(day.raw_models.iter().all(|row| row.total_tokens.is_some()));
+        assert_eq!(day.total_cost, Some(3.0));
+        assert_eq!(result.month_cost, Some(3.0));
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["days"][0]["flashOtherTokens"], serde_json::json!(7));
     }
 
     // ---------- 第七轮复评 F04：月费用与月级模型集合对齐 ----------

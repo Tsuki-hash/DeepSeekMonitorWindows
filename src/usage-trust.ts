@@ -13,6 +13,57 @@ import {
   recentUsageDays,
 } from "./format.ts";
 import type { UsageResult } from "./types";
+import { sumUsageCounts, type UsageCountSum } from "./usage-counts.ts";
+
+export const MONTH_SLOT_UNSAFE_REASON =
+  "本月模型槽位计数或合计超出安全整数范围，合计未知；已知日期与原始模型保留";
+export const MONTH_SLOT_UNKNOWN_REASON =
+  "本月模型槽位部分计数未取得或无法汇总；已知日期与原始模型保留";
+
+/** 只检查已返回的月槽位，不要求未使用的槽位存在，也不改写日级/raw 数据。 */
+function monthSlotIssue(usage: UsageResult): UsageCountSum["issue"] {
+  const countFields = [
+    "totalTokens",
+    "requestCount",
+    "cacheHitTokens",
+    "cacheMissTokens",
+    "responseTokens",
+    "otherTokens",
+  ] as const;
+  let unknown = false;
+  for (const model of usage.models) {
+    const checks = [
+      ...countFields.map((field) => sumUsageCounts([model[field]])),
+      sumUsageCounts([
+        model.cacheHitTokens,
+        model.cacheMissTokens,
+        model.responseTokens,
+        model.otherTokens,
+      ]),
+    ];
+    if (checks.some((check) => check.issue === "unsafe")) return "unsafe";
+    if (!checks.some((check) => check.issue === "unknown")) continue;
+    unknown = true;
+    // 后端把跨别名溢出的槽位置 null；可用所属 raw 行辨别溢出与普通缺项。
+    // raw 行缺失时不推断零，也不将其他合法槽位的总数相加制造月级溢出。
+    const raw = usage.rawModels?.filter((item) =>
+      model.key === "other"
+        ? item.groupKey !== undefined &&
+          item.groupKey !== "flash" &&
+          item.groupKey !== "pro"
+        : item.groupKey === model.key,
+    );
+    if (
+      raw?.length &&
+      countFields.some(
+        (field) =>
+          sumUsageCounts(raw.map((item) => item[field])).issue === "unsafe",
+      )
+    )
+      return "unsafe";
+  }
+  return unknown ? "unknown" : null;
+}
 
 export type Completeness = "complete" | "partial" | "unknown";
 
@@ -37,6 +88,7 @@ export function usageCompleteness(
   if (usage.warnings?.length) return "partial";
   if (usage.unavailableDates?.length) return "partial";
   if (usage.monthCost == null) return "partial";
+  if (monthSlotIssue(usage)) return "partial";
   if (missingUsageDates(usage, now).length) return "partial";
   const days = recentUsageDays(
     usage.days,
@@ -94,6 +146,9 @@ export function usageTrust(input: {
     if (unsafeDay) return `${unsafeDay.date}：${unsafeDay.unavailableReason}`;
     if (chartTotalStatus(points.slice(-7)).issue === "unsafe")
       return CHART_TOTAL_UNSAFE_REASON;
+    const monthIssue = monthSlotIssue(usage);
+    if (monthIssue === "unsafe") return MONTH_SLOT_UNSAFE_REASON;
+    if (monthIssue === "unknown") return MONTH_SLOT_UNKNOWN_REASON;
     if (usage.warnings?.length) return usage.warnings[0];
     if (usage.unavailableDates?.length) {
       return `${usage.unavailableDates.length} 个日期未取得，不代表零用量`;

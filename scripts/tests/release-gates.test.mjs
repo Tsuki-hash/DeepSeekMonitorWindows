@@ -174,9 +174,13 @@ const versionEvidence = () => {
   if (scenario === "version-runtime-duplicate") header += header;
   let suites = scenario === "version-missing-suite" ? versionSuites.slice(0, -1) : versionSuites;
   if (scenario === "version-byte-suite-absent") suites = versionSuites.filter(suite => suite !== "pe-bytes");
+  if (["version-checksum-suite-absent", "version-checksum-zero-tests", "version-checksum-early-exit-zero", "version-checksum-raw-only"].includes(scenario)) suites = versionSuites.filter(suite => suite !== "checksum-pure");
+  if (scenario === "version-checksum-only") suites = ["checksum-pure"];
+  if (scenario === "version-suite-order") suites = [...versionSuites].reverse();
   if (scenario === "version-zero-tests") suites = [];
-  const rows = suites.map((suite, i) => ({ index: i + 1, suite, label: "synthetic " + suite, status: (scenario === "version-failed-assertion" && i === 0) || (scenario === "version-byte-failed-assertion" && suite === "pe-bytes") ? "FAIL" : "PASS" }));
+  const rows = suites.map((suite, i) => ({ index: i + 1, suite, label: "synthetic " + suite, status: (scenario === "version-failed-assertion" && i === 0) || (scenario === "version-byte-failed-assertion" && suite === "pe-bytes") || (scenario === "version-checksum-failed-assertion" && suite === "checksum-pure") ? "FAIL" : "PASS" }));
   if (scenario === "version-row-index") rows[0].index = 9;
+  if (scenario === "version-checksum-row-index") rows.at(-1).index -= 1;
   const summary = {
     schemaVersion: 1,
     scope: "release-version-pure-functions",
@@ -186,11 +190,14 @@ const versionEvidence = () => {
     failed: rows.filter(row => row.status === "FAIL").length,
   };
   if (scenario === "version-count-mismatch") summary.assertions += 1;
+  if (scenario === "version-checksum-count-mismatch") summary.assertions -= 1;
   const end = "RELEASE_VERSION_SUMMARY " + JSON.stringify(summary) + "\\n";
   let text = rows.map(row => "RELEASE_VERSION_ASSERT " + JSON.stringify(row) + "\\n").join("");
+  if (scenario === "version-checksum-raw-only") text += 'RELEASE_CHECKSUM_PURE_ASSERT {"index":1,"label":"synthetic raw-only","passed":true}\\nRELEASE_CHECKSUM_PURE_SUMMARY {"scope":"release-checksum-pure-functions-and-wiring","completed":true,"assertions":1,"passed":1,"failed":0}\\n';
   if (scenario === "version-summary-only") text = "";
-  if (scenario !== "version-missing-summary") text += end;
-  if (scenario === "version-duplicate-summary") text += end;
+  if (!["version-missing-summary", "version-checksum-partial-return"].includes(scenario)) text += end;
+  if (["version-duplicate-summary", "version-checksum-duplicate-summary"].includes(scenario)) text += end;
+  if (scenario === "version-checksum-summary-not-last") text = end + text.slice(0, -end.length);
   if (scenario === "version-malformed-row") text = text.replace(/RELEASE_VERSION_ASSERT [^\\n]+/, "RELEASE_VERSION_ASSERT {broken}");
   if (scenario === "version-malformed-summary") text = text.replace(/RELEASE_VERSION_SUMMARY [^\\n]+/, "RELEASE_VERSION_SUMMARY null");
   if (scenario === "version-legacy-output") text = "PASS：纯函数回归完成。未执行发行校验主流程或真实安装验收。\\n";
@@ -213,6 +220,9 @@ cp.spawnSync = (command, args, options) => {
     if (scenario === "version-missing-script") return { ...ok(), status: 64, stderr: "synthetic script not found\\n" };
     if (scenario === "version-missing-byte-script") return { ...ok(), status: 64, stderr: "synthetic byte script not found\\n" };
     if (scenario === "version-byte-compile-error") return { ...ok(), status: 65, stderr: "synthetic byte parser compile failure\\n" };
+    if (scenario === "version-checksum-missing-script") return { ...ok(), status: 64, stderr: "synthetic checksum script not found\\n" };
+    if (scenario === "version-checksum-throw") return { ...ok(), status: 1, stderr: "synthetic checksum assertion throw\\n" };
+    if (scenario === "version-checksum-nonzero-exit") return { ...ok(versionEvidence()), status: 17, stderr: "synthetic checksum nonzero exit after success output\\n" };
     if (scenario === "version-signal") return { ...ok(), status: null, signal: "SIGTERM" };
     if (scenario === "version-fail") return { ...ok(versionEvidence()), status: 17, stderr: "synthetic assertion failure\\n" };
     if (scenario === "version-stderr-evidence") return { ...ok(), stderr: versionEvidence() };
@@ -708,10 +718,14 @@ test("release: simulated complete Windows result records full coverage, not inst
   assert.match(result.report, /\| cargo test \| PASS \| 0 \|/);
   assert.match(
     result.report,
-    /\| 发行版本纯函数回归 \| PASS \| 0 \|[^\n]*assertions=4 executed=4/,
+    /\| 发行版本纯函数回归 \| PASS \| 0 \|[^\n]*assertions=5 executed=5/,
   );
   assert.match(result.report, /FAIL=0；NOT RUN=0/);
   assert.match(result.report, /门禁命令全部通过，但安装包未校验/);
+  assert.match(
+    result.report,
+    /Windows checksum 合成 hardlink\/并发套件[^\n]*NOT RUN（本源码入口不执行）/,
+  );
   assert.match(result.report, /"scope": "deepseek-windows-release"/);
   assert.match(result.report, /"version": "7\.4\.7"/);
   assert.match(result.report, /"source": "\$PSVersionTable\.PSVersion"/);
@@ -739,6 +753,13 @@ for (const scenario of ["pass", "crlf", "non-windows"]) {
       REQUIRED_VERSION_SUITES.length,
     );
     assert.deepEqual(log.requiredSuites, REQUIRED_VERSION_SUITES);
+    assert.deepEqual(REQUIRED_VERSION_SUITES, [
+      "filename",
+      "pe-header",
+      "pe-version",
+      "pe-bytes",
+      "checksum-pure",
+    ]);
     assert.ok(log.powershell.coverage.every((item) => item.executed > 0));
     assert.deepEqual(log.powershell.args, [
       "-NoProfile",
@@ -778,6 +799,18 @@ const versionErrorScenarios = [
   "version-missing-suite",
   "version-byte-suite-absent",
   "version-byte-failed-assertion",
+  "version-checksum-suite-absent",
+  "version-checksum-zero-tests",
+  "version-checksum-early-exit-zero",
+  "version-checksum-raw-only",
+  "version-checksum-only",
+  "version-suite-order",
+  "version-checksum-failed-assertion",
+  "version-checksum-row-index",
+  "version-checksum-count-mismatch",
+  "version-checksum-partial-return",
+  "version-checksum-duplicate-summary",
+  "version-checksum-summary-not-last",
   "version-incomplete",
   "version-stderr-evidence",
 ];
@@ -798,6 +831,9 @@ for (const [scenario, exitCode] of [
   ["version-missing-script", 64],
   ["version-missing-byte-script", 64],
   ["version-byte-compile-error", 65],
+  ["version-checksum-missing-script", 64],
+  ["version-checksum-throw", 1],
+  ["version-checksum-nonzero-exit", 17],
 ]) {
   test(`pure version gate preserves native failure before output claims: ${scenario}`, () => {
     const result = execute("run-release-version-tests.mjs", scenario);
@@ -813,7 +849,7 @@ for (const [scenario, exitCode] of [
     assert.ok(release.report.includes(`"code": ${exitCode}`));
     assert.match(
       release.report,
-      /synthetic (?:assertion failure|script not found|byte script not found|byte parser compile failure)/,
+      /synthetic (?:assertion failure|script not found|byte script not found|byte parser compile failure|checksum script not found|checksum assertion throw|checksum nonzero exit after success output)/,
     );
   });
 }
@@ -1130,6 +1166,98 @@ test("pure version assertions preserve failure propagation and completion protoc
     source.indexOf("RELEASE_VERSION_RUNTIME $runtime") <
       source.indexOf("$script:AssertionCount = 0"),
   );
+});
+
+// These are source wiring guards, not execution of PowerShell or Win32 tests.
+// The checksum script itself exercises the parent's real validator with memory
+// fixtures when the maintainer runs the shared PowerShell entry point.
+test("checksum is an independently completed fifth same-process pure suite", () => {
+  const parent = readFileSync(
+    join(root, "scripts", "verify-release-version.static-tests.ps1"),
+    "utf8",
+  );
+  const child = readFileSync(
+    join(root, "scripts", "verify-release-checksum.static-tests.ps1"),
+    "utf8",
+  );
+  assert.match(
+    parent,
+    /\$script:AssertionSuite = 'checksum-pure'\s+\$global:LASTEXITCODE = 0\s+\$checksumExecution = @\(& \(Join-Path \$PSScriptRoot 'verify-release-checksum\.static-tests\.ps1'\) -PassThru\)\s+\$checksumExitCode = \$global:LASTEXITCODE/,
+  );
+  assert.match(
+    parent,
+    /Get-CompletedChecksumAssertions -Execution \$checksumExecution -ExitCode \$checksumExitCode/,
+  );
+  const validator = parent.slice(
+    parent.indexOf("function Get-CompletedChecksumAssertions"),
+    parent.indexOf("function New-VersionFixture"),
+  );
+  assert.match(validator, /if \(\$ExitCode -ne 0\) \{ throw/);
+  assert.match(validator, /\$Execution\.Count -lt 2/);
+  assert.match(validator, /\$checksumSummary = \$Execution\[-1\]/);
+  assert.match(validator, /\$checksumAssertions\.Count -le 0/);
+  assert.match(
+    validator,
+    /\$checksumSummary\.kind -cne 'release-checksum-pure-summary'/,
+  );
+  assert.match(
+    validator,
+    /\$checksumSummary\.scope -cne 'release-checksum-pure-functions-and-wiring'/,
+  );
+  assert.match(validator, /\$checksumSummary\.completed -isnot \[bool\]/);
+  for (const field of ["schemaVersion", "assertions", "passed", "failed"])
+    assert.ok(validator.includes(`$checksumSummary.${field} -isnot [int]`));
+  assert.match(
+    validator,
+    /\$checksumSummary\.assertions -ne \$checksumAssertions\.Count/,
+  );
+  assert.match(
+    validator,
+    /\$checksumSummary\.passed -ne \$checksumAssertions\.Count/,
+  );
+  assert.match(validator, /\$checksumSummary\.failed -ne 0/);
+  assert.match(validator, /\$assertion\.index -ne \$index \+ 1/);
+  assert.match(validator, /\$assertion\.passed -isnot \[bool\]/);
+  assert.match(validator, /\$assertion\.label -isnot \[string\]/);
+  assert.match(child, /param\(\[switch\]\$PassThru\)/);
+  assert.match(child, /kind = 'release-checksum-pure-assertion'/);
+  assert.match(child, /kind = 'release-checksum-pure-summary'/);
+  assert.match(child, /if \(\$PassThru\) \{ \$record \}/);
+  assert.match(child, /if \(\$PassThru\) \{ \$summary \}/);
+  assert.match(child, /if \(-not \$Condition\) \{ throw/);
+  assert.match(child, /RELEASE_CHECKSUM_PURE_ASSERT/);
+  assert.match(child, /RELEASE_CHECKSUM_PURE_SUMMARY/);
+  assert.match(child, /\$completionFunctions\.Count -ne 1/);
+  assert.match(
+    child,
+    /Get-CompletedChecksumAssertions -Execution \$records -ExitCode \$exitCode/,
+  );
+  for (const fault of [
+    "partial-no-summary",
+    "summary-only",
+    "count-mismatch",
+    "incomplete",
+    "duplicate-summary",
+    "completion-not-last",
+    "false-passed-count",
+    "false-failed-count",
+    "bad-index",
+    "failed-row",
+    "nonboolean-row",
+    "nonzero-exit",
+    "unknown-kind",
+    "empty-label",
+    "string-count",
+    "string-index",
+    "nonboolean-completed",
+  ])
+    assert.ok(child.includes(`'${fault}'`));
+  assert.ok(
+    parent.indexOf("$checksumExecution =") <
+      parent.indexOf("RELEASE_VERSION_SUMMARY $summary"),
+  );
+  assert.doesNotMatch(parent, /verify-release-checksum\.windows-tests/);
+  assert.doesNotMatch(child, /verify-release-checksum\.windows-tests/);
 });
 
 test("component runner bundles every retained regression suite and executes all outputs", () => {

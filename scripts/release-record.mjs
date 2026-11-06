@@ -446,7 +446,7 @@ for (const [label, command, commandArgs] of checks) {
 
 lines.push("");
 lines.push(
-  `门禁汇总：${["PASS", "FAIL", "NOT RUN", "ERROR"].map((verdict) => `${verdict}=${checkResults.filter((item) => item.verdict === verdict).length}`).join("；")}。NOT RUN 不计通过。`,
+  `源码门禁命令汇总：${["PASS", "FAIL", "NOT RUN", "ERROR"].map((verdict) => `${verdict}=${checkResults.filter((item) => item.verdict === verdict).length}`).join("；")}。NOT RUN 不计通过；独立 Windows 文件快照/checksum 验收不在此计数中。`,
 );
 
 lines.push("");
@@ -487,7 +487,9 @@ for (const {
     appendGateEvidence(lines, evidence);
   }
   if (label === "发行版本纯函数回归") {
-    lines.push("纯函数断言证据（不读取真实安装包，也不代表安装升级验收）：");
+    lines.push(
+      "五组纯函数断言证据（含 checksum；不读取真实安装包，也不代表 Windows hardlink/并发或安装升级验收）：",
+    );
     lines.push("");
     appendGateEvidence(lines, evidence);
   }
@@ -555,7 +557,10 @@ lines.push(
   "- Rust 发布门禁必须在 Windows 本机用明确 MSVC 目标执行；逐项验证 DPAPI、迁移、同秘密重加密语义身份、凭据提交版本和缓存监听。非 Windows、跳过、过滤或缺失必需测试均不构成发布 PASS。",
 );
 lines.push(
-  "- Rust executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。发行版本纯函数回归单独标记 assertions，要求文件名、PE 头、版本规则、PE 字节解析四组非零断言及唯一完成汇总；它不读取或验证真实安装包。NOT RUN 的原始 passed 不纳入可信通过计数。Windows 文件快照双屏障主流程回归仍是必需的本机发行验收，源码门禁不能代替它。",
+  "- Rust executed 是有一致 libtest 完成行的测试函数数，不是 assert 表达式数量。发行版本纯函数回归单独标记 assertions，要求文件名、PE 头、版本规则、PE 字节解析及 checksum 纯函数五组非零断言及唯一完成汇总；它不读取或验证真实安装包。NOT RUN 的原始 passed 不纳入可信通过计数。Windows 文件快照双屏障主流程回归仍是必需的本机发行验收，源码门禁不能代替它。",
+);
+lines.push(
+  "- Windows checksum 合成 hardlink/并发套件（scripts/verify-release-checksum.windows-tests.ps1）：NOT RUN（本源码入口不执行）。这是独立必需验收，须另存本次运行证据；其合成字节结果也不能冒充真实安装包或安装升级验收。",
 );
 lines.push(
   "- 多工具 Agent 统计已移除：引擎集成、WSL/SQLite 工具扫描与目录链接能力探针不再执行，不计为 PASS 或 NOT RUN。",
@@ -596,7 +601,9 @@ if (failures.length) {
     "⚠ 门禁命令全部通过，但安装包未校验：只能作为「源码门禁」证据，不是完整发版证据。",
   );
 } else {
-  lines.push("✅ 门禁全部 PASS 且记录了安装包哈希；仍需真机与安装升级验收。");
+  lines.push(
+    "✅ 源码门禁命令全部 PASS 且记录了安装包哈希；Windows checksum 合成验收在本记录中仍为 NOT RUN，另需文件快照、真机与安装升级验收，不能据此发布。",
+  );
 }
 
 const text = lines.join("\n") + "\n";

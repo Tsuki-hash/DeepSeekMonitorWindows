@@ -15,8 +15,9 @@
 两条完整入口 `npm run verify` 和 `npm run release:record -- ...` 均通过 `scripts/run-release-version-tests.mjs` 调用 `pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1`，无需维护者额外记住单独命令。要求 PowerShell 7+ 可用；缺少 pwsh、脚本或被提取的函数均阻断，不允许跳过后继续报通过。
 
 - `verify.ps1` 和纯函数脚本均有 `#requires -Version 7.0`，并在开始工作前检查当前进程的 `$PSVersionTable.PSVersion` 和 Core edition。纯函数脚本先输出唯一的 `RELEASE_VERSION_RUNTIME`：版本及各数值段、版本来源、当前进程实际可执行文件路径及取值来源。共享入口核对主版本至少为 7、版本文本与数值段一致、来源及路径有效；缺失／损坏／重复／迟到的运行时证据不能通过。取值失败直接阻断，不能只因命令名是 pwsh 就视作 PowerShell 7，也不能用另一个 `pwsh --version` 进程代替。
-- 前三组从 `verify-release.ps1` 的 AST 提取纯函数，检查文件名版本、内存 PE 头、合成版本字段。第 21 轮新增第四组 `pe-bytes`：同一 pwsh 进程实际执行 `verify-release-pe-bytes.static-tests.ps1`，编译并调用真实 C# 字节解析器，以合成 PE 运行断言；不是只检查脚本存在，也不是只提取 AST。四组均不运行发行校验主流程。
-- 纯字节子脚本逐次输出 `PE_BYTE_ASSERT` 并以 `-PassThru` 返回带序号的真实断言对象，只有完整结束才在末尾返回唯一完成对象（scope、completed、assertions/passed/failed）。父脚本先清空再核对子脚本的 `LASTEXITCODE`，校验末尾完成记录、逐断言顺序和计数后才汇入 `RELEASE_VERSION_ASSERT`，最后输出唯一 `RELEASE_VERSION_SUMMARY`。共享入口要求顺序编号、四组各有非零执行、计数一致、全部成功和真实退出码 0。子脚本缺失、C# 编译/解析回归失败、部分记录后提前返回、显式非零 exit、重复/非末尾完成、计数不符、零记录、缺第四组或旧三组证据均不能通过。子脚本在同一已报告运行时执行，不另用一个 pwsh 版本查询冒充运行时证据。
+- 前三组从 `verify-release.ps1` 的 AST 提取纯函数，检查文件名版本、内存 PE 头、合成版本字段。第 21 轮新增第四组 `pe-bytes`：同一 pwsh 进程实际执行 `verify-release-pe-bytes.static-tests.ps1`，编译并调用真实 C# 字节解析器，以合成 PE 运行断言；不是只检查脚本存在，也不是只提取 AST。第 26 轮新增独立第五组 `checksum-pure`：同进程实际执行 `verify-release-checksum.static-tests.ps1`，检查真实 checksum 纯函数、源码接线与父完成协议。五组均不运行发行校验或 checksum 主流程。
+- 纯字节子脚本逐次输出 `PE_BYTE_ASSERT`；checksum 子脚本逐次输出 `RELEASE_CHECKSUM_PURE_ASSERT`，完整结束才输出 `RELEASE_CHECKSUM_PURE_SUMMARY`。两个子脚本均以 `-PassThru` 返回带序号的真实断言对象和末尾唯一完成对象（kind、schemaVersion、scope、completed、assertions/passed/failed）。父脚本分别先清空再核对各自的 `LASTEXITCODE`，校验末尾完成记录、逐断言顺序和计数后才汇入 `RELEASE_VERSION_ASSERT`，最后输出唯一 `RELEASE_VERSION_SUMMARY`。checksum 对象还严格核对整数计数/序号、布尔结果与非空字符串标签，字符串 `"1"` 或 `"true"` 不能冒充类型正确的证据。
+- 共享入口要求连续编号、按清单顺序执行、五组各有非零断言、计数一致、全部成功和真实退出码 0。子脚本缺失、异常、C# 编译/解析失败、部分记录后提前返回或 `exit 0`、显式非零 exit、重复/非末尾完成、计数不符、零记录、缺任一组、旧三/四组证据均不能通过。只有 checksum 原始字符串、未通过父对象校验的 PASS 或仅第五组输出都不足以放行。子脚本在同一已报告运行时执行，不另用一个 pwsh 版本查询冒充运行时证据。
 - 真实非零退出、启动错误或信号优先于输出里的成功声明；`NOT RUN:` 与旧中文 `跳过：` 在 stdout/stderr 中均被识别，不能降级为 PASS。
 - 纯函数可在装有 pwsh 的非 Windows 环境执行；它的 PASS 不改变 Windows 原生门禁的 NOT RUN，也不代表真实 PE 版本、安装包来源、安装或升级已验收。
 
@@ -41,11 +42,17 @@
 - 发行记录重新解析原始输出，并核对本机平台、命令、范围、清单、结论与计数。旧 schema、缺日志、损坏 UTF-8／JSON、篡改／不一致的字段都记为 `ERROR`，不以原文件自称的 PASS 放行。
 - 源码门禁、安装包哈希、实际包来源及安装使用验收是不同证据。即使门禁 PASS 且记录哈希，也不能声称安装／升级或全部真机交互已验收。
 
-发行版本共享入口的 `--log-file` 另生成 schema v2 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与四组执行数，以及 `powershell.runtime` 内同一执行进程的版本和来源。沿用历史 scope 和未改变结构的 schema，但 `requiredSuites` 必须精确包含新增 `pe-bytes`；旧三组日志即使自称 schema v2 也不能通过。发行记录重新解析原始记录并核对运行时、结论、命令、退出状态与计数，缺日志、旧 schema（含 v1）或字段不一致记为 ERROR。运行时行和完成汇总各自的协议版本仍为 1，不等同于外层日志的 schema v2。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
+发行版本共享入口的 `--log-file` 另生成 schema v2 的 `release-version-pure-functions` JSON：记录原始 pwsh 命令、平台、真实退出码（未启动／被信号终止为 null，不伪填 1）、信号、启动错误、完整 stdout/stderr、逐断言与五组执行数，以及 `powershell.runtime` 内同一执行进程的版本和来源。沿用历史 scope 和未改变结构的 schema，但 `requiredSuites` 必须精确为 `filename`、`pe-header`、`pe-version`、`pe-bytes`、`checksum-pure`，不能删除原四组；旧三/四组日志即使自称 schema v2 也不能通过。发行记录重新解析原始记录并核对运行时、结论、命令、退出状态与计数，缺日志、旧 schema（含 v1）或字段不一致记为 ERROR。运行时行和完成汇总各自的协议版本仍为 1，不等同于外层日志的 schema v2。表格中的退出码是共享入口的退出码，嵌入 JSON 中 `powershell.code` 是实际 pwsh 的退出码，两者不可混淆；`assertions` 是断言数，不能与 Rust 的测试函数数混称。
 
 ### 必需的 Windows 文件快照验收
 
-四组源码门禁可跨平台执行，但不提供 Windows 文件共享/目录锁证据。发布前还必须在本机 NTFS 上按 [第 21 轮说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md) 执行 `verify-release-snapshot.windows-tests.ps1`，使用真实当前版本 PE，完成哈希后/版本前双屏障和句柄释放回归。这是独立的必需发行验收，不自动纳入源码纯函数计数；非 Windows 必须标为未执行，不能从四组源码 PASS 或合成故障注入推导它已通过。
+五组源码门禁可跨平台执行，但不提供 Windows 文件共享/目录锁证据。发布前还必须在本机 NTFS 上按 [第 21 轮说明](REVIEW21_RELEASE_SNAPSHOT_REGRESSIONS.md) 执行 `verify-release-snapshot.windows-tests.ps1`，使用真实当前版本 PE，完成哈希后/版本前双屏障和句柄释放回归。这是独立的必需发行验收，不自动纳入源码纯函数计数；非 Windows 必须标为未执行，不能从五组源码 PASS 或合成故障注入推导它已通过。
+
+### 必需的 Windows checksum 合成验收
+
+`verify-release-checksum.windows-tests.ps1` 是另一项独立必需验收，当前为 **NOT RUN**。按 [第 26 轮说明](REVIEW26_CHECKSUM_SIDECAR_REGRESSIONS.md) 在 Windows、PowerShell 7+、本机 NTFS 的全新证据根执行。它只使用新建的不可执行合成字节，覆盖已存在 sidecar、hardlink/符号链接、并发创建、源与输出持锁、失败不覆盖/不删除，以及字面路径；不得把真实包设为破坏性夹具。需要符号链接权限时不得跳过后报整套通过。
+
+两条源码入口不自动运行这个 Windows 套件；发行记录单独标记 `NOT RUN（本源码入口不执行）`，它不混入五组 assertions 或源码命令汇总。维护者须另存实际退出码、完整完成记录及证据目录。纯函数通过、Windows 合成套件通过、真实候选包的校验和生成、真实安装/升级验收是四种不同证据，不能互相替代。
 
 ### 原始证据保全与保留政策
 
@@ -77,13 +84,18 @@ node --test scripts/tests/release-gates.test.mjs
 # 每个 .tsx 输出为独立 .mjs，再由 node --test 的文件级进程隔离执行。
 npm run test:components
 
-# 版本纯函数回归的共享入口，只用合成输入，不检查真实安装包。
+# 五组纯函数回归的共享入口，包含 checksum；只用合成输入，不检查真实安装包。
 node scripts/run-release-version-tests.mjs --log-file ..\version-functions-1.3.1.json
+
+# 独立必需的 Windows checksum 合成回归，仍为 NOT RUN，详见第 26 轮说明。
+# 证据父目录已存在、每次根目录必须全新；不传入真实包。
+pwsh -NoProfile -File scripts/verify-release-checksum.windows-tests.ps1 `
+  -EvidenceDirectory 'C:\release evidence\round26-checksum-new'
 
 # 真正执行 Rust（不可用上面的故障注入通过记录替代）。
 node scripts/run-rust-tests.mjs --log-file ..\rust-1.3.1.json
 
-# 两条完整入口都包含版本纯函数回归；后一条重新执行门禁并记录实际候选包哈希。
+# 两条完整源码入口都包含五组纯函数回归；后一条重新执行门禁并记录实际候选包哈希。
 npm run verify
 npm run release:record -- --out ..\release-1.3.1.md --installer <实际候选安装包路径>
 ```
@@ -95,6 +107,8 @@ npm run release:record -- --out ..\release-1.3.1.md --installer <实际候选安
 门禁脚本回归包含：非 Windows 常规单测、非 Windows 冒充全部 Windows 完成行、中文跳过、英文标记、stderr 标记、混合执行但缺一个必需项、忽略必需项、零测试、全忽略、只有汇总无完成行、总数不符、重复完成行、过滤测试、cargo 失败、工具启动失败、缺日志、旧 schema、篡改计数／清单／平台／架构／范围／命令／原始输出，以及组件门禁失败／零测试／无可解析计数。另保留完整合成成功路径和 Windows CRLF 输出路径。
 
 版本纯函数注入另覆盖：pwsh 不可用、低于 7、版本与数值段不符、版本文本无法解析、版本／可执行文件来源无效、缺少／相对可执行路径、非 Core、运行时证据缺失／损坏／重复／迟到、脚本缺失、非零原生退出但输出声称成功、信号中止、空输出、旧 PASS 文案、零断言、仅汇总、缺失／重复／损坏汇总、损坏断言、编号／计数不一致、失败断言但退出 0、缺一组、未完成、只有 stderr 证据、中英文与 stderr 跳过标记、缺日志及篡改运行时／计数／退出码／命令／组清单／覆盖／平台／架构／范围／原始输出。合成通过路径验证非 Windows 的纯函数可通过，但整体 Windows 发布仍不得通过。
+
+第 26 轮另补 checksum 缺脚本/异常/非零退出但输出声称成功、缺第五组/零断言/提前 `exit 0`、只有原始 checksum 字符串、只第五组而缺原四组、组顺序错误、失败断言、序号/计数不符、部分记录后返回、重复/非末尾汇总的进程输出注入。checksum 纯脚本还提取真实父校验函数，对逐对象完成协议做 18 类纯内存用例；Node 源码断言核对同进程实际调用和错误传播，但不冒充这些 PowerShell 或 Windows 用例已经运行。全部新增回归仅已编写，尚未运行。
 
 原件保全注入覆盖两类日志的损坏 JSON、无效 UTF-8、空文件、旧 schema、篡改字段、文件缺失与读取失败；核对 Base64 还原后的每个字节、长度和 SHA-256，拒绝内容不会作为 Markdown 展示。报告完全写入失败／部分写入／静默截断／flush 失败／读回失败分别覆盖有效与被拒绝证据，检查原件仍完整存在。成功和仅 stdout 输出也分别检查有效／拒绝日志的保留说明。第 24 轮增加 Rust／版本两类 accepted／rejected 快照：在每次实际源读取返回 A 后以 rename 将路径换成未归档 B；若旧实现再次读取，则先恢复 A、再于该末次读取后换 B，重现“比较通过却删除 B”的窗口。修复后只读一次、报告归档 A、路径上的 B 保留；另检查已有报告不变、在真正报告写入前植入指向两类原件的硬链接也不能截断原件，以及 POSIX 原件／目录／新报告无组和其他用户权限。所有新增注入仅已编写，尚未运行。
 

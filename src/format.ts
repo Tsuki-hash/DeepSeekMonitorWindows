@@ -198,7 +198,8 @@ export const CHART_TOTAL_UNSAFE_REASON =
  * 把单日用量映射成柱状图数据点。
  *
  * `scope === "all"` 时合计优先取 `day.totalTokens`（后端覆盖含未识别模型），
- * 与已知分段之和的差额并入 other，避免新模型名出现时按日图静默丢量。
+ * 未识别 rawModels 的安全总量先独立并入 other，保留缺段时已知的新模型用量；
+ * 仅完整安全分段才能把总量的剩余差额并入 other，且不能重复累加 rawModels。
  * 单模型（flash/pro）按分段求和，但不能绕过后端槽位总量的未知状态。
  * `scope === "other"` 是未接入模型的兜底档：平台不给分段明细，
  * 按日量 = 当日合计 − flash − pro，柱子只有一段。
@@ -265,18 +266,47 @@ export const chartPointFromDay = (
           : [],
   );
   const knownSlots = sumUsageCounts([day.flashTokens, day.proTokens]);
+  const unknownModels = day.rawModels!.filter(
+    (model) => model.groupKey !== "flash" && model.groupKey !== "pro",
+  );
+  // null 是后端明确的「未识别模型」组；缺 groupKey 的旧形状没有归属依据，
+  // 不能把整行当作新增 other（它也可能已计入 Flash/Pro），更不能当作零。
+  const rawOther = sumUsageCounts(
+    unknownModels.map((model) =>
+      model.groupKey === undefined ? null : model.totalTokens,
+    ),
+  );
   const knownOther =
     scope === "flash"
       ? sumUsageCounts([day.flashOtherTokens])
       : scope === "pro"
         ? sumUsageCounts([day.proOtherTokens])
         : scope === "all"
-          ? sumUsageCounts([day.flashOtherTokens, day.proOtherTokens])
+          ? sumUsageCounts([
+              day.flashOtherTokens,
+              day.proOtherTokens,
+              rawOther.total,
+            ])
           : knownSlots.total == null || slotTotals[0].total == null
             ? { total: null, issue: knownSlots.issue ?? slotTotals[0].issue }
             : sumUsageCounts([
                 Math.max(0, slotTotals[0].total - knownSlots.total),
               ]);
+  // 旧聚合可能有未归属差额，却没有对应的 raw 模型行。缺段时无法使用
+  // 「日总量 − 全部分段」辨认来源，不得把空 raw 筛选误当成确定的 other=0。
+  // 只有安全日总量明确多出一部分才算差额证据，total=null 不能清掉已知 other。
+  // 完整安全分段仍由下方的剩余差额兼容路径处理。
+  if (
+    scope === "all" &&
+    unknownModels.length === 0 &&
+    [hit, miss, response].some((segment) => segment.total == null) &&
+    slotTotals[0].total != null &&
+    ((knownSlots.total != null && slotTotals[0].total > knownSlots.total) ||
+      (rawTotal.total != null && slotTotals[0].total > rawTotal.total))
+  ) {
+    knownOther.total = null;
+    knownOther.issue ??= "unknown";
+  }
   const segmented = sumUsageCounts([
     hit.total,
     miss.total,
@@ -287,6 +317,7 @@ export const chartPointFromDay = (
     rawTotal,
     ...slotTotals,
     ...(scope === "all" || scope === "other" ? [knownSlots] : []),
+    ...(scope === "all" ? [rawOther] : []),
     hit,
     miss,
     response,

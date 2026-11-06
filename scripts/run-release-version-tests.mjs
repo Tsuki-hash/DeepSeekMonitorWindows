@@ -21,6 +21,7 @@ export const REQUIRED_VERSION_SUITES = [
   "pe-header",
   "pe-version",
   "pe-bytes",
+  "checksum-pure",
 ];
 
 function validRuntime(runtime) {
@@ -92,6 +93,9 @@ function parseExecution(stdout) {
       (row, index) =>
         row?.index === index + 1 &&
         REQUIRED_VERSION_SUITES.includes(row.suite) &&
+        (index === 0 ||
+          REQUIRED_VERSION_SUITES.indexOf(row.suite) >=
+            REQUIRED_VERSION_SUITES.indexOf(rows[index - 1]?.suite)) &&
         typeof row.label === "string" &&
         row.label.trim().length > 0 &&
         ["PASS", "FAIL"].includes(row.status),
@@ -132,7 +136,7 @@ function evaluate(result) {
     );
   if (!execution.valid || coverage.some((item) => item.executed === 0))
     reasons.push(
-      "ERROR: require sequential assertion rows, nonzero execution in all four suites (including PE byte parsing), and one matching completion summary.",
+      "ERROR: require sequential assertion rows, nonzero execution in all five suites (including PE byte parsing and checksum pure functions), and one matching completion summary.",
     );
   if (hasNotRun(`${result.stdout}\n${result.stderr}`))
     reasons.push("NOT RUN: output contains an unexecuted-scenario marker.");

@@ -1,6 +1,7 @@
 import React from "react";
 import { Brain, Shapes, Zap } from "lucide-react";
 import { fmtInt, fmtMoney, fmtMoneyDisplay, fmtTokensShort } from "../format";
+import { sumUsageCounts } from "../usage-counts";
 import type { LoadState, ModelName, UsageModel } from "../types";
 
 function UsageRow({
@@ -51,11 +52,11 @@ function UsageRow({
     totalTokens == null
       ? "0%"
       : `${Math.max(2, (totalTokens / maxTokens) * 100)}%`;
-  // 缓存命中率只在两个分母分量都已知时计算，否则显示未知。
+  // 两个分量及其和都必须安全且已知；零分母没有可定义的命中率。
   const hit = data?.cacheHitTokens ?? null;
   const miss = data?.cacheMissTokens ?? null;
-  const hitRate =
-    hit != null && miss != null && hit + miss > 0 ? hit + miss : null;
+  const cacheInput = sumUsageCounts([hit, miss]).total;
+  const hitRate = cacheInput != null && cacheInput > 0 ? cacheInput : null;
 
   return (
     <button className="card usage-row" onClick={onClick}>

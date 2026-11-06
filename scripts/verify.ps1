@@ -38,7 +38,8 @@ function Invoke-Check {
 
 Invoke-Check '版本一致性' 'node' @('scripts/check-version.mjs')
 
-# 共享入口核对真实退出码、逐断言输出、四组覆盖（含 PE 纯字节解析）和非零完成汇总。
+# 共享入口核对真实退出码、逐断言输出、五组覆盖（含 PE 纯字节解析和 checksum 纯函数）和非零完成汇总。
+# Windows checksum 合成 hardlink/并发套件仍是独立必需验收，源码 PASS 不能替代。
 Invoke-Check '发行版本纯函数回归' 'node' @('scripts/run-release-version-tests.mjs') -ScenarioGate
 
 Invoke-Check '前端测试' 'npm' @('test')

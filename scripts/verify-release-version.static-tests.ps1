@@ -1,8 +1,8 @@
 #requires -Version 7.0
-# 源码回归：从 verify-release.ps1 的 AST 提取规则纯函数，另执行同进程纯字节解析回归，
+# 源码回归：从 verify-release.ps1 的 AST 提取规则纯函数，另执行同进程纯字节解析及 checksum 纯函数回归，
 # 不运行发行校验主流程、
 # 不启动/安装应用，不构建，不调用 Get-FileHash 或 FileVersionInfo 读取真实安装包。
-# 本文件在第 18/19/20/21 轮修改时仅编写/静态审阅，未执行。
+# 本文件在第 18/19/20/21/26 轮修改时仅编写/静态审阅，未执行。
 # 用户本机运行：pwsh -NoProfile -File scripts/verify-release-version.static-tests.ps1
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
@@ -81,6 +81,34 @@ function Get-CompletedPeByteAssertions {
         }
     }
     return $byteAssertions
+}
+function Get-CompletedChecksumAssertions {
+    param([object[]]$Execution, [int]$ExitCode)
+    if ($ExitCode -ne 0) { throw "checksum 纯函数子脚本非零退出：$ExitCode" }
+    if ($Execution.Count -lt 2) { throw 'checksum 纯函数回归缺少断言或完成记录。' }
+    $checksumSummary = $Execution[-1]
+    $checksumAssertions = @($Execution[0..($Execution.Count - 2)])
+    # 除末尾唯一 summary 外只能有顺序断言；重复/提前完成与额外输出一律拒绝。
+    if ($checksumSummary.kind -cne 'release-checksum-pure-summary' -or
+        $checksumSummary.schemaVersion -isnot [int] -or $checksumSummary.schemaVersion -ne 1 -or
+        $checksumSummary.scope -cne 'release-checksum-pure-functions-and-wiring' -or
+        $checksumSummary.completed -isnot [bool] -or -not $checksumSummary.completed -or
+        $checksumSummary.assertions -isnot [int] -or $checksumSummary.assertions -ne $checksumAssertions.Count -or
+        $checksumSummary.passed -isnot [int] -or $checksumSummary.passed -ne $checksumAssertions.Count -or
+        $checksumSummary.failed -isnot [int] -or $checksumSummary.failed -ne 0) {
+        throw 'checksum 纯函数回归未完整完成或记录计数不一致。'
+    }
+    if ($checksumAssertions.Count -le 0) { throw 'checksum 纯函数回归没有实际执行断言。' }
+    for ($index = 0; $index -lt $checksumAssertions.Count; $index++) {
+        $assertion = $checksumAssertions[$index]
+        if ($assertion.kind -cne 'release-checksum-pure-assertion' -or
+            $assertion.index -isnot [int] -or $assertion.index -ne $index + 1 -or
+            $assertion.passed -isnot [bool] -or -not $assertion.passed -or
+            $assertion.label -isnot [string] -or [string]::IsNullOrWhiteSpace($assertion.label)) {
+            throw 'checksum 纯函数回归返回了失败或无法确认的断言记录。'
+        }
+    }
+    return $checksumAssertions
 }
 function New-VersionFixture {
     [pscustomobject]@{
@@ -168,7 +196,18 @@ foreach ($assertion in $byteAssertions) {
     Assert-Equal $assertion.passed $true $assertion.label
 }
 
-# 只有真正走完四组所有断言才输出完成记录；旧的一句 PASS 不是执行证据。
+# 独立第五组必须实际执行完整纯函数脚本，不从文件存在或 stdout 的 PASS 推断成功。
+# 与前四组使用同一已报告的 PowerShell 进程，异常/退出/提前 return 均不能伪造完成。
+$script:AssertionSuite = 'checksum-pure'
+$global:LASTEXITCODE = 0
+$checksumExecution = @(& (Join-Path $PSScriptRoot 'verify-release-checksum.static-tests.ps1') -PassThru)
+$checksumExitCode = $global:LASTEXITCODE
+$checksumAssertions = @(Get-CompletedChecksumAssertions -Execution $checksumExecution -ExitCode $checksumExitCode)
+foreach ($assertion in $checksumAssertions) {
+    Assert-Equal $assertion.passed $true $assertion.label
+}
+
+# 只有真正走完五组所有断言才输出完成记录；旧的一句 PASS 不是执行证据。
 if ($script:AssertionCount -le 0 -or $script:FailedAssertions -ne 0) {
     throw '纯函数回归没有非零成功执行，不能生成完成记录。'
 }

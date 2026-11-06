@@ -9,6 +9,8 @@ import { UsageRow } from "../src/components/UsageRow";
 import { UsageChart } from "../src/components/UsageChart";
 import type { RawModelUsage, UsageModel, UsageResult } from "../src/types";
 import type { UsageDay } from "../src/format";
+import { buildHistory, historyExport } from "../src/history";
+import { MONTH_SLOT_UNSAFE_REASON } from "../src/usage-trust";
 
 // Synthetic rendering only. No platform requests, stored credentials, app launch,
 // native layout assertions, or Windows notification delivery are performed here.
@@ -454,7 +456,7 @@ test("R25: 两个Flash别名的分段和超界，首页/详情显示原因与已
         cacheMissTokens: miss,
       }),
       raw({
-        model: "deepseek-pro",
+        model: "deepseek-v4-pro",
         groupKey: "pro",
         totalTokens: 7,
         responseTokens: 7,
@@ -521,4 +523,345 @@ test("R25: 已返回但其他分段未知，详情保留其他—而不是省略
     const unknown = view.root.findByProps({ title: "其他：未知" });
     assert.equal(text(unknown), "其他 —");
   });
+});
+
+test("R26: 生产形状Flash缺MISS但future RESPONSE=50，首页其他与详情一致且JSON保真", async () => {
+  // Rust build_usage_result 的输出形状：两个端点均返回同一天，Flash
+  // HIT=100/RESPONSE=0、MISS未返回，future-model RESPONSE=50。
+  // 后端日总量仍为已返回类别之和150，缺失分段不能被前端改写成零。
+  const flash = raw({
+    totalTokens: 100,
+    cacheHitTokens: 100,
+    cacheMissTokens: null,
+    cost: 0.1,
+  });
+  const future = raw({
+    model: "future-model",
+    groupKey: null,
+    totalTokens: 50,
+    cacheHitTokens: null,
+    cacheMissTokens: null,
+    responseTokens: 50,
+    cost: 0.05,
+  });
+  const data = usage({
+    schemaVersion: 2,
+    rawModels: [flash, future],
+    monthCost: 0.15,
+    models: [
+      model({
+        totalTokens: 100,
+        cacheHitTokens: 100,
+        cacheMissTokens: null,
+        cost: 0.1,
+      }),
+      model({ key: "pro", name: "V4 Pro" }),
+      model({
+        key: "other",
+        name: "其他",
+        totalTokens: 50,
+        cacheHitTokens: null,
+        cacheMissTokens: null,
+        responseTokens: 50,
+        cost: 0.05,
+      }),
+    ],
+  });
+  data.days[9] = day("2026-11-10", {
+    rawModels: [flash, future],
+    flashTokens: 100,
+    flashCacheHit: 100,
+    flashCacheMiss: null,
+    totalTokens: 150,
+    totalCost: 0.15,
+  });
+  const before = JSON.stringify(data);
+  const exportJson = () =>
+    historyExport(
+      buildHistory(
+        { from: "2026-11-10", to: "2026-11-10", months: ["2026-11"] },
+        [{ month: "2026-11", fetchedAt: NOW, usage: data }],
+        [],
+      ),
+      NOW,
+    ).json;
+  const jsonBefore = exportJson();
+  await render(dashboard(data), async (view) => {
+    assert.ok(view.root.findByProps({ className: "dot other" }));
+    const bar = chartBar(view, "2026-11-10");
+    assert.match(bar.props["aria-label"], /合计未知/);
+    assert.match(
+      bar.props["aria-label"],
+      /命中 100，未命中 未知，输出 0，其他 50/,
+    );
+    assert.doesNotMatch(bar.props["aria-label"], /数据暂未取得|其他 0/);
+    assert.match(
+      chartBar(view, "2026-11-09").props["aria-label"],
+      /合计 0 tokens/,
+    );
+    await act(async () => bar.props.onClick());
+    assert.equal(
+      text(view.root.findByProps({ title: "其他：50 Tokens" })),
+      "其他 50",
+    );
+    assert.equal(
+      text(view.root.findByProps({ title: "未命中：未知" })),
+      "未命中 —",
+    );
+    assert.equal(
+      text(view.root.findByProps({ className: "chart-total" })),
+      "数据待核对 ›",
+    );
+    assert.equal(view.root.findByType(BalanceCard).props.todayCost, 0.15);
+    assert.equal(view.root.findByType(BalanceCard).props.monthCost, 0.15);
+  });
+  await render(detail(data, "other"), async (view) => {
+    const bar = chartBar(view, "2026-11-10");
+    assert.match(bar.props["aria-label"], /合计 50 tokens/);
+    await act(async () => bar.props.onClick());
+    assert.equal(
+      text(view.root.findByProps({ title: "其他：50 Tokens" })),
+      "其他 50",
+    );
+  });
+  await render(detail(data, "pro"), (view) => {
+    assert.match(
+      chartBar(view, "2026-11-10").props["aria-label"],
+      /合计 0 tokens/,
+    );
+  });
+  const exported = JSON.parse(exportJson());
+  assert.deepEqual(exported.missingDates, []);
+  assert.equal(exported.daily.length, 2);
+  assert.equal(exported.daily[0].cacheHitTokens, 100);
+  assert.equal(exported.daily[0].cacheMissTokens, null);
+  assert.equal(exported.daily[0].responseTokens, 0);
+  assert.equal(exported.daily[1].model, "future-model");
+  assert.equal(exported.daily[1].totalTokens, 50);
+  assert.equal(exported.daily[1].cost, 0.05);
+  assert.equal(exportJson(), jsonBefore);
+  assert.equal(JSON.stringify(data), before);
+});
+
+test("R26: 已返回未知模型坏总量在首页保留其他—与合法兄弟，而非其他0", async () => {
+  for (const futureTotal of [null, 2 ** 53]) {
+    const data = usage();
+    data.days[9] = day("2026-11-10", {
+      flashTokens: 7,
+      flashResponse: 7,
+      totalTokens: null,
+      rawModels: [
+        raw({ totalTokens: 7, responseTokens: 7 }),
+        raw({
+          model: "future-model",
+          groupKey: null,
+          totalTokens: futureTotal,
+        }),
+      ],
+    });
+    const before = JSON.stringify(data);
+    await render(dashboard(data), async (view) => {
+      const bar = chartBar(view, "2026-11-10");
+      assert.match(bar.props["aria-label"], /合计未知/);
+      assert.match(bar.props["aria-label"], /输出 7，其他 未知/);
+      await act(async () => bar.props.onClick());
+      assert.equal(
+        text(view.root.findByProps({ title: "其他：未知" })),
+        "其他 —",
+      );
+      assert.ok(view.root.findByProps({ title: "输出：7 Tokens" }));
+    });
+    await render(detail(data), (view) => {
+      assert.match(
+        chartBar(view, "2026-11-10").props["aria-label"],
+        /合计 7 tokens/,
+      );
+    });
+    assert.equal(JSON.stringify(data), before);
+  }
+});
+
+test("R26: 后端缺计数的other=null保留—，纯总量溢出的other=7保留7，兄弟不受影响", async () => {
+  for (const affected of ["flash", "pro"] as const) {
+    const sibling = affected === "flash" ? "pro" : "flash";
+    for (const otherTokens of [null, 7]) {
+      const overflow = otherTokens === 7;
+      const first = raw({
+        model: `deepseek-v4-${affected}`,
+        groupKey: affected,
+        totalTokens: overflow ? 2 ** 52 + 7 : null,
+        cacheHitTokens: overflow ? 2 ** 52 : null,
+        cacheMissTokens: overflow ? 0 : null,
+        responseTokens: overflow ? 0 : null,
+        otherTokens,
+        cost: 0.2,
+      });
+      const second = raw({
+        model: "deepseek-flash",
+        groupKey: affected,
+        totalTokens: overflow ? 2 ** 52 : 7,
+        cacheMissTokens: overflow ? 2 ** 52 : 0,
+        otherTokens: overflow ? 0 : 7,
+      });
+      const data = usage();
+      // Flash 有两个真实别名；Pro 只有 deepseek-v4-pro，不能编造
+      // deepseek-pro 别名。Pro 用单模型多个类别溢出或仅费用缺计数。
+      const affectedRaw =
+        affected === "flash"
+          ? [first, second]
+          : [
+              {
+                ...first,
+                totalTokens: null,
+                cacheMissTokens: overflow ? 2 ** 52 : null,
+              },
+            ];
+      data.days[9] = day("2026-11-10", {
+        [`${affected}Tokens`]: null,
+        [`${affected}CacheHit`]: overflow ? 2 ** 52 : null,
+        [`${affected}CacheMiss`]: overflow ? 2 ** 52 : null,
+        [`${affected}Response`]: overflow ? 0 : null,
+        [`${affected}OtherTokens`]: otherTokens,
+        [`${sibling}Tokens`]: 9,
+        [`${sibling}Response`]: 9,
+        totalTokens: null,
+        totalCost: 0.2,
+        rawModels: [
+          ...affectedRaw,
+          raw({
+            model: sibling === "flash" ? "deepseek-flash" : "deepseek-v4-pro",
+            groupKey: sibling,
+            totalTokens: 9,
+            responseTokens: 9,
+          }),
+        ],
+      });
+      const before = JSON.stringify(data);
+      for (const element of [dashboard(data), detail(data, affected)]) {
+        await render(element, async (view) => {
+          const bar = chartBar(view, "2026-11-10");
+          assert.match(bar.props["aria-label"], /合计未知/);
+          assert.ok(
+            bar.props["aria-label"].includes(`其他 ${overflow ? "7" : "未知"}`),
+          );
+          await act(async () => bar.props.onClick());
+          const value = view.root.findByProps({
+            title: overflow ? "其他：7 Tokens" : "其他：未知",
+          });
+          assert.equal(text(value), overflow ? "其他 7" : "其他 —");
+        });
+      }
+      await render(detail(data, sibling), (view) => {
+        assert.match(
+          chartBar(view, "2026-11-10").props["aria-label"],
+          /合计 9 tokens/,
+        );
+      });
+      assert.equal(data.days[9].totalCost, 0.2);
+      assert.equal(JSON.stringify(data), before);
+    }
+  }
+});
+
+test("R26: 月槽位MAX/超界1发生在近7日外，首页状态降级而真实零日柱保留", async () => {
+  for (const second of [2 ** 52 - 1, 2 ** 52]) {
+    const safe = second === 2 ** 52 - 1;
+    const rawModels = [
+      raw({ totalTokens: 2 ** 52, cacheHitTokens: 2 ** 52 }),
+      raw({
+        model: "deepseek-v4-flash",
+        totalTokens: second,
+        cacheMissTokens: second,
+      }),
+    ];
+    const data = usage({
+      monthCost: 0,
+      rawModels,
+      models: [
+        model({
+          totalTokens: safe ? Number.MAX_SAFE_INTEGER : null,
+          cacheHitTokens: 2 ** 52,
+          cacheMissTokens: second,
+        }),
+        model({ key: "pro", name: "V4 Pro" }),
+      ],
+    });
+    data.days[0] = day("2026-11-01", {
+      flashTokens: 2 ** 52,
+      flashCacheHit: 2 ** 52,
+      totalTokens: 2 ** 52,
+      rawModels: [rawModels[0]],
+    });
+    data.days[1] = day("2026-11-02", {
+      flashTokens: second,
+      flashCacheMiss: second,
+      totalTokens: second,
+      rawModels: [rawModels[1]],
+    });
+    const before = JSON.stringify(data);
+    await render(dashboard(data), (view) => {
+      const trust = text(view.root.findByProps({ className: "source-trust" }));
+      assert.ok(trust.includes(safe ? "完整" : "部分"));
+      if (!safe) {
+        assert.doesNotMatch(trust, /完整/);
+        assert.equal(
+          text(view.root.findByProps({ className: "source-trust-reason" })),
+          MONTH_SLOT_UNSAFE_REASON,
+        );
+      }
+      assert.ok(
+        text(view.root.findByProps({ className: "chart-total" })).startsWith(
+          "0 ·",
+        ),
+      );
+      assert.match(
+        chartBar(view, "2026-11-10").props["aria-label"],
+        /合计 0 tokens/,
+      );
+      const flashRow = view.root
+        .findAllByType(UsageRow)
+        .find((node: any) => node.props.modelKey === "flash");
+      const rates = flashRow.findAllByProps({
+        className: "cache-hit-rate flash",
+      });
+      assert.equal(rates.length, safe ? 1 : 0);
+      if (safe) assert.equal(text(rates[0]), "缓存命中 50%");
+      else assert.ok(text(flashRow).includes("Tokens 未知"));
+      assert.equal(view.root.findByType(BalanceCard).props.monthCost, 0);
+    });
+    assert.equal(JSON.stringify(data), before);
+  }
+});
+
+test("R26: 月命中率分母缺失/非法/溢出/零不造百分比，单侧0与MAX合法", async () => {
+  for (const [hit, miss, expected] of [
+    [null, 0, null],
+    [0, null, null],
+    [0, 0, null],
+    [-1, 2, null],
+    [0.5, 1, null],
+    [NaN, 1, null],
+    [Infinity, 1, null],
+    [2 ** 52, 2 ** 52, null],
+    [0, Number.MAX_SAFE_INTEGER, "缓存命中 0%"],
+    [Number.MAX_SAFE_INTEGER, 0, "缓存命中 100%"],
+    [2 ** 52, 2 ** 52 - 1, "缓存命中 50%"],
+  ] as const) {
+    await render(
+      <UsageRow
+        modelKey="flash"
+        data={model({ cacheHitTokens: hit, cacheMissTokens: miss })}
+        maxTokens={1}
+        state="ok"
+        onClick={noop}
+      />,
+      (view) => {
+        const rates = view.root.findAllByProps({
+          className: "cache-hit-rate flash",
+        });
+        assert.equal(rates.length, expected == null ? 0 : 1);
+        if (expected != null) assert.equal(text(rates[0]), expected);
+      },
+    );
+  }
 });

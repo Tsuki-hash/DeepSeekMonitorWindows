@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   usageCompleteness as completenessAt,
   usageTrust as trustAt,
+  MONTH_SLOT_UNKNOWN_REASON,
+  MONTH_SLOT_UNSAFE_REASON,
 } from "./usage-trust.ts";
-import type { UsageResult } from "./types.ts";
+import type { UsageModel, UsageResult } from "./types.ts";
 import {
   recentUsageDays,
   emptyUsageDay,
@@ -409,4 +411,157 @@ test("R25：已返回的别名合计超界有明确原因，不变成缺日期",
   });
   assert.ok(trust.reason?.includes("2026-11-10"));
   assert.ok(trust.reason?.includes("超出安全整数"));
+});
+
+const monthSlot = (over: Partial<UsageModel> = {}): UsageModel => ({
+  key: "flash",
+  name: "V4.1 Flash",
+  totalTokens: 0,
+  requestCount: 0,
+  cacheHitTokens: 0,
+  cacheMissTokens: 0,
+  responseTokens: 0,
+  otherTokens: 0,
+  cost: 0,
+  ...over,
+});
+const trustFor = (data: UsageResult) =>
+  usageTrust({
+    usage: data,
+    state: "ok",
+    error: "",
+    updatedAt: NOW.getTime(),
+    snapshotMonth: "2026-11",
+    currentMonth: "2026-11",
+    lastSuccessText: null,
+  });
+
+test("R26：近7日外月槽位跨别名刚好MAX安全，超界1必须部分且保留日柱/raw", () => {
+  for (const second of [2 ** 52 - 1, 2 ** 52]) {
+    const safe = second === 2 ** 52 - 1;
+    const rawModels = [
+      { ...rawZero, totalTokens: 2 ** 52, cacheHitTokens: 2 ** 52 },
+      {
+        ...rawZero,
+        model: "deepseek-v4-flash",
+        totalTokens: second,
+        cacheMissTokens: second,
+      },
+    ];
+    const data = usage({
+      rawModels,
+      models: [
+        monthSlot({
+          totalTokens: safe ? Number.MAX_SAFE_INTEGER : null,
+          cacheHitTokens: 2 ** 52,
+          cacheMissTokens: second,
+        }),
+        monthSlot({ key: "pro", name: "V4 Pro" }),
+      ],
+    });
+    data.days[0] = {
+      ...returnedZero("2026-11-01"),
+      totalTokens: 2 ** 52,
+      flashTokens: 2 ** 52,
+      flashCacheHit: 2 ** 52,
+      rawModels: [rawModels[0]],
+    };
+    data.days[1] = {
+      ...returnedZero("2026-11-02"),
+      totalTokens: second,
+      flashTokens: second,
+      flashCacheMiss: second,
+      rawModels: [rawModels[1]],
+    };
+    const before = JSON.stringify(data);
+    assert.deepEqual(missingUsageDates(data, NOW), []);
+    assert.deepEqual(usageNotices(data, NOW), []);
+    const points = data.days.map((day) => chartPointFromDay(day));
+    assert.ok(points.every((point) => !point.unavailable));
+    assert.equal(chartTotal(points.slice(-7)), 0);
+    assert.equal(usageCompleteness(data, false), safe ? "complete" : "partial");
+    assert.equal(trustFor(data).reason, safe ? null : MONTH_SLOT_UNSAFE_REASON);
+    assert.equal(trustFor(data).stale, false);
+    assert.equal(
+      JSON.stringify(data),
+      before,
+      "月状态降级不能改写日柱、兄弟槽位或 raw",
+    );
+  }
+});
+
+test("R26：仅已返回月槽位的缺项/不安全计数降级，空槽位列表及显式零保持完整", () => {
+  for (const models of [[], [monthSlot()], [monthSlot({ key: "pro" })]]) {
+    assert.equal(trustFor(usage({ models })).completeness, "complete");
+    assert.equal(trustFor(usage({ models })).reason, null);
+  }
+  for (const field of [
+    "totalTokens",
+    "requestCount",
+    "cacheHitTokens",
+    "cacheMissTokens",
+    "responseTokens",
+    "otherTokens",
+  ] as const) {
+    for (const value of [null, Number.MAX_SAFE_INTEGER + 1]) {
+      const data = usage({ models: [monthSlot({ [field]: value })] });
+      assert.equal(usageCompleteness(data, false), "partial", field);
+      assert.equal(
+        trustFor(data).reason,
+        value == null ? MONTH_SLOT_UNKNOWN_REASON : MONTH_SLOT_UNSAFE_REASON,
+        field,
+      );
+    }
+  }
+});
+
+test("R26：月槽位未知总量不能被安全分段覆盖；raw别名超界给出准确原因", () => {
+  const data = usage({
+    models: [monthSlot({ totalTokens: null })],
+    rawModels: [rawZero],
+  });
+  assert.equal(trustFor(data).completeness, "partial");
+  assert.equal(trustFor(data).reason, MONTH_SLOT_UNKNOWN_REASON);
+  data.rawModels = [
+    { ...rawZero, totalTokens: Number.MAX_SAFE_INTEGER },
+    { ...rawZero, model: "deepseek-v4-flash", totalTokens: 1 },
+  ];
+  assert.equal(trustFor(data).reason, MONTH_SLOT_UNSAFE_REASON);
+  data.models = [monthSlot({ key: "other", totalTokens: null })];
+  data.rawModels = data.rawModels!.map((item) => ({ ...item, groupKey: null }));
+  assert.equal(trustFor(data).reason, MONTH_SLOT_UNSAFE_REASON);
+  data.rawModels = data.rawModels.map((item) => ({
+    ...item,
+    groupKey: "future-group",
+  }));
+  assert.equal(trustFor(data).reason, MONTH_SLOT_UNSAFE_REASON);
+  data.rawModels = data.rawModels.map((item) => {
+    const legacy = { ...item };
+    Reflect.deleteProperty(legacy, "groupKey");
+    return legacy;
+  });
+  assert.equal(trustFor(data).completeness, "partial");
+  assert.equal(trustFor(data).reason, MONTH_SLOT_UNKNOWN_REASON);
+});
+
+test("R26：合法单侧零及MAX计数保持完整，不跨兄弟月槽位相加", () => {
+  for (const hit of [0, Number.MAX_SAFE_INTEGER]) {
+    const data = usage({
+      models: [
+        monthSlot({
+          totalTokens: Number.MAX_SAFE_INTEGER,
+          requestCount: Number.MAX_SAFE_INTEGER,
+          cacheHitTokens: hit,
+          cacheMissTokens: Number.MAX_SAFE_INTEGER - hit,
+        }),
+        monthSlot({
+          key: "pro",
+          totalTokens: 1,
+          cacheHitTokens: 1,
+        }),
+      ],
+    });
+    assert.equal(trustFor(data).completeness, "complete");
+    assert.equal(trustFor(data).reason, null);
+  }
 });
